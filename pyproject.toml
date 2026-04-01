@@ -1,0 +1,39 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "syncfield"
+version = "0.1.0"
+description = "Lightweight timestamp capture SDK for SyncField multi-stream synchronization"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.9"
+authors = [{ name = "OpenGraph Labs" }]
+keywords = ["synchronization", "timestamp", "multi-camera", "robotics", "data-collection"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering",
+]
+
+[project.urls]
+Homepage = "https://github.com/OpenGraphLabs/syncfield-python"
+Repository = "https://github.com/OpenGraphLabs/syncfield-python"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/syncfield"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.4.2",
+]
