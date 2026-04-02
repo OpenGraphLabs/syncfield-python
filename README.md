@@ -88,12 +88,16 @@ docker run -v ./data:/data -v ./timestamps:/timestamps \
 curl -X POST http://localhost:8080/api/v1/sync \
   -H "Content-Type: application/json" \
   -d '{
-    "streams": [
-      {"path": "/data/cam_left.mp4", "stream_id": "cam_left"},
-      {"path": "/data/cam_right.mp4", "stream_id": "cam_right"}
+    "hosts": [
+      {
+        "host_id": "rig_01",
+        "streams": [
+          {"path": "/data/cam_left.mp4", "stream_id": "cam_left", "is_primary": true},
+          {"path": "/data/cam_right.mp4", "stream_id": "cam_right"}
+        ]
+      }
     ],
-    "timestamps_dir": "/timestamps",
-    "alignment_mode": "timestamp"
+    "timestamps_dir": "/timestamps"
   }'
 ```
 
@@ -112,8 +116,8 @@ files = [
 ]
 data = {
     "stream_ids": "cam_left,cam_right",
+    "host_ids": "rig_01,rig_01",
     "primary_id": "cam_left",
-    "alignment_mode": "timestamp",
 }
 resp = requests.post("http://localhost:8080/api/v1/sync/upload", files=files, data=data)
 ```

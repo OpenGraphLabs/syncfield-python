@@ -26,6 +26,8 @@ classifiers = [
 [project.urls]
 Homepage = "https://github.com/OpenGraphLabs/syncfield-python"
 Repository = "https://github.com/OpenGraphLabs/syncfield-python"
+Documentation = "https://github.com/OpenGraphLabs/syncfield-python#readme"
+Issues = "https://github.com/OpenGraphLabs/syncfield-python/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/syncfield"]

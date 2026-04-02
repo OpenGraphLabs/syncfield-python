@@ -13,8 +13,10 @@ Quick start::
     session.stop()
 """
 
+from importlib.metadata import version as _pkg_version
+
 from syncfield.capture import SyncSession
 from syncfield.types import FrameTimestamp, SyncPoint
 
 __all__ = ["SyncSession", "SyncPoint", "FrameTimestamp"]
-__version__ = "0.1.0"
+__version__ = _pkg_version("syncfield")

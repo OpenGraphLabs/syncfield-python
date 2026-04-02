@@ -6,9 +6,9 @@ import json
 from pathlib import Path
 from typing import IO, Any
 
-from syncfield.types import FrameTimestamp, SyncPoint
+from importlib.metadata import version as _pkg_version
 
-_SDK_VERSION = "0.1.0"
+from syncfield.types import FrameTimestamp, SyncPoint
 
 
 class StreamWriter:
@@ -47,7 +47,7 @@ class StreamWriter:
 def write_sync_point(sync_point: SyncPoint, output_dir: Path) -> Path:
     """Write ``sync_point.json`` to *output_dir* and return the path."""
     path = output_dir / "sync_point.json"
-    data: dict[str, Any] = {"sdk_version": _SDK_VERSION}
+    data: dict[str, Any] = {"sdk_version": _pkg_version("syncfield")}
     data.update(sync_point.to_dict())
     with open(path, "w") as f:
         json.dump(data, f, indent=2)
