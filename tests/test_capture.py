@@ -348,3 +348,74 @@ def test_manifest_mixed_streams(tmp_path: Path):
     # Counts from stop()
     assert counts["cam_left"] == 5
     assert counts["imu"] == 10
+
+
+def test_stamp_with_capture_ns(tmp_path: Path):
+    """stamp() accepts a pre-captured timestamp."""
+    session = SyncSession(host_id="h1", output_dir=tmp_path)
+    session.start()
+
+    import time
+
+    pre_captured = time.monotonic_ns()
+    result = session.stamp("cam", frame_number=0, capture_ns=pre_captured)
+
+    session.stop()
+
+    assert result == pre_captured
+
+    lines = (tmp_path / "cam.timestamps.jsonl").read_text().strip().splitlines()
+    entry = json.loads(lines[0])
+    assert entry["capture_ns"] == pre_captured
+
+
+def test_record_with_capture_ns(tmp_path: Path):
+    """record() accepts a pre-captured timestamp."""
+    session = SyncSession(host_id="h1", output_dir=tmp_path)
+    session.start()
+
+    import time
+
+    pre_captured = time.monotonic_ns()
+    result = session.record(
+        "imu", frame_number=0, channels={"x": 1.0}, capture_ns=pre_captured,
+    )
+
+    session.stop()
+
+    assert result == pre_captured
+
+    # Both files should have the same pre-captured timestamp
+    ts_line = json.loads(
+        (tmp_path / "imu.timestamps.jsonl").read_text().strip().splitlines()[0]
+    )
+    sensor_line = json.loads(
+        (tmp_path / "imu.jsonl").read_text().strip().splitlines()[0]
+    )
+    assert ts_line["capture_ns"] == pre_captured
+    assert sensor_line["capture_ns"] == pre_captured
+
+
+def test_record_nested_channels(tmp_path: Path):
+    """record() accepts nested/complex channel data."""
+    session = SyncSession(host_id="h1", output_dir=tmp_path)
+    session.start()
+
+    hand_state = {
+        "joints": {
+            "wrist": [0.1, 0.2, 0.3],
+            "thumb_tip": [0.4, 0.5, 0.6],
+        },
+        "gestures": {"pinch": 0.95, "fist": 0.02},
+        "finger_angles": [12.5, 45.0, 30.0, 15.0, 5.0],
+    }
+    session.record("hand_tracker", frame_number=0, channels=hand_state)
+
+    session.stop()
+
+    line = json.loads(
+        (tmp_path / "hand_tracker.jsonl").read_text().strip().splitlines()[0]
+    )
+    assert line["channels"]["joints"]["wrist"] == [0.1, 0.2, 0.3]
+    assert line["channels"]["gestures"]["pinch"] == 0.95
+    assert line["channels"]["finger_angles"] == [12.5, 45.0, 30.0, 15.0, 5.0]

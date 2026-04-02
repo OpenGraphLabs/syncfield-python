@@ -118,7 +118,7 @@ class SensorSample:
 
     frame_number: int
     capture_ns: int
-    channels: dict[str, float]
+    channels: dict[str, Any]
     clock_source: str = "host_monotonic"
     clock_domain: str = "local_host"
     uncertainty_ns: int = 5_000_000  # 5 ms

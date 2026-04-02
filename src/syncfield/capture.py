@@ -5,6 +5,7 @@ from __future__ import annotations
 import time
 import threading
 from pathlib import Path
+from typing import Any
 
 from syncfield.types import FrameTimestamp, SensorSample, SyncPoint
 from syncfield.writer import SensorWriter, StreamWriter, write_manifest, write_sync_point
@@ -74,6 +75,7 @@ class SyncSession:
         stream_id: str,
         frame_number: int,
         uncertainty_ns: int = 5_000_000,
+        capture_ns: int | None = None,
     ) -> int:
         """Record a timestamp for one data packet.
 
@@ -84,9 +86,11 @@ class SyncSession:
             stream_id: Identifier for the data stream (e.g. ``"cam_left"``).
             frame_number: Sequential index (0-based) within this stream.
             uncertainty_ns: Timing uncertainty estimate (default 5 ms).
+            capture_ns: Pre-captured ``time.monotonic_ns()`` value. If
+                ``None`` (default), the SDK captures it at call time.
 
         Returns:
-            The captured ``time.monotonic_ns()`` value.
+            The ``time.monotonic_ns()`` value used for this timestamp.
 
         Raises:
             RuntimeError: If :meth:`start` has not been called.
@@ -94,7 +98,8 @@ class SyncSession:
         if not self._started:
             raise RuntimeError("Session not started — call start() first")
 
-        capture_ns = time.monotonic_ns()
+        if capture_ns is None:
+            capture_ns = time.monotonic_ns()
 
         ts = FrameTimestamp(
             frame_number=frame_number,
@@ -118,22 +123,29 @@ class SyncSession:
         self,
         stream_id: str,
         frame_number: int,
-        channels: dict[str, float],
+        channels: dict[str, Any],
         uncertainty_ns: int = 5_000_000,
+        capture_ns: int | None = None,
     ) -> int:
         """Record a sensor sample with timestamp and channel data.
 
         Captures ``time.monotonic_ns()``, then writes to both
         ``{stream_id}.timestamps.jsonl`` and ``{stream_id}.jsonl``.
 
+        Channels can be flat (``{"accel_x": 0.12}``) or nested
+        (``{"joints": {"wrist": [0.1, 0.2, 0.3]}}``).
+
         Args:
             stream_id: Identifier for the sensor stream (e.g. ``"imu"``).
             frame_number: Sequential index (0-based) within this stream.
-            channels: Sensor channel values as ``{name: value}`` pairs.
+            channels: Sensor data as ``{name: value}`` pairs. Values can be
+                floats, lists, or nested dicts for complex sensors.
             uncertainty_ns: Timing uncertainty estimate (default 5 ms).
+            capture_ns: Pre-captured ``time.monotonic_ns()`` value. If
+                ``None`` (default), the SDK captures it at call time.
 
         Returns:
-            The captured ``time.monotonic_ns()`` value.
+            The ``time.monotonic_ns()`` value used for this timestamp.
 
         Raises:
             RuntimeError: If :meth:`start` has not been called.
@@ -141,7 +153,8 @@ class SyncSession:
         if not self._started:
             raise RuntimeError("Session not started — call start() first")
 
-        capture_ns = time.monotonic_ns()
+        if capture_ns is None:
+            capture_ns = time.monotonic_ns()
 
         ts = FrameTimestamp(
             frame_number=frame_number,
