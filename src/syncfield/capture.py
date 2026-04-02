@@ -6,8 +6,8 @@ import time
 import threading
 from pathlib import Path
 
-from syncfield.types import FrameTimestamp, SyncPoint
-from syncfield.writer import StreamWriter, write_sync_point
+from syncfield.types import FrameTimestamp, SensorSample, SyncPoint
+from syncfield.writer import SensorWriter, StreamWriter, write_manifest, write_sync_point
 
 
 class SyncSession:
@@ -40,6 +40,9 @@ class SyncSession:
         self._output_dir = Path(output_dir)
         self._sync_point: SyncPoint | None = None
         self._writers: dict[str, StreamWriter] = {}
+        self._sensor_writers: dict[str, SensorWriter] = {}
+        self._links: dict[str, str] = {}
+        self._recorded_streams: set[str] = set()
         self._lock = threading.Lock()
         self._started = False
 
@@ -111,11 +114,91 @@ class SyncSession:
 
         return capture_ns
 
+    def record(
+        self,
+        stream_id: str,
+        frame_number: int,
+        channels: dict[str, float],
+        uncertainty_ns: int = 5_000_000,
+    ) -> int:
+        """Record a sensor sample with timestamp and channel data.
+
+        Captures ``time.monotonic_ns()``, then writes to both
+        ``{stream_id}.timestamps.jsonl`` and ``{stream_id}.jsonl``.
+
+        Args:
+            stream_id: Identifier for the sensor stream (e.g. ``"imu"``).
+            frame_number: Sequential index (0-based) within this stream.
+            channels: Sensor channel values as ``{name: value}`` pairs.
+            uncertainty_ns: Timing uncertainty estimate (default 5 ms).
+
+        Returns:
+            The captured ``time.monotonic_ns()`` value.
+
+        Raises:
+            RuntimeError: If :meth:`start` has not been called.
+        """
+        if not self._started:
+            raise RuntimeError("Session not started — call start() first")
+
+        capture_ns = time.monotonic_ns()
+
+        ts = FrameTimestamp(
+            frame_number=frame_number,
+            capture_ns=capture_ns,
+            clock_source="host_monotonic",
+            clock_domain=self._host_id,
+            uncertainty_ns=uncertainty_ns,
+        )
+
+        sample = SensorSample(
+            frame_number=frame_number,
+            capture_ns=capture_ns,
+            channels=channels,
+            clock_source="host_monotonic",
+            clock_domain=self._host_id,
+            uncertainty_ns=uncertainty_ns,
+        )
+
+        with self._lock:
+            # Timestamp writer
+            ts_writer = self._writers.get(stream_id)
+            if ts_writer is None:
+                ts_writer = StreamWriter(stream_id, self._output_dir)
+                ts_writer.open()
+                self._writers[stream_id] = ts_writer
+            ts_writer.write(ts)
+
+            # Sensor data writer
+            sensor_writer = self._sensor_writers.get(stream_id)
+            if sensor_writer is None:
+                sensor_writer = SensorWriter(stream_id, self._output_dir)
+                sensor_writer.open()
+                self._sensor_writers[stream_id] = sensor_writer
+            sensor_writer.write(sample)
+
+            self._recorded_streams.add(stream_id)
+
+        return capture_ns
+
+    def link(self, stream_id: str, path: str | Path) -> None:
+        """Associate an external file path with a stream.
+
+        Use this for files produced outside the SDK (e.g. video files,
+        pre-converted sensor files). The association is recorded in
+        ``manifest.json`` when :meth:`stop` is called.
+
+        Args:
+            stream_id: The stream identifier.
+            path: Path to the external file.
+        """
+        self._links[stream_id] = str(path)
+
     def stop(self) -> dict[str, int]:
         """End the recording session.
 
-        Closes all writers, writes ``sync_point.json``, and validates
-        timestamp monotonicity.
+        Closes all writers and writes ``sync_point.json`` and
+        ``manifest.json``.
 
         Returns:
             Mapping of ``{stream_id: frame_count}`` for all recorded streams.
@@ -131,8 +214,36 @@ class SyncSession:
             counts[stream_id] = writer.count
             writer.close()
 
+        for writer in self._sensor_writers.values():
+            writer.close()
+
         if self._sync_point is not None:
             write_sync_point(self._sync_point, self._output_dir)
+
+        # Build manifest
+        streams: dict[str, dict[str, Any]] = {}
+        all_ids = sorted(
+            set(self._writers) | set(self._links) | self._recorded_streams,
+        )
+        for stream_id in all_ids:
+            entry: dict[str, Any] = {}
+
+            if stream_id in self._recorded_streams:
+                entry["type"] = "sensor"
+                entry["sensor_path"] = f"{stream_id}.jsonl"
+            else:
+                entry["type"] = "video"
+
+            if stream_id in self._writers:
+                entry["timestamps_path"] = f"{stream_id}.timestamps.jsonl"
+                entry["frame_count"] = counts[stream_id]
+
+            if stream_id in self._links:
+                entry["path"] = self._links[stream_id]
+
+            streams[stream_id] = entry
+
+        write_manifest(self._host_id, streams, self._output_dir)
 
         self._started = False
         return counts

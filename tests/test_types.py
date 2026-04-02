@@ -1,6 +1,6 @@
 """Tests for syncfield.types."""
 
-from syncfield.types import FrameTimestamp, SyncPoint
+from syncfield.types import FrameTimestamp, SensorSample, SyncPoint
 
 
 def test_sync_point_create_now():
@@ -61,3 +61,60 @@ def test_frame_timestamp_from_dict_defaults():
     assert ts.clock_source == "host_monotonic"
     assert ts.clock_domain == "local_host"
     assert ts.uncertainty_ns == 5_000_000
+
+
+# --- SensorSample tests ---
+
+
+def test_sensor_sample_defaults():
+    sample = SensorSample(frame_number=0, capture_ns=123456789, channels={"x": 1.0})
+    assert sample.clock_source == "host_monotonic"
+    assert sample.clock_domain == "local_host"
+    assert sample.uncertainty_ns == 5_000_000
+
+
+def test_sensor_sample_to_dict():
+    sample = SensorSample(
+        frame_number=3,
+        capture_ns=999,
+        channels={"accel_x": 0.12, "accel_y": -0.34},
+        clock_domain="rig_01",
+    )
+    d = sample.to_dict()
+    assert d == {
+        "frame_number": 3,
+        "capture_ns": 999,
+        "clock_source": "host_monotonic",
+        "clock_domain": "rig_01",
+        "uncertainty_ns": 5_000_000,
+        "channels": {"accel_x": 0.12, "accel_y": -0.34},
+    }
+
+
+def test_sensor_sample_round_trip():
+    original = SensorSample(
+        frame_number=7,
+        capture_ns=5555555,
+        channels={"temp": 22.5, "humidity": 45.0},
+        clock_domain="my_host",
+        uncertainty_ns=1_000_000,
+    )
+    restored = SensorSample.from_dict(original.to_dict())
+    assert restored.frame_number == original.frame_number
+    assert restored.capture_ns == original.capture_ns
+    assert restored.channels == original.channels
+    assert restored.clock_source == original.clock_source
+    assert restored.clock_domain == original.clock_domain
+    assert restored.uncertainty_ns == original.uncertainty_ns
+
+
+def test_sensor_sample_from_dict_defaults():
+    """from_dict should fill defaults for optional fields; frame_number defaults to 0."""
+    minimal = {"capture_ns": 100, "channels": {"v": 3.14}}
+    sample = SensorSample.from_dict(minimal)
+    assert sample.frame_number == 0
+    assert sample.capture_ns == 100
+    assert sample.channels == {"v": 3.14}
+    assert sample.clock_source == "host_monotonic"
+    assert sample.clock_domain == "local_host"
+    assert sample.uncertainty_ns == 5_000_000

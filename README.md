@@ -1,8 +1,6 @@
 # syncfield-python
 
-Lightweight timestamp capture SDK for [SyncField](https://opengraphlabs.com) multi-stream synchronization.
-
-Captures precise `time.monotonic_ns()` timestamps during multi-camera/sensor recording and produces JSONL files that the SyncField Docker service consumes for frame-level temporal alignment.
+Lightweight Python SDK for [SyncField](https://opengraphlabs.com) multi-stream synchronization. Captures precise timestamps during multi-camera and sensor recording and produces JSONL files that the SyncField Docker service consumes for frame-level temporal alignment.
 
 ## Install
 
@@ -10,46 +8,141 @@ Captures precise `time.monotonic_ns()` timestamps during multi-camera/sensor rec
 pip install syncfield
 ```
 
-**Zero dependencies** — uses only the Python standard library.
+**Zero dependencies** -- uses only the Python standard library.
 
 ## Quick Start
+
+### Video Streams
+
+Use `stamp()` to capture timestamps and `link()` to associate the saved video file with the stream.
 
 ```python
 import syncfield as sf
 
-# Start a recording session
-session = sf.SyncSession(host_id="rig_01", output_dir="./timestamps")
+session = sf.SyncSession(host_id="rig_01", output_dir="./sync_data")
 session.start()
 
-# In your I/O loop — call stamp() immediately AFTER each read()
-frame = camera.read()
-session.stamp("cam_left", frame_number=i)
+for i in range(num_frames):
+    frame = camera.read()
+    session.stamp("cam_left", frame_number=i)
+    save_frame_to_video(frame, "cam_left.mp4")
 
-data = imu.read()
-session.stamp("imu", frame_number=i)
-
-# End the session
+session.link("cam_left", "/data/cam_left.mp4")
 session.stop()
 ```
 
 Output:
 ```
-./timestamps/
+./sync_data/
   sync_point.json
   cam_left.timestamps.jsonl
+  manifest.json
+```
+
+### Sensor Streams
+
+Use `record()` to capture timestamps and sensor data in one call. This writes both a `.timestamps.jsonl` file (for alignment) and a `.jsonl` file (sensor channel values).
+
+```python
+import syncfield as sf
+
+session = sf.SyncSession(host_id="rig_01", output_dir="./sync_data")
+session.start()
+
+for i in range(num_samples):
+    data = imu.read()
+    session.record("imu", frame_number=i, channels={
+        "accel_x": data.ax,
+        "accel_y": data.ay,
+        "accel_z": data.az,
+    })
+
+session.stop()
+```
+
+Output:
+```
+./sync_data/
+  sync_point.json
   imu.timestamps.jsonl
+  imu.jsonl
+  manifest.json
+```
+
+### Multi-Stream Example
+
+A complete example with 2 cameras and 1 IMU, each in its own thread.
+
+```python
+import threading
+import syncfield as sf
+
+session = sf.SyncSession(host_id="rig_01", output_dir="./sync_data")
+session.start()
+
+recording = True
+
+def camera_loop(cam, stream_id, video_path):
+    i = 0
+    while recording:
+        frame = cam.read()
+        session.stamp(stream_id, frame_number=i)
+        save_frame(frame, video_path)
+        i += 1
+    session.link(stream_id, video_path)
+
+def imu_loop(imu, stream_id):
+    i = 0
+    while recording:
+        data = imu.read()
+        session.record(stream_id, frame_number=i, channels={
+            "accel_x": data.ax, "accel_y": data.ay, "accel_z": data.az,
+            "gyro_x": data.gx, "gyro_y": data.gy, "gyro_z": data.gz,
+        })
+        i += 1
+
+threads = [
+    threading.Thread(target=camera_loop, args=(cam_left, "cam_left", "/data/cam_left.mp4")),
+    threading.Thread(target=camera_loop, args=(cam_right, "cam_right", "/data/cam_right.mp4")),
+    threading.Thread(target=imu_loop, args=(imu_device, "imu")),
+]
+
+for t in threads:
+    t.start()
+
+# ... record for desired duration ...
+recording = False
+
+for t in threads:
+    t.join()
+
+counts = session.stop()
+# counts == {"cam_left": 900, "cam_right": 900, "imu": 9000}
+```
+
+Output directory:
+```
+./sync_data/
+  sync_point.json
+  cam_left.timestamps.jsonl
+  cam_right.timestamps.jsonl
+  imu.timestamps.jsonl
+  imu.jsonl
+  manifest.json
 ```
 
 ## Best Practices
 
-### Call `stamp()` immediately after I/O read
+### Call `stamp()`/`record()` immediately after I/O read
+
+The timestamp should reflect when data arrived on the host, not when processing finished.
 
 ```python
-# GOOD — timestamp reflects when data arrived on the host
+# GOOD -- timestamp reflects when data arrived on the host
 data = device.read()
 session.stamp("sensor", frame_number=i)  # immediately after read
 
-# BAD — processing delay adds jitter to timestamp
+# BAD -- processing delay adds jitter to timestamp
 data = device.read()
 processed = expensive_transform(data)
 session.stamp("sensor", frame_number=i)  # too late!
@@ -57,34 +150,92 @@ session.stamp("sensor", frame_number=i)  # too late!
 
 ### Use one thread per device
 
-Each device should have its own thread with a tight read loop. `stamp()` is thread-safe.
+Each device should have its own thread with a tight read loop. Both `stamp()` and `record()` are thread-safe.
 
 ```python
 import threading
 
-def capture_loop(device, stream_id, session):
+def camera_thread(cam, stream_id, session):
     i = 0
     while recording:
-        data = device.read()
+        frame = cam.read()
         session.stamp(stream_id, frame_number=i)
         i += 1
 
-t1 = threading.Thread(target=capture_loop, args=(camera, "cam_left", session))
-t2 = threading.Thread(target=capture_loop, args=(imu_device, "imu", session))
+def sensor_thread(imu, stream_id, session):
+    i = 0
+    while recording:
+        data = imu.read()
+        session.record(stream_id, frame_number=i, channels={
+            "accel_x": data.ax, "accel_y": data.ay, "accel_z": data.az,
+        })
+        i += 1
+
+t1 = threading.Thread(target=camera_thread, args=(camera, "cam_left", session))
+t2 = threading.Thread(target=sensor_thread, args=(imu_device, "imu", session))
 t1.start()
 t2.start()
 ```
 
 ## Integration with SyncField Docker
 
+### Using `manifest.json` (recommended)
+
+After `stop()`, the SDK writes a `manifest.json` that maps all streams to their files. Use it to construct the API request body programmatically.
+
+```python
+import json
+import requests
+
+# Read the manifest produced by the SDK
+with open("./sync_data/manifest.json") as f:
+    manifest = json.load(f)
+
+host_id = manifest["host_id"]
+
+# Build the streams list from manifest entries
+streams = []
+for stream_id, info in manifest["streams"].items():
+    stream_entry = {"stream_id": stream_id}
+
+    if "path" in info:
+        stream_entry["path"] = info["path"]
+
+    if info.get("type") == "sensor":
+        stream_entry["stream_type"] = "sensor"
+
+    streams.append(stream_entry)
+
+# Mark the first video stream as primary
+for s in streams:
+    entry = manifest["streams"][s["stream_id"]]
+    if entry.get("type") == "video":
+        s["is_primary"] = True
+        break
+
+# Submit to SyncField Docker
+resp = requests.post("http://localhost:8080/api/v1/sync", json={
+    "hosts": [
+        {
+            "host_id": host_id,
+            "streams": streams,
+        }
+    ],
+    "timestamps_dir": "/timestamps",
+})
+print(resp.json())  # {"job_id": "a1b2c3d4"}
+```
+
 ### Volume-mounted mode
 
-```bash
-# Mount timestamps alongside videos
-docker run -v ./data:/data -v ./timestamps:/timestamps \
-  syncfield-app:latest
+Mount your data and timestamp directories into the container and call the API directly.
 
-# API call
+```bash
+docker run -v ./data:/data -v ./sync_data:/timestamps \
+  syncfield-app:latest
+```
+
+```bash
 curl -X POST http://localhost:8080/api/v1/sync \
   -H "Content-Type: application/json" \
   -d '{
@@ -93,7 +244,8 @@ curl -X POST http://localhost:8080/api/v1/sync \
         "host_id": "rig_01",
         "streams": [
           {"path": "/data/cam_left.mp4", "stream_id": "cam_left", "is_primary": true},
-          {"path": "/data/cam_right.mp4", "stream_id": "cam_right"}
+          {"path": "/data/cam_right.mp4", "stream_id": "cam_right"},
+          {"stream_id": "imu", "stream_type": "sensor"}
         ]
       }
     ],
@@ -101,9 +253,11 @@ curl -X POST http://localhost:8080/api/v1/sync \
   }'
 ```
 
-The service automatically matches `{stream_id}.timestamps.jsonl` files to video streams.
+The service automatically matches `{stream_id}.timestamps.jsonl` and `{stream_id}.jsonl` files to streams using the `timestamps_dir` path.
 
 ### File upload mode
+
+Upload files directly without volume mounts. Use `host_ids` to group streams by host.
 
 ```python
 import requests
@@ -111,8 +265,8 @@ import requests
 files = [
     ("files", open("cam_left.mp4", "rb")),
     ("files", open("cam_right.mp4", "rb")),
-    ("timestamp_files", open("timestamps/cam_left.timestamps.jsonl", "rb")),
-    ("timestamp_files", open("timestamps/cam_right.timestamps.jsonl", "rb")),
+    ("timestamp_files", open("sync_data/cam_left.timestamps.jsonl", "rb")),
+    ("timestamp_files", open("sync_data/cam_right.timestamps.jsonl", "rb")),
 ]
 data = {
     "stream_ids": "cam_left,cam_right",
@@ -120,6 +274,7 @@ data = {
     "primary_id": "cam_left",
 }
 resp = requests.post("http://localhost:8080/api/v1/sync/upload", files=files, data=data)
+print(resp.json())  # {"job_id": "a1b2c3d4"}
 ```
 
 ## Format Specification
@@ -153,7 +308,7 @@ One JSON object per line (no trailing comma, no array wrapper):
 | `frame_number` | int | 0-based sequential index |
 | `capture_ns` | int | Monotonic nanoseconds at data arrival |
 | `clock_source` | string | Always `"host_monotonic"` for SDK output |
-| `clock_domain` | string | Must match `host_id` — identifies the clock |
+| `clock_domain` | string | Must match `host_id` -- identifies the clock |
 | `uncertainty_ns` | int | Timing uncertainty (default: 5000000 = 5ms) |
 
 **Key rules:**
@@ -161,30 +316,65 @@ One JSON object per line (no trailing comma, no array wrapper):
 - `clock_domain` must be identical across all streams on the same host
 - File name must be `{stream_id}.timestamps.jsonl` for auto-matching
 
-### Sensor Data JSONL (`{sensor_id}.jsonl`)
+### `{stream_id}.jsonl` (Sensor Data)
 
-Sensor data files are self-contained — timestamps and channel values in one file.
+One JSON object per line, combining timestamp and channel values:
 
-**Minimal format** (recommended):
 ```jsonl
-{"capture_ns":1234567890123456789,"channels":{"accel_x":0.12,"accel_y":-9.8,"accel_z":0.05}}
-{"capture_ns":1234567890133456789,"channels":{"accel_x":0.13,"accel_y":-9.7,"accel_z":0.06}}
+{"frame_number":0,"capture_ns":1234567890123456789,"clock_source":"host_monotonic","clock_domain":"rig_01","uncertainty_ns":5000000,"channels":{"accel_x":0.12,"accel_y":-9.8,"accel_z":0.05}}
+{"frame_number":1,"capture_ns":1234567890133456789,"clock_source":"host_monotonic","clock_domain":"rig_01","uncertainty_ns":5000000,"channels":{"accel_x":0.13,"accel_y":-9.7,"accel_z":0.06}}
 ```
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `capture_ns` | int | Yes | Monotonic nanoseconds (same clock as video timestamps) |
-| `channels` | object | Yes | Sensor values as key-value pairs |
-| `frame_number` | int | No | Auto-assigned from line order if missing |
-| `clock_domain` | string | No | Auto-filled from video streams if missing |
-| `uncertainty_ns` | int | No | Defaults to 5000000 (5ms) |
+| Field | Type | Description |
+|-------|------|-------------|
+| `frame_number` | int | 0-based sequential index |
+| `capture_ns` | int | Monotonic nanoseconds at data arrival (same clock as video timestamps) |
+| `clock_source` | string | Origin of the timestamp (always `"host_monotonic"` for SDK) |
+| `clock_domain` | string | Host identifier -- must match across all streams on the same host |
+| `uncertainty_ns` | int | Timing uncertainty (default: 5000000 = 5ms) |
+| `channels` | object | Sensor values as key-value pairs (e.g. `{"accel_x": 0.12}`) |
 
-**Capture pattern:**
-```python
-data = imu.read()
-ts = session.stamp("imu", frame_number=i)  # SDK captures timestamp
-my_file.write(json.dumps({"capture_ns": ts, "channels": parse_imu(data)}) + "\n")
+### `manifest.json`
+
+Written by `stop()`. Maps all streams in the session to their output files.
+
+```json
+{
+  "sdk_version": "0.1.0",
+  "host_id": "rig_01",
+  "streams": {
+    "cam_left": {
+      "type": "video",
+      "timestamps_path": "cam_left.timestamps.jsonl",
+      "frame_count": 900,
+      "path": "/data/cam_left.mp4"
+    },
+    "cam_right": {
+      "type": "video",
+      "timestamps_path": "cam_right.timestamps.jsonl",
+      "frame_count": 900,
+      "path": "/data/cam_right.mp4"
+    },
+    "imu": {
+      "type": "sensor",
+      "sensor_path": "imu.jsonl",
+      "timestamps_path": "imu.timestamps.jsonl",
+      "frame_count": 9000
+    }
+  }
+}
 ```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `sdk_version` | string | SDK version that produced this file |
+| `host_id` | string | Host identifier for this recording session |
+| `streams` | object | Map of `stream_id` to stream metadata |
+| `streams.*.type` | string | `"video"` or `"sensor"` |
+| `streams.*.timestamps_path` | string | Relative path to the timestamps JSONL file |
+| `streams.*.frame_count` | int | Number of frames/samples recorded |
+| `streams.*.path` | string | (video only) Path set via `link()` |
+| `streams.*.sensor_path` | string | (sensor only) Relative path to the sensor data JSONL file |
 
 ## License
 

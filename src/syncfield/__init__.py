@@ -16,7 +16,7 @@ Quick start::
 from importlib.metadata import version as _pkg_version
 
 from syncfield.capture import SyncSession
-from syncfield.types import FrameTimestamp, SyncPoint
+from syncfield.types import FrameTimestamp, SensorSample, SyncPoint
 
-__all__ = ["SyncSession", "SyncPoint", "FrameTimestamp"]
+__all__ = ["SyncSession", "SyncPoint", "FrameTimestamp", "SensorSample"]
 __version__ = _pkg_version("syncfield")

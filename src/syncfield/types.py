@@ -97,3 +97,49 @@ class FrameTimestamp:
             clock_domain=data.get("clock_domain", "local_host"),
             uncertainty_ns=data.get("uncertainty_ns", 5_000_000),
         )
+
+
+@dataclass
+class SensorSample:
+    """Single sensor data sample with embedded timestamp.
+
+    Produces JSONL compatible with the syncfield-app ``SensorSample`` schema.
+    Combines timestamp and channel data in one record, written to
+    ``{stream_id}.jsonl``.
+
+    Attributes:
+        frame_number: Sequential index (0-based) within this stream.
+        capture_ns: ``time.monotonic_ns()`` captured at data arrival.
+        channels: Sensor channel values (e.g. ``{"accel_x": 0.12}``).
+        clock_source: Origin of the timestamp.
+        clock_domain: Host identifier.
+        uncertainty_ns: Estimated timing uncertainty in nanoseconds.
+    """
+
+    frame_number: int
+    capture_ns: int
+    channels: dict[str, float]
+    clock_source: str = "host_monotonic"
+    clock_domain: str = "local_host"
+    uncertainty_ns: int = 5_000_000  # 5 ms
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "frame_number": self.frame_number,
+            "capture_ns": self.capture_ns,
+            "clock_source": self.clock_source,
+            "clock_domain": self.clock_domain,
+            "uncertainty_ns": self.uncertainty_ns,
+            "channels": self.channels,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> SensorSample:
+        return cls(
+            frame_number=data.get("frame_number", 0),
+            capture_ns=data["capture_ns"],
+            channels=data["channels"],
+            clock_source=data.get("clock_source", "host_monotonic"),
+            clock_domain=data.get("clock_domain", "local_host"),
+            uncertainty_ns=data.get("uncertainty_ns", 5_000_000),
+        )
