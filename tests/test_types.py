@@ -118,3 +118,17 @@ def test_sensor_sample_from_dict_defaults():
     assert sample.clock_source == "host_monotonic"
     assert sample.clock_domain == "local_host"
     assert sample.uncertainty_ns == 5_000_000
+
+
+def test_sensor_sample_nested_round_trip():
+    """SensorSample round-trips nested channel data through to_dict/from_dict."""
+    channels = {
+        "joints": {"wrist": [0.1, 0.2, 0.3], "elbow": [1.0, 2.0, 3.0]},
+        "gestures": {"pinch": 0.95},
+        "finger_angles": [12.5, 45.0, 30.0],
+    }
+    original = SensorSample(frame_number=0, capture_ns=100, channels=channels)
+    restored = SensorSample.from_dict(original.to_dict())
+    assert restored.channels == channels
+    assert restored.channels["joints"]["wrist"] == [0.1, 0.2, 0.3]
+    assert restored.channels["gestures"]["pinch"] == 0.95

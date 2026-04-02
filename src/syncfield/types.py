@@ -10,7 +10,17 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any
+from typing import Any, Union
+
+# Sensor channel value type.
+# Leaf values are always numeric (float | int).
+# Structure can be nested dicts or lists.
+#
+# Examples:
+#   flat:   {"accel_x": 0.12, "accel_y": -9.8}
+#   nested: {"joints": {"wrist": [0.1, 0.2, 0.3]}}
+#   grid:   {"pressure": [[0.1, 0.2], [0.3, 0.4]]}
+ChannelValue = Union[float, int, list, dict]
 
 
 @dataclass(frozen=True)
@@ -118,7 +128,7 @@ class SensorSample:
 
     frame_number: int
     capture_ns: int
-    channels: dict[str, Any]
+    channels: dict[str, ChannelValue]
     clock_source: str = "host_monotonic"
     clock_domain: str = "local_host"
     uncertainty_ns: int = 5_000_000  # 5 ms

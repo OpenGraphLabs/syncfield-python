@@ -69,6 +69,39 @@ Output:
   manifest.json
 ```
 
+### Complex Sensor Data
+
+Sensors like hand trackers, tactile arrays, and robot joints produce nested data. The SDK handles these natively — leaf values must be numeric (float or int).
+
+```python
+# Hand tracker — nested joint positions and gestures
+session.record("hand_tracker", frame_number=i, channels={
+    "joints": {
+        "wrist": [0.1, 0.2, 0.3],
+        "thumb_tip": [0.4, 0.5, 0.6],
+        "index_tip": [0.7, 0.8, 0.9],
+    },
+    "gestures": {"pinch": 0.95, "fist": 0.02},
+    "finger_angles": [12.5, 45.0, 30.0, 15.0, 5.0],
+})
+
+# Tactile grid — 2D pressure array
+session.record("tactile", frame_number=i, channels={
+    "pressure_grid": [[0.1, 0.2, 0.3, 0.4],
+                       [0.5, 0.6, 0.7, 0.8]],
+    "total_force": 12.5,
+})
+
+# Robot arm — joint states
+session.record("robot_arm", frame_number=i, channels={
+    "joint_positions": [0.0, -1.57, 0.0, -1.57, 0.0, 0.0],
+    "joint_velocities": [0.01, -0.02, 0.0, 0.01, 0.0, 0.0],
+    "gripper": {"width": 0.04, "force": 5.2},
+})
+```
+
+SyncField automatically flattens nested channels for aggregation using dot-notation keys (e.g., `joints.wrist.0`, `gripper.width`).
+
 ### Multi-Stream Example
 
 A complete example with 2 cameras and 1 IMU, each in its own thread.
