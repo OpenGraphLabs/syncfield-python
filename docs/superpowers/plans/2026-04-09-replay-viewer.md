@@ -875,7 +875,7 @@ class ReplayServer:
         """Run the server on the calling thread until shutdown."""
         self._server.run()
 
-    def should_exit(self) -> None:
+    def request_shutdown(self) -> None:
         self._server.should_exit = True
 ```
 
@@ -961,7 +961,7 @@ def test_launch_starts_server_and_serves_session(
     body = r.json()
     assert body["host_id"] == "test_rig"
 
-    server_ref[0].should_exit()
+    server_ref[0].request_shutdown()
     thread.join(timeout=3.0)
     assert not thread.is_alive()
 

@@ -7,6 +7,8 @@ single origin.
 
 from __future__ import annotations
 
+import atexit
+import contextlib
 import logging
 from importlib.resources import as_file, files
 from pathlib import Path
@@ -25,11 +27,25 @@ from syncfield.replay.loader import ReplayManifest
 logger = logging.getLogger(__name__)
 
 
+# Holds the importlib.resources `as_file` context for the bundled static
+# directory. For force-include wheels (the common case) `as_file` is a
+# no-op; for zip-based installs it extracts to a tempdir which we MUST
+# keep alive for the lifetime of the server, otherwise the path becomes
+# a dangling reference once the context manager exits. We register an
+# atexit hook to release it on interpreter shutdown.
+_STATIC_RESOURCE_STACK = contextlib.ExitStack()
+atexit.register(_STATIC_RESOURCE_STACK.close)
+
+
 def _static_dir() -> Path:
-    """Return the bundled static directory shipped inside the package."""
+    """Return the bundled static directory shipped inside the package.
+
+    The returned path is valid for the lifetime of the interpreter — the
+    underlying ``as_file`` context is held by a module-level ExitStack
+    so that zip-extracted resources are not deleted out from under us.
+    """
     pkg_root = files("syncfield.replay").joinpath("static")
-    with as_file(pkg_root) as p:
-        return Path(p)
+    return Path(_STATIC_RESOURCE_STACK.enter_context(as_file(pkg_root)))
 
 
 def build_app(manifest: ReplayManifest) -> Starlette:
@@ -50,6 +66,8 @@ def build_app(manifest: ReplayManifest) -> Starlette:
         stream = streams_by_id.get(stream_id)
         if stream is None or stream.media_path is None:
             raise HTTPException(status_code=404)
+        # TODO(v2): infer media_type from stream.media_path.suffix once we
+        # ship more than just MP4 (.mov, .mkv, .webm).
         return FileResponse(stream.media_path, media_type="video/mp4")
 
     async def get_data(request: Request) -> Response:
@@ -111,5 +129,6 @@ class ReplayServer:
         """Run the server on the calling thread until shutdown."""
         self._server.run()
 
-    def should_exit(self) -> None:
+    def request_shutdown(self) -> None:
+        """Ask the underlying uvicorn server to stop after the current request."""
         self._server.should_exit = True

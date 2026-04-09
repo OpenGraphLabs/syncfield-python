@@ -89,7 +89,7 @@ def test_get_data_path_traversal_rejected(
     client_with_synthetic: TestClient,
 ) -> None:
     response = client_with_synthetic.get("/data/..%2Fetc%2Fpasswd")
-    assert response.status_code in (400, 404)
+    assert response.status_code == 400
 
 
 def test_get_root_serves_index_html(
