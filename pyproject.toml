@@ -32,11 +32,16 @@ audio = [
 ]
 uvc = ["opencv-python>=4.5"]
 ble = ["bleak>=0.21"]
+# OakCameraStream uses depthai v3 for the pipeline and reuses the `uvc`
+# extra's opencv-python for the MP4 writer. Install `syncfield[oak,uvc]`
+# (or `syncfield[all]`) for the full OAK capture path.
+oak = ["depthai>=3.0.0"]
 all = [
     "sounddevice>=0.4.6",
     "numpy>=1.21",
     "opencv-python>=4.5",
     "bleak>=0.21",
+    "depthai>=3.0.0",
 ]
 
 [project.urls]

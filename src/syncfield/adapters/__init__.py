@@ -5,13 +5,14 @@ Adapters gated behind optional extras are re-exported **lazily** — if the
 corresponding extra is not installed, importing ``syncfield.adapters`` still
 succeeds but that specific class is simply absent from the module.
 
-=========================  ====================================  =====================
-Adapter                    Requires                              Install
-=========================  ====================================  =====================
-``JSONLFileStream``        —                                     ``syncfield``
-``UVCWebcamStream``        ``opencv-python``                     ``syncfield[uvc]``
-``BLEImuGenericStream``    ``bleak``                             ``syncfield[ble]``
-=========================  ====================================  =====================
+=========================  =====================================  =============================
+Adapter                    Requires                               Install
+=========================  =====================================  =============================
+``JSONLFileStream``        —                                      ``syncfield``
+``UVCWebcamStream``        ``opencv-python``                      ``syncfield[uvc]``
+``BLEImuGenericStream``    ``bleak``                              ``syncfield[ble]``
+``OakCameraStream``        ``depthai`` + ``opencv-python``        ``syncfield[oak,uvc]``
+=========================  =====================================  =============================
 
 Users who need a specific optional adapter can always import it directly
 (e.g. ``from syncfield.adapters.uvc_webcam import UVCWebcamStream``) — that
@@ -37,5 +38,11 @@ except ImportError:
 try:
     from syncfield.adapters.ble_imu import BLEImuGenericStream  # noqa: F401
     __all__.append("BLEImuGenericStream")
+except ImportError:
+    pass
+
+try:
+    from syncfield.adapters.oak_camera import OakCameraStream  # noqa: F401
+    __all__.append("OakCameraStream")
 except ImportError:
     pass
