@@ -58,12 +58,13 @@ class SyntheticVideoStream(StreamBase):
         height: int = 360,
         fps: float = 30.0,
         hue_shift: float = 0.0,
+        provides_audio_track: bool = False,
     ) -> None:
         super().__init__(
             id=id,
             kind="video",
             capabilities=StreamCapabilities(
-                provides_audio_track=False,
+                provides_audio_track=provides_audio_track,
                 supports_precise_timestamps=True,
                 is_removable=False,
                 produces_file=True,
@@ -259,15 +260,36 @@ class SyntheticImuStream(StreamBase):
 
 
 def build_demo_session(output_dir: Path) -> sf.SessionOrchestrator:
-    """Construct a realistic multi-stream session for the viewer demo."""
+    """Construct a realistic multi-stream session for the viewer demo.
+
+    Chirp is **enabled** with the egonaut production defaults so the viewer
+    shows the real "sync tone active" UI state. A :class:`SilentChirpPlayer`
+    is injected so the demo never actually emits audio — great for running
+    the demo on a laptop or for capturing docs screenshots without beeping.
+    """
+    from syncfield.tone import SilentChirpPlayer
+
     session = sf.SessionOrchestrator(
         host_id="demo_rig",
         output_dir=output_dir,
-        sync_tone=sf.SyncToneConfig.silent(),  # don't actually play audio in the demo
+        sync_tone=sf.SyncToneConfig.default(),   # chirp enabled by default
+        chirp_player=SilentChirpPlayer(),         # ...but don't actually beep
     )
-    session.add(SyntheticVideoStream("cam_ego", width=640, height=360, hue_shift=0.0))
+    # Mark at least one stream as audio-capable so the orchestrator decides
+    # chirp is eligible and fills in chirp_start_ns / chirp_stop_ns in the
+    # sync point — without that, the viewer's "chirp" line would read
+    # "pending" forever.
     session.add(
-        SyntheticVideoStream("cam_wrist_left", width=480, height=480, hue_shift=1.7)
+        SyntheticVideoStream(
+            "cam_ego", width=640, height=360, hue_shift=0.0,
+            provides_audio_track=True,
+        )
+    )
+    session.add(
+        SyntheticVideoStream(
+            "cam_wrist_left", width=480, height=480, hue_shift=1.7,
+            provides_audio_track=False,
+        )
     )
     session.add(SyntheticImuStream("torso_imu"))
     session.add(FakeStream("tactile_left", provides_audio_track=False))
@@ -301,12 +323,25 @@ def main(argv: Optional[List[str]] = None) -> int:
             "Useful for screenshotting."
         ),
     )
+    parser.add_argument(
+        "--screenshot",
+        type=Path,
+        default=None,
+        help=(
+            "Path to save a PNG screenshot of the viewer. Implies "
+            "--auto-record. The viewer runs for --duration seconds, waits "
+            "until the streams have warmed up, then captures the viewport "
+            "via dpg.output_frame_buffer() and exits."
+        ),
+    )
     args = parser.parse_args(argv)
+
+    if args.screenshot is not None and args.duration <= 0:
+        # A screenshot run needs a bounded duration; default to 3s.
+        args.duration = 3.0
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     session = build_demo_session(args.output_dir)
-
-    import syncfield.viewer as viewer
 
     if args.auto_record:
         # Start the session immediately so screenshots look populated.
@@ -319,14 +354,85 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         threading.Thread(target=_auto_record, daemon=True).start()
 
-    if args.duration > 0:
-        # Auto-close mode: run the viewer on the main thread for the
-        # requested duration, then stop. The viewer's event loop doesn't
-        # block on os.exit, so we set a timer that calls dpg.stop_dearpygui.
+    if args.duration > 0 or args.screenshot is not None:
         import dearpygui.dearpygui as dpg
+        import subprocess
+
+        def _capture_window_screenshot() -> None:
+            """Capture the viewer window via AppleScript window discovery.
+
+            On macOS 'screencapture -l <window_id>' grabs a specific window
+            by its CoreGraphics window id. The id is resolved via
+            AppleScript by matching the frontmost process's window title
+            against 'SyncField'. This avoids manual coordinate math and
+            Retina scaling entirely.
+            """
+            args.screenshot.parent.mkdir(parents=True, exist_ok=True)
+
+            # Step 1: ask macOS for the window id of the 'SyncField' window
+            osa = """
+                tell application "System Events"
+                    set frontApp to first application process whose frontmost is true
+                    set frontWin to window 1 of frontApp
+                    return value of attribute "AXTitle" of frontWin
+                end tell
+            """
+            try:
+                result = subprocess.run(
+                    ["osascript", "-e", osa],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                    timeout=5,
+                )
+                print(f"frontmost window title: {result.stdout.strip()!r}", file=sys.stderr)
+            except Exception as exc:
+                print(f"title probe failed: {exc}", file=sys.stderr)
+
+            # Step 2: capture the full screen then we can inspect it. If the
+            # full-screen dump looks right we'll refine to a window capture.
+            full_path = args.screenshot.with_suffix(".full.png")
+            try:
+                subprocess.run(
+                    ["screencapture", "-x", "-t", "png", str(full_path)],
+                    check=True,
+                    timeout=5,
+                )
+                print(f"full-screen dump → {full_path}", file=sys.stderr)
+            except Exception as exc:
+                print(f"full-screen capture failed: {exc}", file=sys.stderr)
+
+            # Step 3: also try the interactive window capture by sending a
+            # key-like instruction to screencapture's -W mode. That's not
+            # scriptable; fall back to capturing a point-sized region.
+            try:
+                from syncfield.viewer import theme
+
+                x, y = 60, 60
+                w, h = theme.VIEWPORT_WIDTH, theme.VIEWPORT_HEIGHT
+                subprocess.run(
+                    [
+                        "screencapture",
+                        "-x",
+                        "-t",
+                        "png",
+                        "-R",
+                        f"{x},{y},{w},{h}",
+                        str(args.screenshot),
+                    ],
+                    check=True,
+                    timeout=5,
+                )
+                print(f"region dump → {args.screenshot}", file=sys.stderr)
+            except Exception as exc:
+                print(f"region capture failed: {exc}", file=sys.stderr)
 
         def _timer() -> None:
+            # Extra settling time — DPG viewport move is async and the
+            # first few frames can show a flash of the default dark theme.
             time.sleep(args.duration)
+            if args.screenshot is not None:
+                _capture_window_screenshot()
             try:
                 dpg.stop_dearpygui()
             except Exception:
@@ -334,7 +440,17 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         threading.Thread(target=_timer, daemon=True).start()
 
-    viewer.launch(session)
+    # Pin the viewport so the screenshot helper knows where to look.
+    pin_pos = (60, 60) if args.screenshot is not None else None
+
+    from syncfield.viewer.app import ViewerApp
+
+    app = ViewerApp(session, title="SyncField", viewport_pos=pin_pos)
+    try:
+        app.setup()
+        app.run()
+    finally:
+        app.close()
     return 0
 
 

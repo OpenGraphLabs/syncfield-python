@@ -155,9 +155,11 @@ class ViewerApp:
         session: SessionOrchestrator,
         *,
         title: str = "SyncField",
+        viewport_pos: Optional[tuple] = None,
     ) -> None:
         self._session = session
         self._title = title
+        self._viewport_pos = viewport_pos
         self._poller = SessionPoller(session)
         self._layout: Optional[ViewerLayout] = None
         self._running = False
@@ -199,6 +201,15 @@ class ViewerApp:
 
         dpg.setup_dearpygui()
         dpg.show_viewport()
+
+        # Pin the viewport to a specific on-screen position when the caller
+        # supplies one (used by the screenshot harness to place the window
+        # at a known coordinate).
+        if self._viewport_pos is not None:
+            try:
+                dpg.set_viewport_pos(self._viewport_pos)
+            except Exception:
+                pass
 
         # Make the primary window fill the viewport so resizing feels
         # native. The layout's main window is tagged "main_window".
