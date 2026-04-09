@@ -34,7 +34,7 @@ from syncfield.types import (
     SessionState,
     SyncPoint,
 )
-from syncfield.writer import write_manifest, write_sync_point
+from syncfield.writer import SessionLogWriter, write_manifest, write_sync_point
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +73,7 @@ class SessionOrchestrator:
         self._session_clock: Optional[SessionClock] = None
         self._chirp_start_ns: Optional[int] = None
         self._chirp_stop_ns: Optional[int] = None
+        self._log_writer: Optional[SessionLogWriter] = None
 
     # ------------------------------------------------------------------
     # Public properties
@@ -148,7 +149,12 @@ class SessionOrchestrator:
             if not self._streams:
                 raise RuntimeError("cannot start() with no streams registered")
 
-            self._state = SessionState.PREPARING
+            # Open the crash-safe session log BEFORE any state mutation so
+            # failures during preparation are still recorded on disk.
+            self._log_writer = SessionLogWriter(self._output_dir)
+            self._log_writer.open()
+
+            self._transition(SessionState.PREPARING)
             self._sync_point = SyncPoint.create_now(self._host_id)
             self._session_clock = SessionClock(sync_point=self._sync_point)
 
@@ -158,13 +164,14 @@ class SessionOrchestrator:
                     stream.prepare()
                     stream.start(self._session_clock)
                     started.append(stream)
-            except Exception:
+            except Exception as exc:
+                self._log_rollback(exc, len(started))
                 self._rollback_started_streams(started)
-                self._state = SessionState.IDLE
+                self._transition(SessionState.IDLE)
                 raise
 
             self._maybe_play_start_chirp()
-            self._state = SessionState.RECORDING
+            self._transition(SessionState.RECORDING)
 
     @staticmethod
     def _rollback_started_streams(started: List[Stream]) -> None:
@@ -215,14 +222,17 @@ class SessionOrchestrator:
                 raise RuntimeError(
                     f"stop() requires RECORDING state; current state is {self._state.value}"
                 )
-            self._state = SessionState.STOPPING
+            self._transition(SessionState.STOPPING)
 
             self._maybe_play_stop_chirp_and_wait()
 
             finalizations = self._finalize_streams()
             self._persist_session_artifacts(finalizations)
 
-            self._state = SessionState.STOPPED
+            self._transition(SessionState.STOPPED)
+            if self._log_writer is not None:
+                self._log_writer.close()
+                self._log_writer = None
             return SessionReport(
                 host_id=self._host_id,
                 finalizations=finalizations,
@@ -299,6 +309,43 @@ class SessionOrchestrator:
             streams_dict[stream.id] = entry
 
         write_manifest(self._host_id, streams_dict, self._output_dir)
+
+    # ------------------------------------------------------------------
+    # Session log helpers (crash safety)
+    # ------------------------------------------------------------------
+
+    def _transition(self, new_state: SessionState) -> None:
+        """Record a state transition in the session log and update state.
+
+        This is the single source of truth for state mutations after the
+        session log has been opened. Every transition is flushed to disk
+        immediately so a crash mid-recording still leaves an ordered
+        timeline that the sync core can reconstruct.
+        """
+        old = self._state
+        self._state = new_state
+        if self._log_writer is not None:
+            self._log_writer.log_event(
+                {
+                    "kind": "state_transition",
+                    "from": old.value,
+                    "to": new_state.value,
+                    "at_ns": time.monotonic_ns(),
+                }
+            )
+
+    def _log_rollback(self, exc: BaseException, started_count: int) -> None:
+        """Persist a rollback event with the failing exception for post-mortem."""
+        if self._log_writer is None:
+            return
+        self._log_writer.log_event(
+            {
+                "kind": "rollback",
+                "reason": str(exc),
+                "started_count": started_count,
+                "at_ns": time.monotonic_ns(),
+            }
+        )
 
     # ------------------------------------------------------------------
     # Chirp injection

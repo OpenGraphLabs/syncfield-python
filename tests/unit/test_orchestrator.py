@@ -314,3 +314,44 @@ class TestChirpIntegration:
         report = session.stop()
         assert report.chirp_start_ns is not None
         assert report.chirp_stop_ns is not None
+
+
+class TestSessionLog:
+    def test_session_log_captures_state_transitions(self, tmp_path):
+        session = _session(tmp_path)
+        session.add(FakeStream("a"))
+        session.start()
+        session.stop()
+
+        log_path = tmp_path / "session_log.jsonl"
+        assert log_path.exists()
+        lines = [json.loads(l) for l in log_path.read_text().strip().split("\n")]
+        transitions = [l for l in lines if l["kind"] == "state_transition"]
+        edges = {(t["from"], t["to"]) for t in transitions}
+        assert ("idle", "preparing") in edges
+        assert ("preparing", "recording") in edges
+        assert ("recording", "stopping") in edges
+        assert ("stopping", "stopped") in edges
+
+    def test_session_log_flushes_during_recording(self, tmp_path):
+        """A crash between start() and stop() must leave a readable log."""
+        session = _session(tmp_path)
+        session.add(FakeStream("a"))
+        session.start()
+        # Simulate "read the log while still RECORDING"
+        content = (tmp_path / "session_log.jsonl").read_text()
+        assert "preparing" in content
+        assert "recording" in content
+        session.stop()
+
+    def test_rollback_is_logged(self, tmp_path):
+        session = _session(tmp_path)
+        session.add(FakeStream("a"))
+        session.add(FakeStream("b", fail_on_start=True))
+        with pytest.raises(RuntimeError):
+            session.start()
+
+        log_path = tmp_path / "session_log.jsonl"
+        assert log_path.exists()
+        lines = [json.loads(l) for l in log_path.read_text().strip().split("\n")]
+        assert any(l["kind"] == "rollback" for l in lines)
