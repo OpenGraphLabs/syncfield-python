@@ -116,11 +116,27 @@ class Stream(Protocol):
         Sample and health callbacks may be invoked from a background
         thread owned by the stream. Callback functions must therefore
         be thread-safe.
+
+    Type-checking note:
+        :attr:`id`, :attr:`kind`, :attr:`capabilities`, and
+        :attr:`device_key` are declared as read-only properties so
+        the protocol is **covariant** in those attributes — a
+        concrete adapter like :class:`UVCWebcamStream` can expose
+        ``kind: Literal["video"]`` without tripping the mutable-
+        attribute invariance rule that static type checkers apply
+        to bare class attributes in Protocols. None of these fields
+        are reassigned at runtime after ``__init__``, so read-only
+        semantics match actual usage.
     """
 
-    id: str
-    kind: StreamKind
-    capabilities: StreamCapabilities
+    @property
+    def id(self) -> str: ...
+
+    @property
+    def kind(self) -> StreamKind: ...
+
+    @property
+    def capabilities(self) -> StreamCapabilities: ...
 
     @property
     def device_key(self) -> Optional[DeviceKey]:
@@ -155,11 +171,27 @@ class StreamBase:
     the data-producing code (e.g. a capture thread) to forward events to
     registered callbacks and to the internal health buffer.
 
+    The three identity attributes — :attr:`id`, :attr:`kind`,
+    :attr:`capabilities` — are declared at the class level with exact
+    protocol types so static type checkers (basedpyright / pyright in
+    strict mode) can confirm every ``StreamBase`` subclass is
+    structurally compatible with :class:`Stream`. Without these
+    annotations the checker infers ``kind`` as plain ``str`` from the
+    ``__init__`` assignment, which breaks protocol compatibility with
+    the ``Literal``-based :data:`StreamKind`.
+
     Args:
         id: Unique stream identifier within a session.
         kind: One of ``"video" | "audio" | "sensor" | "custom"``.
         capabilities: What the adapter declares it can provide.
     """
+
+    # Class-level annotations with exact protocol types so subclasses
+    # satisfy the :class:`Stream` protocol check. Instance attributes
+    # are still assigned in ``__init__`` below.
+    id: str
+    kind: StreamKind
+    capabilities: StreamCapabilities
 
     def __init__(
         self,
