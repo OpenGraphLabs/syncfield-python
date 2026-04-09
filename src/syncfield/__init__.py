@@ -1,22 +1,9 @@
-"""SyncField — lightweight timestamp capture for multi-stream synchronization.
+"""SyncField — capture orchestration framework for multi-modal synchronization.
 
-Quick start::
-
-    import syncfield as sf
-
-    session = sf.SyncSession(host_id="rig_01", output_dir="./timestamps")
-    session.start()
-
-    frame = camera.read()
-    session.stamp("cam_left", frame_number=0)
-
-    session.stop()
+This module's public API is being rebuilt. Imports will be added as tasks complete.
 """
 
 from importlib.metadata import version as _pkg_version
 
-from syncfield.capture import SyncSession
-from syncfield.types import ChannelValue, FrameTimestamp, SensorSample, SyncPoint
-
-__all__ = ["SyncSession", "SyncPoint", "FrameTimestamp", "SensorSample", "ChannelValue"]
 __version__ = _pkg_version("syncfield")
+__all__: list[str] = []
