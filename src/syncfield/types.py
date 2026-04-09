@@ -10,7 +10,9 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Union
+from enum import Enum
+from pathlib import Path
+from typing import Any, Literal, Union
 
 # Sensor channel value type.
 # Leaf values are always numeric (float | int).
@@ -153,3 +155,164 @@ class SensorSample:
             clock_domain=data.get("clock_domain", "local_host"),
             uncertainty_ns=data.get("uncertainty_ns", 5_000_000),
         )
+
+
+StreamKind = Literal["video", "audio", "sensor", "custom"]
+
+
+@dataclass(frozen=True)
+class StreamCapabilities:
+    """What a Stream declares it can provide.
+
+    Attributes:
+        provides_audio_track: True if the stream records an audio track
+            (used to determine chirp eligibility for inter-host sync).
+        supports_precise_timestamps: True if per-sample timestamps are
+            accurate to nanosecond resolution.
+        is_removable: True if the underlying device may disconnect
+            (wireless, USB unplug); the orchestrator treats it more defensively.
+        produces_file: True if the stream writes a file (e.g. video) rather
+            than an in-memory sample stream.
+    """
+
+    provides_audio_track: bool = False
+    supports_precise_timestamps: bool = False
+    is_removable: bool = False
+    produces_file: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "provides_audio_track": self.provides_audio_track,
+            "supports_precise_timestamps": self.supports_precise_timestamps,
+            "is_removable": self.is_removable,
+            "produces_file": self.produces_file,
+        }
+
+
+class SessionState(Enum):
+    """Lifecycle state of a SessionOrchestrator."""
+
+    IDLE = "idle"
+    PREPARING = "preparing"
+    RECORDING = "recording"
+    STOPPING = "stopping"
+    STOPPED = "stopped"
+
+
+class HealthEventKind(Enum):
+    """Category of a health event reported by a Stream."""
+
+    HEARTBEAT = "heartbeat"
+    DROP = "drop"
+    RECONNECT = "reconnect"
+    WARNING = "warning"
+    ERROR = "error"
+
+
+@dataclass(frozen=True)
+class HealthEvent:
+    """A stream reports a health observation to the orchestrator.
+
+    Attributes:
+        stream_id: Stream that emitted the event.
+        kind: Category of the event.
+        at_ns: ``time.monotonic_ns()`` when the event was observed.
+        detail: Optional free-form description.
+    """
+
+    stream_id: str
+    kind: HealthEventKind
+    at_ns: int
+    detail: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "stream_id": self.stream_id,
+            "kind": self.kind.value,
+            "at_ns": self.at_ns,
+            "detail": self.detail,
+        }
+
+
+@dataclass(frozen=True)
+class SampleEvent:
+    """A stream reports a sample (timestamp + optional channels) to the orchestrator."""
+
+    stream_id: str
+    frame_number: int
+    capture_ns: int
+    channels: dict[str, "ChannelValue"] | None = None
+    uncertainty_ns: int = 5_000_000
+
+
+@dataclass
+class FinalizationReport:
+    """Result of stopping a single Stream.
+
+    Attributes:
+        stream_id: Stream that was finalized.
+        status: One of ``"completed"``, ``"partial"``, ``"failed"``.
+        frame_count: Number of samples/frames produced.
+        file_path: Path to any file the stream wrote, or None.
+        first_sample_at_ns: Monotonic ns of first sample, or None if empty.
+        last_sample_at_ns: Monotonic ns of last sample, or None if empty.
+        health_events: Health events observed during recording.
+        error: Error message if status is ``"failed"``.
+    """
+
+    stream_id: str
+    status: Literal["completed", "partial", "failed"]
+    frame_count: int
+    file_path: Path | None
+    first_sample_at_ns: int | None
+    last_sample_at_ns: int | None
+    health_events: list[HealthEvent]
+    error: str | None
+
+
+@dataclass(frozen=True)
+class ChirpSpec:
+    """Specification for an audio sync chirp.
+
+    Linear FM sweep from ``from_hz`` to ``to_hz`` over ``duration_ms``,
+    with a cosine envelope of ``envelope_ms`` attack/release.
+
+    Attributes:
+        from_hz: Sweep start frequency (Hz).
+        to_hz: Sweep end frequency (Hz).
+        duration_ms: Total duration in milliseconds.
+        amplitude: Peak amplitude in [0.0, 1.0].
+        envelope_ms: Cosine fade in/out duration in milliseconds.
+    """
+
+    from_hz: float
+    to_hz: float
+    duration_ms: int
+    amplitude: float
+    envelope_ms: int
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "from_hz": self.from_hz,
+            "to_hz": self.to_hz,
+            "duration_ms": self.duration_ms,
+            "amplitude": self.amplitude,
+            "envelope_ms": self.envelope_ms,
+        }
+
+
+@dataclass
+class SessionReport:
+    """Aggregated result of a completed session.
+
+    Attributes:
+        host_id: Host identifier.
+        finalizations: Per-stream finalization reports.
+        chirp_start_ns: Monotonic ns when start chirp was played (or None).
+        chirp_stop_ns: Monotonic ns when stop chirp was played (or None).
+    """
+
+    host_id: str
+    finalizations: list[FinalizationReport]
+    chirp_start_ns: int | None
+    chirp_stop_ns: int | None
