@@ -4,11 +4,21 @@ from __future__ import annotations
 
 import dataclasses
 import struct
+import sys
 import wave
+from unittest.mock import MagicMock, patch
 
 import pytest
 
-from syncfield.tone import SyncToneConfig, generate_chirp_samples, write_chirp_wav
+from syncfield.tone import (
+    ChirpPlayer,
+    SilentChirpPlayer,
+    SoundDeviceChirpPlayer,
+    SyncToneConfig,
+    create_default_player,
+    generate_chirp_samples,
+    write_chirp_wav,
+)
 from syncfield.types import ChirpSpec
 
 
@@ -121,3 +131,59 @@ class TestSyncToneConfig:
         )
         assert cfg.start_chirp.from_hz == 100
         assert cfg.post_start_stabilization_ms == 50
+
+
+class TestSilentChirpPlayer:
+    def test_play_is_noop(self):
+        player: ChirpPlayer = SilentChirpPlayer()
+        player.play(ChirpSpec(400, 2500, 100, 0.5, 5))  # must not raise
+
+    def test_is_silent_returns_true(self):
+        assert SilentChirpPlayer().is_silent() is True
+
+    def test_satisfies_chirp_player_protocol(self):
+        assert isinstance(SilentChirpPlayer(), ChirpPlayer)
+
+
+class TestSoundDeviceChirpPlayer:
+    def test_play_forwards_samples_and_sample_rate_to_sounddevice(self):
+        fake_sd = MagicMock()
+        with patch.dict(sys.modules, {"sounddevice": fake_sd}):
+            player = SoundDeviceChirpPlayer(sample_rate=SAMPLE_RATE)
+            player.play(ChirpSpec(400, 2500, 100, 0.5, 5))
+            assert fake_sd.play.called
+            args, kwargs = fake_sd.play.call_args
+            samples = args[0]
+            assert len(samples) == int(SAMPLE_RATE * 0.1)
+            sent_rate = args[1] if len(args) > 1 else kwargs.get("samplerate")
+            assert sent_rate == SAMPLE_RATE
+
+    def test_play_is_non_blocking(self):
+        """play() must NEVER call sd.wait() — the orchestrator owns all timing."""
+        fake_sd = MagicMock()
+        with patch.dict(sys.modules, {"sounddevice": fake_sd}):
+            player = SoundDeviceChirpPlayer(sample_rate=SAMPLE_RATE)
+            player.play(ChirpSpec(400, 2500, 500, 0.8, 15))
+            assert not fake_sd.wait.called
+
+    def test_is_silent_returns_false(self):
+        fake_sd = MagicMock()
+        with patch.dict(sys.modules, {"sounddevice": fake_sd}):
+            assert SoundDeviceChirpPlayer().is_silent() is False
+
+
+class TestCreateDefaultPlayer:
+    def test_returns_sounddevice_backend_when_import_succeeds(self):
+        fake_sd = MagicMock()
+        with patch.dict(sys.modules, {"sounddevice": fake_sd}):
+            assert isinstance(create_default_player(), SoundDeviceChirpPlayer)
+
+    def test_returns_silent_backend_when_import_fails(self):
+        # Patch sounddevice to None — import raises ImportError
+        original = sys.modules.pop("sounddevice", None)
+        try:
+            with patch.dict(sys.modules, {"sounddevice": None}):
+                assert isinstance(create_default_player(), SilentChirpPlayer)
+        finally:
+            if original is not None:
+                sys.modules["sounddevice"] = original

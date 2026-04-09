@@ -15,14 +15,17 @@ headless machines.
 
 from __future__ import annotations
 
+import logging
 import math
 import struct
 import wave
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List
+from typing import List, Protocol, runtime_checkable
 
 from syncfield.types import ChirpSpec
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -186,3 +189,92 @@ class SyncToneConfig:
         with no audio output path.
         """
         return cls(enabled=False)
+
+
+# ---------------------------------------------------------------------------
+# Playback
+# ---------------------------------------------------------------------------
+
+
+@runtime_checkable
+class ChirpPlayer(Protocol):
+    """Protocol for playing a chirp to the system audio output.
+
+    Implementations must be **non-blocking**: ``play()`` returns immediately
+    after scheduling the sound. The caller
+    (:class:`~syncfield.orchestrator.SessionOrchestrator`) is responsible for
+    all timing margins — it sleeps for the chirp's duration plus the
+    configured tail margin before stopping streams.
+    """
+
+    def play(self, spec: ChirpSpec) -> None:
+        """Schedule playback of a chirp. Returns immediately."""
+        ...
+
+    def is_silent(self) -> bool:
+        """True if this player produces no actual audio output."""
+        ...
+
+
+class SilentChirpPlayer:
+    """No-op player used when ``sounddevice`` is unavailable or disabled.
+
+    Emits an INFO log line on every ``play()`` so callers can see that a
+    chirp was requested but not produced. Used automatically on headless
+    lab machines where :func:`create_default_player` cannot import
+    ``sounddevice``.
+    """
+
+    def play(self, spec: ChirpSpec) -> None:
+        logger.info(
+            "SilentChirpPlayer.play(%s): chirp skipped (no audio output)", spec
+        )
+
+    def is_silent(self) -> bool:
+        return True
+
+
+class SoundDeviceChirpPlayer:
+    """Plays chirps via the optional ``sounddevice`` library, non-blocking.
+
+    ``sounddevice`` is an optional dependency (``pip install syncfield[audio]``).
+    Prefer :func:`create_default_player` over direct instantiation — it
+    chooses this backend when ``sounddevice`` imports successfully and falls
+    back to :class:`SilentChirpPlayer` otherwise.
+
+    Args:
+        sample_rate: Sample rate used both for sample synthesis and for
+            the sounddevice stream. Default ``44100``.
+    """
+
+    def __init__(self, sample_rate: int = 44100) -> None:
+        self._sample_rate = sample_rate
+
+    def play(self, spec: ChirpSpec) -> None:
+        # Lazy import keeps the module importable on machines that lack
+        # sounddevice — only instantiating this class requires the dep.
+        import sounddevice as sd  # type: ignore[import-not-found]
+
+        samples = generate_chirp_samples(spec, sample_rate=self._sample_rate)
+        sd.play(samples, self._sample_rate)  # non-blocking: returns immediately
+
+    def is_silent(self) -> bool:
+        return False
+
+
+def create_default_player(sample_rate: int = 44100) -> ChirpPlayer:
+    """Return the best available :class:`ChirpPlayer` for this environment.
+
+    Returns a :class:`SoundDeviceChirpPlayer` when ``sounddevice`` is
+    importable, else a :class:`SilentChirpPlayer`. Import errors are
+    logged at INFO — never raised — so the SDK stays usable on headless
+    machines with no audio output.
+    """
+    try:
+        import sounddevice  # noqa: F401
+    except (ImportError, OSError) as exc:
+        logger.info(
+            "sounddevice unavailable (%s); chirp playback disabled", exc
+        )
+        return SilentChirpPlayer()
+    return SoundDeviceChirpPlayer(sample_rate=sample_rate)
