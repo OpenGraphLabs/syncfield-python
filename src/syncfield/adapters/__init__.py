@@ -11,6 +11,7 @@ Adapter                    Requires                               Install
 ``JSONLFileStream``        —                                      ``syncfield``
 ``UVCWebcamStream``        ``opencv-python``                      ``syncfield[uvc]``
 ``BLEImuGenericStream``    ``bleak``                              ``syncfield[ble]``
+``OgloTactileStream``      ``bleak``                              ``syncfield[ble]``
 ``OakCameraStream``        ``depthai`` + ``opencv-python``        ``syncfield[oak,uvc]``
 =========================  =====================================  =============================
 
@@ -38,6 +39,12 @@ except ImportError:
 try:
     from syncfield.adapters.ble_imu import BLEImuGenericStream  # noqa: F401
     __all__.append("BLEImuGenericStream")
+except ImportError:
+    pass
+
+try:
+    from syncfield.adapters.oglo_tactile import OgloTactileStream  # noqa: F401
+    __all__.append("OgloTactileStream")
 except ImportError:
     pass
 
