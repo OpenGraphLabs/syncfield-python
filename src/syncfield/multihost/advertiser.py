@@ -135,15 +135,8 @@ class SessionAdvertiser:
             if self._zc is not None:
                 raise RuntimeError("SessionAdvertiser already started")
             zc_factory = _get_zeroconf_cls()
-            info_cls = _get_service_info_cls()
             self._zc = zc_factory()
-            self._info = info_cls(
-                SERVICE_TYPE,
-                f"{self._announcement.session_id}.{SERVICE_TYPE}",
-                port=ADVERT_PORT,
-                properties=self._announcement.to_txt_record(),
-                server=f"{socket.gethostname()}.local.",
-            )
+            self._info = self._build_service_info(self._announcement)
             self._zc.register_service(self._info)
             logger.info(
                 "SessionAdvertiser started: session_id=%s host_id=%s",
@@ -158,6 +151,12 @@ class SessionAdvertiser:
         started_at_ns: Optional[int] = None,
     ) -> None:
         """Transition the advertised status.
+
+        Builds a **new** ``ServiceInfo`` with the updated TXT record
+        and passes it to ``Zeroconf.update_service``. We don't mutate
+        the existing ``ServiceInfo`` in place because ``properties``
+        is read-only on ``zeroconf>=0.140`` — mutating it used to
+        work silently on older versions, which was brittle.
 
         Args:
             status: New lifecycle phase.
@@ -185,13 +184,30 @@ class SessionAdvertiser:
                     else self._announcement.started_at_ns
                 ),
             )
-            self._info.properties = self._announcement.to_txt_record()
+            self._info = self._build_service_info(self._announcement)
             self._zc.update_service(self._info)
             logger.info(
                 "SessionAdvertiser status=%s (session_id=%s)",
                 status,
                 self._announcement.session_id,
             )
+
+    def _build_service_info(self, announcement: SessionAnnouncement) -> Any:
+        """Construct a ``ServiceInfo`` for the given announcement.
+
+        Both :meth:`start` (initial registration) and
+        :meth:`update_status` (every status transition) call this so
+        the TXT record is always built via the public constructor
+        rather than through private attribute mutation.
+        """
+        info_cls = _get_service_info_cls()
+        return info_cls(
+            SERVICE_TYPE,
+            f"{announcement.session_id}.{SERVICE_TYPE}",
+            port=ADVERT_PORT,
+            properties=announcement.to_txt_record(),
+            server=f"{socket.gethostname()}.local.",
+        )
 
     def close(self) -> None:
         """Unregister the service and close the ``Zeroconf`` instance.

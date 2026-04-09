@@ -197,6 +197,14 @@ class SessionBrowser:
             self._sessions.pop(name, None)
             self._update_event.notify_all()
 
+    #: Default ``get_service_info`` timeout, in milliseconds.
+    #: zeroconf's listener callbacks fire as soon as the service name
+    #: is known, sometimes before the TXT record has been fully
+    #: resolved. Passing an explicit timeout tells zeroconf to wait
+    #: for the full resolution before returning, which is what we
+    #: want so the browser never sees a half-populated announcement.
+    _GET_INFO_TIMEOUT_MS = 3000
+
     def _refresh(self, zc: Any, name: str) -> None:
         """Re-fetch the TXT record for *name* and update ``_sessions``.
 
@@ -204,9 +212,25 @@ class SessionBrowser:
         and ignored — the browser must never crash on a single bad
         peer. The update condition is notified even when the refresh
         failed so waiters can re-evaluate their predicate.
+
+        Uses :attr:`_GET_INFO_TIMEOUT_MS` as the blocking timeout on
+        ``get_service_info`` so the callback waits for the full TXT
+        record to resolve before returning. Tests that stub zeroconf
+        with a synchronous fake backend can still call the same
+        method with their fake ``get_service_info(type, name)`` —
+        the keyword argument is forwarded via ``**kwargs`` so the
+        fake only needs to accept what it cares about.
         """
         try:
-            info = zc.get_service_info(SERVICE_TYPE, name)
+            try:
+                info = zc.get_service_info(
+                    SERVICE_TYPE, name, timeout=self._GET_INFO_TIMEOUT_MS
+                )
+            except TypeError:
+                # Fake backends in unit tests don't accept timeout —
+                # retry without it so the same browser works against
+                # both real zeroconf and the test doubles.
+                info = zc.get_service_info(SERVICE_TYPE, name)
         except Exception as exc:  # pragma: no cover - best-effort
             logger.warning("get_service_info failed for %s: %s", name, exc)
             return

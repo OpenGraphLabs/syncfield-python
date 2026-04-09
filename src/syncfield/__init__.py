@@ -25,9 +25,12 @@ from importlib.metadata import version as _pkg_version
 
 from syncfield.clock import SessionClock
 from syncfield.orchestrator import SessionOrchestrator
+from syncfield.roles import FollowerRole, LeaderRole, RoleKind
 from syncfield.stream import Stream, StreamBase
 from syncfield.tone import ChirpSpec, SyncToneConfig
 from syncfield.types import (
+    ChirpEmission,
+    ChirpSource,
     FinalizationReport,
     HealthEvent,
     HealthEventKind,
@@ -40,20 +43,29 @@ from syncfield.types import (
 )
 
 __all__ = [
+    # Core orchestrator
     "SessionOrchestrator",
-    "Stream",
-    "StreamBase",
-    "StreamCapabilities",
-    "StreamKind",
     "SessionClock",
     "SessionState",
     "SessionReport",
     "FinalizationReport",
+    # Stream SPI + capabilities
+    "Stream",
+    "StreamBase",
+    "StreamCapabilities",
+    "StreamKind",
+    "SampleEvent",
     "HealthEvent",
     "HealthEventKind",
-    "SampleEvent",
     "SyncPoint",
+    # Sync tone / chirp
     "SyncToneConfig",
     "ChirpSpec",
+    "ChirpEmission",
+    "ChirpSource",
+    # Multi-host roles (opt-in)
+    "LeaderRole",
+    "FollowerRole",
+    "RoleKind",
 ]
 __version__ = _pkg_version("syncfield")
