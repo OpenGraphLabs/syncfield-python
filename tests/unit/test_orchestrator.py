@@ -3,14 +3,26 @@
 from __future__ import annotations
 
 import json
+from unittest.mock import MagicMock
 
 import pytest
 
 from syncfield.clock import SessionClock
 from syncfield.orchestrator import SessionOrchestrator
 from syncfield.testing import FakeStream
-from syncfield.tone import SyncToneConfig
+from syncfield.tone import ChirpPlayer, ChirpSpec, SyncToneConfig
 from syncfield.types import SessionState
+
+
+def _fast_chirp_config() -> SyncToneConfig:
+    """Very short chirp + margins — keeps orchestrator tests snappy."""
+    return SyncToneConfig(
+        enabled=True,
+        start_chirp=ChirpSpec(400, 2500, 10, 0.8, 2),
+        stop_chirp=ChirpSpec(2500, 400, 10, 0.8, 2),
+        post_start_stabilization_ms=5,
+        pre_stop_tail_margin_ms=5,
+    )
 
 
 def _session(tmp_path, **kwargs) -> SessionOrchestrator:
@@ -223,3 +235,82 @@ class TestStop:
         assert by_id["bad"].status == "failed"
         # Session still reaches STOPPED state — stop() is best-effort
         assert session.state is SessionState.STOPPED
+
+
+class TestChirpIntegration:
+    def test_chirp_skipped_when_no_audio_capable_stream(self, tmp_path, caplog):
+        player = MagicMock(spec=ChirpPlayer)
+        player.is_silent.return_value = False
+        session = SessionOrchestrator(
+            host_id="h",
+            output_dir=tmp_path,
+            sync_tone=SyncToneConfig.default(),
+            chirp_player=player,
+        )
+        session.add(FakeStream("a", provides_audio_track=False))
+        with caplog.at_level("INFO", logger="syncfield.orchestrator"):
+            session.start()
+        session.stop()
+        player.play.assert_not_called()
+        assert "cannot participate" in caplog.text.lower()
+
+    def test_chirp_played_when_audio_capable_stream_exists(self, tmp_path):
+        player = MagicMock(spec=ChirpPlayer)
+        player.is_silent.return_value = False
+        session = SessionOrchestrator(
+            host_id="h",
+            output_dir=tmp_path,
+            sync_tone=_fast_chirp_config(),
+            chirp_player=player,
+        )
+        session.add(FakeStream("a", provides_audio_track=True))
+        session.start()
+        session.stop()
+        assert player.play.call_count == 2  # start + stop chirp
+
+    def test_silent_tone_never_plays_chirp(self, tmp_path):
+        player = MagicMock(spec=ChirpPlayer)
+        session = SessionOrchestrator(
+            host_id="h",
+            output_dir=tmp_path,
+            sync_tone=SyncToneConfig.silent(),
+            chirp_player=player,
+        )
+        session.add(FakeStream("a", provides_audio_track=True))
+        session.start()
+        session.stop()
+        player.play.assert_not_called()
+
+    def test_chirp_fields_written_to_sync_point_json(self, tmp_path):
+        player = MagicMock(spec=ChirpPlayer)
+        player.is_silent.return_value = False
+        session = SessionOrchestrator(
+            host_id="h",
+            output_dir=tmp_path,
+            sync_tone=_fast_chirp_config(),
+            chirp_player=player,
+        )
+        session.add(FakeStream("a", provides_audio_track=True))
+        session.start()
+        session.stop()
+        sp = json.loads((tmp_path / "sync_point.json").read_text())
+        assert "chirp_start_ns" in sp
+        assert "chirp_stop_ns" in sp
+        assert sp["chirp_start_ns"] > 0
+        assert sp["chirp_stop_ns"] > sp["chirp_start_ns"]
+        assert sp["chirp_spec"]["from_hz"] == 400
+
+    def test_session_report_carries_chirp_timestamps(self, tmp_path):
+        player = MagicMock(spec=ChirpPlayer)
+        player.is_silent.return_value = False
+        session = SessionOrchestrator(
+            host_id="h",
+            output_dir=tmp_path,
+            sync_tone=_fast_chirp_config(),
+            chirp_player=player,
+        )
+        session.add(FakeStream("a", provides_audio_track=True))
+        session.start()
+        report = session.stop()
+        assert report.chirp_start_ns is not None
+        assert report.chirp_stop_ns is not None

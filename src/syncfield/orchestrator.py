@@ -19,13 +19,15 @@ Thread safety:
 
 from __future__ import annotations
 
+import logging
 import threading
+import time
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from syncfield.clock import SessionClock
 from syncfield.stream import Stream
-from syncfield.tone import SyncToneConfig
+from syncfield.tone import ChirpPlayer, SyncToneConfig, create_default_player
 from syncfield.types import (
     FinalizationReport,
     SessionReport,
@@ -33,6 +35,8 @@ from syncfield.types import (
     SyncPoint,
 )
 from syncfield.writer import write_manifest, write_sync_point
+
+logger = logging.getLogger(__name__)
 
 
 class SessionOrchestrator:
@@ -53,18 +57,22 @@ class SessionOrchestrator:
         host_id: str,
         output_dir: Path | str,
         sync_tone: SyncToneConfig | None = None,
+        chirp_player: ChirpPlayer | None = None,
     ) -> None:
         self._host_id = host_id
         self._output_dir = Path(output_dir)
         self._output_dir.mkdir(parents=True, exist_ok=True)
         self._sync_tone = sync_tone or SyncToneConfig.default()
+        self._chirp_player = chirp_player or create_default_player()
         self._streams: Dict[str, Stream] = {}
         self._state = SessionState.IDLE
         self._lock = threading.RLock()
 
         # Populated during start(); consumed during stop().
-        self._sync_point: SyncPoint | None = None
-        self._session_clock: SessionClock | None = None
+        self._sync_point: Optional[SyncPoint] = None
+        self._session_clock: Optional[SessionClock] = None
+        self._chirp_start_ns: Optional[int] = None
+        self._chirp_stop_ns: Optional[int] = None
 
     # ------------------------------------------------------------------
     # Public properties
@@ -155,6 +163,7 @@ class SessionOrchestrator:
                 self._state = SessionState.IDLE
                 raise
 
+            self._maybe_play_start_chirp()
             self._state = SessionState.RECORDING
 
     @staticmethod
@@ -208,6 +217,8 @@ class SessionOrchestrator:
                 )
             self._state = SessionState.STOPPING
 
+            self._maybe_play_stop_chirp_and_wait()
+
             finalizations = self._finalize_streams()
             self._persist_session_artifacts(finalizations)
 
@@ -215,8 +226,8 @@ class SessionOrchestrator:
             return SessionReport(
                 host_id=self._host_id,
                 finalizations=finalizations,
-                chirp_start_ns=None,
-                chirp_stop_ns=None,
+                chirp_start_ns=self._chirp_start_ns,
+                chirp_stop_ns=self._chirp_stop_ns,
             )
 
     def _finalize_streams(self) -> List[FinalizationReport]:
@@ -253,11 +264,22 @@ class SessionOrchestrator:
 
         Assumes ``start()`` has already captured ``self._sync_point``;
         safe because ``stop()`` requires ``RECORDING`` state which can
-        only be entered through ``start()``.
+        only be entered through ``start()``. Chirp fields are included
+        only when a chirp was actually played — the writer omits
+        ``chirp_*`` fields otherwise.
         """
         assert self._sync_point is not None  # guaranteed by state check
 
-        write_sync_point(self._sync_point, self._output_dir)
+        chirp_spec = (
+            self._sync_tone.start_chirp if self._chirp_start_ns is not None else None
+        )
+        write_sync_point(
+            self._sync_point,
+            self._output_dir,
+            chirp_start_ns=self._chirp_start_ns,
+            chirp_stop_ns=self._chirp_stop_ns,
+            chirp_spec=chirp_spec,
+        )
 
         streams_dict: Dict[str, dict] = {}
         final_by_id = {f.stream_id: f for f in finalizations}
@@ -277,3 +299,62 @@ class SessionOrchestrator:
             streams_dict[stream.id] = entry
 
         write_manifest(self._host_id, streams_dict, self._output_dir)
+
+    # ------------------------------------------------------------------
+    # Chirp injection
+    # ------------------------------------------------------------------
+
+    def _is_chirp_eligible(self) -> bool:
+        """Return True if this host should play sync chirps.
+
+        Chirp eligibility is a host-level check: chirps exist to enable
+        inter-host audio cross-correlation, so they only matter if at
+        least one registered stream actually captures audio. Single-host
+        sessions with no audio stream happily rely on intra-host
+        timestamp alignment and need no chirp at all.
+        """
+        if not self._sync_tone.enabled:
+            return False
+        return any(
+            s.capabilities.provides_audio_track for s in self._streams.values()
+        )
+
+    def _maybe_play_start_chirp(self) -> None:
+        """Play the start chirp if eligible, else log an INFO line.
+
+        Sleeps ``post_start_stabilization_ms`` first so audio capture
+        pipelines have time to warm up and begin recording before the
+        chirp hits the microphone.
+        """
+        if self._is_chirp_eligible():
+            time.sleep(self._sync_tone.post_start_stabilization_ms / 1000.0)
+            self._chirp_start_ns = time.monotonic_ns()
+            self._chirp_player.play(self._sync_tone.start_chirp)
+            return
+
+        if self._sync_tone.enabled:
+            logger.info(
+                "[%s] No audio-capable stream registered on this host. "
+                "Chirp injection disabled — host cannot participate in "
+                "inter-host audio sync. Single-host sessions unaffected.",
+                self._host_id,
+            )
+
+    def _maybe_play_stop_chirp_and_wait(self) -> None:
+        """Play the stop chirp BEFORE stopping streams and wait for it to flush.
+
+        The stop chirp must be captured in each recording audio track, so
+        we play it first, then sleep for the chirp's duration plus a
+        configurable tail margin, then let ``stop()`` proceed to finalize
+        the streams.
+        """
+        if not self._is_chirp_eligible():
+            return
+
+        self._chirp_stop_ns = time.monotonic_ns()
+        self._chirp_player.play(self._sync_tone.stop_chirp)
+        total_wait_ms = (
+            self._sync_tone.stop_chirp.duration_ms
+            + self._sync_tone.pre_stop_tail_margin_ms
+        )
+        time.sleep(total_wait_ms / 1000.0)
