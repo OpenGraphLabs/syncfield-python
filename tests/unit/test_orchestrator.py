@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from syncfield.clock import SessionClock
@@ -144,3 +146,80 @@ class TestStartRollback:
         assert bad.start_calls == 0  # never reached start
 
         assert session.state is SessionState.IDLE
+
+
+class TestStop:
+    def test_stop_transitions_to_stopped(self, tmp_path):
+        session = _session(tmp_path)
+        session.add(FakeStream("a"))
+        session.start()
+        report = session.stop()
+        assert session.state is SessionState.STOPPED
+        assert report.host_id == "rig_01"
+
+    def test_stop_calls_stop_on_every_stream(self, tmp_path):
+        session = _session(tmp_path)
+        fs1 = FakeStream("a")
+        fs2 = FakeStream("b")
+        session.add(fs1)
+        session.add(fs2)
+        session.start()
+        session.stop()
+        assert fs1.stop_calls == 1
+        assert fs2.stop_calls == 1
+
+    def test_stop_collects_finalization_reports(self, tmp_path):
+        session = _session(tmp_path)
+        fs1 = FakeStream("a")
+        fs2 = FakeStream("b")
+        session.add(fs1)
+        session.add(fs2)
+        session.start()
+        fs1.push_sample(0, 100)
+        fs1.push_sample(1, 200)
+        report = session.stop()
+        by_id = {r.stream_id: r for r in report.finalizations}
+        assert by_id["a"].frame_count == 2
+        assert by_id["a"].first_sample_at_ns == 100
+        assert by_id["a"].last_sample_at_ns == 200
+        assert by_id["b"].frame_count == 0
+
+    def test_stop_writes_sync_point_json(self, tmp_path):
+        session = _session(tmp_path)
+        session.add(FakeStream("a"))
+        session.start()
+        session.stop()
+        sp = json.loads((tmp_path / "sync_point.json").read_text())
+        assert sp["host_id"] == "rig_01"
+        assert "monotonic_ns" in sp
+        # Silent mode → no chirp fields
+        assert "chirp_start_ns" not in sp
+
+    def test_stop_writes_manifest_with_capabilities(self, tmp_path):
+        session = _session(tmp_path)
+        session.add(FakeStream("a", provides_audio_track=True))
+        session.start()
+        session.stop()
+        m = json.loads((tmp_path / "manifest.json").read_text())
+        assert m["host_id"] == "rig_01"
+        assert "a" in m["streams"]
+        assert m["streams"]["a"]["capabilities"]["provides_audio_track"] is True
+        assert m["streams"]["a"]["status"] == "completed"
+        assert m["streams"]["a"]["frame_count"] == 0
+
+    def test_stop_requires_recording_state(self, tmp_path):
+        session = _session(tmp_path)
+        with pytest.raises(RuntimeError, match="stop.*idle"):
+            session.stop()
+
+    def test_failing_stream_does_not_block_other_stops(self, tmp_path):
+        session = _session(tmp_path)
+        session.add(FakeStream("good"))
+        session.add(FakeStream("bad", fail_on_stop=True))
+        session.start()
+        report = session.stop()
+        by_id = {r.stream_id: r for r in report.finalizations}
+        assert by_id["good"].status == "completed"
+        assert by_id["bad"].status == "failed"
+        # Session still reaches STOPPED state — stop() is best-effort
+        assert session.state is SessionState.STOPPED
