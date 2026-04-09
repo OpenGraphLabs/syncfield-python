@@ -112,6 +112,7 @@ class ViewerLayout:
         dpg.bind_item_theme("control_panel", self._soft_panel_theme)
         dpg.bind_item_theme("clock_panel", self._soft_panel_theme)
         dpg.bind_item_theme("btn_connect", self._primary_theme)
+        dpg.bind_item_theme("btn_disconnect", self._ghost_theme)
         dpg.bind_item_theme("btn_record", self._primary_theme)
         dpg.bind_item_theme("btn_stop", self._danger_theme)
         dpg.bind_item_theme("btn_cancel", self._ghost_theme)
@@ -235,14 +236,16 @@ class ViewerLayout:
 
         Control panel button stack (top to bottom):
 
-            [         Connect         ]   ← IDLE only; opens devices + live preview
-            [ Record  ] [    Stop    ]    ← Record is CONNECTED-only; Stop is RECORDING-only
-            [          Cancel          ]   ← COUNTDOWN / RECORDING only
+            [ Connect ] [ Disconnect ]   ← toggle pair; one active per state
+            [ Record  ] [    Stop    ]   ← Record: CONNECTED, Stop: RECORDING
+            [         Cancel         ]   ← COUNTDOWN / RECORDING
 
-        Connect is a separate explicit step so the user can open the
-        viewer, review the registered streams, run Discovery if they
-        want, and then kick off device I/O with a single click —
-        nothing opens a camera handle until they ask for it.
+        Connect and Disconnect are a toggle pair: only one is enabled
+        at a time. Connect opens devices (IDLE or STOPPED → CONNECTED);
+        Disconnect closes them (CONNECTED or STOPPED → IDLE). STOPPED
+        accepts both because the user may want to either tear the
+        session down for good or start a fresh recording on the same
+        rig without re-opening hardware.
         """
         with dpg.group(horizontal=True):
             # --- Control panel ----------------------------------------
@@ -257,16 +260,24 @@ class ViewerLayout:
                     "CONTROLS", tag="label_controls", color=theme.TEXT_MUTED,
                 )
                 dpg.add_spacer(height=10)
-                # Row 1 — Connect (primary in IDLE, disabled otherwise)
-                dpg.add_button(
-                    label="Connect",
-                    tag="btn_connect",
-                    width=212,
-                    height=34,
-                    callback=self._on_connect_click,
-                )
+                # Row 1 — Connect + Disconnect toggle pair (102 + 8 + 102 = 212)
+                with dpg.group(horizontal=True):
+                    dpg.add_button(
+                        label="Connect",
+                        tag="btn_connect",
+                        width=102,
+                        height=34,
+                        callback=self._on_connect_click,
+                    )
+                    dpg.add_button(
+                        label="Disconnect",
+                        tag="btn_disconnect",
+                        width=102,
+                        height=34,
+                        callback=self._on_disconnect_click,
+                    )
                 dpg.add_spacer(height=8)
-                # Row 2 — Record + Stop (split 112 / 92 = 204 + 8 gap)
+                # Row 2 — Record + Stop (112 + 8 + 92 = 212)
                 with dpg.group(horizontal=True):
                     dpg.add_button(
                         label="Record",
@@ -472,10 +483,15 @@ class ViewerLayout:
           teardown has completed and the viewer is typically closing.
         """
         state = snapshot.state
-        # Connect: the one gateway out of IDLE. After the user clicks
-        # it the session walks IDLE → CONNECTING → CONNECTED on its
-        # own, so the button stays disabled from CONNECTING onward.
-        _set_enabled("btn_connect", state == "idle")
+        # Connect / Disconnect are a toggle pair — exactly one is
+        # enabled in any resting state (IDLE, CONNECTED, STOPPED),
+        # and both are disabled during transitions (CONNECTING,
+        # PREPARING, COUNTDOWN, RECORDING, STOPPING). STOPPED accepts
+        # BOTH: the user may want to tear the session down for good
+        # (Disconnect → IDLE) or start a fresh recording on the same
+        # rig without re-opening hardware (Connect → CONNECTED).
+        _set_enabled("btn_connect", state in ("idle", "stopped"))
+        _set_enabled("btn_disconnect", state in ("connected", "stopped"))
         _set_enabled("btn_record", state == "connected")
         _set_enabled("btn_stop", state == "recording")
         _set_enabled(
@@ -595,6 +611,25 @@ class ViewerLayout:
             target=self._safe_call,
             args=(self._session.connect,),
             name="viewer-ctrl-connect",
+            daemon=True,
+        ).start()
+
+    def _on_disconnect_click(self) -> None:
+        """Close devices on every connected stream (CONNECTED/STOPPED → IDLE).
+
+        The mirror of :meth:`_on_connect_click`. Dispatched onto a
+        worker thread because ``disconnect()`` joins each adapter's
+        capture thread and releases OS-level device handles — a few
+        ms per stream on most hardware but up to a second per BLE
+        peripheral. On return the session is back in ``IDLE`` and
+        the stream cards fall quiet (``latest_frame`` stops
+        updating); the cards themselves stay in place so the user
+        can click Connect again.
+        """
+        threading.Thread(
+            target=self._safe_call,
+            args=(self._session.disconnect,),
+            name="viewer-ctrl-disconnect",
             daemon=True,
         ).start()
 
