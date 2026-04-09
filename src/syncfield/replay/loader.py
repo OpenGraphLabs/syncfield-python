@@ -23,7 +23,7 @@ class ReplayStream:
 
     ``media_path`` is kept on the Python side for the file-serving
     handler; it is intentionally excluded from the JSON view of the
-    manifest (see :meth:`ReplayManifest.to_json`).
+    manifest (see :meth:`ReplayManifest.to_dict`).
     """
 
     id: str
@@ -31,7 +31,6 @@ class ReplayStream:
     media_url: Optional[str]
     media_path: Optional[Path]
     data_url: Optional[str]
-    data_path: Optional[Path]
     frame_count: int
 
 
@@ -46,8 +45,10 @@ class ReplayManifest:
     sync_report: Optional[dict]
     has_frame_map: bool
 
-    def to_json(self) -> dict[str, Any]:
-        """Serializable view — strips Path fields the SPA does not need."""
+    def to_dict(self) -> dict[str, Any]:
+        """Serializable view — strips Path fields and the sync_report
+        (which is served separately via the /api/sync-report route).
+        """
         return {
             "host_id": self.host_id,
             "sync_point": self.sync_point,
@@ -89,7 +90,6 @@ def load_session(session_dir: Path) -> ReplayManifest:
 
         media_path: Optional[Path] = None
         media_url: Optional[str] = None
-        data_path: Optional[Path] = None
         data_url: Optional[str] = None
 
         if kind == "video":
@@ -100,7 +100,6 @@ def load_session(session_dir: Path) -> ReplayManifest:
 
         sensor_jsonl = session_dir / f"{stream_id}.jsonl"
         if sensor_jsonl.is_file():
-            data_path = sensor_jsonl
             data_url = f"/data/{stream_id}.jsonl"
 
         streams.append(
@@ -110,7 +109,6 @@ def load_session(session_dir: Path) -> ReplayManifest:
                 media_url=media_url,
                 media_path=media_path,
                 data_url=data_url,
-                data_path=data_path,
                 frame_count=frame_count,
             )
         )
