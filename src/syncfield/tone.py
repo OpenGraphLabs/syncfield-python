@@ -16,6 +16,9 @@ headless machines.
 from __future__ import annotations
 
 import math
+import struct
+import wave
+from pathlib import Path
 from typing import List
 
 from syncfield.types import ChirpSpec
@@ -73,3 +76,40 @@ def generate_chirp_samples(spec: ChirpSpec, sample_rate: int = 44100) -> List[fl
         out[i] = spec.amplitude * value
 
     return out
+
+
+def _float_to_int16(sample: float) -> int:
+    """Clamp a float to ``[-1, 1]`` and scale to int16 range."""
+    clamped = max(-1.0, min(1.0, sample))
+    return int(round(clamped * 32767))
+
+
+def write_chirp_wav(
+    spec: ChirpSpec,
+    path: Path | str,
+    sample_rate: int = 44100,
+) -> Path:
+    """Write a chirp to a 16-bit mono PCM ``.wav`` file.
+
+    Used by playback backends and for debugging chirp signals. Samples are
+    clamped to ``[-1, 1]`` before int16 conversion so amplitude overflows
+    never corrupt the output.
+
+    Args:
+        spec: Chirp parameters.
+        path: Output file path (``str`` or :class:`~pathlib.Path`).
+        sample_rate: Sample rate in Hz. Default ``44100``.
+
+    Returns:
+        The path that was written, as a :class:`~pathlib.Path`.
+    """
+    out_path = Path(path)
+    samples = generate_chirp_samples(spec, sample_rate)
+    int16_samples = [_float_to_int16(s) for s in samples]
+    frames = struct.pack(f"<{len(int16_samples)}h", *int16_samples)
+    with wave.open(str(out_path), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)  # 16-bit
+        w.setframerate(sample_rate)
+        w.writeframes(frames)
+    return out_path

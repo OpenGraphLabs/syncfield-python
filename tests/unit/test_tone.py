@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-from syncfield.tone import generate_chirp_samples
+import struct
+import wave
+
+from syncfield.tone import generate_chirp_samples, write_chirp_wav
 from syncfield.types import ChirpSpec
 
 
@@ -49,3 +52,32 @@ class TestGenerateChirpSamples:
     def test_empty_when_duration_zero(self):
         spec = ChirpSpec(400, 2500, 0, amplitude=0.8, envelope_ms=0)
         assert generate_chirp_samples(spec, sample_rate=SAMPLE_RATE) == []
+
+
+class TestWriteChirpWav:
+    def test_writes_valid_16bit_pcm_wav(self, tmp_path):
+        spec = ChirpSpec(400, 2500, 500, 0.8, 15)
+        out_path = tmp_path / "chirp.wav"
+        write_chirp_wav(spec, out_path, sample_rate=SAMPLE_RATE)
+        assert out_path.exists()
+        with wave.open(str(out_path), "rb") as w:
+            assert w.getnchannels() == 1
+            assert w.getsampwidth() == 2  # 16-bit
+            assert w.getframerate() == SAMPLE_RATE
+            assert w.getnframes() == int(SAMPLE_RATE * 0.5)
+
+    def test_samples_are_int16_and_nontrivial(self, tmp_path):
+        # amplitude = 1.0 would overflow int16 if not clipped
+        spec = ChirpSpec(400, 2500, 100, amplitude=1.0, envelope_ms=0)
+        out_path = tmp_path / "chirp.wav"
+        write_chirp_wav(spec, out_path, sample_rate=SAMPLE_RATE)
+        with wave.open(str(out_path), "rb") as w:
+            frames = w.readframes(w.getnframes())
+        values = struct.unpack(f"<{len(frames) // 2}h", frames)
+        assert all(-32768 <= v <= 32767 for v in values)
+        assert max(abs(v) for v in values) > 20000
+
+    def test_returns_path(self, tmp_path):
+        out = tmp_path / "x.wav"
+        result = write_chirp_wav(ChirpSpec(400, 500, 10, 0.5, 0), out)
+        assert result == out
