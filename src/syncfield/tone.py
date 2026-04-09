@@ -21,11 +21,22 @@ import struct
 import wave
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Protocol, runtime_checkable
+from typing import Any, List, Protocol, runtime_checkable
 
 from syncfield.types import ChirpSpec
 
 logger = logging.getLogger(__name__)
+
+
+# numpy is an optional runtime dependency of SoundDeviceChirpPlayer (sounddevice
+# itself needs it internally). Import it lazily here — but at module load time
+# rather than inside ``play()`` — so that test fixtures which patch
+# ``sys.modules["sounddevice"]`` don't accidentally trigger numpy's C-extension
+# one-time initialization failure inside a patch.dict block.
+try:
+    import numpy as _np  # type: ignore[import-not-found]
+except ImportError:  # pragma: no cover - exercised on machines without numpy
+    _np = None  # type: ignore[assignment]
 
 
 # ---------------------------------------------------------------------------
@@ -251,12 +262,22 @@ class SoundDeviceChirpPlayer:
         self._sample_rate = sample_rate
 
     def play(self, spec: ChirpSpec) -> None:
-        # Lazy import keeps the module importable on machines that lack
-        # sounddevice — only instantiating this class requires the dep.
+        # Lazy sounddevice import keeps this module importable on machines
+        # that lack the audio extras. sounddevice.play() internally requires
+        # numpy even if the caller passes a list, so we hand it a float32
+        # ndarray constructed from the module-level numpy reference.
         import sounddevice as sd  # type: ignore[import-not-found]
 
         samples = generate_chirp_samples(spec, sample_rate=self._sample_rate)
-        sd.play(samples, self._sample_rate)  # non-blocking: returns immediately
+        buffer: Any
+        if _np is not None:
+            buffer = _np.asarray(samples, dtype=_np.float32)
+        else:
+            # No numpy available — pass the raw list and let sounddevice
+            # raise its own ImportError at play time. Tests mock sd so this
+            # branch is only hit in real headful runs without numpy.
+            buffer = samples
+        sd.play(buffer, self._sample_rate)  # non-blocking: returns immediately
 
     def is_silent(self) -> bool:
         return False
