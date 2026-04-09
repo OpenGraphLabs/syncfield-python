@@ -11,7 +11,7 @@ from syncfield.clock import SessionClock
 from syncfield.orchestrator import SessionOrchestrator
 from syncfield.testing import FakeStream
 from syncfield.tone import ChirpPlayer, ChirpSpec, SyncToneConfig
-from syncfield.types import SessionState
+from syncfield.types import HealthEventKind, SessionState
 
 
 def _fast_chirp_config() -> SyncToneConfig:
@@ -355,3 +355,43 @@ class TestSessionLog:
         assert log_path.exists()
         lines = [json.loads(l) for l in log_path.read_text().strip().split("\n")]
         assert any(l["kind"] == "rollback" for l in lines)
+
+
+class TestHealthRouting:
+    def test_stream_health_events_routed_to_session_log(self, tmp_path):
+        session = _session(tmp_path)
+        fs = FakeStream("a")
+        session.add(fs)
+        session.start()
+        fs.push_health(HealthEventKind.DROP, at_ns=500, detail="buffer full")
+        fs.push_health(HealthEventKind.RECONNECT, at_ns=600)
+        session.stop()
+
+        lines = [
+            json.loads(l)
+            for l in (tmp_path / "session_log.jsonl").read_text().strip().split("\n")
+        ]
+        health_lines = [l for l in lines if l["kind"] == "health"]
+        assert len(health_lines) == 2
+        assert health_lines[0]["stream_id"] == "a"
+        assert health_lines[0]["health_kind"] == "drop"
+        assert health_lines[0]["detail"] == "buffer full"
+        assert health_lines[1]["health_kind"] == "reconnect"
+
+    def test_health_emitted_before_start_is_buffered_not_logged(self, tmp_path):
+        """Before start(), the session log isn't open yet — health events
+        must still reach the FinalizationReport via the StreamBase buffer.
+        """
+        session = _session(tmp_path)
+        fs = FakeStream("a")
+        session.add(fs)
+        # Session log not yet open
+        fs.push_health(HealthEventKind.WARNING, at_ns=1, detail="early")
+        session.start()
+        report = session.stop()
+
+        final = next(f for f in report.finalizations if f.stream_id == "a")
+        assert any(
+            h.kind is HealthEventKind.WARNING and h.detail == "early"
+            for h in final.health_events
+        )

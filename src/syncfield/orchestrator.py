@@ -30,6 +30,7 @@ from syncfield.stream import Stream
 from syncfield.tone import ChirpPlayer, SyncToneConfig, create_default_player
 from syncfield.types import (
     FinalizationReport,
+    HealthEvent,
     SessionReport,
     SessionState,
     SyncPoint,
@@ -99,7 +100,9 @@ class SessionOrchestrator:
         """Register a stream with this session.
 
         Must be called before :meth:`start`. Duplicate stream ids are
-        rejected so session output files are always unique.
+        rejected so session output files are always unique. Once
+        ``start()`` has been called, any health events the stream emits
+        are forwarded to the session log automatically.
 
         Raises:
             ValueError: If a stream with the same id is already registered.
@@ -112,6 +115,7 @@ class SessionOrchestrator:
         if stream.id in self._streams:
             raise ValueError(f"duplicate stream id: {stream.id!r}")
         self._streams[stream.id] = stream
+        stream.on_health(self._on_stream_health)
 
     # ------------------------------------------------------------------
     # Lifecycle — start
@@ -346,6 +350,17 @@ class SessionOrchestrator:
                 "at_ns": time.monotonic_ns(),
             }
         )
+
+    def _on_stream_health(self, event: HealthEvent) -> None:
+        """Forward a stream-reported health event into the session log.
+
+        Events emitted before :meth:`start` (while the log is not yet
+        open) are silently buffered by :class:`~syncfield.stream.StreamBase`
+        and surface later in the :class:`FinalizationReport` so nothing
+        is lost.
+        """
+        if self._log_writer is not None:
+            self._log_writer.log_health(event)
 
     # ------------------------------------------------------------------
     # Chirp injection
