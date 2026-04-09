@@ -1,20 +1,25 @@
 """SessionOrchestrator — lifecycle coordinator for a multi-stream capture session.
 
 The orchestrator owns state transitions, atomic start/stop across all
-registered streams, chirp injection, crash-safe manifest flushing, and
+registered streams, chirp injection, crash-safe session logging, and
 health-event routing. Each instance represents **one host**; multi-host
-coordination happens at the sync core when outputs from multiple hosts are
-submitted together.
+coordination happens at the sync core when outputs from multiple hosts
+are submitted together.
 
-This skeleton is expanded incrementally — the ``start()``/``stop()`` logic,
-chirp integration, crash-safe session log, and health routing are added in
-subsequent tasks.
+The file is organized top-down so the public lifecycle is easy to read:
+
+1. Construction and public properties
+2. ``add()`` — stream registration
+3. ``start()`` — atomic multi-stream start with rollback
+4. ``stop()`` — chirp + finalization + artifact persistence
+5. Session log helpers (crash safety)
+6. Chirp injection helpers
 
 Thread safety:
     ``add()`` is **not** thread-safe — call it from the thread that
-    constructed the session. ``start()`` and ``stop()`` acquire an internal
-    reentrant lock, so it is safe for other threads to observe state but
-    only one lifecycle transition runs at a time.
+    constructed the session. ``start()`` and ``stop()`` acquire an
+    internal reentrant lock, so it is safe for other threads to observe
+    state but only one lifecycle transition runs at a time.
 """
 
 from __future__ import annotations
@@ -203,20 +208,21 @@ class SessionOrchestrator:
         Sequence:
             1. Validate state (must be ``RECORDING``) and transition to
                ``STOPPING``.
-            2. For each stream, call ``stop()``. Exceptions become failed
+            2. If chirp is eligible, play the stop chirp **before**
+               stopping streams so it lands in recording audio tracks,
+               then wait for its tail to flush.
+            3. For each stream, call ``stop()``. Exceptions become failed
                :class:`FinalizationReport` entries — one slow or broken
                stream must never block finalization of the others.
-            3. Write ``sync_point.json`` and ``manifest.json`` to the
+            4. Write ``sync_point.json`` and ``manifest.json`` to the
                output directory.
-            4. Transition to ``STOPPED`` and return the aggregated
-               :class:`SessionReport`.
-
-        Chirp playback integration is added in a subsequent task; this
-        base implementation handles only the non-chirp finalization path.
+            5. Transition to ``STOPPED``, close the session log, and
+               return the aggregated :class:`SessionReport`.
 
         Returns:
             Aggregated :class:`SessionReport` with per-stream
-            finalization reports.
+            finalization reports and chirp timestamps (if a chirp was
+            played).
 
         Raises:
             RuntimeError: If state is not ``RECORDING``.
