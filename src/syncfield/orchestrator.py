@@ -27,10 +27,15 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from importlib.metadata import version as _pkg_version
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 
 from syncfield.clock import SessionClock
+from syncfield.multihost.advertiser import SessionAdvertiser
+from syncfield.multihost.browser import SessionBrowser
+from syncfield.multihost.types import SessionAnnouncement
+from syncfield.roles import FollowerRole, LeaderRole
 from syncfield.stream import Stream
 from syncfield.tone import ChirpPlayer, SyncToneConfig, create_default_player
 from syncfield.types import (
@@ -45,18 +50,39 @@ from syncfield.writer import SessionLogWriter, write_manifest, write_sync_point
 
 logger = logging.getLogger(__name__)
 
+#: Discriminated union of the multi-host role configs.
+Role = Union[LeaderRole, FollowerRole]
+
 
 class SessionOrchestrator:
     """Coordinates a multi-stream recording session for one host.
 
+    A single orchestrator represents **one host**. Multi-host
+    coordination happens via the optional ``role`` parameter, which
+    plugs a :class:`~syncfield.multihost.SessionAdvertiser` (leader) or
+    a :class:`~syncfield.multihost.SessionBrowser` (follower) into the
+    lifecycle. Single-host callers omit ``role`` entirely and see no
+    behavioral change.
+
     Args:
-        host_id: Identifier for this capture host. Must match across all
-            orchestrators belonging to the same logical host.
-        output_dir: Directory where all output files are written. Created
-            if it does not exist.
+        host_id: Identifier for this capture host. Must match across
+            all orchestrators belonging to the same logical host.
+        output_dir: Directory where all output files are written.
+            Created if it does not exist.
         sync_tone: Chirp configuration. Defaults to enabled with the
             egonaut production chirp spec. Use
             :meth:`~syncfield.tone.SyncToneConfig.silent` to disable.
+        chirp_player: Optional custom player. Defaults to the
+            best-available player via
+            :func:`~syncfield.tone.create_default_player`.
+        role: Optional multi-host role. Supply
+            :class:`~syncfield.roles.LeaderRole` to advertise this
+            session on the local network, or
+            :class:`~syncfield.roles.FollowerRole` to block on
+            :meth:`start` until a leader is advertising ``recording``.
+            Followers **never** play chirps — they rely on the
+            leader's chirps being captured by every host's microphones
+            in the same physical space.
     """
 
     def __init__(
@@ -65,6 +91,7 @@ class SessionOrchestrator:
         output_dir: Path | str,
         sync_tone: SyncToneConfig | None = None,
         chirp_player: ChirpPlayer | None = None,
+        role: Optional[Role] = None,
     ) -> None:
         self._host_id = host_id
         self._output_dir = Path(output_dir)
@@ -74,6 +101,12 @@ class SessionOrchestrator:
         self._streams: Dict[str, Stream] = {}
         self._state = SessionState.IDLE
         self._lock = threading.RLock()
+        self._role: Optional[Role] = role
+
+        # Multi-host infrastructure — populated only when role is set.
+        self._advertiser: Optional[SessionAdvertiser] = None
+        self._browser: Optional[SessionBrowser] = None
+        self._observed_leader: Optional[SessionAnnouncement] = None
 
         # Populated during start(); consumed during stop().
         self._sync_point: Optional[SyncPoint] = None
@@ -97,6 +130,36 @@ class SessionOrchestrator:
     @property
     def output_dir(self) -> Path:
         return self._output_dir
+
+    @property
+    def role(self) -> Optional[Role]:
+        """Return the attached multi-host role, or ``None`` for single-host."""
+        return self._role
+
+    @property
+    def session_id(self) -> Optional[str]:
+        """Return the shared multi-host session id.
+
+        For :class:`LeaderRole` the id is known at construction time
+        (auto-generated if the caller didn't supply one). For
+        :class:`FollowerRole` the id may come from the role config
+        or — when the follower uses auto-discovery — from the leader
+        announcement observed during :meth:`start`. Returns ``None``
+        for single-host sessions.
+        """
+        if isinstance(self._role, LeaderRole):
+            return self._role.session_id
+        if isinstance(self._role, FollowerRole):
+            if self._role.session_id is not None:
+                return self._role.session_id
+            if self._observed_leader is not None:
+                return self._observed_leader.session_id
+        return None
+
+    @property
+    def observed_leader(self) -> Optional[SessionAnnouncement]:
+        """Last announcement observed from the leader (follower-only)."""
+        return self._observed_leader
 
     # ------------------------------------------------------------------
     # Stream registration
@@ -165,6 +228,19 @@ class SessionOrchestrator:
             self._log_writer.open()
 
             self._transition(SessionState.PREPARING)
+
+            # Leader: start advertising in the PREPARING state so
+            # followers already on the network see the session coming
+            # up. Follower: block here until a leader advertises
+            # `recording`. Both branches no-op for single-host.
+            try:
+                self._maybe_start_advertising()
+                self._maybe_wait_for_leader()
+            except Exception:
+                self._stop_discovery_on_failure()
+                self._transition(SessionState.IDLE)
+                raise
+
             self._sync_point = SyncPoint.create_now(self._host_id)
             self._session_clock = SessionClock(sync_point=self._sync_point)
 
@@ -177,11 +253,17 @@ class SessionOrchestrator:
             except Exception as exc:
                 self._log_rollback(exc, len(started))
                 self._rollback_started_streams(started)
+                self._stop_discovery_on_failure()
                 self._transition(SessionState.IDLE)
                 raise
 
             self._maybe_play_start_chirp()
             self._transition(SessionState.RECORDING)
+
+            # Leader only: flip the advertised status to `recording`
+            # now that we actually are — the start chirp has played
+            # and streams are live.
+            self._maybe_update_advert_recording()
 
     @staticmethod
     def _rollback_started_streams(started: List[Stream]) -> None:
@@ -236,14 +318,30 @@ class SessionOrchestrator:
             self._transition(SessionState.STOPPING)
 
             self._maybe_play_stop_chirp_and_wait()
-
             finalizations = self._finalize_streams()
+
+            # Leader: flip advert status to stopped BEFORE closing the
+            # advertiser so every follower on the network observes the
+            # transition. Close happens further down after artifacts
+            # are persisted, which gives the graceful_shutdown_ms
+            # margin time to propagate.
+            self._maybe_update_advert_stopped()
+
             self._persist_session_artifacts(finalizations)
 
             self._transition(SessionState.STOPPED)
             if self._log_writer is not None:
                 self._log_writer.close()
                 self._log_writer = None
+
+            # Tear down discovery. The advertiser's close() sleeps for
+            # graceful_shutdown_ms before unregistering so followers
+            # still browsing see the final "stopped" status; the
+            # browser closes immediately because the follower has
+            # already finalized its own streams.
+            self._stop_discovery_on_failure()
+
+            role_str = self._role.kind if self._role is not None else None
             return SessionReport(
                 host_id=self._host_id,
                 finalizations=finalizations,
@@ -267,6 +365,8 @@ class SessionOrchestrator:
                     if self._chirp_stop is not None
                     else None
                 ),
+                session_id=self.session_id,
+                role=role_str,
             )
 
     def _finalize_streams(self) -> List[FinalizationReport]:
@@ -308,12 +408,19 @@ class SessionOrchestrator:
         ``chirp_*`` fields otherwise.
 
         Both the best-available timestamp (``chirp_*_ns``) and the
-        provenance tag (``chirp_*_source``) are threaded through so the
-        downstream sync core can decide whether to claim sub-ms
+        provenance tag (``chirp_*_source``) are threaded through so
+        the downstream sync core can decide whether to claim sub-ms
         (``hardware``) or ~1 ms (``software_fallback``) precision for
-        this host.
+        this host. Multi-host ``session_id`` / ``role`` /
+        ``leader_host_id`` are written for both leader and follower
+        so the sync core can reconstruct the host relationship.
         """
         assert self._sync_point is not None  # guaranteed by state check
+
+        role_str = self._role.kind if self._role is not None else None
+        leader_host_id: Optional[str] = None
+        if isinstance(self._role, FollowerRole) and self._observed_leader is not None:
+            leader_host_id = self._observed_leader.host_id
 
         chirp_spec = (
             self._sync_tone.start_chirp if self._chirp_start is not None else None
@@ -334,6 +441,8 @@ class SessionOrchestrator:
                 self._chirp_stop.source if self._chirp_stop is not None else None
             ),
             chirp_spec=chirp_spec,
+            session_id=self.session_id,
+            role=role_str,
         )
 
         streams_dict: Dict[str, dict] = {}
@@ -353,7 +462,14 @@ class SessionOrchestrator:
                     entry["error"] = final.error
             streams_dict[stream.id] = entry
 
-        write_manifest(self._host_id, streams_dict, self._output_dir)
+        write_manifest(
+            self._host_id,
+            streams_dict,
+            self._output_dir,
+            session_id=self.session_id,
+            role=role_str,
+            leader_host_id=leader_host_id,
+        )
 
     # ------------------------------------------------------------------
     # Session log helpers (crash safety)
@@ -410,12 +526,20 @@ class SessionOrchestrator:
     def _is_chirp_eligible(self) -> bool:
         """Return True if this host should play sync chirps.
 
-        Chirp eligibility is a host-level check: chirps exist to enable
-        inter-host audio cross-correlation, so they only matter if at
-        least one registered stream actually captures audio. Single-host
-        sessions with no audio stream happily rely on intra-host
-        timestamp alignment and need no chirp at all.
+        Chirp eligibility is a host-level check: chirps exist to
+        enable inter-host audio cross-correlation, so they only matter
+        if at least one registered stream actually captures audio.
+        Single-host sessions with no audio stream happily rely on
+        intra-host timestamp alignment and need no chirp at all.
+
+        **Followers never play chirps.** They rely on the leader's
+        chirps being captured by every host's microphones in the same
+        physical space — if every follower also played its own chirps
+        they would interfere with each other and corrupt the shared
+        acoustic anchors.
         """
+        if isinstance(self._role, FollowerRole):
+            return False
         if not self._sync_tone.enabled:
             return False
         return any(
@@ -464,3 +588,134 @@ class SessionOrchestrator:
             + self._sync_tone.pre_stop_tail_margin_ms
         )
         time.sleep(total_wait_ms / 1000.0)
+
+    # ------------------------------------------------------------------
+    # Multi-host discovery (leader advertising + follower browsing)
+    # ------------------------------------------------------------------
+
+    def _maybe_start_advertising(self) -> None:
+        """Leader-only: open an advertiser in the ``preparing`` state.
+
+        No-op for follower and single-host sessions. Called from
+        :meth:`start` inside the ``PREPARING`` transition so followers
+        already on the network can see the session coming up before
+        streams actually begin recording.
+        """
+        if not isinstance(self._role, LeaderRole):
+            return
+        assert self._role.session_id is not None  # post_init guarantees
+        self._advertiser = SessionAdvertiser(
+            session_id=self._role.session_id,
+            host_id=self._host_id,
+            sdk_version=_pkg_version("syncfield"),
+            chirp_enabled=self._sync_tone.enabled,
+            graceful_shutdown_ms=self._role.graceful_shutdown_ms,
+        )
+        self._advertiser.start()
+
+    def _maybe_update_advert_recording(self) -> None:
+        """Leader-only: flip the advert status to ``recording``.
+
+        Called after streams have started and the start chirp has
+        played so followers observing the advertiser see
+        ``recording`` only when this host is actually ready. The
+        embedded ``started_at_ns`` is the leader's own monotonic
+        anchor — it lives in the leader's clock domain and must not
+        be compared directly to a follower's clock.
+        """
+        if self._advertiser is None:
+            return
+        started_ns = self._sync_point.monotonic_ns if self._sync_point else None
+        self._advertiser.update_status("recording", started_at_ns=started_ns)
+
+    def _maybe_update_advert_stopped(self) -> None:
+        """Leader-only: flip the advert status to ``stopped``.
+
+        Called inside :meth:`stop` between the stop chirp and the
+        teardown of the advertiser instance, so followers watching
+        the TXT record observe the ``stopped`` transition before the
+        service unregisters (via the advertiser's graceful shutdown
+        sleep).
+        """
+        if self._advertiser is None:
+            return
+        self._advertiser.update_status("stopped")
+
+    def _maybe_wait_for_leader(self) -> None:
+        """Follower-only: block until a leader is advertising recording.
+
+        Opens a :class:`SessionBrowser`, waits up to
+        ``leader_wait_timeout_sec``, and stores the observed
+        announcement on :attr:`_observed_leader`. No-op for leader
+        and single-host sessions.
+
+        Raises:
+            TimeoutError: If no leader reaches ``recording`` before
+                the deadline. Caller (``start()``) is responsible
+                for cleaning up discovery state.
+        """
+        if not isinstance(self._role, FollowerRole):
+            return
+        self._browser = SessionBrowser(session_id=self._role.session_id)
+        self._browser.start()
+        self._observed_leader = self._browser.wait_for_recording(
+            timeout=self._role.leader_wait_timeout_sec
+        )
+
+    def _stop_discovery_on_failure(self) -> None:
+        """Tear down advertiser and browser, swallowing cleanup errors.
+
+        Shared between the happy-path end of :meth:`stop` and the
+        failure paths in :meth:`start` (rollback after stream start
+        exception or follower wait timeout). Leaves
+        :attr:`_advertiser` and :attr:`_browser` set to ``None`` so
+        a subsequent session on the same orchestrator starts clean.
+        """
+        if self._advertiser is not None:
+            try:
+                self._advertiser.close()
+            except Exception:  # pragma: no cover - best-effort cleanup
+                pass
+            self._advertiser = None
+        if self._browser is not None:
+            try:
+                self._browser.close()
+            except Exception:  # pragma: no cover - best-effort cleanup
+                pass
+            self._browser = None
+
+    def wait_for_leader_stopped(
+        self, timeout: float = 3600.0
+    ) -> SessionAnnouncement:
+        """Block until the observed leader advertises ``status="stopped"``.
+
+        Follower-only convenience so the caller can drive its own
+        :meth:`stop` call off the leader's lifecycle instead of
+        relying on a wall-clock deadline::
+
+            session = SessionOrchestrator(
+                host_id="follower", output_dir="./data",
+                role=FollowerRole(session_id="amber-tiger-042"),
+            )
+            session.add(camera)
+            session.start()              # blocks until leader recording
+            session.wait_for_leader_stopped()
+            session.stop()
+
+        Args:
+            timeout: Maximum seconds to wait. Default one hour.
+
+        Raises:
+            RuntimeError: If called on a non-follower orchestrator or
+                before :meth:`start`.
+            TimeoutError: If *timeout* elapses before the leader
+                announces ``stopped``.
+        """
+        if not isinstance(self._role, FollowerRole):
+            raise RuntimeError("wait_for_leader_stopped() requires FollowerRole")
+        if self._browser is None:
+            raise RuntimeError(
+                "wait_for_leader_stopped() requires an active SessionBrowser; "
+                "call start() first"
+            )
+        return self._browser.wait_for_stopped(timeout=timeout)

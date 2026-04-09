@@ -397,6 +397,373 @@ class TestChirpEmissionPropagation:
         assert report.chirp_stop_source == "software_fallback"
 
 
+# ---------------------------------------------------------------------------
+# Multi-host leader / follower role integration
+# ---------------------------------------------------------------------------
+
+
+class _FakeAdvertiser:
+    """Stand-in for :class:`syncfield.multihost.SessionAdvertiser`."""
+
+    instances: list["_FakeAdvertiser"] = []
+
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+        self.started = False
+        self.closed = False
+        self.status_calls: list[tuple[str, int | None]] = []
+        _FakeAdvertiser.instances.append(self)
+
+    @property
+    def session_id(self) -> str:
+        return self.kwargs["session_id"]
+
+    def start(self) -> None:
+        self.started = True
+
+    def update_status(self, status: str, *, started_at_ns=None) -> None:
+        self.status_calls.append((status, started_at_ns))
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _FakeBrowser:
+    """Stand-in for :class:`syncfield.multihost.SessionBrowser`.
+
+    Scripted by setting :attr:`wait_recording_result` (either a
+    :class:`SessionAnnouncement` to return or an :class:`Exception` to
+    raise) before ``start()`` is called on the orchestrator.
+    """
+
+    instances: list["_FakeBrowser"] = []
+
+    wait_recording_result: object = None
+    wait_stopped_result: object = None
+
+    def __init__(self, session_id=None):
+        self.session_id = session_id
+        self.started = False
+        self.closed = False
+        self.wait_recording_calls: list[float] = []
+        self.wait_stopped_calls: list[float] = []
+        _FakeBrowser.instances.append(self)
+
+    def start(self) -> None:
+        self.started = True
+
+    def wait_for_recording(self, timeout: float):
+        self.wait_recording_calls.append(timeout)
+        result = type(self).wait_recording_result
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    def wait_for_stopped(self, timeout: float):
+        self.wait_stopped_calls.append(timeout)
+        result = type(self).wait_stopped_result
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    def close(self) -> None:
+        self.closed = True
+
+
+@pytest.fixture
+def fake_multihost(monkeypatch):
+    """Patch the orchestrator's SessionAdvertiser + SessionBrowser symbols."""
+    _FakeAdvertiser.instances.clear()
+    _FakeBrowser.instances.clear()
+    _FakeBrowser.wait_recording_result = None
+    _FakeBrowser.wait_stopped_result = None
+    monkeypatch.setattr(
+        "syncfield.orchestrator.SessionAdvertiser", _FakeAdvertiser
+    )
+    monkeypatch.setattr(
+        "syncfield.orchestrator.SessionBrowser", _FakeBrowser
+    )
+    yield
+    _FakeAdvertiser.instances.clear()
+    _FakeBrowser.instances.clear()
+
+
+class TestLeaderRoleIntegration:
+    def test_start_constructs_and_starts_advertiser(self, tmp_path, fake_multihost):
+        from syncfield.roles import LeaderRole
+
+        session = SessionOrchestrator(
+            host_id="leader_host",
+            output_dir=tmp_path,
+            sync_tone=SyncToneConfig.silent(),
+            role=LeaderRole(session_id="amber-tiger-042"),
+        )
+        session.add(FakeStream("cam"))
+        session.start()
+
+        assert len(_FakeAdvertiser.instances) == 1
+        adv = _FakeAdvertiser.instances[0]
+        assert adv.kwargs["session_id"] == "amber-tiger-042"
+        assert adv.kwargs["host_id"] == "leader_host"
+        assert adv.kwargs["chirp_enabled"] is False  # silent config
+        assert adv.started is True
+        # One update to `recording` after streams start.
+        assert adv.status_calls == [("recording", session._sync_point.monotonic_ns)]
+
+        session.stop()
+        # Second update: stopped. Then close.
+        assert ("stopped", None) in adv.status_calls
+        assert adv.closed is True
+
+    def test_stop_returns_session_report_with_leader_metadata(
+        self, tmp_path, fake_multihost
+    ):
+        from syncfield.roles import LeaderRole
+
+        session = SessionOrchestrator(
+            host_id="leader_host",
+            output_dir=tmp_path,
+            sync_tone=SyncToneConfig.silent(),
+            role=LeaderRole(session_id="amber-tiger-042"),
+        )
+        session.add(FakeStream("cam"))
+        session.start()
+        report = session.stop()
+
+        assert report.role == "leader"
+        assert report.session_id == "amber-tiger-042"
+
+    def test_manifest_and_sync_point_include_session_id(
+        self, tmp_path, fake_multihost
+    ):
+        from syncfield.roles import LeaderRole
+
+        session = SessionOrchestrator(
+            host_id="leader_host",
+            output_dir=tmp_path,
+            sync_tone=SyncToneConfig.silent(),
+            role=LeaderRole(session_id="amber-tiger-042"),
+        )
+        session.add(FakeStream("cam"))
+        session.start()
+        session.stop()
+
+        sp = json.loads((tmp_path / "sync_point.json").read_text())
+        mf = json.loads((tmp_path / "manifest.json").read_text())
+        assert sp["session_id"] == "amber-tiger-042"
+        assert sp["role"] == "leader"
+        assert mf["session_id"] == "amber-tiger-042"
+        assert mf["role"] == "leader"
+        assert "leader_host_id" not in mf  # leader has no leader_host_id
+
+    def test_auto_generates_session_id(self, tmp_path, fake_multihost):
+        from syncfield.roles import LeaderRole
+
+        role = LeaderRole()  # no session_id
+        session = SessionOrchestrator(
+            host_id="h",
+            output_dir=tmp_path,
+            sync_tone=SyncToneConfig.silent(),
+            role=role,
+        )
+        session.add(FakeStream("cam"))
+        session.start()
+        session.stop()
+
+        assert role.session_id is not None
+        assert session.session_id == role.session_id
+
+    def test_chirp_chirp_enabled_flag_matches_sync_tone(
+        self, tmp_path, fake_multihost
+    ):
+        """Leader with chirps enabled must advertise chirp_enabled=True."""
+        from syncfield.roles import LeaderRole
+
+        player = _mock_player()
+        session = SessionOrchestrator(
+            host_id="leader_host",
+            output_dir=tmp_path,
+            sync_tone=_fast_chirp_config(),
+            chirp_player=player,
+            role=LeaderRole(session_id="amber-tiger-042"),
+        )
+        session.add(FakeStream("cam", provides_audio_track=True))
+        session.start()
+        session.stop()
+
+        adv = _FakeAdvertiser.instances[0]
+        assert adv.kwargs["chirp_enabled"] is True
+        # Leader DID play both chirps (start + stop).
+        assert player.play.call_count == 2
+
+
+class TestFollowerRoleIntegration:
+    def _leader_announcement(self) -> "SessionAnnouncement":
+        from syncfield.multihost.types import SessionAnnouncement
+
+        return SessionAnnouncement(
+            session_id="amber-tiger-042",
+            host_id="leader_host",
+            status="recording",
+            sdk_version="0.2.0",
+            chirp_enabled=True,
+            started_at_ns=1234,
+        )
+
+    def test_start_blocks_for_leader_then_proceeds(
+        self, tmp_path, fake_multihost
+    ):
+        from syncfield.roles import FollowerRole
+
+        _FakeBrowser.wait_recording_result = self._leader_announcement()
+
+        session = SessionOrchestrator(
+            host_id="follower_host",
+            output_dir=tmp_path,
+            sync_tone=SyncToneConfig.silent(),
+            role=FollowerRole(session_id="amber-tiger-042"),
+        )
+        session.add(FakeStream("cam"))
+        session.start()
+
+        assert len(_FakeBrowser.instances) == 1
+        browser = _FakeBrowser.instances[0]
+        assert browser.session_id == "amber-tiger-042"
+        assert browser.started is True
+        assert browser.wait_recording_calls == [60.0]  # default timeout
+
+        assert session.observed_leader is not None
+        assert session.observed_leader.host_id == "leader_host"
+        assert session.session_id == "amber-tiger-042"
+
+        report = session.stop()
+        assert report.role == "follower"
+        assert report.session_id == "amber-tiger-042"
+        assert browser.closed is True
+
+    def test_follower_never_plays_chirp_even_with_audio_stream(
+        self, tmp_path, fake_multihost
+    ):
+        from syncfield.roles import FollowerRole
+
+        _FakeBrowser.wait_recording_result = self._leader_announcement()
+
+        player = _mock_player()
+        session = SessionOrchestrator(
+            host_id="follower_host",
+            output_dir=tmp_path,
+            sync_tone=_fast_chirp_config(),
+            chirp_player=player,
+            role=FollowerRole(session_id="amber-tiger-042"),
+        )
+        # Audio-capable stream would normally trigger chirps — but the
+        # follower role must override that.
+        session.add(FakeStream("audio_cam", provides_audio_track=True))
+        session.start()
+        session.stop()
+
+        player.play.assert_not_called()
+
+    def test_follower_leader_timeout_propagates_and_cleans_up(
+        self, tmp_path, fake_multihost
+    ):
+        from syncfield.roles import FollowerRole
+
+        _FakeBrowser.wait_recording_result = TimeoutError("no leader")
+
+        session = SessionOrchestrator(
+            host_id="follower_host",
+            output_dir=tmp_path,
+            sync_tone=SyncToneConfig.silent(),
+            role=FollowerRole(
+                session_id="amber-tiger-042", leader_wait_timeout_sec=0.05
+            ),
+        )
+        session.add(FakeStream("cam"))
+        with pytest.raises(TimeoutError):
+            session.start()
+
+        assert session.state is SessionState.IDLE
+        # Browser was cleaned up on failure.
+        assert _FakeBrowser.instances[0].closed is True
+
+    def test_manifest_records_leader_host_id(self, tmp_path, fake_multihost):
+        from syncfield.roles import FollowerRole
+
+        _FakeBrowser.wait_recording_result = self._leader_announcement()
+
+        session = SessionOrchestrator(
+            host_id="follower_host",
+            output_dir=tmp_path,
+            sync_tone=SyncToneConfig.silent(),
+            role=FollowerRole(session_id="amber-tiger-042"),
+        )
+        session.add(FakeStream("cam"))
+        session.start()
+        session.stop()
+
+        mf = json.loads((tmp_path / "manifest.json").read_text())
+        assert mf["role"] == "follower"
+        assert mf["session_id"] == "amber-tiger-042"
+        assert mf["leader_host_id"] == "leader_host"
+
+    def test_wait_for_leader_stopped_delegates_to_browser(
+        self, tmp_path, fake_multihost
+    ):
+        from syncfield.multihost.types import SessionAnnouncement
+        from syncfield.roles import FollowerRole
+
+        _FakeBrowser.wait_recording_result = self._leader_announcement()
+        _FakeBrowser.wait_stopped_result = SessionAnnouncement(
+            session_id="amber-tiger-042",
+            host_id="leader_host",
+            status="stopped",
+            sdk_version="0.2.0",
+            chirp_enabled=True,
+            started_at_ns=1234,
+        )
+
+        session = SessionOrchestrator(
+            host_id="follower_host",
+            output_dir=tmp_path,
+            sync_tone=SyncToneConfig.silent(),
+            role=FollowerRole(session_id="amber-tiger-042"),
+        )
+        session.add(FakeStream("cam"))
+        session.start()
+        observed_stop = session.wait_for_leader_stopped(timeout=1.5)
+        assert observed_stop.status == "stopped"
+        assert _FakeBrowser.instances[0].wait_stopped_calls == [1.5]
+        session.stop()
+
+    def test_wait_for_leader_stopped_requires_follower_role(self, tmp_path):
+        """Calling on a single-host session must raise."""
+        session = SessionOrchestrator(
+            host_id="h",
+            output_dir=tmp_path,
+            sync_tone=SyncToneConfig.silent(),
+        )
+        session.add(FakeStream("cam"))
+        session.start()
+        with pytest.raises(RuntimeError, match="FollowerRole"):
+            session.wait_for_leader_stopped()
+        session.stop()
+
+    def test_wait_for_leader_stopped_before_start_raises(
+        self, tmp_path, fake_multihost
+    ):
+        from syncfield.roles import FollowerRole
+
+        session = SessionOrchestrator(
+            host_id="h",
+            output_dir=tmp_path,
+            sync_tone=SyncToneConfig.silent(),
+            role=FollowerRole(session_id="amber-tiger-042"),
+        )
+        with pytest.raises(RuntimeError, match="start"):
+            session.wait_for_leader_stopped()
+
+
 class TestSessionLog:
     def test_session_log_captures_state_transitions(self, tmp_path):
         session = _session(tmp_path)
