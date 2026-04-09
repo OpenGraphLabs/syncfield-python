@@ -134,9 +134,12 @@ class TestSyncToneConfig:
 
 
 class TestSilentChirpPlayer:
-    def test_play_is_noop(self):
+    def test_play_returns_silent_emission(self):
         player: ChirpPlayer = SilentChirpPlayer()
-        player.play(ChirpSpec(400, 2500, 100, 0.5, 5))  # must not raise
+        emission = player.play(ChirpSpec(400, 2500, 100, 0.5, 5))
+        assert emission.source == "silent"
+        assert emission.hardware_ns is None
+        assert emission.software_ns > 0
 
     def test_is_silent_returns_true(self):
         assert SilentChirpPlayer().is_silent() is True
@@ -146,25 +149,71 @@ class TestSilentChirpPlayer:
 
 
 class TestSoundDeviceChirpPlayer:
-    def test_play_forwards_samples_and_sample_rate_to_sounddevice(self):
-        fake_sd = MagicMock()
-        with patch.dict(sys.modules, {"sounddevice": fake_sd}):
-            player = SoundDeviceChirpPlayer(sample_rate=SAMPLE_RATE)
-            player.play(ChirpSpec(400, 2500, 100, 0.5, 5))
-            assert fake_sd.play.called
-            args, kwargs = fake_sd.play.call_args
-            samples = args[0]
-            assert len(samples) == int(SAMPLE_RATE * 0.1)
-            sent_rate = args[1] if len(args) > 1 else kwargs.get("samplerate")
-            assert sent_rate == SAMPLE_RATE
+    """Coarse integration-style tests that validate ``play()`` opens a
+    ``sounddevice.OutputStream`` with an appropriate sample rate and
+    returns a :class:`~syncfield.types.ChirpEmission`.
 
-    def test_play_is_non_blocking(self):
-        """play() must NEVER call sd.wait() — the orchestrator owns all timing."""
-        fake_sd = MagicMock()
+    Detailed hardware-timestamp capture behavior lives in
+    ``test_chirp_emission.py`` (which drives a fake callback thread);
+    these tests just guard the public surface.
+    """
+
+    def test_play_opens_outputstream_with_sample_rate(self):
+        from types import SimpleNamespace
+
+        class _Stub:
+            def __init__(self, *, samplerate, channels, callback, finished_callback=None, **_):
+                _Stub.last = self
+                self.samplerate = samplerate
+                self.channels = channels
+                self.started = False
+            def start(self):
+                self.started = True
+            def close(self):
+                pass
+
+        fake_sd = SimpleNamespace(
+            OutputStream=_Stub,
+            CallbackStop=type("CallbackStop", (Exception,), {}),
+        )
         with patch.dict(sys.modules, {"sounddevice": fake_sd}):
             player = SoundDeviceChirpPlayer(sample_rate=SAMPLE_RATE)
+            player._first_callback_timeout = 0.02  # type: ignore[attr-defined]
+            emission = player.play(ChirpSpec(400, 2500, 100, 0.5, 5))
+            assert _Stub.last.samplerate == SAMPLE_RATE
+            assert _Stub.last.channels == 1
+            assert _Stub.last.started is True
+            # No callback fired → software fallback emission
+            assert emission.source == "software_fallback"
+            assert emission.software_ns > 0
+
+    def test_play_does_not_call_sd_wait(self):
+        """play() must NEVER call sd.wait() — the orchestrator owns all timing."""
+        from types import SimpleNamespace
+
+        wait_called = []
+
+        class _Stub:
+            def __init__(self, **_):
+                pass
+            def start(self):
+                pass
+            def close(self):
+                pass
+
+        def _wait(*a, **k):
+            wait_called.append(True)
+
+        fake_sd = SimpleNamespace(
+            OutputStream=_Stub,
+            CallbackStop=type("CallbackStop", (Exception,), {}),
+            wait=_wait,
+        )
+        with patch.dict(sys.modules, {"sounddevice": fake_sd}):
+            player = SoundDeviceChirpPlayer(sample_rate=SAMPLE_RATE)
+            player._first_callback_timeout = 0.02  # type: ignore[attr-defined]
             player.play(ChirpSpec(400, 2500, 500, 0.8, 15))
-            assert not fake_sd.wait.called
+            assert wait_called == []
 
     def test_is_silent_returns_false(self):
         fake_sd = MagicMock()

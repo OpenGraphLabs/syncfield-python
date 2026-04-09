@@ -11,7 +11,36 @@ from syncfield.clock import SessionClock
 from syncfield.orchestrator import SessionOrchestrator
 from syncfield.testing import FakeStream
 from syncfield.tone import ChirpPlayer, ChirpSpec, SyncToneConfig
-from syncfield.types import HealthEventKind, SessionState
+from syncfield.types import ChirpEmission, HealthEventKind, SessionState
+
+
+def _mk_emission(
+    software_ns: int = 1_000_000,
+    hardware_ns: int | None = None,
+    source: str = "software_fallback",
+) -> ChirpEmission:
+    """Build a ``ChirpEmission`` for tests that mock ``ChirpPlayer.play``."""
+    return ChirpEmission(
+        software_ns=software_ns,
+        hardware_ns=hardware_ns,
+        source=source,  # type: ignore[arg-type]
+    )
+
+
+def _mock_player() -> MagicMock:
+    """Build a ``MagicMock`` spec'd on :class:`ChirpPlayer` that returns
+    distinct :class:`ChirpEmission` values for successive ``play`` calls.
+
+    Most tests don't care about the exact numeric values as long as they
+    differ so ``chirp_stop_ns > chirp_start_ns`` assertions hold.
+    """
+    player = MagicMock(spec=ChirpPlayer)
+    player.is_silent.return_value = False
+    player.play.side_effect = [
+        _mk_emission(software_ns=1_000_000),
+        _mk_emission(software_ns=2_000_000),
+    ]
+    return player
 
 
 def _fast_chirp_config() -> SyncToneConfig:
@@ -239,8 +268,7 @@ class TestStop:
 
 class TestChirpIntegration:
     def test_chirp_skipped_when_no_audio_capable_stream(self, tmp_path, caplog):
-        player = MagicMock(spec=ChirpPlayer)
-        player.is_silent.return_value = False
+        player = _mock_player()
         session = SessionOrchestrator(
             host_id="h",
             output_dir=tmp_path,
@@ -255,8 +283,7 @@ class TestChirpIntegration:
         assert "cannot participate" in caplog.text.lower()
 
     def test_chirp_played_when_audio_capable_stream_exists(self, tmp_path):
-        player = MagicMock(spec=ChirpPlayer)
-        player.is_silent.return_value = False
+        player = _mock_player()
         session = SessionOrchestrator(
             host_id="h",
             output_dir=tmp_path,
@@ -269,7 +296,7 @@ class TestChirpIntegration:
         assert player.play.call_count == 2  # start + stop chirp
 
     def test_silent_tone_never_plays_chirp(self, tmp_path):
-        player = MagicMock(spec=ChirpPlayer)
+        player = _mock_player()
         session = SessionOrchestrator(
             host_id="h",
             output_dir=tmp_path,
@@ -282,8 +309,7 @@ class TestChirpIntegration:
         player.play.assert_not_called()
 
     def test_chirp_fields_written_to_sync_point_json(self, tmp_path):
-        player = MagicMock(spec=ChirpPlayer)
-        player.is_silent.return_value = False
+        player = _mock_player()
         session = SessionOrchestrator(
             host_id="h",
             output_dir=tmp_path,
@@ -301,8 +327,7 @@ class TestChirpIntegration:
         assert sp["chirp_spec"]["from_hz"] == 400
 
     def test_session_report_carries_chirp_timestamps(self, tmp_path):
-        player = MagicMock(spec=ChirpPlayer)
-        player.is_silent.return_value = False
+        player = _mock_player()
         session = SessionOrchestrator(
             host_id="h",
             output_dir=tmp_path,
@@ -314,6 +339,62 @@ class TestChirpIntegration:
         report = session.stop()
         assert report.chirp_start_ns is not None
         assert report.chirp_stop_ns is not None
+
+
+class TestChirpEmissionPropagation:
+    def test_hardware_emission_surfaces_in_session_report(self, tmp_path):
+        player = MagicMock(spec=ChirpPlayer)
+        player.is_silent.return_value = False
+        player.play.side_effect = [
+            ChirpEmission(software_ns=100, hardware_ns=500, source="hardware"),
+            ChirpEmission(software_ns=200, hardware_ns=700, source="hardware"),
+        ]
+        session = SessionOrchestrator(
+            host_id="h",
+            output_dir=tmp_path,
+            sync_tone=_fast_chirp_config(),
+            chirp_player=player,
+        )
+        session.add(FakeStream("a", provides_audio_track=True))
+        session.start()
+        report = session.stop()
+
+        assert report.chirp_start_ns == 500
+        assert report.chirp_stop_ns == 700
+        assert report.chirp_start_source == "hardware"
+        assert report.chirp_stop_source == "hardware"
+
+        sp = json.loads((tmp_path / "sync_point.json").read_text())
+        assert sp["chirp_start_source"] == "hardware"
+        assert sp["chirp_stop_source"] == "hardware"
+        assert sp["chirp_start_ns"] == 500
+        assert sp["chirp_stop_ns"] == 700
+
+    def test_software_fallback_emission_surfaces_in_report(self, tmp_path):
+        player = MagicMock(spec=ChirpPlayer)
+        player.is_silent.return_value = False
+        player.play.side_effect = [
+            ChirpEmission(
+                software_ns=1_000, hardware_ns=None, source="software_fallback"
+            ),
+            ChirpEmission(
+                software_ns=2_000, hardware_ns=None, source="software_fallback"
+            ),
+        ]
+        session = SessionOrchestrator(
+            host_id="h",
+            output_dir=tmp_path,
+            sync_tone=_fast_chirp_config(),
+            chirp_player=player,
+        )
+        session.add(FakeStream("a", provides_audio_track=True))
+        session.start()
+        report = session.stop()
+
+        assert report.chirp_start_ns == 1_000
+        assert report.chirp_stop_ns == 2_000
+        assert report.chirp_start_source == "software_fallback"
+        assert report.chirp_stop_source == "software_fallback"
 
 
 class TestSessionLog:
