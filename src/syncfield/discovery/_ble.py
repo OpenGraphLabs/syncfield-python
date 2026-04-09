@@ -54,6 +54,8 @@ def scan_peripherals(timeout: float = 5.0) -> List[Any]:
         Bluetooth adapter error, etc. Discovery is never allowed to raise
         into the scan coordinator.
     """
+    global _cache, _cache_time
+
     # Cache hit path — fast, no subprocess or asyncio overhead.
     with _cache_lock:
         now = time.monotonic()
@@ -83,7 +85,6 @@ def scan_peripherals(timeout: float = 5.0) -> List[Any]:
     # Update the cache under lock; the list is intentionally a fresh copy
     # so a reader that mutates its own copy can't affect the cache.
     with _cache_lock:
-        global _cache, _cache_time
         _cache = list(devices)
         _cache_time = time.monotonic()
     return list(devices)
@@ -91,7 +92,7 @@ def scan_peripherals(timeout: float = 5.0) -> List[Any]:
 
 def clear_cache() -> None:
     """Invalidate the shared BLE scan cache. Primarily a test hook."""
+    global _cache, _cache_time
     with _cache_lock:
-        global _cache, _cache_time
         _cache = []
         _cache_time = 0.0

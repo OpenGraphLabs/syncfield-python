@@ -78,10 +78,18 @@ class OakCameraStream(StreamBase):
         depth_fps: Depth frame rate.
     """
 
+    # Class-level hints for the discovery registry (see
+    # ``syncfield.discovery``). ``_discovery_kind`` filters adapters by
+    # Stream kind; ``_discovery_adapter_type`` is the stable string id
+    # used in ``DiscoveryReport.errors`` keys and the CLI output.
+    _discovery_kind = "video"
+    _discovery_adapter_type = "oak_camera"
+
     def __init__(
         self,
         id: str,
         output_dir: Path | str,
+        device_id: Optional[str] = None,
         rgb_resolution: Tuple[int, int] = (1920, 1080),
         rgb_fps: int = 30,
         depth_enabled: bool = False,
@@ -99,6 +107,7 @@ class OakCameraStream(StreamBase):
             ),
         )
         self._output_dir = Path(output_dir)
+        self._device_id = device_id
         self._rgb_resolution = rgb_resolution
         self._rgb_fps = rgb_fps
         self._depth_enabled = depth_enabled
@@ -135,8 +144,15 @@ class OakCameraStream(StreamBase):
     def prepare(self) -> None:
         """Discover a device and build the DepthAI pipeline.
 
+        When multiple OAK devices are connected, the ``device_id``
+        constructor argument (a ``deviceId`` serial string as returned
+        by :func:`depthai.Device.getAllAvailableDevices`) selects which
+        one to open. If omitted, the first available device is used.
+
         Raises:
-            RuntimeError: If no OAK devices are connected.
+            RuntimeError: If no OAK devices are connected, or if the
+                requested ``device_id`` is not among the currently
+                attached devices.
         """
         self._output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -144,8 +160,28 @@ class OakCameraStream(StreamBase):
         if not devices:
             raise RuntimeError("No OAK devices found")
 
+        if self._device_id is not None:
+            matching = [
+                d for d in devices
+                if getattr(d, "deviceId", None) == self._device_id
+            ]
+            if not matching:
+                available = [getattr(d, "deviceId", "?") for d in devices]
+                raise RuntimeError(
+                    f"OAK device_id {self._device_id!r} not found. "
+                    f"Available: {available}"
+                )
+            selected = matching[0]
+        else:
+            selected = devices[0]
+
         self._pipeline = self._build_pipeline()
-        self._pipeline.build()
+        # DepthAI v3 build() accepts an optional device info; older
+        # shims without the argument fall back to "first available".
+        try:
+            self._pipeline.build(selected)
+        except TypeError:
+            self._pipeline.build()
         self._pipeline.start()
 
         # Short warmup — the first few frames are often None while the
@@ -343,6 +379,63 @@ class OakCameraStream(StreamBase):
         """
         with self._frame_lock:
             return self._latest_frame
+
+    # ------------------------------------------------------------------
+    # Discovery
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def discover(cls, *, timeout: float = 5.0) -> list:
+        """Enumerate currently attached OAK devices.
+
+        Uses :func:`depthai.Device.getAllAvailableDevices` which is
+        near-instant (sub-millisecond) — ``timeout`` is accepted for
+        interface consistency but effectively ignored.
+
+        Each returned :class:`~syncfield.discovery.DiscoveredDevice`
+        has its ``device_id`` populated from the OAK serial
+        (``deviceId``), so auto-added streams from ``scan_and_add`` pin
+        to specific devices even when multiple OAKs are attached.
+
+        Returns:
+            List of :class:`~syncfield.discovery.DiscoveredDevice`. Empty
+            list if no devices found or if the depthai probe raises for
+            any reason — discovery never propagates errors.
+        """
+        from syncfield.discovery import DiscoveredDevice
+
+        try:
+            devices_info = dai.Device.getAllAvailableDevices()
+        except Exception:
+            return []
+
+        results = []
+        for info in devices_info:
+            device_id = getattr(info, "deviceId", None) or ""
+            name = getattr(info, "name", None) or "OAK"
+            state = getattr(info, "state", None)
+            state_str = getattr(state, "name", None) or str(state) if state else ""
+
+            description_parts = [f"OAK · {device_id[:8]}…"] if device_id else ["OAK"]
+            if state_str:
+                description_parts.append(state_str.lower())
+            description = " · ".join(description_parts)
+
+            results.append(
+                DiscoveredDevice(
+                    adapter_type="oak_camera",
+                    adapter_cls=cls,
+                    kind="video",
+                    display_name=name or "OAK camera",
+                    description=description,
+                    device_id=device_id or name or "oak",
+                    construct_kwargs=(
+                        {"device_id": device_id} if device_id else {}
+                    ),
+                    accepts_output_dir=True,
+                )
+            )
+        return results
 
 
 # ---------------------------------------------------------------------------

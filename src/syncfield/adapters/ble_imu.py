@@ -57,6 +57,14 @@ class BLEImuGenericStream(StreamBase):
             produced by ``frame_format``.
     """
 
+    # Class-level hints for ``syncfield.discovery``. ``ble_peripheral`` is
+    # used as the adapter_type (rather than ``ble_imu``) because the
+    # generic discoverer returns *any* BLE peripheral — not just IMUs —
+    # as a candidate; the user must still supply a characteristic_uuid
+    # to turn one into a working stream.
+    _discovery_kind = "sensor"
+    _discovery_adapter_type = "ble_peripheral"
+
     DEFAULT_FORMAT = "<fffffff"
     DEFAULT_CHANNELS: Tuple[str, ...] = ("ax", "ay", "az", "gx", "gy", "gz", "temp")
 
@@ -209,3 +217,72 @@ class BLEImuGenericStream(StreamBase):
     def _dispatch_notification_for_test(self, payload: bytes) -> None:
         """Test-only hook: push a payload through the decode path synchronously."""
         self._handle_payload(payload)
+
+    # ------------------------------------------------------------------
+    # Discovery
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def discover(cls, *, timeout: float = 5.0) -> list:
+        """Enumerate generic BLE peripherals as candidate IMUs.
+
+        Unlike the other BLE-based adapters (e.g.
+        :class:`~syncfield.adapters.OgloTactileStream`), this discoverer
+        can't know which of the advertising peripherals are actually
+        IMUs. It returns *every* peripheral it sees and marks each one
+        with a :attr:`~syncfield.discovery.DiscoveredDevice.warnings`
+        entry explaining that the caller still needs to supply a
+        ``characteristic_uuid`` (and possibly a custom ``frame_format``)
+        before a stream can be constructed.
+
+        ``scan_and_add`` treats devices with non-empty warnings as
+        "needs manual attention" and skips them — which is the correct
+        behavior here, because there is no generic way to determine the
+        notify characteristic of an arbitrary peripheral. Users wiring
+        a real BLE IMU should construct the adapter explicitly with the
+        UUID they learned from the device datasheet or a BLE explorer.
+
+        Peripherals that match a more-specific adapter (e.g. ``oglo``
+        for :class:`OgloTactileStream`) are filtered out here so they
+        don't appear twice in the discovery report.
+        """
+        from syncfield.discovery import DiscoveredDevice
+        from syncfield.discovery._ble import scan_peripherals
+
+        peripherals = scan_peripherals(timeout=timeout)
+
+        # Adapters that match specific device families filter themselves
+        # in; we exclude those here so a single peripheral shows up under
+        # one adapter only. Keep this list short — if you add a new
+        # device-family adapter, add its name filter substring here.
+        _EXCLUDE_NAME_SUBSTRINGS = ("oglo",)
+
+        results = []
+        for peripheral in peripherals:
+            name = (getattr(peripheral, "name", None) or "").strip()
+            lowered = name.lower()
+            if any(token in lowered for token in _EXCLUDE_NAME_SUBSTRINGS):
+                continue
+
+            address = getattr(peripheral, "address", None) or ""
+            display_name = name or f"BLE peripheral {address[:8]}"
+
+            results.append(
+                DiscoveredDevice(
+                    adapter_type="ble_peripheral",
+                    adapter_cls=cls,
+                    kind="sensor",
+                    display_name=display_name,
+                    description=(
+                        f"generic BLE · {address}" if address else "generic BLE"
+                    ),
+                    device_id=address or name or display_name,
+                    construct_kwargs={"mac": address},
+                    accepts_output_dir=False,
+                    warnings=(
+                        "requires characteristic_uuid for construction — "
+                        "use BLEImuGenericStream(characteristic_uuid=…) manually",
+                    ),
+                )
+            )
+        return results

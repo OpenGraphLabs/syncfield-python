@@ -107,6 +107,10 @@ class OgloTactileStream(StreamBase):
             Default ``10.0``.
     """
 
+    # Class-level hints for ``syncfield.discovery``.
+    _discovery_kind = "sensor"
+    _discovery_adapter_type = "oglo_tactile"
+
     def __init__(
         self,
         id: str,
@@ -318,6 +322,75 @@ class OgloTactileStream(StreamBase):
                     uncertainty_ns=500_000,  # ~0.5 ms — MCU clock precision
                 )
             )
+
+    # ------------------------------------------------------------------
+    # Discovery
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def discover(cls, *, timeout: float = 5.0) -> list:
+        """Enumerate OGLO tactile gloves currently advertising over BLE.
+
+        Uses the shared BLE scan cache in :mod:`syncfield.discovery._ble`
+        so a single :class:`BleakScanner` run is reused by every BLE
+        discoverer during one ``syncfield.discovery.scan()`` pass.
+        Filters the raw peripheral list by case-insensitive substring
+        match on the advertised name — the stock egonaut firmware
+        advertises ``"OGLO …"``, so the default ``"oglo"`` filter picks
+        up both left and right gloves without any manual configuration.
+
+        Each returned :class:`~syncfield.discovery.DiscoveredDevice` has
+        its ``construct_kwargs`` pre-populated with the exact BLE
+        address, so ``scan_and_add`` can build a working ``OgloTactileStream``
+        without any extra input from the caller.
+
+        Returns:
+            List of ready-to-construct ``DiscoveredDevice``. Empty list
+            on platforms without bleak, on Bluetooth adapter errors, or
+            when no OGLO-named peripherals are in range.
+        """
+        from syncfield.discovery import DiscoveredDevice
+        from syncfield.discovery._ble import scan_peripherals
+
+        peripherals = scan_peripherals(timeout=timeout)
+        results = []
+        for peripheral in peripherals:
+            name = (getattr(peripheral, "name", None) or "").strip()
+            if "oglo" not in name.lower():
+                continue
+
+            address = getattr(peripheral, "address", None) or ""
+            # Best-effort hand inference from the advertised name.
+            # Firmware often suffixes "Left" / "Right"; we extract that
+            # as a hint but do not require it.
+            lowered = name.lower()
+            if "right" in lowered:
+                hand = "right"
+            elif "left" in lowered:
+                hand = "left"
+            else:
+                hand = "unknown"
+
+            results.append(
+                DiscoveredDevice(
+                    adapter_type="oglo_tactile",
+                    adapter_cls=cls,
+                    kind="sensor",
+                    display_name=name or "OGLO tactile glove",
+                    description=(
+                        f"oglo tactile · {hand} · {address[:8]}…"
+                        if address
+                        else f"oglo tactile · {hand}"
+                    ),
+                    device_id=address or name,
+                    construct_kwargs={
+                        "address": address,
+                        "hand": hand,
+                    },
+                    accepts_output_dir=False,
+                )
+            )
+        return results
 
     # ------------------------------------------------------------------
     # Test hooks

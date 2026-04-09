@@ -46,6 +46,10 @@ class UVCWebcamStream(StreamBase):
         fps: Desired frame rate (or ``None`` to use the device default).
     """
 
+    # Class-level hints for ``syncfield.discovery``.
+    _discovery_kind = "video"
+    _discovery_adapter_type = "uvc_webcam"
+
     def __init__(
         self,
         id: str,
@@ -198,3 +202,150 @@ class UVCWebcamStream(StreamBase):
         if self._capture is not None:
             self._capture.release()
             self._capture = None
+
+    # ------------------------------------------------------------------
+    # Discovery
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def discover(cls, *, timeout: float = 5.0) -> list:
+        """Enumerate attached UVC webcams.
+
+        Uses the platform-native enumeration tool when available so the
+        discovery pass is fast and avoids triggering the camera permission
+        dialog (which ``cv2.VideoCapture`` does on macOS even for a probe):
+
+        - macOS: ``system_profiler SPCameraDataType -json``
+        - Linux: ``/dev/video*`` inspection
+        - Other / fallback: nothing returned — use explicit
+          ``UVCWebcamStream(device_index=...)`` construction
+
+        Each returned device's ``construct_kwargs`` carries the OpenCV
+        ``device_index`` that matches its position in the native listing.
+        On some platforms that mapping is not perfectly stable — if the
+        resulting stream fails to open, users fall back to explicit
+        construction.
+
+        Returns:
+            List of :class:`~syncfield.discovery.DiscoveredDevice`. Empty
+            on unsupported platforms or if the probe raises.
+        """
+        from syncfield.discovery import DiscoveredDevice
+
+        import sys
+
+        if sys.platform == "darwin":
+            raw = _discover_uvc_macos()
+        elif sys.platform.startswith("linux"):
+            raw = _discover_uvc_linux()
+        else:
+            raw = []
+
+        return [
+            DiscoveredDevice(
+                adapter_type="uvc_webcam",
+                adapter_cls=cls,
+                kind="video",
+                display_name=entry["name"],
+                description=entry.get("description", "uvc"),
+                device_id=str(entry["index"]),
+                construct_kwargs={"device_index": int(entry["index"])},
+                accepts_output_dir=True,
+            )
+            for entry in raw
+        ]
+
+
+# ---------------------------------------------------------------------------
+# Platform-specific UVC enumeration — factored out so each platform can be
+# unit-tested in isolation with a subprocess/filesystem mock.
+# ---------------------------------------------------------------------------
+
+
+def _discover_uvc_macos() -> list[dict]:
+    """macOS enumeration via ``system_profiler SPCameraDataType``.
+
+    The tool is free to execute, doesn't prompt for camera permissions,
+    and gives us the human-readable name that shows up in System Settings.
+    We map its array position to the OpenCV device_index — on almost all
+    MacBooks this mapping is stable (built-in at 0, Continuity Camera at
+    1, external at 2, ...).
+    """
+    import json
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            ["system_profiler", "SPCameraDataType", "-json"],
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return []
+
+    if result.returncode != 0:
+        return []
+
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return []
+
+    cameras = data.get("SPCameraDataType", [])
+    entries: list[dict] = []
+    for index, item in enumerate(cameras):
+        name = item.get("_name") or f"Camera {index}"
+        model = item.get("spcamera_model-id", "")
+        description = "uvc" if not model else f"uvc · {model}"
+        entries.append(
+            {"index": index, "name": name, "description": description}
+        )
+    return entries
+
+
+def _discover_uvc_linux() -> list[dict]:
+    """Linux enumeration via ``/dev/video*`` + optional name lookup.
+
+    Reads ``/sys/class/video4linux/videoN/name`` for each ``/dev/videoN``
+    — that's what ``v4l2-ctl --list-devices`` uses internally. No
+    subprocess needed.
+    """
+    import re
+    from pathlib import Path as _Path
+
+    entries: list[dict] = []
+    video_dir = _Path("/dev")
+    if not video_dir.exists():
+        return []
+
+    device_files = sorted(
+        video_dir.glob("video*"),
+        key=lambda p: int(re.sub(r"\D", "", p.name) or "0"),
+    )
+    for device_file in device_files:
+        match = re.match(r"video(\d+)$", device_file.name)
+        if not match:
+            continue
+        index = int(match.group(1))
+
+        # Try to read the human-readable name via sysfs. Falls back to
+        # the device path when sysfs isn't available.
+        sysfs_name = _Path(f"/sys/class/video4linux/{device_file.name}/name")
+        if sysfs_name.exists():
+            try:
+                name = sysfs_name.read_text().strip() or device_file.name
+            except OSError:
+                name = device_file.name
+        else:
+            name = device_file.name
+
+        entries.append(
+            {
+                "index": index,
+                "name": name,
+                "description": f"uvc · {device_file}",
+            }
+        )
+    return entries
