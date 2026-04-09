@@ -18,10 +18,29 @@ from __future__ import annotations
 import math
 import struct
 import wave
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List
 
 from syncfield.types import ChirpSpec
+
+
+# ---------------------------------------------------------------------------
+# Defaults
+# ---------------------------------------------------------------------------
+#
+# These spec values are ported directly from the egonaut production
+# implementation (``EgonautMobile/SoundFeedbackModule.swift``) and have been
+# validated against real iPhone microphones in field recording sessions.
+# The rising-then-falling asymmetry is intentional: it lets the alignment
+# core distinguish start chirps from stop chirps via cross-correlation.
+
+_DEFAULT_START_CHIRP = ChirpSpec(
+    from_hz=400, to_hz=2500, duration_ms=500, amplitude=0.8, envelope_ms=15
+)
+_DEFAULT_STOP_CHIRP = ChirpSpec(
+    from_hz=2500, to_hz=400, duration_ms=500, amplitude=0.8, envelope_ms=15
+)
 
 
 def generate_chirp_samples(spec: ChirpSpec, sample_rate: int = 44100) -> List[float]:
@@ -113,3 +132,57 @@ def write_chirp_wav(
         w.setframerate(sample_rate)
         w.writeframes(frames)
     return out_path
+
+
+@dataclass(frozen=True)
+class SyncToneConfig:
+    """Configuration for automatic audio sync chirp injection.
+
+    Controls whether the :class:`~syncfield.orchestrator.SessionOrchestrator`
+    plays sync chirps at session start and stop, the parameters of those
+    chirps, and the timing margins around them so that each chirp is
+    captured in the recording's audio track.
+
+    Defaults are taken from the egonaut production implementation:
+
+    - ``start_chirp``: 400 → 2500 Hz rising sweep
+    - ``stop_chirp``: 2500 → 400 Hz falling sweep
+    - ``duration_ms``: 500 ms each
+    - ``amplitude``: 0.8 with a 15 ms cosine envelope
+    - ``post_start_stabilization_ms``: 200 ms (let audio pipelines warm up)
+    - ``pre_stop_tail_margin_ms``: 200 ms (let the chirp tail flush into WAV)
+
+    Attributes:
+        enabled: If ``False``, the orchestrator never plays a chirp and
+            never writes chirp fields to ``sync_point.json``.
+        start_chirp: Parameters for the chirp played right after all
+            streams have started.
+        stop_chirp: Parameters for the chirp played right before the
+            orchestrator stops all streams.
+        post_start_stabilization_ms: How long to wait after starting every
+            stream before playing the start chirp.
+        pre_stop_tail_margin_ms: Extra wait time (on top of the stop
+            chirp's own duration) before stopping streams so the chirp
+            tail is fully captured in any recording audio track.
+    """
+
+    enabled: bool = True
+    start_chirp: ChirpSpec = field(default_factory=lambda: _DEFAULT_START_CHIRP)
+    stop_chirp: ChirpSpec = field(default_factory=lambda: _DEFAULT_STOP_CHIRP)
+    post_start_stabilization_ms: int = 200
+    pre_stop_tail_margin_ms: int = 200
+
+    @classmethod
+    def default(cls) -> "SyncToneConfig":
+        """Construct with all defaults (chirp enabled)."""
+        return cls()
+
+    @classmethod
+    def silent(cls) -> "SyncToneConfig":
+        """Construct with chirp disabled.
+
+        Use for recording environments where audible chirps are
+        unacceptable (quiet rooms, meetings) or for headless lab machines
+        with no audio output path.
+        """
+        return cls(enabled=False)

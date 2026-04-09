@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import dataclasses
 import struct
 import wave
 
-from syncfield.tone import generate_chirp_samples, write_chirp_wav
+import pytest
+
+from syncfield.tone import SyncToneConfig, generate_chirp_samples, write_chirp_wav
 from syncfield.types import ChirpSpec
 
 
@@ -81,3 +84,40 @@ class TestWriteChirpWav:
         out = tmp_path / "x.wav"
         result = write_chirp_wav(ChirpSpec(400, 500, 10, 0.5, 0), out)
         assert result == out
+
+
+class TestSyncToneConfig:
+    def test_default_uses_egonaut_validated_defaults(self):
+        cfg = SyncToneConfig.default()
+        assert cfg.enabled is True
+        assert cfg.start_chirp.from_hz == 400
+        assert cfg.start_chirp.to_hz == 2500
+        assert cfg.start_chirp.duration_ms == 500
+        assert cfg.start_chirp.amplitude == 0.8
+        assert cfg.start_chirp.envelope_ms == 15
+        # Stop chirp is the reverse sweep
+        assert cfg.stop_chirp.from_hz == 2500
+        assert cfg.stop_chirp.to_hz == 400
+        # Timing margins
+        assert cfg.post_start_stabilization_ms == 200
+        assert cfg.pre_stop_tail_margin_ms == 200
+
+    def test_silent_factory_disables_playback(self):
+        cfg = SyncToneConfig.silent()
+        assert cfg.enabled is False
+
+    def test_is_frozen(self):
+        cfg = SyncToneConfig.default()
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            cfg.enabled = False  # type: ignore[misc]
+
+    def test_custom_values_round_trip(self):
+        cfg = SyncToneConfig(
+            enabled=True,
+            start_chirp=ChirpSpec(100, 500, 100, 0.5, 5),
+            stop_chirp=ChirpSpec(500, 100, 100, 0.5, 5),
+            post_start_stabilization_ms=50,
+            pre_stop_tail_margin_ms=50,
+        )
+        assert cfg.start_chirp.from_hz == 100
+        assert cfg.post_start_stabilization_ms == 50
