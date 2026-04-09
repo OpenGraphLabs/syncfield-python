@@ -802,7 +802,7 @@ def build_app(manifest: ReplayManifest) -> Starlette:
     streams_by_id = {s.id: s for s in manifest.streams}
 
     async def get_session(_request: Request) -> JSONResponse:
-        return JSONResponse(manifest.to_json())
+        return JSONResponse(manifest.to_dict())
 
     async def get_sync_report(_request: Request) -> Response:
         if manifest.sync_report is None:
