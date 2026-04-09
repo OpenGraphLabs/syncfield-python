@@ -82,6 +82,22 @@ class TestConstruction:
         assert target.exists()
 
 
+class _DeviceKeyedFakeStream(FakeStream):
+    """FakeStream variant that advertises a physical device key.
+
+    Used to exercise :meth:`SessionOrchestrator.add` duplicate-device
+    detection without needing real hardware adapters.
+    """
+
+    def __init__(self, id, device_key, **kwargs):
+        super().__init__(id=id, **kwargs)
+        self._device_key = device_key
+
+    @property
+    def device_key(self):
+        return self._device_key
+
+
 class TestAdd:
     def test_add_stream_in_idle_state(self, tmp_path):
         session = _session(tmp_path)
@@ -93,6 +109,102 @@ class TestAdd:
         session.add(FakeStream("cam"))
         with pytest.raises(ValueError, match="duplicate stream id"):
             session.add(FakeStream("cam"))
+
+    def test_rejects_duplicate_physical_device(self, tmp_path):
+        """Same (adapter_type, device_id) cannot be registered twice.
+
+        Regression for the case where a user registered a camera in
+        code and then ran Discover devices in the viewer — both paths
+        succeeded and the session ended up with two cards for the
+        same physical webcam.
+        """
+        session = _session(tmp_path)
+        session.add(
+            _DeviceKeyedFakeStream("mac_webcam", ("uvc_webcam", "0"))
+        )
+        with pytest.raises(ValueError, match="already registered as stream"):
+            session.add(
+                _DeviceKeyedFakeStream("macbook_pro", ("uvc_webcam", "0"))
+            )
+
+    def test_different_device_keys_are_not_duplicates(self, tmp_path):
+        """Two streams on different device indices register cleanly."""
+        session = _session(tmp_path)
+        session.add(
+            _DeviceKeyedFakeStream("mac_webcam", ("uvc_webcam", "0"))
+        )
+        session.add(
+            _DeviceKeyedFakeStream("iphone", ("uvc_webcam", "1"))
+        )
+        assert len(session._streams) == 2
+
+    def test_none_device_keys_fall_back_to_id_uniqueness(self, tmp_path):
+        """Streams with no hardware identity (device_key == None) are
+        only compared on stream id — two unique-id FakeStreams with
+        no device_key must both register.
+        """
+        session = _session(tmp_path)
+        session.add(FakeStream("a"))  # FakeStream default device_key == None
+        session.add(FakeStream("b"))
+        assert len(session._streams) == 2
+
+
+class TestRemove:
+    def test_remove_from_idle_state(self, tmp_path):
+        session = _session(tmp_path)
+        session.add(FakeStream("cam"))
+        assert "cam" in session._streams
+        session.remove("cam")
+        assert "cam" not in session._streams
+        assert session.state is SessionState.IDLE
+
+    def test_remove_unknown_stream_raises_key_error(self, tmp_path):
+        session = _session(tmp_path)
+        with pytest.raises(KeyError, match="unknown stream id"):
+            session.remove("ghost")
+
+    def test_remove_rejected_during_recording(self, tmp_path):
+        """Tearing a stream out of a live recording is not allowed."""
+        session = _session(tmp_path)
+        session.add(FakeStream("a"))
+        session.add(FakeStream("b"))
+        session.start()
+        try:
+            with pytest.raises(RuntimeError, match="remove.*requires"):
+                session.remove("a")
+            # Stream is still there after the failed remove.
+            assert "a" in session._streams
+        finally:
+            session.stop()
+
+    def test_remove_after_stop_allowed(self, tmp_path):
+        """STOPPED is a valid state for removal — the session can be
+        rebuilt with a different set of streams after one recording.
+        """
+        session = _session(tmp_path)
+        session.add(FakeStream("a"))
+        session.add(FakeStream("b"))
+        session.start()
+        session.stop()
+        assert session.state is SessionState.STOPPED
+        session.remove("a")
+        assert "a" not in session._streams
+        assert "b" in session._streams
+
+    def test_remove_frees_device_key_for_re_add(self, tmp_path):
+        """After removing a stream its device_key should free up so a
+        fresh stream can grab the same hardware.
+        """
+        session = _session(tmp_path)
+        session.add(
+            _DeviceKeyedFakeStream("mac_webcam", ("uvc_webcam", "0"))
+        )
+        session.remove("mac_webcam")
+        # Same device_key is no longer claimed.
+        session.add(
+            _DeviceKeyedFakeStream("mac_webcam_v2", ("uvc_webcam", "0"))
+        )
+        assert "mac_webcam_v2" in session._streams
 
 
 class TestStartHappyPath:
@@ -171,6 +283,16 @@ class TestStartRollback:
         assert session.state is SessionState.IDLE
 
     def test_failure_during_prepare_stops_earlier_streams(self, tmp_path):
+        """A failure in ``prepare()`` happens during the connect phase,
+        which runs all preparations before any stream starts recording.
+        The rollback therefore calls ``disconnect()`` on streams that
+        connected — and ``start()`` is never reached on any of them.
+
+        This differs from the 0.1 behaviour where ``prepare()`` and
+        ``start()`` interleaved per stream; the 0.2 orchestrator splits
+        the two phases so all devices connect before any begin writing,
+        matching the egonaut lab recorder's 2-phase model.
+        """
         session = _session(tmp_path)
         good = FakeStream("a")
         bad = FakeStream("b", fail_on_prepare=True)
@@ -180,13 +302,92 @@ class TestStartRollback:
         with pytest.raises(RuntimeError, match="fake failure in prepare"):
             session.start()
 
+        # prepare() ran on both in the connect phase
         assert good.prepare_calls == 1
-        assert good.start_calls == 1  # fully started
-        assert good.stop_calls == 1  # then rolled back
         assert bad.prepare_calls == 1
-        assert bad.start_calls == 0  # never reached start
-
+        # start_recording() was never invoked because the connect phase failed
+        assert good.start_calls == 0
+        assert bad.start_calls == 0
+        # Rollback returned the auto-connected session to IDLE
         assert session.state is SessionState.IDLE
+
+
+class TestFourPhaseLifecycle:
+    """Cover the 0.2 explicit ``connect → start → stop → disconnect`` path.
+
+    The legacy one-shot ``start() / stop()`` path is still exercised by
+    :class:`TestStartHappyPath` and :class:`TestStop`. This class pins
+    the newer semantics down:
+
+    * ``connect()`` transitions ``IDLE → CONNECTING → CONNECTED`` and
+      calls each stream's ``prepare()`` and ``connect()`` methods.
+    * ``start(countdown_s=0)`` walks ``CONNECTED → PREPARING →
+      COUNTDOWN → RECORDING`` and calls ``start_recording()`` on
+      every stream (which routes to ``start()`` on a legacy
+      :class:`FakeStream`).
+    * ``stop()`` returns to ``CONNECTED`` (not ``STOPPED``) so the
+      operator can record another episode without reopening devices.
+    * ``disconnect()`` brings the session back to ``IDLE``.
+    """
+
+    def test_connect_start_stop_disconnect_happy_path(self, tmp_path):
+        session = _session(tmp_path)
+        fs = FakeStream("cam")
+        session.add(fs)
+
+        session.connect()
+        assert session.state is SessionState.CONNECTED
+        assert fs.prepare_calls == 1
+
+        session.start(countdown_s=0)
+        assert session.state is SessionState.RECORDING
+        assert fs.start_calls == 1  # start_recording() → legacy start()
+
+        report = session.stop()
+        # Explicit-connect path stays in CONNECTED after stop so the
+        # operator can record the next episode immediately.
+        assert session.state is SessionState.CONNECTED
+        assert fs.stop_calls == 1  # stop_recording() → legacy stop()
+        assert report.host_id == "rig_01"
+
+        session.disconnect()
+        assert session.state is SessionState.IDLE
+
+    def test_start_from_connected_does_not_auto_disconnect_on_stop(self, tmp_path):
+        """Explicit connect + stop leaves devices open; a new start works."""
+        session = _session(tmp_path)
+        fs = FakeStream("cam")
+        session.add(fs)
+
+        session.connect()
+        session.start(countdown_s=0)
+        session.stop()
+        assert session.state is SessionState.CONNECTED
+
+        # Second recording — no reconnect needed.
+        session.start(countdown_s=0)
+        assert session.state is SessionState.RECORDING
+        # Stream saw two recording cycles (two start+stop pairs).
+        assert fs.start_calls == 2
+        session.stop()
+        assert fs.stop_calls == 2
+        session.disconnect()
+
+    def test_countdown_tick_callback_fires(self, tmp_path):
+        """The ``on_countdown_tick`` callback should fire for each second."""
+        session = _session(tmp_path)
+        session.add(FakeStream("cam"))
+        session.connect()
+
+        seen = []
+        session.start(
+            countdown_s=3,
+            on_countdown_tick=lambda n: seen.append(n),
+        )
+        # Ticks go 3 → 2 → 1 in descending order
+        assert seen == [3, 2, 1]
+        session.stop()
+        session.disconnect()
 
 
 class TestStop:
@@ -768,7 +969,7 @@ class TestSessionLog:
     def test_session_log_captures_state_transitions(self, tmp_path):
         session = _session(tmp_path)
         session.add(FakeStream("a"))
-        session.start()
+        session.start(countdown_s=0)
         session.stop()
 
         log_path = tmp_path / "session_log.jsonl"
@@ -776,8 +977,15 @@ class TestSessionLog:
         lines = [json.loads(l) for l in log_path.read_text().strip().split("\n")]
         transitions = [l for l in lines if l["kind"] == "state_transition"]
         edges = {(t["from"], t["to"]) for t in transitions}
-        assert ("idle", "preparing") in edges
-        assert ("preparing", "recording") in edges
+        # 0.2 four-phase lifecycle: IDLE → CONNECTING → CONNECTED →
+        # PREPARING → COUNTDOWN → RECORDING → STOPPING → STOPPED
+        # (the auto-connect path used by the legacy one-shot
+        # start()/stop() still lands in STOPPED at the end).
+        assert ("idle", "connecting") in edges
+        assert ("connecting", "connected") in edges
+        assert ("connected", "preparing") in edges
+        assert ("preparing", "countdown") in edges
+        assert ("countdown", "recording") in edges
         assert ("recording", "stopping") in edges
         assert ("stopping", "stopped") in edges
 
@@ -785,7 +993,7 @@ class TestSessionLog:
         """A crash between start() and stop() must leave a readable log."""
         session = _session(tmp_path)
         session.add(FakeStream("a"))
-        session.start()
+        session.start(countdown_s=0)
         # Simulate "read the log while still RECORDING"
         content = (tmp_path / "session_log.jsonl").read_text()
         assert "preparing" in content

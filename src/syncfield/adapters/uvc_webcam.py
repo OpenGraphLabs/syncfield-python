@@ -26,7 +26,7 @@ except ImportError as exc:  # pragma: no cover - exercised via sys.modules patch
     ) from exc
 
 from syncfield.clock import SessionClock
-from syncfield.stream import StreamBase
+from syncfield.stream import DeviceKey, StreamBase
 from syncfield.types import (
     FinalizationReport,
     SampleEvent,
@@ -90,6 +90,13 @@ class UVCWebcamStream(StreamBase):
         # reference so no copy is made in the hot path.
         self._frame_lock = threading.Lock()
         self._latest_frame: Any = None
+
+    @property
+    def device_key(self) -> Optional[DeviceKey]:
+        """``("uvc_webcam", str(device_index))`` — the OpenCV index is
+        the stable hardware id on macOS / Linux / Windows.
+        """
+        return ("uvc_webcam", str(self._device_index))
 
     # ------------------------------------------------------------------
     # Stream SPI

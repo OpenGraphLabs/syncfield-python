@@ -14,18 +14,24 @@ viewer looks consistent regardless of what kind of data the user registers.
 from __future__ import annotations
 
 import time
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 import dearpygui.dearpygui as dpg
 import numpy as np
 
 from syncfield.viewer import theme
+from syncfield.viewer.fonts import FontRegistry
 from syncfield.viewer.state import StreamSnapshot
 from syncfield.viewer.widgets.formatting import (
     format_count,
     format_hz,
     format_ns_ago,
 )
+
+#: Session states in which a stream may be removed from the live session.
+#: Kept in sync with :meth:`syncfield.orchestrator.SessionOrchestrator.remove`
+#: — any state outside this set disables the remove button on every card.
+_REMOVABLE_STATES = frozenset({"idle", "connected", "stopped"})
 
 
 # Texture resolution for video previews. We keep this fixed so all cards
@@ -43,9 +49,18 @@ class StreamCard:
     stream additions Just Work.
     """
 
-    def __init__(self, parent_tag: str, snapshot: StreamSnapshot) -> None:
+    def __init__(
+        self,
+        parent_tag: str,
+        snapshot: StreamSnapshot,
+        *,
+        fonts: Optional[FontRegistry] = None,
+        on_remove: Optional[Callable[[str], None]] = None,
+    ) -> None:
         self._stream_id = snapshot.id
         self._kind = snapshot.kind
+        self._fonts = fonts or FontRegistry()
+        self._on_remove = on_remove
         self._card_tag = f"card::{snapshot.id}"
         self._title_tag = f"card_title::{snapshot.id}"
         self._state_dot_tag = f"card_dot::{snapshot.id}"
@@ -53,6 +68,8 @@ class StreamCard:
         self._hz_tag = f"card_hz::{snapshot.id}"
         self._last_sample_tag = f"card_last::{snapshot.id}"
         self._capability_tag = f"card_cap::{snapshot.id}"
+        self._remove_button_tag = f"card_remove::{snapshot.id}"
+        self._last_remove_enabled: Optional[bool] = None
 
         # Variant-specific tags (populated by the matching _build_body method)
         self._texture_tag: Optional[str] = None
@@ -78,21 +95,64 @@ class StreamCard:
         ):
             dpg.bind_item_theme(self._card_tag, theme.build_card_theme())
 
-            # --- Header row: stream id + status dot -------------------
+            # --- Header row: stream id + status dot + remove button ---
+            #
+            # We right-pin the ``×`` button by pre-computing the spacer
+            # width from the card width. DPG has no flexbox; a fixed
+            # spacer is the simplest way to keep the remove button
+            # anchored to the card's top-right corner regardless of the
+            # stream id's length.
+            _REMOVE_BUTTON_W = 22
+            _CONTENT_PADDING = 14   # DPG child_window inner padding
+            _HEADER_GAP = 6
             with dpg.group(horizontal=True):
                 dpg.add_text(snapshot.id, tag=self._title_tag)
-                dpg.add_spacer(width=4)
+                dpg.add_spacer(width=_HEADER_GAP)
                 dpg.add_text(
                     "●",
                     tag=self._state_dot_tag,
                     color=theme.SUCCESS,
                 )
+                # Push the × to the right edge. We assume the id fits
+                # in the default header width; longer ids bleed into
+                # the spacer first before clipping the button.
+                spacer_w = max(
+                    4,
+                    theme.CARD_WIDTH
+                    - _CONTENT_PADDING * 2
+                    - _REMOVE_BUTTON_W
+                    - 60,  # rough width budget for id text + dot
+                )
+                dpg.add_spacer(width=spacer_w)
+                dpg.add_button(
+                    label="×",
+                    tag=self._remove_button_tag,
+                    width=_REMOVE_BUTTON_W,
+                    height=_REMOVE_BUTTON_W,
+                    callback=self._on_remove_click,
+                )
+                dpg.bind_item_theme(
+                    self._remove_button_tag,
+                    theme.build_ghost_button_theme(),
+                )
             dpg.add_text(
                 _capability_label(snapshot),
                 tag=self._capability_tag,
-                color=theme.TEXT_SECONDARY,
+                color=theme.TEXT_MUTED,
             )
-            dpg.add_spacer(height=6)
+            dpg.add_spacer(height=8)
+
+            # Bind card title to the emphasized font once the tag exists.
+            if self._fonts.ui_md is not None:
+                try:
+                    dpg.bind_item_font(self._title_tag, self._fonts.ui_md)
+                except Exception:
+                    pass
+            if self._fonts.ui_sm is not None:
+                try:
+                    dpg.bind_item_font(self._capability_tag, self._fonts.ui_sm)
+                except Exception:
+                    pass
 
             # --- Body: variant-specific --------------------------------
             if self._kind == "video":
@@ -102,16 +162,18 @@ class StreamCard:
             else:
                 self._build_stats_body()
 
-            dpg.add_spacer(height=6)
+            dpg.add_spacer(height=8)
 
             # --- Footer stats row -------------------------------------
             with dpg.group(horizontal=True):
                 dpg.add_text(
                     format_count(snapshot.frame_count),
                     tag=self._frame_count_tag,
+                    color=theme.TEXT_PRIMARY,
                 )
+                dpg.add_spacer(width=4)
                 dpg.add_text("frames", color=theme.TEXT_SECONDARY)
-                dpg.add_spacer(width=10)
+                dpg.add_spacer(width=14)
                 dpg.add_text(
                     format_hz(snapshot.effective_hz),
                     tag=self._hz_tag,
@@ -122,6 +184,19 @@ class StreamCard:
                 tag=self._last_sample_tag,
                 color=theme.TEXT_MUTED,
             )
+
+            # Stats row uses monospace so numeric counters don't jitter.
+            if self._fonts.mono is not None:
+                try:
+                    dpg.bind_item_font(self._frame_count_tag, self._fonts.mono)
+                    dpg.bind_item_font(self._hz_tag, self._fonts.mono)
+                except Exception:
+                    pass
+            if self._fonts.ui_sm is not None:
+                try:
+                    dpg.bind_item_font(self._last_sample_tag, self._fonts.ui_sm)
+                except Exception:
+                    pass
 
     def _build_video_body(self, snapshot: StreamSnapshot) -> None:
         """A raw-texture image that the render loop updates in place."""
@@ -174,8 +249,24 @@ class StreamCard:
     # Update — called every render frame
     # ------------------------------------------------------------------
 
-    def update(self, snapshot: StreamSnapshot, now_ns: int) -> None:
-        """Sync this card to the newest snapshot."""
+    def update(
+        self,
+        snapshot: StreamSnapshot,
+        now_ns: int,
+        session_state: Optional[str] = None,
+    ) -> None:
+        """Sync this card to the newest snapshot.
+
+        Args:
+            snapshot: Latest per-stream data.
+            now_ns: Monotonic ns for staleness comparisons.
+            session_state: Lowercase session state string (see
+                :attr:`SessionSnapshot.state`). Used to enable or
+                disable the remove button — removal is only legal in
+                ``idle`` / ``connected`` / ``stopped``. ``None`` means
+                "don't touch the button" (the initial state set at
+                build time).
+        """
         dpg.set_value(self._frame_count_tag, format_count(snapshot.frame_count))
         dpg.set_value(self._hz_tag, format_hz(snapshot.effective_hz))
         dpg.set_value(
@@ -187,10 +278,42 @@ class StreamCard:
             color=_dot_color(snapshot, now_ns),
         )
 
+        if session_state is not None:
+            self._sync_remove_button_enabled(session_state)
+
         if self._kind == "video":
             self._update_video_texture(snapshot)
         elif self._kind in ("sensor", "audio"):
             self._update_plot(snapshot)
+
+    def _sync_remove_button_enabled(self, session_state: str) -> None:
+        """Enable the remove button only in removal-safe session states.
+
+        Caches the last enabled/disabled state so DPG doesn't get a
+        fresh ``configure_item`` call every render frame — the check
+        is a cheap string membership test + equality.
+        """
+        should_enable = session_state in _REMOVABLE_STATES
+        if should_enable == self._last_remove_enabled:
+            return
+        try:
+            if should_enable:
+                dpg.enable_item(self._remove_button_tag)
+            else:
+                dpg.disable_item(self._remove_button_tag)
+        except Exception:  # pragma: no cover — DPG not yet ready at first tick
+            return
+        self._last_remove_enabled = should_enable
+
+    def _on_remove_click(self, sender=None, app_data=None, user_data=None) -> None:
+        """Fire the injected remove callback with this card's stream id.
+
+        The callback (owned by :class:`ViewerLayout`) is expected to
+        call :meth:`SessionOrchestrator.remove` on a worker thread so
+        the UI thread doesn't block on device teardown.
+        """
+        if self._on_remove is not None:
+            self._on_remove(self._stream_id)
 
     def _update_video_texture(self, snapshot: StreamSnapshot) -> None:
         """Upload the latest frame to the GPU texture, with letterboxing."""

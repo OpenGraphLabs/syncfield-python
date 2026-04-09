@@ -6,20 +6,68 @@ health-event routing. Each instance represents **one host**; multi-host
 coordination happens at the sync core when outputs from multiple hosts
 are submitted together.
 
+Lifecycle
+---------
+
+SyncField 0.2 follows the same 4-phase lifecycle used by the egonaut
+lab recorder::
+
+    ┌─────────┐  connect()   ┌───────────┐  start()   ┌──────────┐
+    │  IDLE   │─────────────▶│ CONNECTED │───────────▶│ COUNTDOWN│
+    │         │◀─────────────│           │            └────┬─────┘
+    └─────────┘ disconnect() └───────────┘                 │ 3/2/1
+                                   ▲                       ▼
+                                   │             ┌──────────────────┐
+                             stop()│             │    RECORDING     │
+                                   │             │ (streams writing)│
+                                   │             └────────┬─────────┘
+                                   │                      │ stop()
+                                   │                      ▼
+                                   │             ┌──────────────────┐
+                                   │             │     STOPPING     │
+                                   │             │ (chirp + finalize│
+                                   │             └────────┬─────────┘
+                                   └──────────────────────┘
+
+* **Connect** opens device I/O on every stream so the viewer can
+  render live preview data. No file is written.
+* **Countdown** is a short visual 3/2/1 so the operator has a beat to
+  glance at the rig before capture starts.
+* **Start** atomically enables file writing on every stream, **then**
+  plays the start chirp so the chirp lands inside the recorded audio.
+* **Stop** plays the stop chirp **first** (so it also lands in audio),
+  waits for the tail to flush, then tells every stream to stop writing.
+  The devices stay connected — the operator can immediately start
+  another recording without re-opening hardware.
+
+Legacy compatibility
+--------------------
+
+Applications that used the 0.1 one-shot API (``session.start()`` →
+``session.stop()``) continue to work. When ``start()`` is called from
+``IDLE`` the orchestrator auto-connects, runs the countdown, starts
+recording, and plays the chirp; ``stop()`` from that auto-connected
+mode tears everything down and lands in ``STOPPED``.
+
+Thread safety
+-------------
+
+``add()`` is **not** thread-safe — call it from the thread that
+constructed the session. ``connect()`` / ``start()`` / ``stop()`` /
+``disconnect()`` acquire an internal reentrant lock, so it is safe for
+other threads to observe state but only one lifecycle transition runs
+at a time.
+
 The file is organized top-down so the public lifecycle is easy to read:
 
 1. Construction and public properties
 2. ``add()`` — stream registration
-3. ``start()`` — atomic multi-stream start with rollback
-4. ``stop()`` — chirp + finalization + artifact persistence
-5. Session log helpers (crash safety)
-6. Chirp injection helpers
-
-Thread safety:
-    ``add()`` is **not** thread-safe — call it from the thread that
-    constructed the session. ``start()`` and ``stop()`` acquire an
-    internal reentrant lock, so it is safe for other threads to observe
-    state but only one lifecycle transition runs at a time.
+3. ``connect()`` — open device I/O for live preview
+4. ``start()`` — countdown then atomic multi-stream record-start with rollback
+5. ``stop()`` — chirp + finalization + return to CONNECTED
+6. ``disconnect()`` — tear down device I/O
+7. Session log helpers (crash safety)
+8. Chirp injection helpers
 """
 
 from __future__ import annotations
@@ -29,7 +77,7 @@ import threading
 import time
 from importlib.metadata import version as _pkg_version
 from pathlib import Path
-from typing import Dict, List, Optional, Union
+from typing import Callable, Dict, List, Optional, Union
 
 from syncfield.clock import SessionClock
 from syncfield.multihost.advertiser import SessionAdvertiser
@@ -52,6 +100,76 @@ logger = logging.getLogger(__name__)
 
 #: Discriminated union of the multi-host role configs.
 Role = Union[LeaderRole, FollowerRole]
+
+
+# ---------------------------------------------------------------------------
+# Module-level helpers used by SessionOrchestrator.start() / stop() / connect()
+# ---------------------------------------------------------------------------
+
+
+def _run_countdown(
+    countdown_s: float,
+    on_tick: Optional[Callable[[int], None]],
+) -> None:
+    """Block the calling thread for ``countdown_s`` seconds, ticking.
+
+    Fires ``on_tick(n)`` once per remaining whole second in descending
+    order (``3 → 2 → 1`` for ``countdown_s == 3``). The viewer uses
+    this callback to render a big overlay countdown on the session
+    clock panel. When ``countdown_s <= 0`` this is a no-op — useful
+    for headless scripts that want atomic start semantics without the
+    visual delay.
+    """
+    if countdown_s <= 0:
+        return
+
+    # Round up so non-integer durations still tick through every whole
+    # second. A value of 2.5 ticks "3 → 2 → 1" and sleeps 2.5 s total.
+    ticks = int(countdown_s)
+    if ticks < 1:
+        ticks = 1
+
+    remaining = countdown_s
+    for tick_value in range(ticks, 0, -1):
+        if on_tick is not None:
+            try:
+                on_tick(tick_value)
+            except Exception:  # pragma: no cover — callback must not break start()
+                logger.exception("countdown tick callback raised")
+        step = remaining / tick_value
+        time.sleep(step)
+        remaining -= step
+
+
+def _rollback_disconnect_streams(connected: List["Stream"]) -> None:
+    """Best-effort ``disconnect()`` on each stream, in LIFO order.
+
+    Called during connect-rollback, stop-rollback, and the auto-connect
+    stop path. Exceptions from individual streams are logged at DEBUG
+    level and swallowed — tear-down must never leave a half-closed
+    device in place.
+    """
+    for stream in reversed(connected):
+        try:
+            stream.disconnect()
+        except Exception as exc:  # pragma: no cover — best-effort cleanup
+            logger.debug("disconnect() raised for %s: %s", stream.id, exc)
+
+
+def _rollback_stop_recording(recording: List["Stream"]) -> None:
+    """Best-effort ``stop_recording()`` on each stream, in LIFO order.
+
+    Called when ``start_recording()`` fails partway through the stream
+    list. The streams that did manage to start are told to stop
+    recording so the ones that succeeded don't keep writing after a
+    rollback. Return values are discarded — a rollback is not a
+    finalization.
+    """
+    for stream in reversed(recording):
+        try:
+            stream.stop_recording()
+        except Exception as exc:  # pragma: no cover — best-effort cleanup
+            logger.debug("stop_recording() raised for %s: %s", stream.id, exc)
 
 
 class SessionOrchestrator:
@@ -115,6 +233,17 @@ class SessionOrchestrator:
         self._chirp_stop: Optional[ChirpEmission] = None
         self._log_writer: Optional[SessionLogWriter] = None
 
+        # Which streams successfully ``connect()``-ed so ``disconnect()``
+        # on a partial failure only tears down the ones that actually
+        # opened a device.
+        self._connected_streams: List[Stream] = []
+
+        # True when the operator used the legacy one-shot ``start()`` from
+        # ``IDLE`` instead of explicitly calling ``connect()`` first.
+        # In that case ``stop()`` also tears down the devices and lands
+        # the session in ``STOPPED`` for backward compatibility.
+        self._auto_connected: bool = False
+
     # ------------------------------------------------------------------
     # Public properties
     # ------------------------------------------------------------------
@@ -169,12 +298,21 @@ class SessionOrchestrator:
         """Register a stream with this session.
 
         Must be called before :meth:`start`. Duplicate stream ids are
-        rejected so session output files are always unique. Once
-        ``start()`` has been called, any health events the stream emits
-        are forwarded to the session log automatically.
+        rejected so session output files are always unique, **and**
+        streams that point to the same physical device as one that's
+        already registered (matched by ``stream.device_key``) are
+        rejected too — this stops code + discovery-modal double-adds
+        from creating two cards for the same webcam. Streams that
+        return ``None`` from ``device_key`` (no hardware identity)
+        are compared on stream-id only.
+
+        Once ``start()`` has been called, any health events the stream
+        emits are forwarded to the session log automatically.
 
         Raises:
-            ValueError: If a stream with the same id is already registered.
+            ValueError: If a stream with the same id is already
+                registered, or another stream already owns the same
+                physical device.
             RuntimeError: If the session is not in the ``IDLE`` state.
         """
         if self._state is not SessionState.IDLE:
@@ -183,80 +321,261 @@ class SessionOrchestrator:
             )
         if stream.id in self._streams:
             raise ValueError(f"duplicate stream id: {stream.id!r}")
+        new_key = getattr(stream, "device_key", None)
+        if new_key is not None:
+            for existing in self._streams.values():
+                existing_key = getattr(existing, "device_key", None)
+                if existing_key == new_key:
+                    raise ValueError(
+                        f"physical device {new_key} is already registered "
+                        f"as stream {existing.id!r}"
+                    )
         self._streams[stream.id] = stream
         stream.on_health(self._on_stream_health)
 
-    # ------------------------------------------------------------------
-    # Lifecycle — start
-    # ------------------------------------------------------------------
+    def remove(self, stream_id: str) -> None:
+        """Unregister a previously added stream.
 
-    def start(self) -> None:
-        """Start every registered stream atomically.
+        Valid in :attr:`SessionState.IDLE`, :attr:`CONNECTED`, and
+        :attr:`STOPPED` states. Refuses during ``CONNECTING``,
+        ``PREPARING``, ``COUNTDOWN``, ``RECORDING``, and ``STOPPING``
+        because tearing a stream out of the session mid-lifecycle
+        would leave partial artifacts on disk.
 
-        Sequence:
-            1. Validate state (must be ``IDLE``) and that at least one
-               stream is registered.
-            2. Capture a fresh :class:`~syncfield.types.SyncPoint` and
-               build the shared :class:`~syncfield.clock.SessionClock`.
-            3. For each stream: call ``prepare()`` then
-               ``start(session_clock)``. If any call raises, roll back all
-               streams that were fully started (stopping them in reverse
-               order) and re-raise the original exception.
-            4. On success, transition to ``RECORDING``.
+        If the session is currently ``CONNECTED``, the stream's
+        device is disconnected first so its hardware handle is
+        released before the stream leaves the registry.
 
-        The failed stream itself is **not** rolled back — it never reached
-        a successfully-started state.
+        Args:
+            stream_id: Id of the stream to remove.
 
         Raises:
-            RuntimeError: If state is not ``IDLE`` or no streams are
-                registered.
-            Exception: Any exception raised by a stream during
-                ``prepare``/``start`` propagates after rollback. State
-                returns to ``IDLE`` before the exception escapes.
+            KeyError: If ``stream_id`` is not registered.
+            RuntimeError: If the session is in a state that does not
+                allow stream removal.
+        """
+        valid_states = (
+            SessionState.IDLE,
+            SessionState.CONNECTED,
+            SessionState.STOPPED,
+        )
+        with self._lock:
+            if self._state not in valid_states:
+                raise RuntimeError(
+                    "remove() requires one of "
+                    f"{[s.value for s in valid_states]}; current state is "
+                    f"{self._state.value}"
+                )
+            if stream_id not in self._streams:
+                raise KeyError(f"unknown stream id: {stream_id!r}")
+
+            stream = self._streams[stream_id]
+
+            # If the session is connected (live preview running), tear
+            # this stream's device down before unregistering so no
+            # background thread keeps a dead reference to it.
+            if self._state is SessionState.CONNECTED:
+                try:
+                    stream.disconnect()
+                except Exception as exc:  # pragma: no cover — best-effort
+                    logger.debug(
+                        "disconnect() raised while removing %s: %s",
+                        stream_id,
+                        exc,
+                    )
+                try:
+                    self._connected_streams.remove(stream)
+                except ValueError:  # pragma: no cover — defensive
+                    pass
+
+            del self._streams[stream_id]
+            logger.info("removed stream %s", stream_id)
+
+    # ------------------------------------------------------------------
+    # Lifecycle — connect
+    # ------------------------------------------------------------------
+
+    def connect(self) -> None:
+        """Open device I/O on every registered stream.
+
+        Transitions ``IDLE → CONNECTING → CONNECTED``. Each stream's
+        ``prepare()`` runs first (for permission checks and one-shot
+        setup) and then ``connect()`` opens the underlying device and
+        begins live capture for preview. After this call the viewer can
+        render ``latest_frame`` / plot values without any file being
+        written to disk.
+
+        If any stream raises during ``prepare`` or ``connect``, every
+        stream that successfully connected so far is disconnected in
+        LIFO order and the exception re-raises. The session lands back
+        in ``IDLE`` with no lingering device handles.
+
+        Raises:
+            RuntimeError: If the session is not in the ``IDLE`` or
+                ``STOPPED`` state, or if no streams are registered.
+            Exception: Any exception from a stream during prepare /
+                connect propagates after rollback.
         """
         with self._lock:
-            if self._state is not SessionState.IDLE:
+            if self._state not in (SessionState.IDLE, SessionState.STOPPED):
                 raise RuntimeError(
-                    f"start() requires IDLE state; current state is {self._state.value}"
+                    f"connect() requires IDLE or STOPPED state; current state is "
+                    f"{self._state.value}"
                 )
             if not self._streams:
-                raise RuntimeError("cannot start() with no streams registered")
+                raise RuntimeError("cannot connect() with no streams registered")
 
-            # Open the crash-safe session log BEFORE any state mutation so
-            # failures during preparation are still recorded on disk.
-            self._log_writer = SessionLogWriter(self._output_dir)
-            self._log_writer.open()
+            # Open the crash-safe session log BEFORE any mutation so even
+            # a failure during the connect phase leaves a forensic trail.
+            if self._log_writer is None:
+                self._log_writer = SessionLogWriter(self._output_dir)
+                self._log_writer.open()
 
+            self._transition(SessionState.CONNECTING)
+
+            connected: List[Stream] = []
+            try:
+                for stream in self._streams.values():
+                    stream.prepare()
+                    stream.connect()
+                    connected.append(stream)
+            except Exception as exc:
+                self._log_rollback(exc, len(connected))
+                _rollback_disconnect_streams(connected)
+                self._transition(SessionState.IDLE)
+                if self._log_writer is not None:
+                    self._log_writer.close()
+                    self._log_writer = None
+                raise
+
+            self._connected_streams = connected
+            self._transition(SessionState.CONNECTED)
+
+    # ------------------------------------------------------------------
+    # Lifecycle — start (countdown → record → chirp)
+    # ------------------------------------------------------------------
+
+    def start(
+        self,
+        *,
+        countdown_s: float = 3.0,
+        on_countdown_tick: Optional[Callable[[int], None]] = None,
+    ) -> None:
+        """Run the countdown, start recording, and play the start chirp.
+
+        Sequence:
+            1. Validate state. If the session is ``IDLE``, auto-call
+               :meth:`connect` first so legacy callers that skip the
+               explicit connect step still work.
+            2. Transition to ``COUNTDOWN`` and fire the optional
+               ``on_countdown_tick`` callback for each remaining second
+               (``3 → 2 → 1``). The viewer uses this to render a big
+               overlay countdown.
+            3. Capture a fresh :class:`~syncfield.types.SyncPoint`.
+            4. Call ``start_recording(session_clock)`` on every stream
+               in registration order. This is meant to be fast —
+               adapters should do any slow setup inside ``connect()``.
+            5. If any stream raises, roll back by calling
+               ``stop_recording()`` on the streams that did start, then
+               return to ``CONNECTED`` and re-raise.
+            6. Play the start chirp. The chirp is intentionally
+               **after** every stream has enabled file writing so the
+               audio track actually captures it.
+            7. Transition to ``RECORDING``.
+
+        Args:
+            countdown_s: How long to count down before recording starts.
+                Pass ``0`` to skip the countdown entirely (useful for
+                headless scripts). Default ``3.0`` seconds.
+            on_countdown_tick: Optional callback invoked once per
+                remaining second with the current tick value. Useful
+                for rendering a GUI overlay. Called on the calling
+                thread — the orchestrator does not spin up a worker.
+
+        Raises:
+            RuntimeError: If the session is not in ``IDLE``,
+                ``STOPPED``, or ``CONNECTED`` states.
+            Exception: Any exception raised by a stream during
+                ``start_recording`` propagates after rollback.
+        """
+        with self._lock:
+            if self._state in (SessionState.IDLE, SessionState.STOPPED):
+                # Legacy one-shot path — auto-connect then proceed.
+                self._auto_connected = True
+                self.connect()
+            elif self._state is not SessionState.CONNECTED:
+                raise RuntimeError(
+                    f"start() requires CONNECTED state; current state is "
+                    f"{self._state.value}"
+                )
+            else:
+                self._auto_connected = False
+
+            # Multi-host: advertise PREPARING / wait for leader. Moved
+            # out of the legacy PREPARING branch because CONNECTED
+            # already lets us know devices are live.
             self._transition(SessionState.PREPARING)
-
-            # Leader: start advertising in the PREPARING state so
-            # followers already on the network see the session coming
-            # up. Follower: block here until a leader advertises
-            # `recording`. Both branches no-op for single-host.
             try:
                 self._maybe_start_advertising()
                 self._maybe_wait_for_leader()
             except Exception:
                 self._stop_discovery_on_failure()
-                self._transition(SessionState.IDLE)
+                # Auto-connected sessions tear all the way back to IDLE
+                # on multi-host failure; explicit-connect sessions stay
+                # in CONNECTED so the caller can retry without
+                # re-opening hardware.
+                if self._auto_connected:
+                    _rollback_disconnect_streams(self._connected_streams)
+                    self._connected_streams = []
+                    self._auto_connected = False
+                    self._transition(SessionState.IDLE)
+                    if self._log_writer is not None:
+                        self._log_writer.close()
+                        self._log_writer = None
+                else:
+                    self._transition(SessionState.CONNECTED)
                 raise
 
+            # --- Countdown -------------------------------------------
+            self._transition(SessionState.COUNTDOWN)
+            _run_countdown(countdown_s, on_countdown_tick)
+
+            # --- Atomic start_recording ------------------------------
             self._sync_point = SyncPoint.create_now(self._host_id)
             self._session_clock = SessionClock(sync_point=self._sync_point)
 
-            started: List[Stream] = []
+            recording: List[Stream] = []
             try:
                 for stream in self._streams.values():
-                    stream.prepare()
-                    stream.start(self._session_clock)
-                    started.append(stream)
+                    stream.start_recording(self._session_clock)
+                    recording.append(stream)
             except Exception as exc:
-                self._log_rollback(exc, len(started))
-                self._rollback_started_streams(started)
+                # Roll back the streams that did start writing.
+                self._log_rollback(exc, len(recording))
+                _rollback_stop_recording(recording)
                 self._stop_discovery_on_failure()
-                self._transition(SessionState.IDLE)
+
+                # If the user took the legacy one-shot path through
+                # IDLE, tear down devices too and land in IDLE to
+                # preserve 0.1 rollback semantics. Explicit connect
+                # callers stay in CONNECTED so they can retry without
+                # re-opening hardware.
+                if self._auto_connected:
+                    _rollback_disconnect_streams(self._connected_streams)
+                    self._connected_streams = []
+                    self._auto_connected = False
+                    self._transition(SessionState.IDLE)
+                    if self._log_writer is not None:
+                        self._log_writer.close()
+                        self._log_writer = None
+                else:
+                    self._transition(SessionState.CONNECTED)
                 raise
 
+            # --- Start chirp — AFTER every stream is writing --------
+            # This is the critical ordering: the chirp must land inside
+            # the recorded audio track, so we wait until every stream
+            # has enabled file writing before playing it.
             self._maybe_play_start_chirp()
             self._transition(SessionState.RECORDING)
 
@@ -265,42 +584,32 @@ class SessionOrchestrator:
             # and streams are live.
             self._maybe_update_advert_recording()
 
-    @staticmethod
-    def _rollback_started_streams(started: List[Stream]) -> None:
-        """Best-effort tear-down of streams that were fully started.
-
-        Called when ``start()`` fails partway through. Streams are stopped
-        in reverse order (LIFO) so later-started streams release their
-        resources before earlier-started ones. Any exceptions raised by
-        ``stop()`` during rollback are swallowed — the primary failure is
-        already on its way up the stack and is the real story.
-        """
-        for s in reversed(started):
-            try:
-                s.stop()
-            except Exception:  # pragma: no cover — best-effort cleanup
-                pass
-
     # ------------------------------------------------------------------
     # Lifecycle — stop
     # ------------------------------------------------------------------
 
     def stop(self) -> SessionReport:
-        """Stop all streams and persist session artifacts.
+        """Play the stop chirp, finalize recording, and return to CONNECTED.
 
         Sequence:
             1. Validate state (must be ``RECORDING``) and transition to
                ``STOPPING``.
-            2. If chirp is eligible, play the stop chirp **before**
-               stopping streams so it lands in recording audio tracks,
-               then wait for its tail to flush.
-            3. For each stream, call ``stop()``. Exceptions become failed
-               :class:`FinalizationReport` entries — one slow or broken
-               stream must never block finalization of the others.
+            2. Play the stop chirp **before** any stream is told to
+               stop writing, so the chirp lands in every recorded audio
+               track. Wait for the chirp tail to flush.
+            3. Call ``stop_recording()`` on every stream. Exceptions
+               become failed :class:`FinalizationReport` entries — one
+               slow or broken stream must never block finalization of
+               the others.
             4. Write ``sync_point.json`` and ``manifest.json`` to the
                output directory.
-            5. Transition to ``STOPPED``, close the session log, and
-               return the aggregated :class:`SessionReport`.
+            5. Return the session to ``CONNECTED`` so the operator can
+               start another recording immediately without re-opening
+               hardware. Legacy one-shot callers (who reached
+               ``RECORDING`` via an auto-connect from ``IDLE``) are
+               taken all the way to ``STOPPED`` instead, matching the
+               0.1 behavior.
+            6. Return the aggregated :class:`SessionReport`.
 
         Returns:
             Aggregated :class:`SessionReport` with per-stream
@@ -317,7 +626,12 @@ class SessionOrchestrator:
                 )
             self._transition(SessionState.STOPPING)
 
+            # --- Stop chirp — BEFORE any stream is told to stop -----
+            # This is the critical ordering: the chirp must be captured
+            # inside every recorded audio track, so we play it first
+            # and let its tail flush before telling streams to stop.
             self._maybe_play_stop_chirp_and_wait()
+
             finalizations = self._finalize_streams()
 
             # Leader: flip advert status to stopped BEFORE closing the
@@ -329,17 +643,25 @@ class SessionOrchestrator:
 
             self._persist_session_artifacts(finalizations)
 
-            self._transition(SessionState.STOPPED)
-            if self._log_writer is not None:
-                self._log_writer.close()
-                self._log_writer = None
-
-            # Tear down discovery. The advertiser's close() sleeps for
-            # graceful_shutdown_ms before unregistering so followers
-            # still browsing see the final "stopped" status; the
-            # browser closes immediately because the follower has
-            # already finalized its own streams.
-            self._stop_discovery_on_failure()
+            # --- Landing state -------------------------------------
+            # If the caller explicitly connected before calling start,
+            # keep devices open so they can record again. Otherwise
+            # (legacy one-shot) tear down fully and land in STOPPED.
+            if self._auto_connected:
+                self._transition(SessionState.STOPPED)
+                if self._log_writer is not None:
+                    self._log_writer.close()
+                    self._log_writer = None
+                _rollback_disconnect_streams(self._connected_streams)
+                self._connected_streams = []
+                self._stop_discovery_on_failure()
+                self._auto_connected = False
+            else:
+                self._transition(SessionState.CONNECTED)
+                # Leave the session log open for the next recording in
+                # this connected session. It gets flushed on each
+                # transition.
+                self._stop_discovery_on_failure()
 
             role_str = self._role.kind if self._role is not None else None
             return SessionReport(
@@ -369,8 +691,39 @@ class SessionOrchestrator:
                 role=role_str,
             )
 
+    # ------------------------------------------------------------------
+    # Lifecycle — disconnect
+    # ------------------------------------------------------------------
+
+    def disconnect(self) -> None:
+        """Close device I/O on every connected stream.
+
+        Transitions ``CONNECTED`` or ``STOPPED`` back to ``IDLE``. Each
+        stream's ``disconnect()`` is called in reverse registration
+        order so later-opened devices release their resources before
+        earlier-opened ones. Exceptions from individual streams are
+        logged and swallowed — tear-down must never leave a connected
+        device behind.
+
+        Raises:
+            RuntimeError: If the session is in any state other than
+                ``CONNECTED`` / ``STOPPED``.
+        """
+        with self._lock:
+            if self._state not in (SessionState.CONNECTED, SessionState.STOPPED):
+                raise RuntimeError(
+                    f"disconnect() requires CONNECTED or STOPPED state; "
+                    f"current state is {self._state.value}"
+                )
+            _rollback_disconnect_streams(self._connected_streams)
+            self._connected_streams = []
+            self._transition(SessionState.IDLE)
+            if self._log_writer is not None:
+                self._log_writer.close()
+                self._log_writer = None
+
     def _finalize_streams(self) -> List[FinalizationReport]:
-        """Call ``stop()`` on each stream and collect FinalizationReports.
+        """Call ``stop_recording()`` on each stream and collect FinalizationReports.
 
         Stream exceptions are converted to failed reports so that one
         broken stream cannot prevent the session from reaching a clean
@@ -380,7 +733,7 @@ class SessionOrchestrator:
         finalizations: List[FinalizationReport] = []
         for stream in self._streams.values():
             try:
-                report = stream.stop()
+                report = stream.stop_recording()
             except Exception as exc:
                 report = FinalizationReport(
                     stream_id=stream.id,

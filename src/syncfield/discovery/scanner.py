@@ -290,6 +290,15 @@ def scan_and_add(
     # iteration surface for registered streams yet.
     existing_ids = set(session._streams.keys())  # noqa: SLF001
 
+    # Snapshot the physical devices this session already owns so we
+    # don't double-add the same webcam / BLE peripheral / OAK when the
+    # user registered one in code and then ran scan_and_add too.
+    existing_device_keys: set[tuple[str, str]] = set()
+    for stream in session._streams.values():  # noqa: SLF001
+        key = getattr(stream, "device_key", None)
+        if key is not None:
+            existing_device_keys.add(key)
+
     added: List[DiscoveredDevice] = []
 
     for device in report.devices:
@@ -303,6 +312,12 @@ def scan_and_add(
         if device.in_use:
             logger.info(
                 "skipping %s: device appears to be in use by another process",
+                device.display_name,
+            )
+            continue
+        if (device.adapter_type, device.device_id) in existing_device_keys:
+            logger.info(
+                "skipping %s: physical device already registered on this session",
                 device.display_name,
             )
             continue

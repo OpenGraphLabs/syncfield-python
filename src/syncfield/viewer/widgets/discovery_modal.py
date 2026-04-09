@@ -47,6 +47,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 import dearpygui.dearpygui as dpg
 
 from syncfield.viewer import theme
+from syncfield.viewer.fonts import FontRegistry
 
 if TYPE_CHECKING:
     from syncfield.discovery import DiscoveredDevice, DiscoveryReport
@@ -100,9 +101,11 @@ class DiscoveryModal:
         self,
         session: "SessionOrchestrator",
         *,
+        fonts: Optional[FontRegistry] = None,
         on_added: Optional[Callable[[List["DiscoveredDevice"]], None]] = None,
     ) -> None:
         self._session = session
+        self._fonts = fonts or FontRegistry()
         self._on_added = on_added
         self._state = _ModalState()
         self._lock = threading.Lock()
@@ -303,15 +306,38 @@ class DiscoveryModal:
             self._state.report = report
             self._state.error_message = error
             # Preselect every device that's ready to add (no warnings,
-            # not in use) so the common "everything looks good, just
-            # click Add" path is one click away.
+            # not in use, AND not already registered on the session)
+            # so the common "everything looks good, just click Add"
+            # path is one click away. Devices whose physical hardware
+            # is already owned by a registered stream are rendered as
+            # "already added" and their checkbox stays off by default.
             if report is not None:
                 self._state.selected = {
                     d.device_id
                     for d in report.devices
-                    if not d.warnings and not d.in_use
+                    if not d.warnings
+                    and not d.in_use
+                    and self._already_registered_as(d) is None
                 }
             self._state.needs_rebuild = True
+
+    def _already_registered_as(
+        self, device: "DiscoveredDevice"
+    ) -> Optional[str]:
+        """Return the stream id that already owns *device*, or ``None``.
+
+        A discovered device is "already registered" when the current
+        session contains a stream whose ``device_key`` equals
+        ``(device.adapter_type, device.device_id)``. The check is
+        defensive against adapters that predate the ``device_key``
+        property — ``getattr(..., None)`` falls through to ``None``.
+        """
+        target = (device.adapter_type, device.device_id)
+        for stream in self._session._streams.values():  # noqa: SLF001
+            key = getattr(stream, "device_key", None)
+            if key == target:
+                return stream.id
+        return None
 
     # ------------------------------------------------------------------
     # Rendering
@@ -415,7 +441,12 @@ class DiscoveryModal:
 
     def _render_device_row(self, device: "DiscoveredDevice") -> None:
         """One row per discovered device — checkbox + two-line label."""
-        addable = not device.warnings and not device.in_use
+        already_as = self._already_registered_as(device)
+        addable = (
+            not device.warnings
+            and not device.in_use
+            and already_as is None
+        )
         checkbox_tag = f"discovery::check_{device.device_id}"
         row_tag = f"discovery::row_{device.device_id}"
 
@@ -443,6 +474,16 @@ class DiscoveryModal:
             with dpg.group(horizontal=True):
                 dpg.add_spacer(width=24)  # align under the label
                 dpg.add_text("  ·  ".join(sub_bits), color=theme.TEXT_MUTED)
+
+            # "Already added" row — physical device is already owned by
+            # a registered stream, so the checkbox is disabled above.
+            if already_as is not None:
+                with dpg.group(horizontal=True):
+                    dpg.add_spacer(width=24)
+                    dpg.add_text(
+                        f"✓  Already added as '{already_as}'",
+                        color=theme.TEXT_MUTED,
+                    )
 
             # Warning row if the device can't be auto-added.
             if device.warnings:
@@ -510,6 +551,14 @@ class DiscoveryModal:
 
         for device in report.devices:
             if device.device_id not in selected:
+                continue
+            # Defense in depth: even though the checkbox for already-
+            # registered devices is disabled in the UI, re-check here
+            # so a stale ``selected`` snapshot from before a previous
+            # Add-click cannot resurrect a device the session already
+            # owns. The orchestrator would reject it anyway with a
+            # ValueError, but skipping here keeps the error log clean.
+            if self._already_registered_as(device) is not None:
                 continue
             try:
                 stream_id = make_stream_id(device.display_name, existing_ids)
