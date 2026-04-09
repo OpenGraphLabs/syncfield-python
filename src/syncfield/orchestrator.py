@@ -21,11 +21,12 @@ from __future__ import annotations
 
 import threading
 from pathlib import Path
-from typing import Dict
+from typing import Dict, List
 
+from syncfield.clock import SessionClock
 from syncfield.stream import Stream
 from syncfield.tone import SyncToneConfig
-from syncfield.types import SessionState
+from syncfield.types import SessionState, SyncPoint
 
 
 class SessionOrchestrator:
@@ -54,6 +55,10 @@ class SessionOrchestrator:
         self._streams: Dict[str, Stream] = {}
         self._state = SessionState.IDLE
         self._lock = threading.RLock()
+
+        # Populated during start(); consumed during stop().
+        self._sync_point: SyncPoint | None = None
+        self._session_clock: SessionClock | None = None
 
     # ------------------------------------------------------------------
     # Public properties
@@ -92,3 +97,72 @@ class SessionOrchestrator:
         if stream.id in self._streams:
             raise ValueError(f"duplicate stream id: {stream.id!r}")
         self._streams[stream.id] = stream
+
+    # ------------------------------------------------------------------
+    # Lifecycle — start
+    # ------------------------------------------------------------------
+
+    def start(self) -> None:
+        """Start every registered stream atomically.
+
+        Sequence:
+            1. Validate state (must be ``IDLE``) and that at least one
+               stream is registered.
+            2. Capture a fresh :class:`~syncfield.types.SyncPoint` and
+               build the shared :class:`~syncfield.clock.SessionClock`.
+            3. For each stream: call ``prepare()`` then
+               ``start(session_clock)``. If any call raises, roll back all
+               streams that were fully started (stopping them in reverse
+               order) and re-raise the original exception.
+            4. On success, transition to ``RECORDING``.
+
+        The failed stream itself is **not** rolled back — it never reached
+        a successfully-started state.
+
+        Raises:
+            RuntimeError: If state is not ``IDLE`` or no streams are
+                registered.
+            Exception: Any exception raised by a stream during
+                ``prepare``/``start`` propagates after rollback. State
+                returns to ``IDLE`` before the exception escapes.
+        """
+        with self._lock:
+            if self._state is not SessionState.IDLE:
+                raise RuntimeError(
+                    f"start() requires IDLE state; current state is {self._state.value}"
+                )
+            if not self._streams:
+                raise RuntimeError("cannot start() with no streams registered")
+
+            self._state = SessionState.PREPARING
+            self._sync_point = SyncPoint.create_now(self._host_id)
+            self._session_clock = SessionClock(sync_point=self._sync_point)
+
+            started: List[Stream] = []
+            try:
+                for stream in self._streams.values():
+                    stream.prepare()
+                    stream.start(self._session_clock)
+                    started.append(stream)
+            except Exception:
+                self._rollback_started_streams(started)
+                self._state = SessionState.IDLE
+                raise
+
+            self._state = SessionState.RECORDING
+
+    @staticmethod
+    def _rollback_started_streams(started: List[Stream]) -> None:
+        """Best-effort tear-down of streams that were fully started.
+
+        Called when ``start()`` fails partway through. Streams are stopped
+        in reverse order (LIFO) so later-started streams release their
+        resources before earlier-started ones. Any exceptions raised by
+        ``stop()`` during rollback are swallowed — the primary failure is
+        already on its way up the stack and is the real story.
+        """
+        for s in reversed(started):
+            try:
+                s.stop()
+            except Exception:  # pragma: no cover — best-effort cleanup
+                pass
