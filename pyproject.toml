@@ -4,13 +4,13 @@ build-backend = "hatchling.build"
 
 [project]
 name = "syncfield"
-version = "0.1.1"
-description = "Lightweight timestamp capture SDK for SyncField multi-stream synchronization"
+version = "0.2.0"
+description = "Multi-modal capture orchestration framework with precision sync for Physical AI data collection"
 readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.9"
 authors = [{ name = "OpenGraph Labs" }]
-keywords = ["synchronization", "timestamp", "multi-camera", "robotics", "data-collection"]
+keywords = ["synchronization", "timestamp", "multi-camera", "robotics", "data-collection", "physical-ai"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -21,6 +21,22 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Topic :: Scientific/Engineering",
+]
+
+[project.optional-dependencies]
+# sounddevice.play() internally requires numpy even when the caller hands it
+# Python lists, so numpy is part of the audio extra.
+audio = [
+    "sounddevice>=0.4.6",
+    "numpy>=1.21",
+]
+uvc = ["opencv-python>=4.5"]
+ble = ["bleak>=0.21"]
+all = [
+    "sounddevice>=0.4.6",
+    "numpy>=1.21",
+    "opencv-python>=4.5",
+    "bleak>=0.21",
 ]
 
 [project.urls]
@@ -34,8 +50,12 @@ packages = ["src/syncfield"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "hardware: tests that require physical hardware (cameras, BLE devices)",
+]
 
 [dependency-groups]
 dev = [
     "pytest>=8.4.2",
+    "pytest-mock>=3.12.0",
 ]
