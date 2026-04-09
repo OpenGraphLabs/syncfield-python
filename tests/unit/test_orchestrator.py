@@ -44,11 +44,18 @@ def _mock_player() -> MagicMock:
 
 
 def _fast_chirp_config() -> SyncToneConfig:
-    """Very short chirp + margins — keeps orchestrator tests snappy."""
+    """Very short chirp + margins — keeps orchestrator tests snappy.
+
+    ``countdown_tick`` is intentionally disabled so the mock chirp
+    player only gets called twice (start + stop chirp). Tests that
+    want to exercise the countdown beep explicitly construct their
+    own :class:`SyncToneConfig` with a tick spec.
+    """
     return SyncToneConfig(
         enabled=True,
         start_chirp=ChirpSpec(400, 2500, 10, 0.8, 2),
         stop_chirp=ChirpSpec(2500, 400, 10, 0.8, 2),
+        countdown_tick=None,
         post_start_stabilization_ms=5,
         pre_stop_tail_margin_ms=5,
     )
@@ -468,20 +475,28 @@ class TestStop:
 
 
 class TestChirpIntegration:
-    def test_chirp_skipped_when_no_audio_capable_stream(self, tmp_path, caplog):
+    def test_chirp_plays_even_when_no_stream_captures_audio(self, tmp_path):
+        """Regression test for the 0.2 audio-track gate removal.
+
+        Pre-0.2.1 the orchestrator silently skipped chirps when no
+        stream had ``provides_audio_track=True``. That surprised
+        operators driving plain webcam rigs — they pressed Record and
+        heard nothing. The fix was to play chirps whenever
+        :class:`SyncToneConfig` is enabled; this test pins the new
+        behaviour down so it doesn't regress.
+        """
         player = _mock_player()
         session = SessionOrchestrator(
             host_id="h",
             output_dir=tmp_path,
-            sync_tone=SyncToneConfig.default(),
+            sync_tone=_fast_chirp_config(),
             chirp_player=player,
         )
         session.add(FakeStream("a", provides_audio_track=False))
-        with caplog.at_level("INFO", logger="syncfield.orchestrator"):
-            session.start()
+        session.start()
         session.stop()
-        player.play.assert_not_called()
-        assert "cannot participate" in caplog.text.lower()
+        # Start chirp + stop chirp = 2 calls even with no audio stream.
+        assert player.play.call_count == 2
 
     def test_chirp_played_when_audio_capable_stream_exists(self, tmp_path):
         player = _mock_player()
@@ -495,6 +510,34 @@ class TestChirpIntegration:
         session.start()
         session.stop()
         assert player.play.call_count == 2  # start + stop chirp
+
+    def test_countdown_tick_plays_once_per_tick(self, tmp_path):
+        """A 3-second countdown fires exactly 3 tick beeps."""
+        player = MagicMock(spec=ChirpPlayer)
+        player.is_silent.return_value = False
+        # 3 countdown ticks + start chirp + stop chirp = 5 calls total.
+        player.play.side_effect = [
+            _mk_emission(software_ns=n) for n in (1, 2, 3, 4, 5)
+        ]
+        session = SessionOrchestrator(
+            host_id="h",
+            output_dir=tmp_path,
+            sync_tone=SyncToneConfig(
+                enabled=True,
+                start_chirp=ChirpSpec(400, 2500, 10, 0.8, 2),
+                stop_chirp=ChirpSpec(2500, 400, 10, 0.8, 2),
+                countdown_tick=ChirpSpec(1000, 1000, 10, 0.5, 2),
+                post_start_stabilization_ms=5,
+                pre_stop_tail_margin_ms=5,
+            ),
+            chirp_player=player,
+        )
+        session.add(FakeStream("a"))
+        session.connect()
+        session.start(countdown_s=3)
+        session.stop()
+        session.disconnect()
+        assert player.play.call_count == 5
 
     def test_silent_tone_never_plays_chirp(self, tmp_path):
         player = _mock_player()
@@ -963,6 +1006,126 @@ class TestFollowerRoleIntegration:
         )
         with pytest.raises(RuntimeError, match="start"):
             session.wait_for_leader_stopped()
+
+
+class TestSamplePersistence:
+    """Every recording session must persist the capture timestamps to
+    disk as ``{stream_id}.timestamps.jsonl`` (video/audio/custom) or
+    ``{stream_id}.jsonl`` (sensor). These files are the SDK→core
+    handoff — without them the sync service has nothing to align
+    against regardless of whether the MP4s landed correctly.
+    """
+
+    def test_video_stream_writes_timestamps_jsonl(self, tmp_path):
+        session = _session(tmp_path)
+        cam = FakeStream("cam")
+        session.add(cam)
+        session.start(countdown_s=0)
+        cam.push_sample(frame_number=0, capture_ns=1_000_000)
+        cam.push_sample(frame_number=1, capture_ns=2_000_000)
+        cam.push_sample(frame_number=2, capture_ns=3_000_000)
+        session.stop()
+
+        timestamps_path = tmp_path / "cam.timestamps.jsonl"
+        assert timestamps_path.exists(), (
+            "orchestrator must persist SampleEvents to "
+            "{stream_id}.timestamps.jsonl — they are the SDK→core sync handoff"
+        )
+        lines = [
+            json.loads(line)
+            for line in timestamps_path.read_text().splitlines()
+            if line
+        ]
+        assert len(lines) == 3
+        assert lines[0]["frame_number"] == 0
+        assert lines[0]["capture_ns"] == 1_000_000
+        assert lines[2]["frame_number"] == 2
+        assert lines[2]["capture_ns"] == 3_000_000
+        # Every emitted sample carries the session host id in
+        # ``clock_domain`` so the core can group streams by host later.
+        assert all(line["clock_domain"] == "rig_01" for line in lines)
+
+    def test_sensor_stream_writes_channel_jsonl(self, tmp_path):
+        """Sensor streams write ``{id}.jsonl`` including channel data."""
+        from syncfield.stream import StreamBase
+        from syncfield.types import (
+            FinalizationReport as _FR,
+            SampleEvent as _SE,
+            StreamCapabilities as _SC,
+        )
+
+        class _SensorFake(StreamBase):
+            def __init__(self, id):
+                super().__init__(
+                    id=id,
+                    kind="sensor",
+                    capabilities=_SC(),
+                )
+
+            def prepare(self):
+                pass
+
+            def start(self, clock):
+                pass
+
+            def stop(self):
+                return _FR(
+                    stream_id=self.id,
+                    status="completed",
+                    frame_count=0,
+                    file_path=None,
+                    first_sample_at_ns=None,
+                    last_sample_at_ns=None,
+                    health_events=[],
+                    error=None,
+                )
+
+            def push(self, frame_number, capture_ns, channels):
+                self._emit_sample(_SE(
+                    stream_id=self.id,
+                    frame_number=frame_number,
+                    capture_ns=capture_ns,
+                    channels=channels,
+                ))
+
+        session = _session(tmp_path)
+        imu = _SensorFake("torso_imu")
+        session.add(imu)
+        session.start(countdown_s=0)
+        imu.push(0, 100, {"ax": 0.1, "ay": -9.8})
+        imu.push(1, 110, {"ax": 0.15, "ay": -9.79})
+        session.stop()
+
+        sensor_path = tmp_path / "torso_imu.jsonl"
+        assert sensor_path.exists()
+        lines = [
+            json.loads(line)
+            for line in sensor_path.read_text().splitlines()
+            if line
+        ]
+        assert len(lines) == 2
+        assert lines[0]["channels"] == {"ax": 0.1, "ay": -9.8}
+        assert lines[1]["frame_number"] == 1
+
+    def test_samples_after_stop_do_not_race_closed_writer(self, tmp_path):
+        """The handler's ``active`` flag must neutralize trailing events."""
+        session = _session(tmp_path)
+        cam = FakeStream("cam")
+        session.add(cam)
+        session.start(countdown_s=0)
+        cam.push_sample(0, 100)
+        session.stop()
+        # Trailing emission AFTER stop() — the handler must no-op,
+        # not raise or write to the (now-closed) jsonl file.
+        cam.push_sample(1, 200)
+
+        lines = [
+            line
+            for line in (tmp_path / "cam.timestamps.jsonl").read_text().splitlines()
+            if line
+        ]
+        # Only the pre-stop sample made it to disk.
+        assert len(lines) == 1
 
 
 class TestSessionLog:

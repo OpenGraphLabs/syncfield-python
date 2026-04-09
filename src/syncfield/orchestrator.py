@@ -89,12 +89,28 @@ from syncfield.tone import ChirpPlayer, SyncToneConfig, create_default_player
 from syncfield.types import (
     ChirpEmission,
     FinalizationReport,
+    FrameTimestamp,
     HealthEvent,
+    SampleEvent,
+    SensorSample,
     SessionReport,
     SessionState,
     SyncPoint,
 )
-from syncfield.writer import SessionLogWriter, write_manifest, write_sync_point
+from syncfield.writer import (
+    SensorWriter,
+    SessionLogWriter,
+    StreamWriter,
+    write_manifest,
+    write_sync_point,
+)
+
+#: Either of the per-stream sample-persistence writers. Video / audio /
+#: custom streams get a :class:`StreamWriter` (``{id}.timestamps.jsonl``);
+#: sensor streams get a :class:`SensorWriter` (``{id}.jsonl``). The
+#: :class:`SessionOrchestrator` holds one writer per registered stream
+#: for the duration of a recording cycle and closes them on stop.
+SampleWriter = Union[StreamWriter, SensorWriter]
 
 logger = logging.getLogger(__name__)
 
@@ -243,6 +259,17 @@ class SessionOrchestrator:
         # In that case ``stop()`` also tears down the devices and lands
         # the session in ``STOPPED`` for backward compatibility.
         self._auto_connected: bool = False
+
+        # Sample persistence — one writer per registered stream, opened
+        # at the start of every recording cycle and closed at its end.
+        # ``_sample_handler_active`` holds a mutable flag per stream
+        # whose sole purpose is to let ``_close_sample_writers`` flip
+        # the corresponding handler closure into a no-op before the
+        # underlying file handle is released, so any in-flight
+        # ``SampleEvent`` from the capture thread can't race a
+        # ``write()`` against a closed writer.
+        self._sample_writers: Dict[str, SampleWriter] = {}
+        self._sample_handler_active: Dict[str, List[bool]] = {}
 
     # ------------------------------------------------------------------
     # Public properties
@@ -537,12 +564,30 @@ class SessionOrchestrator:
                 raise
 
             # --- Countdown -------------------------------------------
+            # Wrap the caller's visual callback with the tick beep so a
+            # single tick produces both the "3 → 2 → 1" overlay and a
+            # short audible cue. The tick plays first (so the sound
+            # front arrives at the same moment the number appears),
+            # then the user callback fires.
             self._transition(SessionState.COUNTDOWN)
-            _run_countdown(countdown_s, on_countdown_tick)
+
+            def _tick_with_beep(n: int) -> None:
+                self._maybe_play_countdown_tick()
+                if on_countdown_tick is not None:
+                    on_countdown_tick(n)
+
+            _run_countdown(countdown_s, _tick_with_beep)
 
             # --- Atomic start_recording ------------------------------
             self._sync_point = SyncPoint.create_now(self._host_id)
             self._session_clock = SessionClock(sync_point=self._sync_point)
+
+            # Open persistence writers BEFORE start_recording so the
+            # very first ``SampleEvent`` each adapter emits after
+            # flipping its ``_recording`` flag already has a handler
+            # attached. The writers live on ``self`` so the matching
+            # close path in ``_finalize_streams`` can flush them.
+            self._open_sample_writers()
 
             recording: List[Stream] = []
             try:
@@ -553,6 +598,10 @@ class SessionOrchestrator:
                 # Roll back the streams that did start writing.
                 self._log_rollback(exc, len(recording))
                 _rollback_stop_recording(recording)
+                # Close any writers we already opened — same path
+                # the happy stop() flow takes, so trailing samples
+                # from rolled-back streams don't race a closed file.
+                self._close_sample_writers()
                 self._stop_discovery_on_failure()
 
                 # If the user took the legacy one-shot path through
@@ -746,7 +795,122 @@ class SessionOrchestrator:
                     error=str(exc),
                 )
             finalizations.append(report)
+        # Close persistence writers AFTER every adapter's capture loop
+        # has observed ``_recording = False`` via ``stop_recording()``.
+        # Doing it in this order means no sample writes race the
+        # file-close path even on adapters that queue events between
+        # the flag flip and the thread join.
+        self._close_sample_writers()
         return finalizations
+
+    # ------------------------------------------------------------------
+    # Sample persistence — one writer per stream per recording cycle
+    # ------------------------------------------------------------------
+
+    def _open_sample_writers(self) -> None:
+        """Create + wire a persistence writer for every registered stream.
+
+        Called inside :meth:`start` just before the atomic
+        ``start_recording()`` loop so the very first ``SampleEvent``
+        each adapter emits under its ``_recording`` flag is already
+        captured to disk. Two writer shapes, one per stream kind:
+
+        * ``stream.kind == "sensor"`` → :class:`SensorWriter`
+          producing ``{stream_id}.jsonl`` with channel values.
+        * Everything else (video / audio / custom) →
+          :class:`StreamWriter` producing
+          ``{stream_id}.timestamps.jsonl`` with frame timestamps only.
+
+        The handler closure holds a mutable ``active`` flag that
+        :meth:`_close_sample_writers` flips to ``False`` before
+        releasing the file handle, so trailing samples from the
+        capture thread become no-ops instead of writing to a closed
+        writer.
+        """
+        for stream in self._streams.values():
+            writer: SampleWriter
+            if stream.kind == "sensor":
+                writer = SensorWriter(stream.id, self._output_dir)
+            else:
+                writer = StreamWriter(stream.id, self._output_dir)
+            writer.open()
+            active: List[bool] = [True]
+            stream.on_sample(self._make_sample_handler(writer, active))
+            self._sample_writers[stream.id] = writer
+            self._sample_handler_active[stream.id] = active
+
+    def _make_sample_handler(
+        self,
+        writer: SampleWriter,
+        active: List[bool],
+    ) -> Callable[[SampleEvent], None]:
+        """Build the ``on_sample`` callback that persists events.
+
+        Separated from :meth:`_open_sample_writers` so the closure
+        captures exactly ``writer`` + ``active`` + ``host_id`` and
+        nothing else — no stray references to the orchestrator that
+        would keep it alive across sessions.
+        """
+        host_id = self._host_id
+
+        def _handle(event: SampleEvent) -> None:
+            if not active[0]:
+                return
+            try:
+                if isinstance(writer, SensorWriter):
+                    writer.write(
+                        SensorSample(
+                            frame_number=event.frame_number,
+                            capture_ns=event.capture_ns,
+                            channels=event.channels or {},
+                            clock_source="host_monotonic",
+                            clock_domain=host_id,
+                            uncertainty_ns=event.uncertainty_ns,
+                        )
+                    )
+                else:
+                    writer.write(
+                        FrameTimestamp(
+                            frame_number=event.frame_number,
+                            capture_ns=event.capture_ns,
+                            clock_source="host_monotonic",
+                            clock_domain=host_id,
+                            uncertainty_ns=event.uncertainty_ns,
+                        )
+                    )
+            except Exception as exc:  # pragma: no cover - best-effort
+                logger.warning(
+                    "sample writer for %s raised %s: %s",
+                    event.stream_id,
+                    type(exc).__name__,
+                    exc,
+                )
+
+        return _handle
+
+    def _close_sample_writers(self) -> None:
+        """Flush and close every per-stream sample writer.
+
+        Flips every handler's ``active`` flag to ``False`` FIRST so
+        any trailing ``SampleEvent`` already in flight from the
+        capture thread becomes a no-op before we close the backing
+        file handles. Swallows per-writer close errors so a single
+        broken file cannot block the rest of the teardown.
+        """
+        for active in self._sample_handler_active.values():
+            active[0] = False
+        for stream_id, writer in self._sample_writers.items():
+            try:
+                writer.close()
+            except Exception as exc:  # pragma: no cover - best-effort
+                logger.warning(
+                    "closing sample writer for %s raised %s: %s",
+                    stream_id,
+                    type(exc).__name__,
+                    exc,
+                )
+        self._sample_writers.clear()
+        self._sample_handler_active.clear()
 
     def _persist_session_artifacts(
         self,
@@ -879,11 +1043,25 @@ class SessionOrchestrator:
     def _is_chirp_eligible(self) -> bool:
         """Return True if this host should play sync chirps.
 
-        Chirp eligibility is a host-level check: chirps exist to
-        enable inter-host audio cross-correlation, so they only matter
-        if at least one registered stream actually captures audio.
-        Single-host sessions with no audio stream happily rely on
-        intra-host timestamp alignment and need no chirp at all.
+        Chirps now serve two roles:
+
+        1. **Operator feedback** — audible start/stop cues so whoever
+           is driving a recording knows the session actually began
+           and ended. This matters in every config, even a video-only
+           single-host rig with no microphone attached.
+        2. **Inter-host audio cross-correlation** — when at least one
+           stream captures audio, the chirp also lands inside that
+           track and becomes the shared acoustic anchor the sync
+           service uses to align peer hosts. That's a side effect of
+           playing the chirp, not a precondition for playing it.
+
+        Up through 0.2.x the eligibility check also required at least
+        one ``provides_audio_track=True`` stream, which meant a plain
+        webcam rig recorded in total silence — operators pressed
+        Record and heard nothing. The gate is gone: chirps now play
+        whenever :class:`SyncToneConfig` is enabled and this host is
+        not a follower. Silent operation is still available via
+        :meth:`SyncToneConfig.silent`.
 
         **Followers never play chirps.** They rely on the leader's
         chirps being captured by every host's microphones in the same
@@ -895,9 +1073,7 @@ class SessionOrchestrator:
             return False
         if not self._sync_tone.enabled:
             return False
-        return any(
-            s.capabilities.provides_audio_track for s in self._streams.values()
-        )
+        return True
 
     def _maybe_play_start_chirp(self) -> None:
         """Play the start chirp if eligible, else log an INFO line.
@@ -910,18 +1086,41 @@ class SessionOrchestrator:
         """
         if self._is_chirp_eligible():
             time.sleep(self._sync_tone.post_start_stabilization_ms / 1000.0)
-            self._chirp_start = self._chirp_player.play(
-                self._sync_tone.start_chirp
-            )
+            try:
+                self._chirp_start = self._chirp_player.play(
+                    self._sync_tone.start_chirp
+                )
+            except Exception:  # pragma: no cover — audio path is best-effort
+                logger.exception("start chirp playback failed")
             return
 
         if self._sync_tone.enabled:
             logger.info(
-                "[%s] No audio-capable stream registered on this host. "
-                "Chirp injection disabled — host cannot participate in "
-                "inter-host audio sync. Single-host sessions unaffected.",
+                "[%s] Chirp injection skipped (sync_tone.enabled=False or "
+                "follower role). No operator start cue will be played.",
                 self._host_id,
             )
+
+    def _maybe_play_countdown_tick(self) -> None:
+        """Play the configured countdown tick beep if eligible.
+
+        Called from the countdown loop once per remaining second.
+        Short (default 100 ms) and non-blocking — the
+        :class:`SoundDeviceChirpPlayer` returns as soon as the audio
+        backend's first callback fires, so the countdown sleep
+        proceeds without waiting for the full tick to drain.
+        Exceptions are swallowed: a misbehaving audio path should
+        never prevent the recording from starting.
+        """
+        if not self._is_chirp_eligible():
+            return
+        tick = self._sync_tone.countdown_tick
+        if tick is None:
+            return
+        try:
+            self._chirp_player.play(tick)
+        except Exception:  # pragma: no cover — audio path is best-effort
+            logger.exception("countdown tick playback failed")
 
     def _maybe_play_stop_chirp_and_wait(self) -> None:
         """Play the stop chirp BEFORE stopping streams and wait for it to flush.
