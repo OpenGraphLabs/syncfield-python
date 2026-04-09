@@ -103,3 +103,100 @@ def test_cv2_missing_raises_clear_install_hint(monkeypatch):
     sys.modules.pop("syncfield.adapters.uvc_webcam", None)
     with pytest.raises(ImportError, match=r"syncfield\[uvc\]"):
         importlib.import_module("syncfield.adapters.uvc_webcam")
+
+
+# ---------------------------------------------------------------------------
+# 4-phase lifecycle — live preview before recording
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def mock_cv2_generous(monkeypatch):
+    """Like ``mock_cv2`` but with a large frame budget so the capture
+    thread can run through a preview phase AND a recording phase
+    without exhausting the mocked ``read()`` side-effect.
+    """
+    fake = _build_fake_cv2(frame_budget=10_000)
+    monkeypatch.setitem(sys.modules, "cv2", fake)
+    sys.modules.pop("syncfield.adapters.uvc_webcam", None)
+    importlib.import_module("syncfield.adapters.uvc_webcam")
+    yield fake
+    sys.modules.pop("syncfield.adapters.uvc_webcam", None)
+
+
+class TestFourPhaseLifecycle:
+    """UVCWebcamStream must support live preview in CONNECTED state.
+
+    The 4-phase lifecycle is what the viewer uses: ``connect()`` runs
+    the capture thread in preview-only mode so ``latest_frame``
+    populates before the user clicks Record; ``start_recording()``
+    then flips the recording flag and opens the writer without
+    respawning the thread.
+    """
+
+    def test_connect_starts_preview_without_writing(self, mock_cv2_generous, tmp_path):
+        from syncfield.adapters.uvc_webcam import UVCWebcamStream
+
+        stream = UVCWebcamStream("cam", device_index=0, output_dir=tmp_path)
+        stream.prepare()
+        stream.connect()
+        time.sleep(0.1)  # let the thread read a few mocked frames
+        try:
+            # Writer was never constructed — preview phase doesn't write.
+            assert stream._writer is None  # noqa: SLF001
+            # No SampleEvent emissions, no advanced frame counter.
+            assert stream._frame_count == 0  # noqa: SLF001
+            # But latest_frame IS populated so the viewer card can
+            # render the live thumbnail.
+            assert stream.latest_frame is not None
+        finally:
+            stream.disconnect()
+
+    def test_start_recording_flips_to_writing(self, mock_cv2_generous, tmp_path):
+        from syncfield.adapters.uvc_webcam import UVCWebcamStream
+
+        stream = UVCWebcamStream("cam", device_index=0, output_dir=tmp_path)
+        stream.prepare()
+        stream.connect()
+        time.sleep(0.05)  # preview phase
+        frames_before = stream._frame_count  # noqa: SLF001
+
+        stream.start_recording(_clock())
+        time.sleep(0.1)  # recording phase
+
+        report = stream.stop_recording()
+        try:
+            assert frames_before == 0  # preview didn't advance the counter
+            assert report.frame_count >= 1  # recording did
+            assert report.file_path is not None
+            # Stream stays connected after stop_recording — the thread
+            # is still alive so the preview continues.
+            assert stream._thread is not None  # noqa: SLF001
+            assert stream._thread.is_alive()  # noqa: SLF001
+        finally:
+            stream.disconnect()
+
+    def test_disconnect_stops_capture_thread(self, mock_cv2_generous, tmp_path):
+        from syncfield.adapters.uvc_webcam import UVCWebcamStream
+
+        stream = UVCWebcamStream("cam", device_index=0, output_dir=tmp_path)
+        stream.prepare()
+        stream.connect()
+        time.sleep(0.05)
+        stream.disconnect()
+        # Thread handle is cleared and the OS thread has joined.
+        assert stream._thread is None  # noqa: SLF001
+
+    def test_connect_is_idempotent(self, mock_cv2_generous, tmp_path):
+        """Calling connect() twice must not spawn a second thread."""
+        from syncfield.adapters.uvc_webcam import UVCWebcamStream
+
+        stream = UVCWebcamStream("cam", device_index=0, output_dir=tmp_path)
+        stream.prepare()
+        stream.connect()
+        first_thread = stream._thread  # noqa: SLF001
+        stream.connect()  # second call is a no-op
+        try:
+            assert stream._thread is first_thread  # noqa: SLF001
+        finally:
+            stream.disconnect()

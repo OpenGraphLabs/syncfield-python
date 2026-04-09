@@ -6,8 +6,33 @@ Requires the optional ``uvc`` extra:
 
 The adapter runs a background thread that reads frames in a tight loop,
 timestamps each read with ``time.monotonic_ns()`` **before** any further
-processing, emits a :class:`~syncfield.types.SampleEvent`, and writes the
-frame to an MP4 via ``cv2.VideoWriter``.
+processing, and publishes them to :attr:`latest_frame` for the viewer
+to preview. The **same thread** writes to an MP4 via ``cv2.VideoWriter``
+and emits :class:`~syncfield.types.SampleEvent` — but only while the
+session is in :attr:`~syncfield.SessionState.RECORDING`. In the
+:attr:`~syncfield.SessionState.CONNECTED` live-preview phase the loop
+keeps feeding ``latest_frame`` so the viewer card shows a live
+thumbnail, without touching the filesystem.
+
+Lifecycle
+---------
+
+This adapter implements the 4-phase :class:`~syncfield.Stream` SPI:
+
+* ``prepare()``   — create the output directory and open ``cv2.VideoCapture``.
+* ``connect()``   — start the capture thread in preview-only mode;
+  ``latest_frame`` begins updating immediately.
+* ``start_recording()`` — open the ``VideoWriter`` and flip the
+  ``_recording`` flag so the loop starts writing and emitting samples.
+* ``stop_recording()`` — flip ``_recording`` off and close the writer;
+  the capture thread keeps running so preview continues.
+* ``disconnect()`` — stop the capture thread and release the
+  ``VideoCapture`` handle.
+
+Legacy ``start()`` / ``stop()`` are still supported for one-shot code
+paths (tests, scripts that don't use the viewer): they simply call
+``connect() + start_recording()`` and ``stop_recording() + disconnect()``
+respectively.
 """
 
 from __future__ import annotations
@@ -84,6 +109,13 @@ class UVCWebcamStream(StreamBase):
         self._first_at: Optional[int] = None
         self._last_at: Optional[int] = None
 
+        # True while the capture loop is writing frames to the MP4
+        # writer and emitting ``SampleEvent``s. ``connect()`` leaves
+        # this False so the preview phase stays write-free;
+        # ``start_recording()`` flips it True; ``stop_recording()``
+        # flips it False again while the thread keeps running.
+        self._recording = False
+
         # Live preview support — the viewer reads ``latest_frame`` to render
         # the stream card thumbnail. ``_frame_lock`` protects handoff between
         # the capture thread and the reader; the frame itself is a plain
@@ -99,35 +131,84 @@ class UVCWebcamStream(StreamBase):
         return ("uvc_webcam", str(self._device_index))
 
     # ------------------------------------------------------------------
-    # Stream SPI
+    # Stream SPI — 4-phase lifecycle
     # ------------------------------------------------------------------
 
     def prepare(self) -> None:
+        """Create the output directory and open ``cv2.VideoCapture``.
+
+        Called once by the orchestrator before ``connect()``. The
+        device handle stays open from here until ``disconnect()``.
+        """
         self._output_dir.mkdir(parents=True, exist_ok=True)
-        self._capture = cv2.VideoCapture(self._device_index)
+        if self._capture is None:
+            self._capture = cv2.VideoCapture(self._device_index)
         if not self._capture.isOpened():
             raise RuntimeError(
                 f"cv2.VideoCapture({self._device_index}) failed to open"
             )
 
-    def start(self, session_clock: SessionClock) -> None:
-        width, height, fps = self._resolve_frame_geometry()
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        self._writer = cv2.VideoWriter(
-            str(self._file_path), fourcc, fps, (width, height)
-        )
+    def connect(self) -> None:
+        """Start the capture thread in preview-only mode.
+
+        After this call the background thread reads frames as fast as
+        the device allows and publishes each one to
+        :attr:`latest_frame` so the viewer's stream card shows a live
+        thumbnail. **No file is written and no SampleEvents are
+        emitted** until ``start_recording()`` flips the
+        ``_recording`` flag.
+
+        Idempotent: calling ``connect()`` on an already-connected
+        stream is a no-op so the legacy ``start()`` wrapper can call
+        it unconditionally without risking a second thread.
+        """
+        if self._thread is not None and self._thread.is_alive():
+            return
+        # prepare() is the documented step that opens the capture,
+        # but legacy scripts that jump straight to start() route
+        # through connect() too — so open the device here if nobody
+        # already did.
+        if self._capture is None or not self._capture.isOpened():
+            self.prepare()
+        self._recording = False
         self._stop_event.clear()
         self._thread = threading.Thread(
             target=self._capture_loop, name=f"uvc-{self.id}", daemon=True
         )
         self._thread.start()
 
-    def stop(self) -> FinalizationReport:
-        self._stop_event.set()
-        if self._thread is not None:
-            self._thread.join(timeout=2.0)
-        self._release_cv2_resources()
+    def start_recording(self, session_clock: SessionClock) -> None:
+        """Open the ``VideoWriter`` and flip recording on.
 
+        The capture thread is already running from ``connect()``,
+        so this is effectively a flag flip plus one ``cv2.VideoWriter``
+        construction. The first frame written after this call lands
+        at ``frame_count == 1``.
+
+        If the caller skipped ``connect()`` (legacy ``start()`` path),
+        the thread is started first so the writer always has a
+        feeder thread to back it.
+        """
+        if self._thread is None or not self._thread.is_alive():
+            self.connect()
+        width, height, fps = self._resolve_frame_geometry()
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        self._writer = cv2.VideoWriter(
+            str(self._file_path), fourcc, fps, (width, height)
+        )
+        self._recording = True
+
+    def stop_recording(self) -> FinalizationReport:
+        """Flip recording off, close the writer, emit the report.
+
+        The capture thread **keeps running** after this call so the
+        viewer preview stays live and the user can start a new
+        recording on the same session without re-opening hardware.
+        """
+        self._recording = False
+        if self._writer is not None:
+            self._writer.release()
+            self._writer = None
         return FinalizationReport(
             stream_id=self.id,
             status="completed",
@@ -138,6 +219,59 @@ class UVCWebcamStream(StreamBase):
             health_events=list(self._collected_health),
             error=None,
         )
+
+    def disconnect(self) -> None:
+        """Stop the capture thread and release the device handle.
+
+        Called by the orchestrator when the session returns to
+        ``IDLE``. After this call the adapter holds no OS resources.
+        Idempotent — calling it twice is safe.
+        """
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+            self._thread = None
+        self._release_cv2_resources()
+
+    # ------------------------------------------------------------------
+    # Legacy one-shot lifecycle
+    # ------------------------------------------------------------------
+
+    def start(self, session_clock: SessionClock) -> None:
+        """Legacy one-shot start — open writer and start recording immediately.
+
+        Exists so 0.1-era scripts that call ``prepare() → start() →
+        stop()`` keep working without changes. The flag and writer
+        are set up **before** the capture thread spawns so the very
+        first frame off ``read()`` lands in both the file and the
+        emitted :class:`SampleEvent` — no preview phase.
+
+        New callers (the viewer, the 4-phase orchestrator path)
+        should use :meth:`connect` and :meth:`start_recording`
+        directly to get live preview before the first Record click.
+        """
+        if self._capture is None or not self._capture.isOpened():
+            self.prepare()
+        width, height, fps = self._resolve_frame_geometry()
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        self._writer = cv2.VideoWriter(
+            str(self._file_path), fourcc, fps, (width, height)
+        )
+        # Flip the recording flag BEFORE spawning the thread so the
+        # loop records from frame 1 instead of racing through a
+        # preview phase the caller never asked for.
+        self._recording = True
+        self._stop_event.clear()
+        self._thread = threading.Thread(
+            target=self._capture_loop, name=f"uvc-{self.id}", daemon=True
+        )
+        self._thread.start()
+
+    def stop(self) -> FinalizationReport:
+        """Legacy one-shot stop — stop_recording + disconnect in one call."""
+        report = self.stop_recording()
+        self.disconnect()
+        return report
 
     # ------------------------------------------------------------------
     # Helpers
@@ -155,11 +289,25 @@ class UVCWebcamStream(StreamBase):
         return width, height, fps
 
     def _capture_loop(self) -> None:
-        """Background thread body — read/timestamp/emit/write in a tight loop.
+        """Background thread body — read frames in a tight loop.
 
-        The timestamp is captured immediately after ``read()`` so the
-        jitter between the physical frame and our recorded timestamp
-        stays as small as possible.
+        Two phases, distinguished by the ``_recording`` flag:
+
+        * **Preview** (``_recording == False``) — publish every frame
+          to ``latest_frame`` so the viewer card stays live, but do
+          **not** write to the file, update frame counters, or emit
+          ``SampleEvent``. The capture runs continuously from the
+          moment ``connect()`` spawned this thread.
+        * **Recording** (``_recording == True``) — same preview
+          publish, plus append the frame to the ``VideoWriter``,
+          advance ``_frame_count``, and emit ``SampleEvent``. The
+          capture timestamp is sampled immediately after ``read()``
+          so the jitter between the physical frame and the recorded
+          monotonic time stays as small as possible.
+
+        The loop exits when ``_stop_event`` fires (from
+        ``disconnect()``) or when ``read()`` returns a falsy result
+        (hardware disconnect / device busy).
         """
         assert self._capture is not None
         while not self._stop_event.is_set():
@@ -167,24 +315,26 @@ class UVCWebcamStream(StreamBase):
             capture_ns = time.monotonic_ns()
             if not ok or frame is None:
                 break
-            if self._first_at is None:
-                self._first_at = capture_ns
-            self._last_at = capture_ns
-            self._frame_count += 1
 
-            # Publish the latest frame for live preview (viewer reads this).
+            # Always publish for live preview — the viewer reads this
+            # in both CONNECTED and RECORDING states.
             with self._frame_lock:
                 self._latest_frame = frame
 
-            if self._writer is not None:
-                self._writer.write(frame)
-            self._emit_sample(
-                SampleEvent(
-                    stream_id=self.id,
-                    frame_number=self._frame_count - 1,
-                    capture_ns=capture_ns,
+            if self._recording:
+                if self._first_at is None:
+                    self._first_at = capture_ns
+                self._last_at = capture_ns
+                self._frame_count += 1
+                if self._writer is not None:
+                    self._writer.write(frame)
+                self._emit_sample(
+                    SampleEvent(
+                        stream_id=self.id,
+                        frame_number=self._frame_count - 1,
+                        capture_ns=capture_ns,
+                    )
                 )
-            )
 
     # ------------------------------------------------------------------
     # Live preview

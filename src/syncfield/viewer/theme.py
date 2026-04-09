@@ -59,9 +59,13 @@ DANGER = (220, 38, 38, 255)            # #DC2626  — red-600
 DANGER_SOFT = (254, 226, 226, 255)     # #FEE2E2
 INFO = (14, 165, 233, 255)             # #0EA5E9  — sky-500
 
-# Session state indicators
+# Session state indicators — one color per value of SessionState so the
+# header dot gives an at-a-glance read on what the session is doing.
 STATE_IDLE = TEXT_MUTED
+STATE_CONNECTING = WARNING
+STATE_CONNECTED = INFO
 STATE_PREPARING = WARNING
+STATE_COUNTDOWN = WARNING
 STATE_RECORDING = DANGER
 STATE_STOPPING = WARNING
 STATE_STOPPED = SUCCESS
@@ -109,14 +113,19 @@ VIDEO_THUMBNAIL_HEIGHT = 146  # 16:9 at 260 width
 PLOT_HEIGHT = 146
 
 # Layout sections
-HEADER_HEIGHT = 72
-CONTROL_PANEL_HEIGHT = 160
-STREAMS_SECTION_HEIGHT = 340
-HEALTH_SECTION_HEIGHT = 180
-FOOTER_HEIGHT = 48
+HEADER_HEIGHT = 76
+# 3-row control stack: Connect (34) + spacer (8) + Record/Stop row
+# (34) + spacer (8) + Cancel (28) + label row (~28) + DPG padding.
+CONTROL_PANEL_HEIGHT = 212
+STREAMS_SECTION_HEIGHT = 332   # 300 card + ~14 scrollbar + internal padding
+HEALTH_SECTION_HEIGHT = 130
+FOOTER_HEIGHT = 44
 
-VIEWPORT_WIDTH = 1200
-VIEWPORT_HEIGHT = 900
+# Viewport sized to fit on a 13" MacBook screen (1440x900 scaled, 1728x1117
+# native) with the window pinned at (60, 60) — the content rectangle
+# stays above the Dock and below the menu bar.
+VIEWPORT_WIDTH = 1240
+VIEWPORT_HEIGHT = 960
 
 
 # ---------------------------------------------------------------------------
@@ -301,16 +310,22 @@ def build_card_theme() -> int:
 
 
 def build_soft_panel_theme() -> int:
-    """Theme for secondary panels — light gray fill, no border."""
+    """Theme for secondary panels — light gray fill with a hairline border.
+
+    The 1 px border lets control/clock panels read as distinct containers
+    against the same-tone app background without leaning on heavier
+    chrome. Matches the stream cards' visual weight so the whole UI
+    feels like one consistent family of cards.
+    """
     import dearpygui.dearpygui as dpg
 
     with dpg.theme() as theme_tag:
         with dpg.theme_component(dpg.mvChildWindow):
             dpg.add_theme_color(dpg.mvThemeCol_ChildBg, BG_PANEL_SOFT)
-            dpg.add_theme_color(dpg.mvThemeCol_Border, (0, 0, 0, 0))
+            dpg.add_theme_color(dpg.mvThemeCol_Border, BORDER_SUBTLE)
             dpg.add_theme_style(dpg.mvStyleVar_ChildRounding, CHILD_ROUNDING)
-            dpg.add_theme_style(dpg.mvStyleVar_ChildBorderSize, 0)
-            dpg.add_theme_style(dpg.mvStyleVar_WindowPadding, 16, 14)
+            dpg.add_theme_style(dpg.mvStyleVar_ChildBorderSize, 1)
+            dpg.add_theme_style(dpg.mvStyleVar_WindowPadding, 18, 16)
     return theme_tag
 
 
@@ -323,7 +338,10 @@ def state_color(state_value: str) -> Tuple[int, int, int, int]:
     """Map a ``SessionState.value`` string to its indicator color."""
     return {
         "idle": STATE_IDLE,
+        "connecting": STATE_CONNECTING,
+        "connected": STATE_CONNECTED,
         "preparing": STATE_PREPARING,
+        "countdown": STATE_COUNTDOWN,
         "recording": STATE_RECORDING,
         "stopping": STATE_STOPPING,
         "stopped": STATE_STOPPED,

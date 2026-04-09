@@ -111,6 +111,7 @@ class ViewerLayout:
 
         dpg.bind_item_theme("control_panel", self._soft_panel_theme)
         dpg.bind_item_theme("clock_panel", self._soft_panel_theme)
+        dpg.bind_item_theme("btn_connect", self._primary_theme)
         dpg.bind_item_theme("btn_record", self._primary_theme)
         dpg.bind_item_theme("btn_stop", self._danger_theme)
         dpg.bind_item_theme("btn_cancel", self._ghost_theme)
@@ -127,33 +128,13 @@ class ViewerLayout:
         self._discovery_modal = DiscoveryModal(self._session, fonts=self._fonts)
         self._discovery_modal.build()
 
-        # Kick off the connect phase on a worker thread so the viewer
-        # can render its first frame before device I/O finishes (some
-        # adapters block for hundreds of ms on open). After the thread
-        # returns, the session is in CONNECTED and streams publish
-        # live preview data until the user hits Record.
-        self._auto_connect_on_build()
-
-    def _auto_connect_on_build(self) -> None:
-        """Transition the session into CONNECTED on a worker thread.
-
-        Called from :meth:`build`. The orchestrator's ``connect()`` is
-        fast for synthetic streams but slow for real hardware, so we
-        dispatch it off the render thread. Errors are logged and
-        swallowed — a failed connect leaves the session in ``IDLE``
-        with the error visible in the session log and the viewer's
-        state chip.
-        """
-        if self._session.state is not SessionState.IDLE:
-            return
-        if not self._session._streams:  # noqa: SLF001
-            return
-        threading.Thread(
-            target=self._safe_call,
-            args=(self._session.connect,),
-            name="viewer-auto-connect",
-            daemon=True,
-        ).start()
+        # The viewer intentionally does NOT auto-connect. The user
+        # clicks the Connect button when they're ready, at which
+        # point the session transitions IDLE → CONNECTED and every
+        # adapter starts producing live preview frames for its card.
+        # Before that click the viewer sits in IDLE with empty
+        # stream cards, which gives the user a beat to review the
+        # registered streams and run Discovery if needed.
 
     def _bind_fonts(self) -> None:
         """Assign per-widget fonts from the shared :class:`FontRegistry`.
@@ -250,7 +231,19 @@ class ViewerLayout:
         )
 
     def _build_control_and_clock_row(self) -> None:
-        """Two side-by-side panels: controls + session clock."""
+        """Two side-by-side panels: controls + session clock.
+
+        Control panel button stack (top to bottom):
+
+            [         Connect         ]   ← IDLE only; opens devices + live preview
+            [ Record  ] [    Stop    ]    ← Record is CONNECTED-only; Stop is RECORDING-only
+            [          Cancel          ]   ← COUNTDOWN / RECORDING only
+
+        Connect is a separate explicit step so the user can open the
+        viewer, review the registered streams, run Discovery if they
+        want, and then kick off device I/O with a single click —
+        nothing opens a camera handle until they ask for it.
+        """
         with dpg.group(horizontal=True):
             # --- Control panel ----------------------------------------
             with dpg.child_window(
@@ -264,6 +257,16 @@ class ViewerLayout:
                     "CONTROLS", tag="label_controls", color=theme.TEXT_MUTED,
                 )
                 dpg.add_spacer(height=10)
+                # Row 1 — Connect (primary in IDLE, disabled otherwise)
+                dpg.add_button(
+                    label="Connect",
+                    tag="btn_connect",
+                    width=212,
+                    height=34,
+                    callback=self._on_connect_click,
+                )
+                dpg.add_spacer(height=8)
+                # Row 2 — Record + Stop (split 112 / 92 = 204 + 8 gap)
                 with dpg.group(horizontal=True):
                     dpg.add_button(
                         label="Record",
@@ -280,6 +283,7 @@ class ViewerLayout:
                         callback=self._on_stop_click,
                     )
                 dpg.add_spacer(height=8)
+                # Row 3 — Cancel (aborts COUNTDOWN / best-effort Stop)
                 dpg.add_button(
                     label="Cancel",
                     tag="btn_cancel",
@@ -468,16 +472,20 @@ class ViewerLayout:
           teardown has completed and the viewer is typically closing.
         """
         state = snapshot.state
+        # Connect: the one gateway out of IDLE. After the user clicks
+        # it the session walks IDLE → CONNECTING → CONNECTED on its
+        # own, so the button stays disabled from CONNECTING onward.
+        _set_enabled("btn_connect", state == "idle")
         _set_enabled("btn_record", state == "connected")
         _set_enabled("btn_stop", state == "recording")
         _set_enabled(
             "btn_cancel",
             state in ("preparing", "countdown", "recording"),
         )
-        # Discovery is allowed during the preview phase (CONNECTED)
-        # because ``scan_and_add`` refuses if the session is actually
-        # recording, so the registry add path stays safe.
-        _set_enabled("btn_discover", state == "connected")
+        # Discovery is allowed before connecting (IDLE) so the user
+        # can add more streams to the session before live preview
+        # starts. ``scan_and_add`` requires IDLE anyway.
+        _set_enabled("btn_discover", state == "idle")
 
     def _update_streams(self, snapshot: SessionSnapshot, now_ns: int) -> None:
         # Create cards for new streams.
@@ -568,6 +576,27 @@ class ViewerLayout:
     # Button callbacks — all delegate to a worker thread so the UI stays
     # responsive while the SDK's start()/stop() run.
     # ------------------------------------------------------------------
+
+    def _on_connect_click(self) -> None:
+        """Open devices on every registered stream (IDLE → CONNECTED).
+
+        Dispatched onto a worker thread because device open is slow
+        for real hardware (several hundred ms per UVC device, longer
+        for BLE). After ``connect()`` returns the session is in
+        ``CONNECTED`` and each adapter's capture loop is publishing
+        live frames to its :attr:`latest_frame` / plot buffers — the
+        next render tick picks them up and the stream cards go live.
+
+        Errors from ``connect()`` are logged by :meth:`_safe_call`
+        and leave the session back in ``IDLE`` so the user can
+        retry without closing the viewer.
+        """
+        threading.Thread(
+            target=self._safe_call,
+            args=(self._session.connect,),
+            name="viewer-ctrl-connect",
+            daemon=True,
+        ).start()
 
     def _on_record_click(self) -> None:
         """Trigger the full start flow: countdown → record → chirp.
