@@ -3,8 +3,22 @@
 import json
 from pathlib import Path
 
-from syncfield.types import FrameTimestamp, SensorSample, SyncPoint
-from syncfield.writer import SensorWriter, StreamWriter, write_manifest, write_sync_point
+from syncfield.types import (
+    ChirpSpec,
+    FrameTimestamp,
+    HealthEvent,
+    HealthEventKind,
+    SensorSample,
+    StreamCapabilities,
+    SyncPoint,
+)
+from syncfield.writer import (
+    SensorWriter,
+    SessionLogWriter,
+    StreamWriter,
+    write_manifest,
+    write_sync_point,
+)
 
 
 def test_stream_writer_creates_jsonl(tmp_path: Path):
@@ -123,3 +137,103 @@ def test_write_manifest(tmp_path: Path):
     assert data["host_id"] == "test_host"
     assert "streams" in data
     assert data["streams"]["cam_left"]["type"] == "video"
+
+
+# --- sync_point.json chirp extensions ---
+
+
+class TestSyncPointWithChirp:
+    def test_writes_chirp_fields_when_provided(self, tmp_path: Path):
+        sp = SyncPoint.create_now("h")
+        spec = ChirpSpec(400, 2500, 500, 0.8, 15)
+        path = write_sync_point(
+            sp,
+            tmp_path,
+            chirp_start_ns=1_000_000_000,
+            chirp_stop_ns=5_000_000_000,
+            chirp_spec=spec,
+        )
+        data = json.loads(path.read_text())
+        assert data["chirp_start_ns"] == 1_000_000_000
+        assert data["chirp_stop_ns"] == 5_000_000_000
+        assert data["chirp_spec"] == spec.to_dict()
+
+    def test_omits_chirp_fields_when_none(self, tmp_path: Path):
+        sp = SyncPoint.create_now("h")
+        path = write_sync_point(sp, tmp_path)
+        data = json.loads(path.read_text())
+        assert "chirp_start_ns" not in data
+        assert "chirp_stop_ns" not in data
+        assert "chirp_spec" not in data
+
+
+# --- manifest.json capability round-trip ---
+
+
+class TestManifestWithCapabilities:
+    def test_writes_capabilities_when_provided(self, tmp_path: Path):
+        caps = StreamCapabilities(provides_audio_track=True, produces_file=True)
+        streams = {
+            "cam": {
+                "type": "video",
+                "path": "cam.mp4",
+                "capabilities": caps.to_dict(),
+            }
+        }
+        path = write_manifest("h", streams, tmp_path)
+        data = json.loads(path.read_text())
+        assert data["streams"]["cam"]["capabilities"]["provides_audio_track"] is True
+        assert data["streams"]["cam"]["capabilities"]["produces_file"] is True
+
+
+# --- SessionLogWriter ---
+
+
+class TestSessionLogWriter:
+    def test_writes_events_and_health_as_jsonl(self, tmp_path: Path):
+        writer = SessionLogWriter(tmp_path)
+        writer.open()
+        writer.log_event(
+            {
+                "kind": "state_transition",
+                "from": "idle",
+                "to": "preparing",
+                "at_ns": 100,
+            }
+        )
+        writer.log_health(
+            HealthEvent("cam", HealthEventKind.HEARTBEAT, at_ns=200, detail=None)
+        )
+        writer.close()
+
+        lines = (tmp_path / "session_log.jsonl").read_text().strip().split("\n")
+        assert len(lines) == 2
+        ev1 = json.loads(lines[0])
+        ev2 = json.loads(lines[1])
+        assert ev1["kind"] == "state_transition"
+        assert ev1["from"] == "idle"
+        assert ev2["kind"] == "health"
+        assert ev2["stream_id"] == "cam"
+        assert ev2["health_kind"] == "heartbeat"
+
+    def test_flushes_on_every_write(self, tmp_path: Path):
+        """Log lines must survive a process crash mid-recording."""
+        writer = SessionLogWriter(tmp_path)
+        writer.open()
+        writer.log_event({"kind": "test", "at_ns": 1})
+        # Without calling close(), the line must already be on disk
+        content = (tmp_path / "session_log.jsonl").read_text()
+        assert "test" in content
+        writer.close()
+
+    def test_log_event_before_open_raises(self, tmp_path: Path):
+        writer = SessionLogWriter(tmp_path)
+        try:
+            writer.log_event({"kind": "x", "at_ns": 1})
+            assert False, "should have raised"
+        except RuntimeError:
+            pass
+
+    def test_path_property_points_at_session_log_jsonl(self, tmp_path: Path):
+        writer = SessionLogWriter(tmp_path)
+        assert writer.path == tmp_path / "session_log.jsonl"
