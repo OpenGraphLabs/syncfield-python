@@ -324,6 +324,22 @@ def main(argv: Optional[List[str]] = None) -> int:
         ),
     )
     parser.add_argument(
+        "--empty-session",
+        action="store_true",
+        help=(
+            "Skip the synthetic streams and open with an empty session — "
+            "useful for capturing the 'click Discover to begin' state."
+        ),
+    )
+    parser.add_argument(
+        "--open-discovery",
+        action="store_true",
+        help=(
+            "After startup, automatically click the 'Discover devices' "
+            "header button so screenshots capture the discovery modal."
+        ),
+    )
+    parser.add_argument(
         "--screenshot",
         type=Path,
         default=None,
@@ -341,7 +357,21 @@ def main(argv: Optional[List[str]] = None) -> int:
         args.duration = 3.0
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    session = build_demo_session(args.output_dir)
+    if args.empty_session:
+        # Bare session with no pre-populated streams — used to capture
+        # the "click Discover to begin" screenshot.
+        import syncfield.adapters  # noqa: F401 (register discoverers)
+
+        from syncfield.tone import SilentChirpPlayer
+
+        session = sf.SessionOrchestrator(
+            host_id="demo_rig",
+            output_dir=args.output_dir,
+            sync_tone=sf.SyncToneConfig.default(),
+            chirp_player=SilentChirpPlayer(),
+        )
+    else:
+        session = build_demo_session(args.output_dir)
 
     if args.auto_record:
         # Start the session immediately so screenshots look populated.
@@ -446,6 +476,20 @@ def main(argv: Optional[List[str]] = None) -> int:
     from syncfield.viewer.app import ViewerApp
 
     app = ViewerApp(session, title="SyncField", viewport_pos=pin_pos)
+
+    # Optional: programmatically open the discovery modal a moment after
+    # startup so screenshots can capture it without the user clicking.
+    if args.open_discovery:
+        def _auto_open_modal() -> None:
+            time.sleep(0.8)
+            try:
+                if app._layout and app._layout._discovery_modal is not None:  # noqa: SLF001
+                    app._layout._discovery_modal.open()  # noqa: SLF001
+            except Exception as exc:
+                print(f"auto-open-discovery failed: {exc}", file=sys.stderr)
+
+        threading.Thread(target=_auto_open_modal, daemon=True).start()
+
     try:
         app.setup()
         app.run()

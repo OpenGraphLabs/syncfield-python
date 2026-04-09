@@ -28,6 +28,7 @@ from syncfield.orchestrator import SessionOrchestrator
 from syncfield.types import SessionState
 from syncfield.viewer import theme
 from syncfield.viewer.state import SessionSnapshot
+from syncfield.viewer.widgets.discovery_modal import DiscoveryModal
 from syncfield.viewer.widgets.formatting import (
     format_chirp_pair,
     format_elapsed,
@@ -51,6 +52,10 @@ class ViewerLayout:
         self._streams_row_tag = "streams_row"
         self._health_table_tag = "health_table"
         self._last_health_keys: tuple = ()
+        # Discovery modal — built lazily the first time the user clicks
+        # the header button. Holds its own DPG tags so the layout does
+        # not need to know about its internals.
+        self._discovery_modal: Optional[DiscoveryModal] = None
 
     # ------------------------------------------------------------------
     # Build (called once at viewer startup)
@@ -87,13 +92,21 @@ class ViewerLayout:
         dpg.bind_item_theme("btn_record", self._primary_theme)
         dpg.bind_item_theme("btn_stop", self._danger_theme)
         dpg.bind_item_theme("btn_cancel", self._ghost_theme)
+        dpg.bind_item_theme("btn_discover", self._ghost_theme)
+
+        # Construct (but don't yet show) the discovery modal. Building
+        # it here means the first click on the Discover button opens
+        # an already-ready window instead of waiting for DPG to build
+        # on demand.
+        self._discovery_modal = DiscoveryModal(self._session)
+        self._discovery_modal.build()
 
     # ------------------------------------------------------------------
     # Sections
     # ------------------------------------------------------------------
 
     def _build_header(self) -> None:
-        """Top row: logo, host id, state chip, elapsed timer."""
+        """Top row: logo, host id, state chip, elapsed timer, discover button."""
         with dpg.group(horizontal=True):
             dpg.add_text("SyncField", tag="app_title")
             dpg.add_spacer(width=12)
@@ -109,6 +122,15 @@ class ViewerLayout:
                 "00:00.000",
                 tag="elapsed_text",
                 color=theme.TEXT_SECONDARY,
+            )
+            # Right-side spacer pushes the discover button to the edge.
+            dpg.add_spacer(width=220)
+            dpg.add_button(
+                label="⚡  Discover devices",
+                tag="btn_discover",
+                width=180,
+                height=30,
+                callback=self._on_discover_click,
             )
 
         dpg.add_spacer(height=4)
@@ -245,6 +267,12 @@ class ViewerLayout:
         self._update_health(snapshot)
         self._update_footer(snapshot)
 
+        # Discovery modal has its own per-frame tick that only does work
+        # when the worker thread has produced new scan results or the
+        # elapsed-time display needs a bump. Cheap no-op when closed.
+        if self._discovery_modal is not None:
+            self._discovery_modal.tick()
+
     def _update_header(self, snapshot: SessionSnapshot) -> None:
         dpg.configure_item("state_dot", color=theme.state_color(snapshot.state))
         dpg.set_value("state_label", state_label(snapshot.state))
@@ -275,6 +303,10 @@ class ViewerLayout:
         _set_enabled("btn_record", state == "idle")
         _set_enabled("btn_stop", state == "recording")
         _set_enabled("btn_cancel", state in ("preparing", "recording"))
+        # Discovery only makes sense before recording — the session's
+        # ``add()`` contract refuses new streams once ``start()`` has
+        # been called.
+        _set_enabled("btn_discover", state == "idle")
 
     def _update_streams(self, snapshot: SessionSnapshot, now_ns: int) -> None:
         # Create cards for new streams.
@@ -358,6 +390,17 @@ class ViewerLayout:
         the best-effort path. Applications with richer cancellation can
         subclass this layout in the future."""
         self._on_stop_click()
+
+    def _on_discover_click(self) -> None:
+        """Open the discovery modal. Disabled while recording to keep the
+        registry-add path out of a live session's hot path."""
+        if self._session.state is not SessionState.IDLE:
+            # Silently ignore — the add button will be disabled anyway,
+            # and the visual affordance in the header tells the user to
+            # stop the session first.
+            return
+        if self._discovery_modal is not None:
+            self._discovery_modal.open()
 
     @staticmethod
     def _safe_call(fn) -> None:
