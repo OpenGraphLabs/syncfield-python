@@ -122,6 +122,12 @@ class OakCameraStream(StreamBase):
         self._first_at: Optional[int] = None
         self._last_at: Optional[int] = None
 
+        # Live preview support — the viewer reads ``latest_frame`` to render
+        # the stream card thumbnail. ``_frame_lock`` protects handoff between
+        # the capture thread and the reader.
+        self._frame_lock = threading.Lock()
+        self._latest_frame: Any = None
+
     # ------------------------------------------------------------------
     # Stream SPI
     # ------------------------------------------------------------------
@@ -253,6 +259,10 @@ class OakCameraStream(StreamBase):
             self._last_at = capture_ns
             self._frame_count += 1
 
+            # Publish the latest frame for live preview (viewer reads this).
+            with self._frame_lock:
+                self._latest_frame = frame
+
             if self._video_writer is not None:
                 self._video_writer.write(frame)
             self._emit_sample(
@@ -317,6 +327,22 @@ class OakCameraStream(StreamBase):
             self._pipeline = None
         self._q_rgb = None
         self._q_depth = None
+
+    # ------------------------------------------------------------------
+    # Live preview
+    # ------------------------------------------------------------------
+
+    @property
+    def latest_frame(self) -> Any:
+        """Return the most recently captured RGB frame, or ``None``.
+
+        Thread-safe: the frame reference is published under a lock by the
+        capture thread. Readers that mutate the returned array should
+        ``.copy()`` it first — the viewer uploads it as a texture
+        immediately and never mutates it in place.
+        """
+        with self._frame_lock:
+            return self._latest_frame
 
 
 # ---------------------------------------------------------------------------

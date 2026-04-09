@@ -80,6 +80,13 @@ class UVCWebcamStream(StreamBase):
         self._first_at: Optional[int] = None
         self._last_at: Optional[int] = None
 
+        # Live preview support — the viewer reads ``latest_frame`` to render
+        # the stream card thumbnail. ``_frame_lock`` protects handoff between
+        # the capture thread and the reader; the frame itself is a plain
+        # reference so no copy is made in the hot path.
+        self._frame_lock = threading.Lock()
+        self._latest_frame: Any = None
+
     # ------------------------------------------------------------------
     # Stream SPI
     # ------------------------------------------------------------------
@@ -154,6 +161,10 @@ class UVCWebcamStream(StreamBase):
             self._last_at = capture_ns
             self._frame_count += 1
 
+            # Publish the latest frame for live preview (viewer reads this).
+            with self._frame_lock:
+                self._latest_frame = frame
+
             if self._writer is not None:
                 self._writer.write(frame)
             self._emit_sample(
@@ -163,6 +174,22 @@ class UVCWebcamStream(StreamBase):
                     capture_ns=capture_ns,
                 )
             )
+
+    # ------------------------------------------------------------------
+    # Live preview
+    # ------------------------------------------------------------------
+
+    @property
+    def latest_frame(self) -> Any:
+        """Return the most recently captured BGR frame, or ``None``.
+
+        Thread-safe: the frame reference is published under a lock by the
+        capture thread. Readers that mutate the returned array should
+        ``.copy()`` it first — in practice the viewer uploads it as a
+        texture immediately and never mutates it in place.
+        """
+        with self._frame_lock:
+            return self._latest_frame
 
     def _release_cv2_resources(self) -> None:
         if self._writer is not None:

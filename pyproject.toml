@@ -36,12 +36,20 @@ ble = ["bleak>=0.21"]
 # extra's opencv-python for the MP4 writer. Install `syncfield[oak,uvc]`
 # (or `syncfield[all]`) for the full OAK capture path.
 oak = ["depthai>=3.0.0"]
+# The desktop viewer uses dearpygui (GPU-accelerated, light 1.8 MiB wheel).
+# It also reuses numpy from the audio extra when rendering video frames —
+# if you install ``syncfield[viewer]`` on its own, numpy is pulled in too.
+viewer = [
+    "dearpygui>=2.0",
+    "numpy>=1.21",
+]
 all = [
     "sounddevice>=0.4.6",
     "numpy>=1.21",
     "opencv-python>=4.5",
     "bleak>=0.21",
     "depthai>=3.0.0",
+    "dearpygui>=2.0",
 ]
 
 [project.urls]
