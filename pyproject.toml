@@ -43,6 +43,12 @@ viewer = [
     "dearpygui>=2.0",
     "numpy>=1.21",
 ]
+# Local browser-based replay viewer (syncfield.replay). Starlette + uvicorn
+# serve a pre-built React SPA from the package's static/ directory.
+replay = [
+    "starlette>=0.36",
+    "uvicorn>=0.27",
+]
 # mDNS-based multi-host session rendezvous (syncfield.multihost). Required
 # only when you want a leader/follower session discovered automatically
 # on the local network — single-host sessions do not need this.
@@ -57,6 +63,8 @@ all = [
     "depthai>=3.0.0",
     "dearpygui>=2.0",
     "zeroconf>=0.130",
+    "starlette>=0.36",
+    "uvicorn>=0.27",
 ]
 
 [project.urls]
@@ -67,6 +75,9 @@ Issues = "https://github.com/OpenGraphLabs/syncfield-python/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/syncfield"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"src/syncfield/replay/static" = "syncfield/replay/static"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
