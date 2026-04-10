@@ -49,6 +49,17 @@ class _SensorWriteCore:
         self._writer = SensorWriter(self._stream_id, self._output_dir)
         self._writer.open()
 
+    def write(self, sample: SensorSample) -> None:
+        with self._lock:
+            if self._writer is None:
+                raise RuntimeError(
+                    f"_SensorWriteCore for '{self._stream_id}' is not open"
+                )
+            self._writer.write(sample)
+            if self._first_at_ns is None:
+                self._first_at_ns = sample.capture_ns
+            self._last_at_ns = sample.capture_ns
+
     def close(self) -> None:
         if self._writer is not None:
             self._writer.close()
