@@ -11,7 +11,7 @@ from syncfield.writer import SensorWriter
 
 
 class _SensorWriteCore:
-    """Owns the SensorWriter, frame counter, and timing trackers."""
+    """Owns the SensorWriter, frame counter, and timing trackers for a single sensor stream. Thread-safe: all public methods may be called from multiple threads."""
 
     def __init__(self, stream_id: str, output_dir: Path) -> None:
         self._stream_id = stream_id
@@ -45,9 +45,14 @@ class _SensorWriteCore:
             return n
 
     def open(self) -> None:
-        self._output_dir.mkdir(parents=True, exist_ok=True)
-        self._writer = SensorWriter(self._stream_id, self._output_dir)
-        self._writer.open()
+        with self._lock:
+            if self._writer is not None:
+                raise RuntimeError(
+                    f"_SensorWriteCore for '{self._stream_id}' is already open"
+                )
+            self._output_dir.mkdir(parents=True, exist_ok=True)
+            self._writer = SensorWriter(self._stream_id, self._output_dir)
+            self._writer.open()
 
     def write(self, sample: SensorSample) -> None:
         with self._lock:
@@ -61,9 +66,10 @@ class _SensorWriteCore:
             self._last_at_ns = sample.capture_ns
 
     def close(self) -> None:
-        if self._writer is not None:
-            self._writer.close()
-            self._writer = None
+        with self._lock:
+            if self._writer is not None:
+                self._writer.close()
+                self._writer = None
 
 
 def _default_sensor_capabilities(*, precise: bool) -> StreamCapabilities:
