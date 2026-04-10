@@ -1,0 +1,12 @@
+@import "tailwindcss";
+
+:root {
+  --bg-app: #faf8f6;
+  --text-primary: #18181b;
+  --text-secondary: #52525b;
+  --text-muted: #a1a1aa;
+}
+
+html, body, #root {
+  height: 100%;
+}
