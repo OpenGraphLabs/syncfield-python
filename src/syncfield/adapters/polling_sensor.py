@@ -170,14 +170,19 @@ class PollingSensorStream(StreamBase):
 
     def stop_recording(self) -> FinalizationReport:
         self._writing = False
+        # Snapshot stats before close() zeros out the writer reference.
+        frame_count = self._write_core.frame_count
+        first_ns = self._write_core.first_sample_at_ns
+        last_ns = self._write_core.last_sample_at_ns
+        file_path = self._write_core.path
         self._write_core.close()
         return FinalizationReport(
             stream_id=self.id,
             status="completed",
-            frame_count=self._write_core.frame_count,
-            file_path=self._write_core.path,
-            first_sample_at_ns=self._write_core.first_sample_at_ns,
-            last_sample_at_ns=self._write_core.last_sample_at_ns,
+            frame_count=frame_count,
+            file_path=file_path,
+            first_sample_at_ns=first_ns,
+            last_sample_at_ns=last_ns,
             health_events=list(self._collected_health),
             error=None,
         )
