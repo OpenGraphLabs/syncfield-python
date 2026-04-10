@@ -193,7 +193,10 @@ class SessionState(Enum):
     """Lifecycle state of a SessionOrchestrator."""
 
     IDLE = "idle"
+    CONNECTING = "connecting"
+    CONNECTED = "connected"
     PREPARING = "preparing"
+    COUNTDOWN = "countdown"
     RECORDING = "recording"
     STOPPING = "stopping"
     STOPPED = "stopped"
