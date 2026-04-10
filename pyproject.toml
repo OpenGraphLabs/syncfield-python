@@ -70,6 +70,7 @@ packages = ["src/syncfield"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["src"]
 markers = [
     "hardware: tests that require physical hardware (cameras, BLE devices)",
     "slow: integration tests that touch real IO (mDNS sockets, filesystem, etc.)",
