@@ -121,8 +121,23 @@ class ReplayServer:
 
     @property
     def url(self) -> str:
+        """Return ``http://host:port/`` using the actual bound port.
+
+        For ephemeral ports (``port=0``), uvicorn resolves the real port
+        during startup and binds it inside the asyncio server's socket
+        — *not* back onto ``self._server.config.port``, which stays 0.
+        We read from the live socket once it's available, falling back
+        to the configured value before startup.
+        """
         host = self._server.config.host
         port = self._server.config.port
+        if self._server.servers:
+            sockets = self._server.servers[0].sockets
+            if sockets:
+                try:
+                    port = sockets[0].getsockname()[1]
+                except Exception:
+                    pass
         return f"http://{host}:{port}/"
 
     def serve(self) -> None:

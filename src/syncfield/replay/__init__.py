@@ -65,7 +65,14 @@ def launch(
 
     if open_browser:
         def _open_after_ready() -> None:
-            time.sleep(0.2)
+            # Poll uvicorn's `started` flag so we wait for the real
+            # bind to complete — for port=0, reading server.url before
+            # startup would give us http://127.0.0.1:0/ which is broken.
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline:
+                if getattr(server._server, "started", False):
+                    break
+                time.sleep(0.02)
             try:
                 webbrowser.open(server.url)
             except Exception:

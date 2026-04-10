@@ -74,3 +74,37 @@ def test_launch_is_callable_with_open_browser_false(
 
     launch(synthetic_session, open_browser=False)
     assert called["serve"] is True
+
+
+def test_server_url_resolves_ephemeral_port(
+    synthetic_session: Path,
+) -> None:
+    """Regression: ReplayServer.url must report the real bound port when
+    port=0 is used, not the stale ``config.port == 0``."""
+    manifest = load_session(synthetic_session)
+    server = ReplayServer(manifest, host="127.0.0.1", port=0)
+
+    t = threading.Thread(target=server.serve, daemon=True)
+    t.start()
+
+    # Wait for uvicorn to actually bind.
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        if getattr(server._server, "started", False):
+            break
+        time.sleep(0.02)
+    else:
+        server.request_shutdown()
+        pytest.fail("server never started")
+
+    try:
+        url = server.url
+        assert url.startswith("http://127.0.0.1:")
+        # Extract port from URL and assert it's non-zero
+        port_str = url.rsplit(":", 1)[1].rstrip("/")
+        assert port_str.isdigit() and int(port_str) > 0, (
+            f"expected real bound port in url, got {url!r}"
+        )
+    finally:
+        server.request_shutdown()
+        t.join(timeout=3.0)
