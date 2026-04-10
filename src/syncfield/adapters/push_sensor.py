@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import threading
 import time
-from pathlib import Path
 from typing import Callable, Optional
 
 from syncfield.adapters._generic import _SensorWriteCore, _resolve_capabilities
@@ -12,7 +11,7 @@ from syncfield.clock import SessionClock
 from syncfield.stream import DeviceKey, StreamBase
 from syncfield.types import (
     ChannelValue, FinalizationReport, HealthEvent, HealthEventKind,
-    SampleEvent, SensorSample, StreamCapabilities,
+    SampleEvent, StreamCapabilities,
 )
 
 
@@ -23,7 +22,6 @@ class PushSensorStream(StreamBase):
         self,
         id: str,
         *,
-        output_dir: Path | str,
         on_connect: Optional[Callable[["PushSensorStream"], None]] = None,
         on_disconnect: Optional[Callable[["PushSensorStream"], None]] = None,
         device_key: Optional[DeviceKey] = None,
@@ -37,7 +35,7 @@ class PushSensorStream(StreamBase):
         self._on_connect = on_connect
         self._on_disconnect = on_disconnect
         self._device_key = device_key
-        self._write_core = _SensorWriteCore(id, Path(output_dir))
+        self._write_core = _SensorWriteCore(id)
         self._push_lock = threading.Lock()
         self._connected = False
         self._writing = False
@@ -56,22 +54,19 @@ class PushSensorStream(StreamBase):
             self._on_connect(self)
 
     def start_recording(self, session_clock: SessionClock) -> None:
-        self._write_core.open()
+        self._write_core.reset_recording_stats()
         self._writing = True
 
     def stop_recording(self) -> FinalizationReport:
         self._writing = False
-        # Snapshot BEFORE close (frame_count returns 0 after close)
-        frame_count = self._write_core.frame_count
+        frame_count = self._write_core.recorded_count
         first_at = self._write_core.first_sample_at_ns
         last_at = self._write_core.last_sample_at_ns
-        file_path = self._write_core.path
-        self._write_core.close()
         return FinalizationReport(
             stream_id=self.id,
             status="completed",
             frame_count=frame_count,
-            file_path=file_path,
+            file_path=None,
             first_sample_at_ns=first_at,
             last_sample_at_ns=last_at,
             health_events=list(self._collected_health),
@@ -123,15 +118,4 @@ class PushSensorStream(StreamBase):
                 channels=channels,
             ))
             if self._writing:
-                try:
-                    self._write_core.write(SensorSample(
-                        frame_number=frame_number,
-                        capture_ns=capture_ns,
-                        channels=channels,
-                    ))
-                except Exception as exc:
-                    self._emit_health(HealthEvent(
-                        self.id, HealthEventKind.ERROR,
-                        time.monotonic_ns(),
-                        f"sensor write failed: {exc}",
-                    ))
+                self._write_core.record_sample(capture_ns)

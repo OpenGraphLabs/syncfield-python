@@ -5,7 +5,6 @@ from __future__ import annotations
 import inspect
 import threading
 import time
-from pathlib import Path
 from typing import Any, Callable, Literal, Optional
 
 from syncfield.adapters._generic import (
@@ -20,7 +19,6 @@ from syncfield.types import (
     HealthEvent,
     HealthEventKind,
     SampleEvent,
-    SensorSample,
     StreamCapabilities,
 )
 
@@ -34,7 +32,6 @@ class PollingSensorStream(StreamBase):
         *,
         read: Callable[..., dict[str, ChannelValue]],
         hz: float,
-        output_dir: Path | str,
         open: Optional[Callable[[], Any]] = None,
         close: Optional[Callable[[Any], None]] = None,
         device_key: Optional[DeviceKey] = None,
@@ -55,7 +52,7 @@ class PollingSensorStream(StreamBase):
         self._on_read_error = on_read_error
         self._device_key = device_key
 
-        self._write_core = _SensorWriteCore(id, Path(output_dir))
+        self._write_core = _SensorWriteCore(id)
         self._handle: Any = None
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
@@ -127,18 +124,7 @@ class PollingSensorStream(StreamBase):
         ))
 
         if self._writing:
-            try:
-                self._write_core.write(SensorSample(
-                    frame_number=frame_number,
-                    capture_ns=capture_ns,
-                    channels=channels,
-                ))
-            except Exception as exc:
-                self._emit_health(HealthEvent(
-                    self.id, HealthEventKind.ERROR,
-                    time.monotonic_ns(),
-                    f"sensor write failed: {exc}",
-                ))
+            self._write_core.record_sample(capture_ns)
 
         elapsed = time.monotonic() - loop_start
         time.sleep(max(0.0, self._period - elapsed))
@@ -165,22 +151,19 @@ class PollingSensorStream(StreamBase):
         self._thread.start()
 
     def start_recording(self, session_clock: SessionClock) -> None:
-        self._write_core.open()
+        self._write_core.reset_recording_stats()
         self._writing = True
 
     def stop_recording(self) -> FinalizationReport:
         self._writing = False
-        # Snapshot stats before close() zeros out the writer reference.
-        frame_count = self._write_core.frame_count
+        frame_count = self._write_core.recorded_count
         first_ns = self._write_core.first_sample_at_ns
         last_ns = self._write_core.last_sample_at_ns
-        file_path = self._write_core.path
-        self._write_core.close()
         return FinalizationReport(
             stream_id=self.id,
             status="completed",
             frame_count=frame_count,
-            file_path=file_path,
+            file_path=None,
             first_sample_at_ns=first_ns,
             last_sample_at_ns=last_ns,
             health_events=list(self._collected_health),
