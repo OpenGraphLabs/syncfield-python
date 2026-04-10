@@ -310,6 +310,35 @@ resp = requests.post("http://localhost:8080/api/v1/sync/upload", files=files, da
 print(resp.json())  # {"job_id": "a1b2c3d4"}
 ```
 
+## Replay a synced session
+
+After you've recorded a session and run it through the SyncField sync
+service, open the result in a local browser-based viewer:
+
+```python
+import syncfield as sf
+
+sf.replay.launch("./data/session_2026-04-09T14-49")
+```
+
+This boots a small HTTP server on `127.0.0.1`, opens your default
+browser, and shows:
+
+- Synchronized multi-stream video playback
+- A **Before / After** toggle (`B`) to compare raw vs. synced alignment
+- A per-stream sync report (offset, confidence, quality)
+- Minimal SVG charts for each sensor stream
+
+Requires the `replay` extra:
+
+```bash
+pip install 'syncfield[replay]'
+```
+
+The viewer ships a pre-built React bundle, so end users do not need
+Node.js or yarn — those are only needed if you want to hack on the
+frontend itself (`make replay-web-dev`).
+
 ## Format Specification
 
 This section defines the output format for implementors in other languages.
