@@ -92,3 +92,39 @@ def test_sensor_write_core_write_is_thread_safe(tmp_path):
     assert len(lines) == 5000
     for line in lines:
         json.loads(line)
+
+
+from syncfield.adapters._generic import (
+    _default_sensor_capabilities,
+    _resolve_capabilities,
+)
+from syncfield.types import StreamCapabilities
+
+
+def test_default_sensor_capabilities_precise_true():
+    caps = _default_sensor_capabilities(precise=True)
+    assert caps.provides_audio_track is False
+    assert caps.supports_precise_timestamps is True
+    assert caps.is_removable is False
+    assert caps.produces_file is True
+
+
+def test_default_sensor_capabilities_precise_false():
+    caps = _default_sensor_capabilities(precise=False)
+    assert caps.supports_precise_timestamps is False
+
+
+def test_resolve_capabilities_returns_default_when_user_none():
+    caps = _resolve_capabilities(None, precise=True)
+    assert caps == _default_sensor_capabilities(precise=True)
+
+
+def test_resolve_capabilities_returns_user_value_when_provided():
+    user = StreamCapabilities(
+        provides_audio_track=False,
+        supports_precise_timestamps=False,
+        is_removable=True,
+        produces_file=True,
+    )
+    caps = _resolve_capabilities(user, precise=True)
+    assert caps is user

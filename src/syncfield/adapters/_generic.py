@@ -64,3 +64,22 @@ class _SensorWriteCore:
         if self._writer is not None:
             self._writer.close()
             self._writer = None
+
+
+def _default_sensor_capabilities(*, precise: bool) -> StreamCapabilities:
+    return StreamCapabilities(
+        provides_audio_track=False,
+        supports_precise_timestamps=precise,
+        is_removable=False,
+        produces_file=True,
+    )
+
+
+def _resolve_capabilities(
+    user: Optional[StreamCapabilities],
+    *,
+    precise: bool,
+) -> StreamCapabilities:
+    if user is not None:
+        return user
+    return _default_sensor_capabilities(precise=precise)
