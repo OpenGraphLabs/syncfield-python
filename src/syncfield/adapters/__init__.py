@@ -39,6 +39,13 @@ __all__ = [
     "PushSensorStream",
 ]
 
+# HostAudioStream requires the 'audio' extra (sounddevice + numpy).
+try:
+    from syncfield.adapters.host_audio import HostAudioStream  # noqa: F401
+    __all__.append("HostAudioStream")
+except ImportError:
+    pass
+
 
 def _safe_register(cls) -> None:
     """Register an adapter with the discovery registry, swallowing errors.

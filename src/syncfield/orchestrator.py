@@ -271,6 +271,10 @@ class SessionOrchestrator:
         # opened a device.
         self._connected_streams: List[Stream] = []
 
+        # Auto-injected host audio stream (if any). Tracked so it can
+        # be removed on disconnect.
+        self._auto_audio_stream: Optional[Stream] = None
+
         # True when the operator used the legacy one-shot ``start()`` from
         # ``IDLE`` instead of explicitly calling ``connect()`` first.
         # In that case ``stop()`` also tears down the devices and lands
@@ -493,6 +497,12 @@ class SessionOrchestrator:
                 raise
 
             self._connected_streams = connected
+
+            # Auto-inject host audio if no stream provides an audio track.
+            # This enables multi-host cross-correlation sync without the
+            # user having to add an audio stream manually.
+            self._maybe_inject_host_audio()
+
             self._transition(SessionState.CONNECTED)
 
     # ------------------------------------------------------------------
@@ -783,6 +793,13 @@ class SessionOrchestrator:
                 )
             _rollback_disconnect_streams(self._connected_streams)
             self._connected_streams = []
+
+            # Remove auto-injected audio stream
+            if self._auto_audio_stream is not None:
+                sid = self._auto_audio_stream.id
+                self._streams.pop(sid, None)
+                self._auto_audio_stream = None
+
             self._transition(SessionState.IDLE)
             if self._log_writer is not None:
                 self._log_writer.close()
@@ -1052,6 +1069,55 @@ class SessionOrchestrator:
         """
         if self._log_writer is not None:
             self._log_writer.log_health(event)
+
+    # ------------------------------------------------------------------
+    # Host audio auto-injection
+    # ------------------------------------------------------------------
+
+    def _maybe_inject_host_audio(self) -> None:
+        """Auto-add a :class:`HostAudioStream` if no audio track exists.
+
+        Called at the end of :meth:`connect`, after all user-registered
+        streams are connected. If no stream declares
+        ``provides_audio_track=True``, this method tries to detect a
+        host microphone and inject a recording stream so multi-host
+        cross-correlation has an acoustic anchor.
+
+        The injected stream is tracked in ``_auto_audio_stream`` and
+        automatically removed on :meth:`disconnect`.
+        """
+        has_audio = any(
+            s.capabilities.provides_audio_track
+            for s in self._streams.values()
+        )
+        if has_audio:
+            return
+
+        try:
+            from syncfield.adapters.host_audio import (
+                HostAudioStream,
+                is_audio_available,
+            )
+        except ImportError:
+            logger.debug(
+                "Audio extra not installed — skipping host audio auto-capture"
+            )
+            return
+
+        if not is_audio_available():
+            logger.debug("No audio input device detected — skipping host audio")
+            return
+
+        try:
+            audio = HostAudioStream("host_audio", output_dir=self._output_dir)
+            audio.prepare()
+            audio.connect()
+            self._streams[audio.id] = audio
+            self._connected_streams.append(audio)
+            self._auto_audio_stream = audio
+            logger.info("Auto-injected host audio stream (mic detected)")
+        except Exception as exc:
+            logger.warning("Failed to auto-inject host audio: %s", exc)
 
     # ------------------------------------------------------------------
     # Chirp injection

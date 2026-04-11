@@ -683,6 +683,28 @@ class ViewerServer:
                     {"frames": [], "error": str(exc)}, status_code=500,
                 )
 
+        @app.get("/api/episodes/{episode_id}/waveform/{stream_id}")
+        async def api_waveform(
+            episode_id: str, stream_id: str,
+        ) -> JSONResponse:
+            """Return a downsampled waveform envelope from a WAV file."""
+            ep_dir = self._session.output_dir.parent / episode_id
+            wav_path = ep_dir / f"{stream_id}.wav"
+            if not wav_path.is_file():
+                return JSONResponse(
+                    {"error": f"WAV file not found: {stream_id}.wav"},
+                    status_code=404,
+                )
+
+            try:
+                envelope = await asyncio.to_thread(
+                    _read_wav_envelope, wav_path, 1000,
+                )
+                return JSONResponse(envelope)
+            except Exception as exc:
+                logger.exception("Failed to read waveform")
+                return JSONResponse({"error": str(exc)}, status_code=500)
+
     # ------------------------------------------------------------------
     # Static files (built React app)
     # ------------------------------------------------------------------
@@ -874,6 +896,63 @@ def _download_sync_results(
             logger.info("Downloaded sync result: %s", local_path)
         except Exception:
             logger.warning("Failed to download sync file: %s", filepath)
+
+
+def _read_wav_envelope(wav_path: Path, num_points: int = 1000) -> dict:
+    """Read a WAV file and return a downsampled min/max envelope.
+
+    Returns a dict with ``sample_rate``, ``duration_s``, ``channels``,
+    and ``envelope`` — a list of ``[min, max]`` pairs representing the
+    amplitude range within each bucket.
+    """
+    import struct as struct_mod
+    import wave
+
+    with wave.open(str(wav_path), "rb") as wf:
+        n_channels = wf.getnchannels()
+        sample_rate = wf.getframerate()
+        n_frames = wf.getnframes()
+        sample_width = wf.getsampwidth()
+        raw = wf.readframes(n_frames)
+
+    duration_s = n_frames / sample_rate if sample_rate > 0 else 0
+
+    # Parse PCM samples (16-bit assumed)
+    if sample_width == 2:
+        fmt = f"<{n_frames * n_channels}h"
+        samples = list(struct_mod.unpack(fmt, raw))
+    else:
+        # Fallback: treat as unsigned bytes
+        samples = [b - 128 for b in raw]
+
+    # Take first channel only for mono envelope
+    if n_channels > 1:
+        samples = samples[::n_channels]
+
+    # Downsample to num_points buckets
+    total = len(samples)
+    if total == 0:
+        return {
+            "sample_rate": sample_rate,
+            "duration_s": duration_s,
+            "channels": n_channels,
+            "envelope": [],
+        }
+
+    bucket_size = max(1, total // num_points)
+    envelope = []
+    for i in range(0, total, bucket_size):
+        bucket = samples[i : i + bucket_size]
+        lo = min(bucket) / 32768.0
+        hi = max(bucket) / 32768.0
+        envelope.append([round(lo, 4), round(hi, 4)])
+
+    return {
+        "sample_rate": sample_rate,
+        "duration_s": round(duration_s, 3),
+        "channels": n_channels,
+        "envelope": envelope,
+    }
 
 
 def _guess_media_type(path: str) -> str:

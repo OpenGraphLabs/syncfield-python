@@ -1,6 +1,7 @@
 import type { StreamSnapshot } from "@/lib/types";
 import { formatCount, formatHz } from "@/lib/format";
 import { cn } from "@/lib/utils";
+import { AudioLevelChart } from "./audio-level-chart";
 import { VideoPreview } from "./video-preview";
 import { SensorChart } from "./sensor-chart";
 
@@ -61,6 +62,8 @@ export function StreamCard({ stream, canRemove, onRemove }: StreamCardProps) {
       <div className="flex-1 border-t">
         {stream.kind === "video" ? (
           <VideoPreview streamId={stream.id} />
+        ) : stream.kind === "audio" ? (
+          <AudioLevelChart streamId={stream.id} />
         ) : stream.kind === "sensor" ? (
           <SensorChart streamId={stream.id} />
         ) : (

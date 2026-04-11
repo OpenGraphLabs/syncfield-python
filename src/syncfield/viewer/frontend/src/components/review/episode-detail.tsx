@@ -8,6 +8,7 @@ import { SyncQualityPanel } from "./sync-quality-panel";
 import { ReviewVideoPlayer } from "./review-video-player";
 import { ReviewTimeline } from "./review-timeline";
 import { DriftChart } from "./drift-chart";
+import { WaveformChart } from "./waveform-chart";
 import { SyncComparisonModal } from "./sync-comparison-modal";
 
 interface EpisodeDetailProps {
@@ -67,6 +68,12 @@ export function EpisodeDetail({ episodeId, onBack }: EpisodeDetailProps) {
     syncReport?.summary.primary_stream ?? streams[0] ?? "";
   const secondaryStreams = streams.filter((s) => s !== primaryStream);
   const fps = syncReport?.summary.actual_mean_fps ?? 30;
+
+  // Identify audio streams from manifest
+  const audioStreams = streams.filter((sid) => {
+    const streamMeta = episode.manifest?.streams[sid];
+    return streamMeta?.kind === "audio";
+  });
 
   // Get drift for the compare target
   const compareResult = compareStream
@@ -177,6 +184,19 @@ export function EpisodeDetail({ episodeId, onBack }: EpisodeDetailProps) {
           {(episode.has_synced_videos || driftData) && (
             <div className="border-t">
               <DriftChart data={driftData} isLoading={driftLoading} />
+            </div>
+          )}
+
+          {/* Audio waveform for audio streams */}
+          {audioStreams.length > 0 && (
+            <div className="border-t">
+              {audioStreams.map((sid) => (
+                <WaveformChart
+                  key={sid}
+                  episodeId={episodeId}
+                  streamId={sid}
+                />
+              ))}
             </div>
           )}
         </div>
