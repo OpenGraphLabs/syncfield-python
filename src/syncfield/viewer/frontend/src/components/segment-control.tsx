@@ -9,17 +9,11 @@ interface NavLinksProps {
 
 export function NavLinks({ mode, onChange }: NavLinksProps) {
   return (
-    <nav className="flex items-center gap-1">
-      <NavLink
-        active={mode === "record"}
-        onClick={() => onChange("record")}
-      >
+    <nav className="flex items-center">
+      <NavLink active={mode === "record"} onClick={() => onChange("record")}>
         Record
       </NavLink>
-      <NavLink
-        active={mode === "review"}
-        onClick={() => onChange("review")}
-      >
+      <NavLink active={mode === "review"} onClick={() => onChange("review")}>
         Review
       </NavLink>
     </nav>
@@ -39,18 +33,16 @@ function NavLink({
     <button
       onClick={onClick}
       className={cn(
-        "rounded-lg px-3 py-1.5 text-sm font-medium transition-colors",
+        "relative px-3 py-3 text-[13px] font-medium tracking-tight transition-colors",
         active
-          ? "bg-foreground/8 text-foreground"
-          : "text-muted hover:text-foreground hover:bg-foreground/4",
+          ? "text-foreground"
+          : "text-muted/60 hover:text-foreground",
       )}
     >
       {children}
+      {active && (
+        <span className="absolute inset-x-3 bottom-0 h-[2px] rounded-full bg-foreground" />
+      )}
     </button>
   );
-}
-
-/** @deprecated Use NavLinks instead */
-export function SegmentControl({ mode, onChange }: NavLinksProps) {
-  return <NavLinks mode={mode} onChange={onChange} />;
 }
