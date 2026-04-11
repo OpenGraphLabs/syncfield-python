@@ -44,11 +44,8 @@ export function useDriftData(episodeId: string | null): UseDriftDataReturn {
         setDriftData(null);
         return;
       }
-      const text = await res.text();
-      const lines = text.trim().split("\n").filter(Boolean);
-      const entries: FrameMapEntry[] = lines.map(
-        (line) => JSON.parse(line) as FrameMapEntry,
-      );
+      const data = await res.json();
+      const entries: FrameMapEntry[] = data.frames ?? [];
 
       if (entries.length === 0) {
         setDriftData(null);

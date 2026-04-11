@@ -31,8 +31,8 @@ export function useEpisodes(): UseEpisodesReturn {
       if (!res.ok) {
         throw new Error(`Failed to fetch episodes (${res.status})`);
       }
-      const data: EpisodeSummary[] = await res.json();
-      setEpisodes(data);
+      const data = await res.json();
+      setEpisodes(data.episodes ?? []);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to fetch episodes");
       setEpisodes([]);
