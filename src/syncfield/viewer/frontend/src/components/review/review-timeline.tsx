@@ -1,4 +1,4 @@
-import { useCallback, useRef } from "react";
+import { useCallback, useRef, useState } from "react";
 
 interface ReviewTimelineProps {
   currentTime: number;
@@ -22,25 +22,50 @@ export function ReviewTimeline({
   onSetRate,
 }: ReviewTimelineProps) {
   const barRef = useRef<HTMLDivElement>(null);
+  const [isDragging, setIsDragging] = useState(false);
   const progress = duration > 0 ? (currentTime / duration) * 100 : 0;
 
-  const handleBarClick = useCallback(
-    (e: React.MouseEvent<HTMLDivElement>) => {
+  const seekFromEvent = useCallback(
+    (clientX: number) => {
       const bar = barRef.current;
       if (!bar || duration <= 0) return;
       const rect = bar.getBoundingClientRect();
-      const pct = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+      const pct = Math.max(
+        0,
+        Math.min(1, (clientX - rect.left) / rect.width),
+      );
       onSeek(pct * duration);
     },
     [duration, onSeek],
   );
 
+  const handlePointerDown = useCallback(
+    (e: React.PointerEvent<HTMLDivElement>) => {
+      setIsDragging(true);
+      seekFromEvent(e.clientX);
+      (e.target as HTMLElement).setPointerCapture(e.pointerId);
+    },
+    [seekFromEvent],
+  );
+
+  const handlePointerMove = useCallback(
+    (e: React.PointerEvent<HTMLDivElement>) => {
+      if (!isDragging) return;
+      seekFromEvent(e.clientX);
+    },
+    [isDragging, seekFromEvent],
+  );
+
+  const handlePointerUp = useCallback(() => {
+    setIsDragging(false);
+  }, []);
+
   return (
-    <div className="flex h-9 items-center gap-3 border-t px-4">
+    <div className="flex h-10 items-center gap-3 border-t px-4">
       {/* Play/Pause */}
       <button
         onClick={onToggle}
-        className="text-foreground transition-colors hover:text-primary"
+        className="flex h-7 w-7 items-center justify-center rounded-md text-foreground transition-colors hover:bg-foreground/5 hover:text-primary"
       >
         {isPlaying ? (
           <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
@@ -54,22 +79,27 @@ export function ReviewTimeline({
         )}
       </button>
 
-      {/* Progress bar */}
+      {/* Progress bar — click + drag to seek */}
       <div
         ref={barRef}
-        onClick={handleBarClick}
-        className="flex-1 cursor-pointer py-2"
+        onPointerDown={handlePointerDown}
+        onPointerMove={handlePointerMove}
+        onPointerUp={handlePointerUp}
+        className="group relative flex-1 cursor-pointer py-2"
       >
-        <div className="h-1 rounded-full bg-foreground/10">
+        <div className="h-1.5 rounded-full bg-foreground/10 transition-[height] group-hover:h-2">
           <div
-            className="h-full rounded-full bg-primary transition-[width] duration-100"
+            className="relative h-full rounded-full bg-primary"
             style={{ width: `${progress}%` }}
-          />
+          >
+            {/* Scrubber handle */}
+            <div className="absolute -right-1.5 top-1/2 h-3 w-3 -translate-y-1/2 rounded-full bg-primary opacity-0 shadow-sm transition-opacity group-hover:opacity-100" />
+          </div>
         </div>
       </div>
 
       {/* Time display */}
-      <span className="shrink-0 font-mono text-[10px] tabular-nums text-muted">
+      <span className="shrink-0 font-mono text-[11px] tabular-nums text-muted">
         {formatTime(currentTime)} / {formatTime(duration)}
       </span>
 
@@ -77,7 +107,7 @@ export function ReviewTimeline({
       <select
         value={playbackRate}
         onChange={(e) => onSetRate(Number(e.target.value))}
-        className="rounded border bg-transparent px-1 py-0.5 text-[10px] text-muted"
+        className="rounded border bg-transparent px-1.5 py-0.5 text-[10px] text-muted"
       >
         {RATES.map((r) => (
           <option key={r} value={r}>
@@ -90,7 +120,7 @@ export function ReviewTimeline({
 }
 
 function formatTime(seconds: number): string {
-  if (!Number.isFinite(seconds)) return "0:00";
+  if (!Number.isFinite(seconds) || seconds < 0) return "0:00";
   const m = Math.floor(seconds / 60);
   const s = Math.floor(seconds % 60);
   return `${m}:${s.toString().padStart(2, "0")}`;

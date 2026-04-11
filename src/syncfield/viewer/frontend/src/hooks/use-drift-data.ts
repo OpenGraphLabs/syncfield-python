@@ -2,96 +2,120 @@ import { useCallback, useEffect, useState } from "react";
 import type { FrameMapEntry } from "@/lib/review-types";
 
 export interface DriftData {
-  /** Frame indices (x-axis). */
-  frames: number[];
-  /** Max |delta_ms| across all streams per frame before correction. */
-  beforeDrift: number[];
-  /** Max |delta_ms| across all streams per frame after correction. */
+  /** Time axis (seconds). */
+  timesSec: number[];
+  /** Per-frame max |delta_ms| after correction (residual). */
   afterDrift: number[];
-  /** Improvement percentage: (1 - meanAfter / meanBefore) * 100. */
+  /** Per-frame estimated pre-correction drift (offset + residual). */
+  beforeDrift: number[];
+  /** Mean after-correction drift in ms. */
+  meanAfterMs: number;
+  /** Mean before-correction drift in ms. */
+  meanBeforeMs: number;
+  /** Improvement percentage. */
   improvementPct: number;
 }
 
 interface UseDriftDataReturn {
-  /** Processed drift data for charting, or null while loading. */
   driftData: DriftData | null;
-  /** Whether the frame map is being loaded. */
   isLoading: boolean;
 }
 
 /**
- * REST hook for fetching and processing the frame map into drift data.
+ * Fetch frame_map.jsonl + sync_report.json and compute drift data.
  *
- * Fetches `GET /api/episodes/{id}/frame-map` (JSONL format, one JSON
- * object per line) and computes per-frame max drift before and after
- * sync correction. The "before" drift uses the raw offset between
- * original frame timing and primary time; the "after" drift uses the
- * post-correction `delta_ms` values from the frame map.
+ * - **After drift**: max |delta_ms| across secondary streams per frame
+ *   from frame_map.jsonl. This is the post-correction residual.
+ * - **Before drift**: estimated by adding the sync correction offset
+ *   (from sync_report.json) back to each frame's delta. Shows what
+ *   the drift looked like before SyncField corrected it.
  */
 export function useDriftData(episodeId: string | null): UseDriftDataReturn {
   const [driftData, setDriftData] = useState<DriftData | null>(null);
   const [isLoading, setIsLoading] = useState(false);
 
-  const fetchDriftData = useCallback(async () => {
+  const fetchData = useCallback(async () => {
     if (!episodeId) {
       setDriftData(null);
       return;
     }
     setIsLoading(true);
     try {
-      const res = await fetch(`/api/episodes/${episodeId}/frame-map`);
-      if (!res.ok) {
+      // Fetch frame map and episode detail in parallel
+      const [fmRes, epRes] = await Promise.all([
+        fetch(`/api/episodes/${episodeId}/frame-map`),
+        fetch(`/api/episodes/${episodeId}`),
+      ]);
+
+      if (!fmRes.ok || !epRes.ok) {
         setDriftData(null);
         return;
       }
-      const data = await res.json();
-      const entries: FrameMapEntry[] = data.frames ?? [];
 
+      const fmData = await fmRes.json();
+      const epData = await epRes.json();
+
+      const entries: FrameMapEntry[] = fmData.frames ?? [];
       if (entries.length === 0) {
         setDriftData(null);
         return;
       }
 
-      const frames: number[] = [];
-      const beforeDrift: number[] = [];
+      // Get the sync correction offset from the report
+      const syncReport = epData.sync_report;
+      const offsetMs: Record<string, number> = {};
+      if (syncReport?.streams) {
+        for (const [sid, info] of Object.entries(syncReport.streams)) {
+          const s = info as { offset_ms?: number; role?: string };
+          if (s.role !== "primary" && s.offset_ms != null) {
+            offsetMs[sid] = s.offset_ms;
+          }
+        }
+      }
+
+      const timesSec: number[] = [];
       const afterDrift: number[] = [];
+      const beforeDrift: number[] = [];
 
       for (const entry of entries) {
-        frames.push(entry.frame);
+        timesSec.push(entry.primary_time_sec);
 
-        const streamValues = Object.values(entry.streams);
-        // After correction: max |delta_ms| across all streams for this frame
-        const maxAfter =
-          streamValues.length > 0
-            ? Math.max(...streamValues.map((s) => Math.abs(s.delta_ms)))
-            : 0;
+        const streamDeltas = Object.entries(entry.streams);
+        if (streamDeltas.length === 0) {
+          afterDrift.push(0);
+          beforeDrift.push(0);
+          continue;
+        }
+
+        // After: max |delta_ms| (the residual after correction)
+        const maxAfter = Math.max(
+          ...streamDeltas.map(([, s]) => Math.abs(s.delta_ms)),
+        );
         afterDrift.push(maxAfter);
 
-        // Before correction: use original_frame offset as a proxy
-        // The delta_ms in the frame map is the post-correction residual.
-        // For "before", we estimate from the difference between the
-        // original frame index and the mapped frame index, scaled by
-        // the frame's time step.
-        const maxBefore =
-          streamValues.length > 0
-            ? Math.max(
-                ...streamValues.map((s) =>
-                  Math.abs(s.delta_ms + (entry.frame - s.frame) * (1000 / 30)),
-                ),
-              )
-            : 0;
+        // Before: add back the correction offset to estimate raw drift
+        const maxBefore = Math.max(
+          ...streamDeltas.map(([sid, s]) => {
+            const correction = offsetMs[sid] ?? 0;
+            return Math.abs(s.delta_ms + correction);
+          }),
+        );
         beforeDrift.push(maxBefore);
       }
 
-      // Compute improvement
-      const meanBefore =
-        beforeDrift.reduce((a, b) => a + b, 0) / beforeDrift.length;
-      const meanAfter =
-        afterDrift.reduce((a, b) => a + b, 0) / afterDrift.length;
+      const meanAfterMs = mean(afterDrift);
+      const meanBeforeMs = mean(beforeDrift);
       const improvementPct =
-        meanBefore > 0 ? (1 - meanAfter / meanBefore) * 100 : 0;
+        meanBeforeMs > 0 ? (1 - meanAfterMs / meanBeforeMs) * 100 : 0;
 
-      setDriftData({ frames, beforeDrift, afterDrift, improvementPct });
+      setDriftData({
+        timesSec,
+        afterDrift,
+        beforeDrift,
+        meanAfterMs,
+        meanBeforeMs,
+        improvementPct,
+      });
     } catch {
       setDriftData(null);
     } finally {
@@ -100,8 +124,13 @@ export function useDriftData(episodeId: string | null): UseDriftDataReturn {
   }, [episodeId]);
 
   useEffect(() => {
-    void fetchDriftData();
-  }, [fetchDriftData]);
+    void fetchData();
+  }, [fetchData]);
 
   return { driftData, isLoading };
+}
+
+function mean(arr: number[]): number {
+  if (arr.length === 0) return 0;
+  return arr.reduce((a, b) => a + b, 0) / arr.length;
 }
