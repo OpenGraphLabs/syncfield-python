@@ -1,6 +1,7 @@
 import type { SessionSnapshot } from "@/lib/types";
 import { formatElapsed, stateLabel } from "@/lib/format";
 import { cn } from "@/lib/utils";
+import { Logo } from "./logo";
 
 interface HeaderProps {
   snapshot: SessionSnapshot | null;
@@ -22,11 +23,17 @@ export function Header({ snapshot, onDiscoverClick }: HeaderProps) {
   const state = snapshot?.state ?? "idle";
   const hostId = snapshot?.host_id ?? "—";
   const elapsed = snapshot?.elapsed_s ?? 0;
+  const isRecording = state === "recording";
 
   return (
-    <header className="flex h-12 items-center gap-4 border-b px-4">
-      {/* Logo */}
-      <h1 className="text-sm font-semibold tracking-tight">SyncField</h1>
+    <header
+      className={cn(
+        "flex h-12 items-center gap-4 border-b px-4 transition-colors",
+        isRecording && "border-recording/30 bg-recording/5",
+      )}
+    >
+      {/* OpenGraph Labs logo */}
+      <Logo className="h-4 shrink-0" />
 
       <div className="mx-1 h-4 w-px bg-border" />
 
@@ -38,12 +45,15 @@ export function Header({ snapshot, onDiscoverClick }: HeaderProps) {
       {/* State indicator */}
       <div className="flex items-center gap-1.5">
         <span
-          className={cn("inline-block h-2 w-2 rounded-full", STATE_COLORS[state])}
+          className={cn(
+            "inline-block h-2 w-2 rounded-full",
+            STATE_COLORS[state],
+          )}
         />
         <span
           className={cn(
             "text-xs font-medium",
-            state === "recording" ? "text-recording" : "text-muted",
+            isRecording ? "text-recording" : "text-muted",
           )}
         >
           {stateLabel(state)}
@@ -51,7 +61,7 @@ export function Header({ snapshot, onDiscoverClick }: HeaderProps) {
       </div>
 
       {/* Elapsed timer */}
-      {state === "recording" && (
+      {isRecording && (
         <>
           <div className="mx-1 h-4 w-px bg-border" />
           <span className="font-mono text-xs tabular-nums text-recording">
@@ -70,7 +80,7 @@ export function Header({ snapshot, onDiscoverClick }: HeaderProps) {
           "transition-colors hover:bg-foreground/5",
           "disabled:cursor-not-allowed disabled:opacity-50",
         )}
-        disabled={state === "recording" || state === "starting"}
+        disabled={isRecording || state === "starting"}
       >
         Discover Devices
       </button>

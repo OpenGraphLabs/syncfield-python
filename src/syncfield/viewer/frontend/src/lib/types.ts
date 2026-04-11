@@ -79,6 +79,9 @@ export interface DiscoveredDevice {
   name: string;
   adapter: string;
   kind: string;
+  description: string;
+  in_use: boolean;
+  warnings: string[];
 }
 
 // ---------------------------------------------------------------------------

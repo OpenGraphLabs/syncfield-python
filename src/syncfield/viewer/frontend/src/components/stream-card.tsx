@@ -1,5 +1,5 @@
 import type { StreamSnapshot } from "@/lib/types";
-import { formatCount, formatHz, formatMsAgo } from "@/lib/format";
+import { formatCount, formatHz } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import { VideoPreview } from "./video-preview";
 import { SensorChart } from "./sensor-chart";
@@ -75,8 +75,6 @@ export function StreamCard({ stream, canRemove, onRemove }: StreamCardProps) {
         <span className="font-mono">{formatCount(stream.frame_count)}</span>
         <span className="h-3 w-px bg-border" />
         <span className="font-mono">{formatHz(stream.effective_hz)}</span>
-        <span className="h-3 w-px bg-border" />
-        <span className="font-mono">{formatMsAgo(stream.last_sample_ms_ago)}</span>
         {stream.health_count > 0 && (
           <>
             <span className="h-3 w-px bg-border" />

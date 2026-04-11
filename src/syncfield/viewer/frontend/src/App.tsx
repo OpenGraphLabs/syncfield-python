@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { useSession } from "@/hooks/use-session";
 import { useDiscovery } from "@/hooks/use-discovery";
+import { cn } from "@/lib/utils";
 import { Header } from "@/components/header";
 import { ControlPanel } from "@/components/control-panel";
 import { SessionClock } from "@/components/session-clock";
@@ -19,7 +20,7 @@ import { Footer } from "@/components/footer";
 // ---------------------------------------------------------------------------
 
 export function App() {
-  const { snapshot, countdown, sendCommand, connectionStatus } = useSession();
+  const { snapshot, countdown, sendCommand } = useSession();
   const discovery = useDiscovery();
   const [discoveryOpen, setDiscoveryOpen] = useState(false);
 
@@ -41,8 +42,15 @@ export function App() {
   const streamList = Object.values(streams);
   const canRemove = state === "idle" || state === "connected" || state === "stopped";
 
+  const isRecording = state === "recording";
+
   return (
-    <div className="flex h-screen flex-col">
+    <div
+      className={cn(
+        "flex h-screen flex-col transition-shadow",
+        isRecording && "shadow-[inset_0_0_0_3px_hsl(0_65%_48%)]",
+      )}
+    >
       {/* Header */}
       <Header
         snapshot={snapshot}
@@ -96,13 +104,6 @@ export function App() {
 
       {/* Footer */}
       <Footer outputDir={snapshot?.output_dir ?? ""} />
-
-      {/* Connection status indicator */}
-      {connectionStatus === "disconnected" && (
-        <div className="fixed bottom-10 left-1/2 -translate-x-1/2 rounded-full bg-destructive px-4 py-1.5 text-xs font-medium text-white shadow-lg">
-          Reconnecting…
-        </div>
-      )}
 
       {/* Countdown overlay */}
       {countdown !== null && <CountdownOverlay count={countdown} />}

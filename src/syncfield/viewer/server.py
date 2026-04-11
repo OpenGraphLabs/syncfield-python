@@ -208,18 +208,29 @@ class ViewerServer:
         async def api_discover() -> JSONResponse:
             """Trigger device discovery scan."""
             try:
-                from syncfield.discovery import discover_devices
-                devices = await asyncio.to_thread(discover_devices)
+                import syncfield.adapters  # noqa: F401 — register discoverers
+                from syncfield.discovery import scan
+
+                report = await asyncio.to_thread(scan, use_cache=False)
                 result = [
                     {
-                        "id": d.id,
-                        "name": d.name,
-                        "adapter": d.adapter,
+                        "id": d.device_id,
+                        "name": d.display_name,
+                        "adapter": d.adapter_type,
                         "kind": d.kind,
+                        "description": d.description,
+                        "in_use": d.in_use,
+                        "warnings": list(d.warnings),
                     }
-                    for d in devices
+                    for d in report.devices
                 ]
-                return JSONResponse({"devices": result})
+                errors = (
+                    list(report.errors.values()) if report.errors else None
+                )
+                return JSONResponse({
+                    "devices": result,
+                    "error": errors[0] if errors else None,
+                })
             except ImportError:
                 return JSONResponse({"devices": [], "error": "discovery not available"})
             except Exception as exc:
@@ -230,19 +241,29 @@ class ViewerServer:
 
         @app.post("/api/streams/{stream_id}")
         async def api_add_stream(stream_id: str) -> JSONResponse:
-            """Add a discovered device to the session."""
+            """Add a discovered device to the session by device_id."""
             try:
-                from syncfield.discovery import discover_devices, build_stream
-                devices = await asyncio.to_thread(discover_devices)
-                device = next((d for d in devices if d.id == stream_id), None)
+                import syncfield.adapters  # noqa: F401
+                from syncfield.discovery import scan
+                from syncfield.discovery._id_gen import make_stream_id
+
+                report = await asyncio.to_thread(scan)
+                device = next(
+                    (d for d in report.devices if d.device_id == stream_id),
+                    None,
+                )
                 if device is None:
                     return JSONResponse(
                         {"error": f"Device {stream_id!r} not found"},
                         status_code=404,
                     )
-                stream = build_stream(device)
+                sid = make_stream_id(device.display_name)
+                kwargs: Dict[str, Any] = {"id": sid}
+                if device.accepts_output_dir:
+                    kwargs["output_dir"] = self._session.output_dir
+                stream = device.construct(**kwargs)
                 self._session.add(stream)
-                return JSONResponse({"status": "added", "id": stream_id})
+                return JSONResponse({"status": "added", "id": sid})
             except Exception as exc:
                 logger.exception("Failed to add stream")
                 return JSONResponse({"error": str(exc)}, status_code=500)
