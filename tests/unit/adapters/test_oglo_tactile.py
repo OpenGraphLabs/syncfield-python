@@ -99,6 +99,10 @@ class TestPayloadDecoding:
         from syncfield.adapters.oglo_tactile import OgloTactileStream
 
         stream = OgloTactileStream("tactile_right", address="m", hand="right")
+        # Put the stream into "recording" mode so decoded samples
+        # advance the real frame_number counters rather than flowing
+        # through the preview path (which uses -1 placeholders).
+        stream._recording = True
         received: List[SampleEvent] = []
         stream.on_sample(received.append)
 
@@ -146,6 +150,7 @@ class TestPayloadDecoding:
         from syncfield.adapters.oglo_tactile import OgloTactileStream
 
         stream = OgloTactileStream("tactile_right", address="m")
+        stream._recording = True  # simulate post-``start_recording`` state
 
         for batch_index in range(3):
             samples = [(1, 2, 3, 4, 5)] * 10
@@ -157,6 +162,29 @@ class TestPayloadDecoding:
             stream._dispatch_notification_for_test(packet)
 
         assert stream._frame_count == 30
+
+    def test_preview_samples_do_not_advance_frame_count(self, mock_bleak):
+        """Samples decoded while ``_recording == False`` update the
+        viewer plot but must not pollute the finalization counters.
+        """
+        from syncfield.adapters.oglo_tactile import OgloTactileStream
+
+        stream = OgloTactileStream("tactile_right", address="m")
+        received: List[SampleEvent] = []
+        stream.on_sample(received.append)
+
+        # Stream is in the preview phase — ``_recording`` stays False.
+        samples = [(1, 2, 3, 4, 5)] * 10
+        packet = _build_packet(count=10, timestamp_us=0, samples=samples)
+        stream._dispatch_notification_for_test(packet)
+
+        assert len(received) == 10  # samples reached on_sample subscribers
+        assert stream._frame_count == 0  # but no recording advancement
+        assert stream._first_at is None
+        assert stream._last_at is None
+        # Preview samples carry a sentinel frame_number of -1 so
+        # subscribers can tell them apart from recording samples.
+        assert all(ev.frame_number == -1 for ev in received)
 
     def test_short_packet_becomes_warning(self, mock_bleak):
         from syncfield.adapters.oglo_tactile import OgloTactileStream
@@ -190,6 +218,7 @@ class TestPayloadDecoding:
         from syncfield.adapters.oglo_tactile import OgloTactileStream
 
         stream = OgloTactileStream("tactile_right", address="m", hand="right")
+        stream._recording = True  # simulate post-``start_recording`` state
 
         packet = _build_packet(
             count=5,

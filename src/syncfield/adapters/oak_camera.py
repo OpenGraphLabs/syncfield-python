@@ -12,6 +12,31 @@ Requires two optional extras:
 
 Both extras are available together via ``syncfield[all]``.
 
+Lifecycle
+---------
+
+This adapter implements the 4-phase :class:`~syncfield.Stream` SPI so
+the viewer can show live OAK preview frames **before** Record is
+pressed:
+
+* ``prepare()``       — create the output directory.
+* ``connect()``       — discover the target device, build and start the
+  DepthAI pipeline, spawn the capture thread in preview-only mode.
+  ``latest_frame`` begins updating as soon as the pipeline warms up.
+* ``start_recording()`` — open the MP4 (and optional depth binary)
+  writer and flip the ``_recording`` flag so the running capture loop
+  starts writing and emitting :class:`SampleEvent`\\ s.
+* ``stop_recording()`` — flip the flag back off, close the writers,
+  return the finalization report. The capture loop **keeps running**
+  so preview stays live and the operator can start another recording
+  without rebuilding the pipeline.
+* ``disconnect()``    — signal the capture thread, join it, and
+  release the DepthAI pipeline.
+
+Legacy ``start()`` / ``stop()`` are still supported for 0.1-era code
+paths — they collapse the new lifecycle into a one-shot
+``connect + start_recording`` / ``stop_recording + disconnect`` pair.
+
 The adapter is intentionally thinner than the full-featured OakCamera class
 used inside opengraph-studio/recorder — it ships the 80% common case (RGB +
 optional depth) so the code stays small and easy to extend. For IMU, stereo
@@ -55,17 +80,16 @@ from syncfield.types import (
 class OakCameraStream(StreamBase):
     """Captures RGB (and optional depth) from a Luxonis OAK camera.
 
-    Lifecycle:
-        1. ``prepare()`` discovers a device, builds a DepthAI pipeline with an
-           RGB ``Camera`` node (and optionally a ``StereoDepth`` node), and
-           starts the pipeline.
-        2. ``start()`` opens the MP4 writer (and depth raw-bin file if
-           depth is enabled), then spins up a background thread that reads
-           frames in a tight loop, timestamps each read with
-           ``time.monotonic_ns()``, writes the frame to disk, and emits a
-           :class:`~syncfield.types.SampleEvent`.
-        3. ``stop()`` signals the thread, joins it, releases the pipeline
-           and writers, and returns a :class:`FinalizationReport`.
+    See the module docstring for the full 4-phase lifecycle. In short:
+
+    * ``connect()`` builds and starts the DepthAI pipeline so
+      :attr:`latest_frame` begins updating (live viewer preview).
+    * ``start_recording(session_clock)`` opens the MP4 (and optional
+      depth bin) writer and flips the ``_recording`` flag so the
+      already-running capture loop begins writing and emitting samples.
+    * ``stop_recording()`` closes the writers but leaves the pipeline
+      running so preview stays live.
+    * ``disconnect()`` tears down the pipeline.
 
     Args:
         id: Stream id (also used as the output file name: ``{id}.mp4``).
@@ -131,6 +155,13 @@ class OakCameraStream(StreamBase):
         self._first_at: Optional[int] = None
         self._last_at: Optional[int] = None
 
+        # True while the capture loop should write frames to disk and
+        # emit ``SampleEvent``. ``connect()`` leaves this False so the
+        # CONNECTED preview phase never touches the filesystem;
+        # ``start_recording()`` flips it True; ``stop_recording()``
+        # flips it False again while the capture thread keeps running.
+        self._recording = False
+
         # Live preview support — the viewer reads ``latest_frame`` to render
         # the stream card thumbnail. ``_frame_lock`` protects handoff between
         # the capture thread and the reader.
@@ -138,42 +169,100 @@ class OakCameraStream(StreamBase):
         self._latest_frame: Any = None
 
     # ------------------------------------------------------------------
-    # Stream SPI
+    # Stream SPI — 4-phase lifecycle
     # ------------------------------------------------------------------
 
     def prepare(self) -> None:
-        """Discover a device and build the DepthAI pipeline.
+        """Create the output directory.
 
-        When multiple OAK devices are connected, the ``device_id``
-        constructor argument (a ``deviceId`` serial string as returned
-        by :func:`depthai.Device.getAllAvailableDevices`) selects which
-        one to open. If omitted, the first available device is used.
+        The heavy lifting — device discovery, pipeline build, pipeline
+        start — happens in :meth:`connect` so the viewer can show a
+        live preview as soon as the session enters the ``CONNECTED``
+        state. ``prepare()`` stays cheap and idempotent.
+        """
+        self._output_dir.mkdir(parents=True, exist_ok=True)
+
+    #: How many times to poll ``dai.Device.getAllAvailableDevices()``
+    #: before giving up. The first call often returns only a subset on
+    #: dual-OAK rigs because XLink enumeration is asynchronous — the
+    #: second board shows up after 0.5–1 s. Three tries with a short
+    #: sleep between comfortably covers that gap without extending the
+    #: happy-path connect time (which still returns on the first call).
+    _ENUMERATE_RETRIES = 3
+    _ENUMERATE_RETRY_DELAY_S = 0.8
+
+    def _locate_device(self) -> Any:
+        """Find the target OAK, retrying the XLink enumeration if needed.
+
+        ``dai.Device.getAllAvailableDevices()`` is an asynchronous probe
+        over XLink. On dual-OAK rigs the first call frequently returns
+        only one of the two boards, then 500–1000 ms later the second
+        board appears. When the caller pinned a specific ``device_id``
+        and it's missing from the first probe, we re-probe up to
+        :attr:`_ENUMERATE_RETRIES` times before raising — that's the
+        difference between a flaky startup and a hard failure the
+        operator has to replug around.
+
+        When ``device_id`` is ``None`` (pick any), we return on the
+        first non-empty result so auto-pick stays fast.
+
+        Raises:
+            RuntimeError: If no device is found after exhausting all
+                retries, or if the pinned ``device_id`` never appears.
+        """
+        last_seen: list = []
+        for attempt in range(self._ENUMERATE_RETRIES):
+            devices = dai.Device.getAllAvailableDevices()
+            last_seen = devices
+            if devices:
+                if self._device_id is None:
+                    return devices[0]
+                for dev in devices:
+                    if getattr(dev, "deviceId", None) == self._device_id:
+                        return dev
+            if attempt < self._ENUMERATE_RETRIES - 1:
+                time.sleep(self._ENUMERATE_RETRY_DELAY_S)
+
+        if not last_seen:
+            raise RuntimeError(
+                "No OAK devices found after "
+                f"{self._ENUMERATE_RETRIES} enumeration attempts. Check "
+                "cables, power, and that no other DepthAI process is "
+                "holding the board."
+            )
+        available = [getattr(d, "deviceId", "?") for d in last_seen]
+        raise RuntimeError(
+            f"OAK device_id {self._device_id!r} not found after "
+            f"{self._ENUMERATE_RETRIES} enumeration attempts. Visible "
+            f"devices: {available}. If the missing device is physically "
+            f"attached, unplug and replug its USB cable — Myriad-X "
+            f"boards can enter a zombie state after an unclean shutdown."
+        )
+
+    def connect(self) -> None:
+        """Open the DepthAI pipeline and spawn the preview capture thread.
+
+        Discovers the requested device (by ``device_id`` if supplied,
+        else the first attached OAK), builds the pipeline, starts it,
+        and spawns the capture thread in **preview-only** mode:
+        :attr:`latest_frame` updates continuously, but no file is
+        written and no :class:`SampleEvent` is emitted until
+        :meth:`start_recording` flips the ``_recording`` flag.
+
+        Idempotent — calling ``connect()`` on an already-connected
+        stream is a no-op so legacy callers that jump straight to
+        ``start()`` don't spawn a second capture thread.
 
         Raises:
             RuntimeError: If no OAK devices are connected, or if the
                 requested ``device_id`` is not among the currently
-                attached devices.
+                attached devices after :attr:`_ENUMERATE_RETRIES`
+                probe attempts.
         """
-        self._output_dir.mkdir(parents=True, exist_ok=True)
+        if self._thread is not None and self._thread.is_alive():
+            return
 
-        devices = dai.Device.getAllAvailableDevices()
-        if not devices:
-            raise RuntimeError("No OAK devices found")
-
-        if self._device_id is not None:
-            matching = [
-                d for d in devices
-                if getattr(d, "deviceId", None) == self._device_id
-            ]
-            if not matching:
-                available = [getattr(d, "deviceId", "?") for d in devices]
-                raise RuntimeError(
-                    f"OAK device_id {self._device_id!r} not found. "
-                    f"Available: {available}"
-                )
-            selected = matching[0]
-        else:
-            selected = devices[0]
+        selected = self._locate_device()
 
         self._pipeline = self._build_pipeline()
         # DepthAI v3 build() accepts an optional device info; older
@@ -188,8 +277,33 @@ class OakCameraStream(StreamBase):
         # camera settles. Keeps the capture loop's error counters clean.
         time.sleep(1.0)
 
-    def start(self, session_clock: SessionClock) -> None:
-        """Open output files and launch the background capture thread."""
+        # Reset counters so a reconnect starts clean.
+        self._recording = False
+        self._frame_count = 0
+        self._depth_frame_count = 0
+        self._first_at = None
+        self._last_at = None
+        self._stop_event.clear()
+        self._thread = threading.Thread(
+            target=self._capture_loop, name=f"oak-{self.id}", daemon=True
+        )
+        self._thread.start()
+
+    def start_recording(self, session_clock: SessionClock) -> None:
+        """Open output files and flip the recording flag.
+
+        The capture thread is already running from :meth:`connect`, so
+        this is a :class:`cv2.VideoWriter` construction plus a boolean
+        flip — fast enough to run atomically across every stream in
+        the orchestrator's start phase.
+
+        If the caller skipped :meth:`connect` (legacy 0.1 ``start()``
+        path), the pipeline is started here first so the writer always
+        has a feeder.
+        """
+        if self._thread is None or not self._thread.is_alive():
+            self.connect()
+
         width, height = self._rgb_resolution
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         self._video_writer = cv2.VideoWriter(
@@ -198,29 +312,21 @@ class OakCameraStream(StreamBase):
         if self._depth_enabled:
             self._depth_file = open(self._depth_path, "wb")
 
-        self._stop_event.clear()
-        self._thread = threading.Thread(
-            target=self._capture_loop, name=f"oak-{self.id}", daemon=True
-        )
-        self._thread.start()
+        # Flip the flag LAST so the capture loop doesn't race into a
+        # half-built writer.
+        self._recording = True
 
-    def stop(self) -> FinalizationReport:
-        """Signal the thread, release the pipeline, return the report."""
-        self._stop_event.set()
-        if self._thread is not None:
-            self._thread.join(timeout=3.0)
+    def stop_recording(self) -> FinalizationReport:
+        """Flip recording off, close the writers, return the report.
 
+        The pipeline stays live so the viewer preview keeps rendering
+        and the operator can start a fresh recording on the same
+        session without re-opening hardware.
+        """
+        self._recording = False
         self._release_writers()
-        self._release_pipeline()
 
-        extra_channels: dict[str, Any] = {}
-        if self._depth_enabled:
-            extra_channels["depth_frame_count"] = self._depth_frame_count
-            extra_channels["depth_path"] = (
-                str(self._depth_path) if self._depth_frame_count > 0 else None
-            )
-
-        report = FinalizationReport(
+        return FinalizationReport(
             stream_id=self.id,
             status="completed",
             frame_count=self._frame_count,
@@ -230,8 +336,40 @@ class OakCameraStream(StreamBase):
             health_events=list(self._collected_health),
             error=None,
         )
-        # Expose depth stats through the health_events buffer so consumers
-        # that only look at FinalizationReport still get visibility.
+
+    def disconnect(self) -> None:
+        """Stop the capture thread and release the DepthAI pipeline.
+
+        Called when the session returns to ``IDLE``. Idempotent —
+        calling twice is safe. After this call the adapter holds no
+        DepthAI handles.
+        """
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=3.0)
+            self._thread = None
+        self._release_pipeline()
+
+    # ------------------------------------------------------------------
+    # Legacy one-shot lifecycle
+    # ------------------------------------------------------------------
+
+    def start(self, session_clock: SessionClock) -> None:
+        """Legacy one-shot start — ``connect() + start_recording()``.
+
+        Exists so 0.1-era scripts that call ``prepare() → start() →
+        stop()`` keep working without changes. New callers (the
+        viewer, the 4-phase orchestrator path) should use
+        :meth:`connect` and :meth:`start_recording` directly to get
+        live preview before the first Record click.
+        """
+        self.connect()
+        self.start_recording(session_clock)
+
+    def stop(self) -> FinalizationReport:
+        """Legacy one-shot stop — ``stop_recording() + disconnect()``."""
+        report = self.stop_recording()
+        self.disconnect()
         return report
 
     # ------------------------------------------------------------------
@@ -277,11 +415,23 @@ class OakCameraStream(StreamBase):
     def _capture_loop(self) -> None:
         """Body of the background thread — tight read/timestamp/write loop.
 
-        The timestamp is captured *immediately* after ``queue.get()`` so
-        the jitter between the physical frame and the recorded timestamp
-        stays as small as possible. Depth frames are consumed in the
-        same tick with ``tryGet()`` so depth and RGB share the same
-        monotonic anchor.
+        Two phases, distinguished by the ``_recording`` flag:
+
+        * **Preview** (``_recording == False``) — publish every frame
+          to ``latest_frame`` so the viewer card stays live, but do
+          **not** write to the MP4, update frame counters, or emit
+          ``SampleEvent``. The capture runs continuously from the
+          moment :meth:`connect` spawned this thread.
+        * **Recording** (``_recording == True``) — same preview
+          publish, plus write to the ``VideoWriter``, advance
+          ``_frame_count``, drain a depth tick, and emit
+          ``SampleEvent``. The capture timestamp is sampled
+          *immediately* after ``queue.get()`` so the jitter between
+          the physical frame and the recorded monotonic time stays
+          as small as possible.
+
+        The loop exits when ``_stop_event`` fires (from
+        :meth:`disconnect`).
         """
         while not self._stop_event.is_set():
             rgb_msg = self._safe_get_rgb()
@@ -290,27 +440,30 @@ class OakCameraStream(StreamBase):
                 continue
 
             frame = rgb_msg.getCvFrame()
-            if self._first_at is None:
-                self._first_at = capture_ns
-            self._last_at = capture_ns
-            self._frame_count += 1
 
-            # Publish the latest frame for live preview (viewer reads this).
+            # Always publish the latest frame for live preview — the
+            # viewer reads this in both CONNECTED and RECORDING states.
             with self._frame_lock:
                 self._latest_frame = frame
 
-            if self._video_writer is not None:
-                self._video_writer.write(frame)
-            self._emit_sample(
-                SampleEvent(
-                    stream_id=self.id,
-                    frame_number=self._frame_count - 1,
-                    capture_ns=capture_ns,
-                )
-            )
+            if self._recording:
+                if self._first_at is None:
+                    self._first_at = capture_ns
+                self._last_at = capture_ns
+                self._frame_count += 1
 
-            if self._depth_enabled:
-                self._drain_depth_tick()
+                if self._video_writer is not None:
+                    self._video_writer.write(frame)
+                self._emit_sample(
+                    SampleEvent(
+                        stream_id=self.id,
+                        frame_number=self._frame_count - 1,
+                        capture_ns=capture_ns,
+                    )
+                )
+
+                if self._depth_enabled:
+                    self._drain_depth_tick()
 
     def _safe_get_rgb(self) -> Any:
         """Pull one RGB frame from the queue, swallowing timeouts."""

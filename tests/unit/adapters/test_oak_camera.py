@@ -17,12 +17,19 @@ def _clock() -> SessionClock:
     return SessionClock(sync_point=SyncPoint.create_now("h"))
 
 
-def _build_fake_depthai(frame_budget: int = 3) -> MagicMock:
+def _build_fake_depthai() -> MagicMock:
     """Return a MagicMock that looks enough like depthai for the adapter.
 
     Models the depthai v3 pipeline API: Pipeline.build() / start() / stop(),
     Camera node with requestOutput() → OutputQueue.get() → ImgFrame-like
     object exposing .getCvFrame() and .getTimestamp().
+
+    The fake queue returns an unlimited stream of frames — in the new
+    4-phase lifecycle the capture loop runs across both the preview
+    (``connect()``) and recording (``start_recording()``) phases, so a
+    fixed budget would get consumed before any recording happens.
+    Tests that want to exercise "queue drains" swap in a narrower
+    side_effect manually.
     """
     fake = MagicMock()
 
@@ -35,17 +42,12 @@ def _build_fake_depthai(frame_budget: int = 3) -> MagicMock:
         def getCvFrame(self) -> MagicMock:
             return self._cv_frame
 
-    # --- Fake output queue: returns a few frames then None --------------
-    call_count = {"n": 0}
-
+    # --- Fake output queue: unlimited stream of frames ------------------
     def make_queue() -> MagicMock:
         q = MagicMock()
 
-        def fake_get(timeout: float = 0.1) -> _FakeFrame | None:
-            call_count["n"] += 1
-            if call_count["n"] <= frame_budget:
-                return _FakeFrame()
-            return None
+        def fake_get(timeout: float = 0.1) -> _FakeFrame:
+            return _FakeFrame()
 
         q.get.side_effect = fake_get
         q.tryGet.return_value = None
@@ -111,54 +113,85 @@ class TestCapabilities:
 
 
 class TestLifecycle:
-    def test_prepare_builds_and_starts_pipeline(self, mock_depthai, tmp_path):
+    """Exercise the 4-phase connect → start_recording → stop_recording → disconnect path.
+
+    In 0.2 the pipeline build moved from ``prepare()`` into
+    ``connect()`` so the viewer can show a live preview before Record
+    is pressed. These tests pin that split down.
+    """
+
+    def test_connect_builds_and_starts_pipeline(self, mock_depthai, tmp_path):
         fake, _ = mock_depthai
         from syncfield.adapters.oak_camera import OakCameraStream
 
         stream = OakCameraStream("oak", output_dir=tmp_path)
         stream.prepare()
+        # prepare() no longer opens the pipeline — only connect() does.
+        assert fake.Pipeline.call_count == 0
 
-        # Pipeline was constructed, built, and started
-        fake.Pipeline.assert_called_once()
-        pipeline = fake.Pipeline.return_value
-        assert pipeline.build.called
-        assert pipeline.start.called
+        stream.connect()
+        # Give the capture thread a moment to pull a frame or two.
+        time.sleep(0.05)
+        try:
+            fake.Pipeline.assert_called_once()
+            pipeline = fake.Pipeline.return_value
+            assert pipeline.build.called
+            assert pipeline.start.called
+        finally:
+            stream.disconnect()
 
-    def test_prepare_raises_when_no_devices(self, mock_depthai, tmp_path):
+    def test_connect_raises_when_no_devices(self, mock_depthai, tmp_path):
         fake, _ = mock_depthai
         fake.Device.getAllAvailableDevices.return_value = []
         from syncfield.adapters.oak_camera import OakCameraStream
 
         stream = OakCameraStream("oak", output_dir=tmp_path)
+        stream.prepare()
         with pytest.raises(RuntimeError, match="No OAK devices"):
-            stream.prepare()
+            stream.connect()
 
-    def test_start_stop_produces_file_path(self, mock_depthai, tmp_path):
+    def test_full_lifecycle_produces_file_path(self, mock_depthai, tmp_path):
+        from syncfield.adapters.oak_camera import OakCameraStream
+
+        stream = OakCameraStream("oak", output_dir=tmp_path)
+        stream.prepare()
+        stream.connect()
+        stream.start_recording(_clock())
+        # Give the background thread time to read the mocked frames
+        time.sleep(0.15)
+        report = stream.stop_recording()
+        stream.disconnect()
+
+        assert report.status == "completed"
+        assert report.file_path is not None
+        assert report.frame_count >= 1
+
+    def test_disconnect_releases_pipeline(self, mock_depthai, tmp_path):
+        fake, _ = mock_depthai
+        from syncfield.adapters.oak_camera import OakCameraStream
+
+        stream = OakCameraStream("oak", output_dir=tmp_path)
+        stream.prepare()
+        stream.connect()
+        time.sleep(0.05)
+        stream.disconnect()
+
+        pipeline = fake.Pipeline.return_value
+        assert pipeline.stop.called
+
+    def test_legacy_start_stop_still_works(self, mock_depthai, tmp_path):
+        """Old 0.1-era ``prepare() → start() → stop()`` path stays valid."""
         from syncfield.adapters.oak_camera import OakCameraStream
 
         stream = OakCameraStream("oak", output_dir=tmp_path)
         stream.prepare()
         stream.start(_clock())
-        # Give the background thread time to read the mocked frames
         time.sleep(0.15)
         report = stream.stop()
 
         assert report.status == "completed"
         assert report.file_path is not None
         assert report.frame_count >= 1
-
-    def test_stop_releases_pipeline(self, mock_depthai, tmp_path):
-        fake, _ = mock_depthai
-        from syncfield.adapters.oak_camera import OakCameraStream
-
-        stream = OakCameraStream("oak", output_dir=tmp_path)
-        stream.prepare()
-        stream.start(_clock())
-        time.sleep(0.05)
-        stream.stop()
-
-        pipeline = fake.Pipeline.return_value
-        assert pipeline.stop.called
 
 
 class TestDepthOption:
@@ -173,10 +206,13 @@ class TestDepthOption:
             depth_enabled=True,
         )
         stream.prepare()
-
-        # pipeline.create was called twice (Camera + StereoDepth)
-        pipeline = fake.Pipeline.return_value
-        assert pipeline.create.call_count >= 2
+        stream.connect()
+        try:
+            # pipeline.create was called twice (Camera + StereoDepth)
+            pipeline = fake.Pipeline.return_value
+            assert pipeline.create.call_count >= 2
+        finally:
+            stream.disconnect()
 
     def test_depth_disabled_by_default(self, mock_depthai, tmp_path):
         """Default config builds only the RGB camera node."""
@@ -185,9 +221,12 @@ class TestDepthOption:
 
         stream = OakCameraStream("oak", output_dir=tmp_path)
         stream.prepare()
-
-        pipeline = fake.Pipeline.return_value
-        assert pipeline.create.call_count == 1  # RGB only
+        stream.connect()
+        try:
+            pipeline = fake.Pipeline.return_value
+            assert pipeline.create.call_count == 1  # RGB only
+        finally:
+            stream.disconnect()
 
 
 class TestImportGuard:

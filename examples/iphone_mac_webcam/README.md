@@ -33,21 +33,38 @@ pip install "syncfield[uvc,audio,viewer]"
 | Extra | What it's for |
 |---|---|
 | `uvc` | OpenCV — the `UVCWebcamStream` adapter that drives both cameras |
-| `audio` | `sounddevice` — needed by the sync tone / chirp path, even though chirps are skipped in single-host mode |
+| `audio` | `sounddevice` — plays the 3/2/1 countdown ticks and start/stop sync chirps through the MacBook speakers |
 | `viewer` | `dearpygui` + `numpy` — the bundled desktop viewer |
 
 ## Run
 
+The shortest way to run this example is `uv run` from the **repo root** — no virtualenv, no install step, `uv` resolves the extras against the root `pyproject.toml`:
+
 ```bash
-# Default: webcam at index 0, iPhone at index 1
-python record.py
+# Default: Mac webcam at index 0, iPhone at index 1
+uv run --extra uvc --extra audio --extra viewer \
+    python examples/iphone_mac_webcam/record.py
 
 # Custom indices, output dir, geometry
-python record.py \
-    --webcam-index 0 \
-    --iphone-index 1 \
-    --output-dir ./my_recording \
-    --width 1920 --height 1080 --fps 30
+uv run --extra uvc --extra audio --extra viewer \
+    python examples/iphone_mac_webcam/record.py \
+        --webcam-index 0 \
+        --iphone-index 1 \
+        --output-dir ./my_recording \
+        --width 1920 --height 1080 --fps 30
+```
+
+> If you forget `--extra audio`, the recording still works but the countdown and chirps are silent and the console prints a WARNING telling you to add it.
+
+### Alternative: plain `python` after install
+
+If you'd rather `pip install` into a venv and run the script directly:
+
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install "syncfield[uvc,audio,viewer]"
+cd examples/iphone_mac_webcam
+python record.py
 ```
 
 ### Not sure which index is which?

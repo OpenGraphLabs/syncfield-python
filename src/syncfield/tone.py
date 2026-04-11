@@ -58,6 +58,15 @@ _DEFAULT_STOP_CHIRP = ChirpSpec(
     from_hz=2500, to_hz=400, duration_ms=500, amplitude=0.8, envelope_ms=15
 )
 
+# Countdown tick — a short flat-frequency beep played once per countdown
+# second by :meth:`SessionOrchestrator.start`. The tone is C6 (1046.5 Hz)
+# for 100 ms with a 10 ms envelope, which reads as a clean digital "tick"
+# on MacBook speakers without being jarring. The operator hears
+# beep · beep · beep before the start chirp sweeps in.
+_DEFAULT_COUNTDOWN_TICK = ChirpSpec(
+    from_hz=1047, to_hz=1047, duration_ms=100, amplitude=0.6, envelope_ms=10
+)
+
 
 def generate_chirp_samples(spec: ChirpSpec, sample_rate: int = 44100) -> List[float]:
     """Generate mono PCM float samples for a linear FM chirp with cosine envelope.
@@ -175,6 +184,11 @@ class SyncToneConfig:
             streams have started.
         stop_chirp: Parameters for the chirp played right before the
             orchestrator stops all streams.
+        countdown_tick: Optional short beep played once per second
+            during the ``COUNTDOWN`` phase. Defaults to a 100 ms C6
+            tick so the operator hears ``beep · beep · beep`` before
+            the start chirp sweeps in. Set to ``None`` to silence the
+            countdown while keeping the start/stop chirps audible.
         post_start_stabilization_ms: How long to wait after starting every
             stream before playing the start chirp.
         pre_stop_tail_margin_ms: Extra wait time (on top of the stop
@@ -185,6 +199,9 @@ class SyncToneConfig:
     enabled: bool = True
     start_chirp: ChirpSpec = field(default_factory=lambda: _DEFAULT_START_CHIRP)
     stop_chirp: ChirpSpec = field(default_factory=lambda: _DEFAULT_STOP_CHIRP)
+    countdown_tick: Optional[ChirpSpec] = field(
+        default_factory=lambda: _DEFAULT_COUNTDOWN_TICK
+    )
     post_start_stabilization_ms: int = 200
     pre_stop_tail_margin_ms: int = 200
 
@@ -201,7 +218,7 @@ class SyncToneConfig:
         unacceptable (quiet rooms, meetings) or for headless lab machines
         with no audio output path.
         """
-        return cls(enabled=False)
+        return cls(enabled=False, countdown_tick=None)
 
 
 # ---------------------------------------------------------------------------
@@ -441,14 +458,19 @@ def create_default_player(sample_rate: int = 44100) -> ChirpPlayer:
 
     Returns a :class:`SoundDeviceChirpPlayer` when ``sounddevice`` is
     importable, else a :class:`SilentChirpPlayer`. Import errors are
-    logged at INFO — never raised — so the SDK stays usable on headless
-    machines with no audio output.
+    logged at WARNING — never raised — so the SDK stays usable on
+    headless machines with no audio output, but interactive users see
+    the explicit "install ``syncfield[audio]`` to hear chirps" hint
+    instead of silently wondering why nothing beeps.
     """
     try:
         import sounddevice  # noqa: F401
     except (ImportError, OSError) as exc:
-        logger.info(
-            "sounddevice unavailable (%s); chirp playback disabled", exc
+        logger.warning(
+            "sounddevice unavailable (%s). The countdown ticks and start/"
+            "stop chirps will be SILENT. Install the audio extra to hear "
+            "them: pip install 'syncfield[audio]'",
+            exc,
         )
         return SilentChirpPlayer()
     return SoundDeviceChirpPlayer(sample_rate=sample_rate)
