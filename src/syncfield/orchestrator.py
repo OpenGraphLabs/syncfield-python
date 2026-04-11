@@ -829,11 +829,8 @@ class SessionOrchestrator:
             _rollback_disconnect_streams(self._connected_streams)
             self._connected_streams = []
 
-            # Remove auto-injected audio stream
-            if self._auto_audio_stream is not None:
-                sid = self._auto_audio_stream.id
-                self._streams.pop(sid, None)
-                self._auto_audio_stream = None
+            # Keep auto-injected audio stream registered (visible in viewer)
+            # but disconnected. It will be reconnected on next connect().
 
             self._transition(SessionState.IDLE)
             if self._log_writer is not None:

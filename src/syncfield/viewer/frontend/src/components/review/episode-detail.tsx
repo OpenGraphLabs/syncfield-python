@@ -17,22 +17,39 @@ interface EpisodeDetailProps {
 }
 
 export function EpisodeDetail({ episodeId, onBack }: EpisodeDetailProps) {
-  const { episode, isLoading, error, refresh } = useEpisode(episodeId);
+  // Increment key to force full re-mount after sync completes
+  const [refreshKey, setRefreshKey] = useState(0);
+
+  return (
+    <EpisodeDetailInner
+      key={`${episodeId}-${refreshKey}`}
+      episodeId={episodeId}
+      onBack={onBack}
+      onSyncComplete={() => setRefreshKey((k) => k + 1)}
+    />
+  );
+}
+
+function EpisodeDetailInner({
+  episodeId,
+  onBack,
+  onSyncComplete,
+}: EpisodeDetailProps & { onSyncComplete: () => void }) {
+  const { episode, isLoading, error } = useEpisode(episodeId);
   const { triggerSync, jobStatus, isSyncing, error: syncError } = useSync();
   const { driftData, isLoading: driftLoading } = useDriftData(episodeId);
   const playback = usePlayback();
 
-  // Sync comparison modal state
   const [compareStream, setCompareStream] = useState<string | null>(null);
 
-  // Auto-refresh episode data when sync completes
+  // When sync completes, trigger full re-mount via parent key change
   const prevSyncing = useRef(false);
   useEffect(() => {
     if (prevSyncing.current && !isSyncing && jobStatus?.status === "complete") {
-      refresh();
+      onSyncComplete();
     }
     prevSyncing.current = isSyncing;
-  }, [isSyncing, jobStatus, refresh]);
+  }, [isSyncing, jobStatus, onSyncComplete]);
 
   const handleStreamClick = useCallback((streamId: string) => {
     setCompareStream(streamId);
@@ -64,16 +81,20 @@ export function EpisodeDetail({ episodeId, onBack }: EpisodeDetailProps) {
 
   const streams = episode.streams;
   const syncReport = episode.sync_report;
-  const primaryStream =
-    syncReport?.summary.primary_stream ?? streams[0] ?? "";
-  const secondaryStreams = streams.filter((s) => s !== primaryStream);
   const fps = syncReport?.summary.actual_mean_fps ?? 30;
 
-  // Identify audio streams from manifest
+  // Separate audio from video/sensor streams
   const audioStreams = streams.filter((sid) => {
-    const streamMeta = episode.manifest?.streams[sid];
-    return streamMeta?.kind === "audio";
+    const meta = episode.manifest?.streams[sid];
+    return meta?.kind === "audio";
   });
+  const nonAudioStreams = streams.filter((sid) => !audioStreams.includes(sid));
+
+  const primaryStream =
+    syncReport?.summary.primary_stream ?? nonAudioStreams[0] ?? "";
+  const secondaryVideoStreams = nonAudioStreams.filter(
+    (s) => s !== primaryStream,
+  );
 
   // Get drift for the compare target
   const compareResult = compareStream
@@ -140,7 +161,7 @@ export function EpisodeDetail({ episodeId, onBack }: EpisodeDetailProps) {
                 videoRef={playback.videoRef}
               />
             )}
-            {secondaryStreams.map((sid) => {
+            {secondaryVideoStreams.map((sid) => {
               const streamResult = syncReport?.streams[sid];
               return (
                 <ReviewVideoPlayer

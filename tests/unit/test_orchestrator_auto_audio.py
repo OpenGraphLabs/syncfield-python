@@ -27,10 +27,13 @@ class TestAutoAudioInjection:
         """Should auto-inject HostAudioStream when no audio track exists."""
         session = _session(tmp_path)
 
-        mock_info = {"name": "Test Mic", "max_input_channels": 1}
+        mock_info = {"name": "Test Mic", "max_input_channels": 1, "default_high_input_latency": 0.01}
         with patch("syncfield.adapters.host_audio.is_audio_available", return_value=True), \
-             patch("sounddevice.query_devices", return_value=mock_info):
-            session.add(FakeStream("cam"))  # triggers pre-registration
+             patch("syncfield.orchestrator.SessionOrchestrator._maybe_preregister_host_audio"), \
+             patch("syncfield.adapters.host_audio.is_audio_available", return_value=True), \
+             patch("sounddevice.query_devices", return_value=mock_info), \
+             patch("sounddevice.InputStream"):
+            session.add(FakeStream("cam"))
             session.connect()
 
         assert "host_audio" in session._streams
@@ -73,13 +76,15 @@ class TestAutoAudioInjection:
 
         assert "host_audio" not in session._streams
 
-    def test_removed_on_disconnect(self, tmp_path: Path):
-        """Auto-injected stream should be removed on disconnect."""
+    def test_kept_on_disconnect(self, tmp_path: Path):
+        """Auto-injected stream should stay registered (visible) after disconnect."""
         session = _session(tmp_path)
 
-        mock_info = {"name": "Test Mic", "max_input_channels": 1}
+        mock_info = {"name": "Test Mic", "max_input_channels": 1, "default_high_input_latency": 0.01}
         with patch("syncfield.adapters.host_audio.is_audio_available", return_value=True), \
-             patch("sounddevice.query_devices", return_value=mock_info):
+             patch("syncfield.orchestrator.SessionOrchestrator._maybe_preregister_host_audio"), \
+             patch("sounddevice.query_devices", return_value=mock_info), \
+             patch("sounddevice.InputStream"):
             session.add(FakeStream("cam"))
             session.connect()
 
@@ -87,5 +92,6 @@ class TestAutoAudioInjection:
 
         session.disconnect()
 
-        assert "host_audio" not in session._streams
-        assert session._auto_audio_stream is None
+        # Stream stays registered so it remains visible in the viewer
+        assert "host_audio" in session._streams
+        assert session._auto_audio_stream is not None
