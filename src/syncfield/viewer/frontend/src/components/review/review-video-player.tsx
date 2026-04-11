@@ -7,8 +7,9 @@ interface ReviewVideoPlayerProps {
   isPrimary: boolean;
   videoRef?: (el: HTMLVideoElement | null) => void;
   syncTime?: number;
+  /** Whether the primary video is playing — used to sync secondary play state. */
+  isPlaying?: boolean;
   driftMs?: number;
-  /** Click handler for opening sync comparison (secondary streams only). */
   onClick?: () => void;
 }
 
@@ -18,20 +19,38 @@ export function ReviewVideoPlayer({
   isPrimary,
   videoRef,
   syncTime,
+  isPlaying,
   driftMs,
   onClick,
 }: ReviewVideoPlayerProps) {
   const localRef = useRef<HTMLVideoElement | null>(null);
 
-  // Sync secondary videos to primary's currentTime
+  // Sync secondary videos to primary — debounced to avoid stutter
+  const lastSyncRef = useRef(0);
   useEffect(() => {
     if (isPrimary || syncTime == null) return;
     const video = localRef.current;
     if (!video) return;
-    if (Math.abs(video.currentTime - syncTime) > 0.1) {
+    // Only sync if drift exceeds 300ms (avoids constant seeking during playback)
+    const drift = Math.abs(video.currentTime - syncTime);
+    const now = performance.now();
+    if (drift > 0.3 && now - lastSyncRef.current > 500) {
       video.currentTime = syncTime;
+      lastSyncRef.current = now;
     }
   }, [syncTime, isPrimary]);
+
+  // Sync play/pause state with primary
+  useEffect(() => {
+    if (isPrimary || isPlaying == null) return;
+    const video = localRef.current;
+    if (!video) return;
+    if (isPlaying && video.paused) {
+      void video.play();
+    } else if (!isPlaying && !video.paused) {
+      video.pause();
+    }
+  }, [isPlaying, isPrimary]);
 
   // Show first frame on load
   useEffect(() => {
@@ -69,10 +88,14 @@ export function ReviewVideoPlayer({
         preload="auto"
       />
       {/* Stream label */}
-      <div className="absolute left-2 top-2 rounded bg-black/60 px-1.5 py-0.5 text-[10px] font-medium text-white/80">
-        {streamId}
+      <div className="absolute left-2 top-2 flex items-center gap-1.5">
+        <span className="rounded bg-black/60 px-1.5 py-0.5 text-[10px] font-medium text-white/80">
+          {streamId}
+        </span>
         {isPrimary && (
-          <span className="ml-1 text-white/40">REF</span>
+          <span className="rounded bg-blue-500/80 px-1.5 py-0.5 text-[9px] font-semibold text-white">
+            Primary
+          </span>
         )}
       </div>
       {/* Drift badge + click hint */}

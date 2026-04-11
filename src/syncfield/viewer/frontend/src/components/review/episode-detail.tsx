@@ -142,6 +142,7 @@ export function EpisodeDetail({ episodeId, onBack }: EpisodeDetailProps) {
                   streamId={sid}
                   isPrimary={false}
                   syncTime={playback.currentTime}
+                  isPlaying={playback.isPlaying}
                   driftMs={streamResult?.offset_ms}
                   onClick={
                     syncReport ? () => handleStreamClick(sid) : undefined
@@ -185,6 +186,7 @@ export function EpisodeDetail({ episodeId, onBack }: EpisodeDetailProps) {
       {compareStream && (
         <SyncComparisonModal
           streamId={compareStream}
+          primaryStreamId={primaryStream}
           episodeId={episodeId}
           driftMs={compareDriftMs}
           fps={fps}

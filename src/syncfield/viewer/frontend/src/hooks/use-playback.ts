@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 interface UsePlaybackReturn {
   currentTime: number;
@@ -16,9 +16,8 @@ interface UsePlaybackReturn {
 /**
  * Central playback state for the review video player.
  *
- * Uses `timeupdate` events from the video element (fires ~4 Hz during
- * playback) to sync React state. This is more reliable than rAF for
- * <video> elements since it only fires when the video actually advances.
+ * Uses requestAnimationFrame during playback for smooth timeline
+ * updates (~60 Hz), falling back to event handlers for state changes.
  */
 export function usePlayback(): UsePlaybackReturn {
   const [currentTime, setCurrentTime] = useState(0);
@@ -27,35 +26,80 @@ export function usePlayback(): UsePlaybackReturn {
   const [playbackRate, setPlaybackRateState] = useState(1);
 
   const videoElRef = useRef<HTMLVideoElement | null>(null);
+  const rafRef = useRef<number | null>(null);
+  const playingRef = useRef(false);
+
+  // Smooth time sync loop during playback
+  const startTimeSync = useCallback(() => {
+    const tick = () => {
+      const el = videoElRef.current;
+      if (el && playingRef.current) {
+        setCurrentTime(el.currentTime);
+        rafRef.current = requestAnimationFrame(tick);
+      }
+    };
+    rafRef.current = requestAnimationFrame(tick);
+  }, []);
+
+  const stopTimeSync = useCallback(() => {
+    if (rafRef.current !== null) {
+      cancelAnimationFrame(rafRef.current);
+      rafRef.current = null;
+    }
+    // One final sync
+    const el = videoElRef.current;
+    if (el) setCurrentTime(el.currentTime);
+  }, []);
 
   const videoRef = useCallback((el: HTMLVideoElement | null) => {
     const prev = videoElRef.current;
 
-    // Detach from previous element
     if (prev) {
-      prev.ontimeupdate = null;
       prev.onplay = null;
       prev.onpause = null;
       prev.onended = null;
       prev.onloadedmetadata = null;
       prev.ondurationchange = null;
+      prev.onseeked = null;
+      stopTimeSync();
     }
 
     videoElRef.current = el;
 
     if (el) {
-      el.ontimeupdate = () => setCurrentTime(el.currentTime);
-      el.onplay = () => setIsPlaying(true);
-      el.onpause = () => setIsPlaying(false);
-      el.onended = () => setIsPlaying(false);
+      el.onplay = () => {
+        playingRef.current = true;
+        setIsPlaying(true);
+        startTimeSync();
+      };
+      el.onpause = () => {
+        playingRef.current = false;
+        setIsPlaying(false);
+        stopTimeSync();
+      };
+      el.onended = () => {
+        playingRef.current = false;
+        setIsPlaying(false);
+        stopTimeSync();
+      };
       el.onloadedmetadata = () => setDuration(el.duration);
       el.ondurationchange = () => setDuration(el.duration);
+      el.onseeked = () => setCurrentTime(el.currentTime);
 
-      // Sync initial state
       if (el.duration) setDuration(el.duration);
       setCurrentTime(el.currentTime);
-      setIsPlaying(!el.paused);
+      const wasPlaying = !el.paused;
+      playingRef.current = wasPlaying;
+      setIsPlaying(wasPlaying);
+      if (wasPlaying) startTimeSync();
     }
+  }, [startTimeSync, stopTimeSync]);
+
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      if (rafRef.current !== null) cancelAnimationFrame(rafRef.current);
+    };
   }, []);
 
   const play = useCallback(() => {
