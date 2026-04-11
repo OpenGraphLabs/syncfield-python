@@ -176,8 +176,11 @@ class ViewerApp:
 
         assert self._server is not None
 
-        # Open browser in a background thread after a short delay
         url = f"http://{self._host}:{self._port}"
+        print(f"\n  SyncField Viewer running at: {url}\n")
+        logger.info("Viewer started at %s", url)
+
+        # Open browser in a background thread after a short delay
         threading.Thread(
             target=self._open_browser, args=(url,), daemon=True,
         ).start()

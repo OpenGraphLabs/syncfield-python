@@ -1,3 +1,4 @@
+import { useEffect, useRef } from "react";
 import { useEpisode } from "@/hooks/use-episode";
 import { useSync } from "@/hooks/use-sync";
 import { usePlayback } from "@/hooks/use-playback";
@@ -13,14 +14,20 @@ interface EpisodeDetailProps {
   onBack: () => void;
 }
 
-/**
- * Full episode review view — video playback + timeline + drift chart + sync sidebar.
- */
 export function EpisodeDetail({ episodeId, onBack }: EpisodeDetailProps) {
   const { episode, isLoading, error, refresh } = useEpisode(episodeId);
   const { triggerSync, jobStatus, isSyncing, error: syncError } = useSync();
   const { driftData, isLoading: driftLoading } = useDriftData(episodeId);
   const playback = usePlayback();
+
+  // Auto-refresh episode data when sync completes
+  const prevSyncing = useRef(false);
+  useEffect(() => {
+    if (prevSyncing.current && !isSyncing && jobStatus?.status === "complete") {
+      refresh();
+    }
+    prevSyncing.current = isSyncing;
+  }, [isSyncing, jobStatus, refresh]);
 
   if (isLoading) {
     return (
@@ -45,12 +52,9 @@ export function EpisodeDetail({ episodeId, onBack }: EpisodeDetailProps) {
   }
 
   const streams = episode.streams;
-  const primaryStream = episode.sync_report?.summary.primary_stream ?? streams[0] ?? "";
+  const primaryStream =
+    episode.sync_report?.summary.primary_stream ?? streams[0] ?? "";
   const secondaryStreams = streams.filter((s) => s !== primaryStream);
-
-  function handleSync() {
-    triggerSync(episodeId).then(() => refresh());
-  }
 
   return (
     <div className="flex h-full flex-col">
@@ -74,7 +78,7 @@ export function EpisodeDetail({ episodeId, onBack }: EpisodeDetailProps) {
           jobStatus={jobStatus}
           isSyncing={isSyncing}
           hasSyncReport={episode.sync_report !== null}
-          onSync={handleSync}
+          onSync={() => triggerSync(episodeId)}
         />
       </div>
 
@@ -103,7 +107,6 @@ export function EpisodeDetail({ episodeId, onBack }: EpisodeDetailProps) {
         <div className="flex flex-1 flex-col">
           {/* Video area */}
           <div className="flex flex-1 gap-1 bg-black/95 p-2">
-            {/* Primary */}
             {primaryStream && (
               <ReviewVideoPlayer
                 episodeId={episodeId}
@@ -112,7 +115,6 @@ export function EpisodeDetail({ episodeId, onBack }: EpisodeDetailProps) {
                 videoRef={playback.videoRef}
               />
             )}
-            {/* Secondary videos */}
             {secondaryStreams.map((sid) => {
               const streamResult = episode.sync_report?.streams[sid];
               return (
@@ -149,10 +151,7 @@ export function EpisodeDetail({ episodeId, onBack }: EpisodeDetailProps) {
 
         {/* Right sidebar */}
         <div className="w-64 shrink-0 overflow-y-auto border-l">
-          <SyncQualityPanel
-            report={episode.sync_report}
-            streams={streams}
-          />
+          <SyncQualityPanel report={episode.sync_report} streams={streams} />
         </div>
       </div>
     </div>

@@ -4,18 +4,11 @@ interface ReviewVideoPlayerProps {
   episodeId: string;
   streamId: string;
   isPrimary: boolean;
-  /** Ref callback for the primary video — attaches playback control. */
   videoRef?: (el: HTMLVideoElement | null) => void;
-  /** Current time to sync secondary videos to. */
   syncTime?: number;
-  /** Drift offset in ms (shown as badge on non-primary). */
   driftMs?: number;
 }
 
-/**
- * Video player for episode review. Renders the recorded video from
- * the server's episode video endpoint, preferring synced/ versions.
- */
 export function ReviewVideoPlayer({
   episodeId,
   streamId,
@@ -31,11 +24,23 @@ export function ReviewVideoPlayer({
     if (isPrimary || syncTime == null) return;
     const video = localRef.current;
     if (!video) return;
-    // Only sync if the difference is significant (> 100ms)
     if (Math.abs(video.currentTime - syncTime) > 0.1) {
       video.currentTime = syncTime;
     }
   }, [syncTime, isPrimary]);
+
+  // Show first frame on load
+  useEffect(() => {
+    const video = localRef.current;
+    if (!video) return;
+    const showFirstFrame = () => {
+      if (video.paused && video.currentTime === 0) {
+        video.currentTime = 0.001;
+      }
+    };
+    video.addEventListener("loadeddata", showFirstFrame);
+    return () => video.removeEventListener("loadeddata", showFirstFrame);
+  }, []);
 
   const src = `/api/episodes/${episodeId}/video/${streamId}.mp4`;
 
@@ -50,16 +55,16 @@ export function ReviewVideoPlayer({
         className="h-full w-full object-contain"
         muted
         playsInline
-        preload="metadata"
+        preload="auto"
       />
       {/* Stream label */}
       <div className="absolute left-2 top-2 rounded bg-black/60 px-1.5 py-0.5 text-[10px] font-medium text-white/80">
         {streamId}
         {isPrimary && (
-          <span className="ml-1 text-primary-foreground/60">REF</span>
+          <span className="ml-1 text-white/40">REF</span>
         )}
       </div>
-      {/* Drift badge (non-primary only) */}
+      {/* Drift badge */}
       {!isPrimary && driftMs != null && (
         <div className="absolute bottom-2 right-2 rounded bg-black/60 px-1.5 py-0.5 font-mono text-[10px] text-success">
           {driftMs > 0 ? "+" : ""}
