@@ -10,21 +10,41 @@ import { HealthTable } from "@/components/health-table";
 import { CountdownOverlay } from "@/components/countdown-overlay";
 import { DiscoveryModal } from "@/components/discovery-modal";
 import { Footer } from "@/components/footer";
+import { ReviewPage } from "@/components/review/review-page";
+import type { ViewMode } from "@/components/segment-control";
 
 // ---------------------------------------------------------------------------
 // App
 //
-// Audio feedback (countdown ticks + chirps) is handled entirely by the
-// recording PC via sounddevice/PortAudio. The browser only shows the
-// visual countdown overlay — no Web Audio playback.
+// Two modes: Record (live session monitoring) and Review (episode browsing
+// + sync analysis). Switched via the header segment control.
 // ---------------------------------------------------------------------------
 
 export function App() {
+  const [mode, setMode] = useState<ViewMode>("record");
+
+  return mode === "record" ? (
+    <RecordView mode={mode} onModeChange={setMode} />
+  ) : (
+    <ReviewView mode={mode} onModeChange={setMode} />
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Record view (existing functionality)
+// ---------------------------------------------------------------------------
+
+function RecordView({
+  mode,
+  onModeChange,
+}: {
+  mode: ViewMode;
+  onModeChange: (m: ViewMode) => void;
+}) {
   const { snapshot, countdown, sendCommand } = useSession();
   const discovery = useDiscovery();
   const [discoveryOpen, setDiscoveryOpen] = useState(false);
 
-  // Update page title with session state
   useEffect(() => {
     const state = snapshot?.state ?? "idle";
     document.title = state === "recording" ? "● SyncField" : "SyncField";
@@ -40,8 +60,8 @@ export function App() {
   const state = snapshot?.state ?? "idle";
   const streams = snapshot?.streams ?? {};
   const streamList = Object.values(streams);
-  const canRemove = state === "idle" || state === "connected" || state === "stopped";
-
+  const canRemove =
+    state === "idle" || state === "connected" || state === "stopped";
   const isRecording = state === "recording";
 
   return (
@@ -51,19 +71,17 @@ export function App() {
         isRecording && "shadow-[inset_0_0_0_3px_hsl(0_65%_48%)]",
       )}
     >
-      {/* Header */}
       <Header
         snapshot={snapshot}
         onDiscoverClick={() => setDiscoveryOpen(true)}
+        mode={mode}
+        onModeChange={onModeChange}
       />
 
-      {/* Control + Session clock */}
       <ControlPanel state={state} onCommand={sendCommand} />
       <SessionClock snapshot={snapshot} />
 
-      {/* Main content area */}
       <div className="flex flex-1 overflow-hidden">
-        {/* Streams section (main) */}
         <div className="flex-1 overflow-y-auto p-4">
           {streamList.length > 0 ? (
             <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
@@ -89,7 +107,6 @@ export function App() {
           )}
         </div>
 
-        {/* Health events sidebar */}
         {streamList.length > 0 && (
           <div className="hidden w-72 shrink-0 border-l lg:block">
             <div className="px-3 py-2.5">
@@ -102,13 +119,10 @@ export function App() {
         )}
       </div>
 
-      {/* Footer */}
       <Footer outputDir={snapshot?.output_dir ?? ""} />
 
-      {/* Countdown overlay */}
       {countdown !== null && <CountdownOverlay count={countdown} />}
 
-      {/* Discovery modal */}
       <DiscoveryModal
         isOpen={discoveryOpen}
         onClose={() => setDiscoveryOpen(false)}
@@ -118,6 +132,31 @@ export function App() {
         onScan={discovery.scan}
         onAdd={discovery.addDevice}
       />
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Review view
+// ---------------------------------------------------------------------------
+
+function ReviewView({
+  mode,
+  onModeChange,
+}: {
+  mode: ViewMode;
+  onModeChange: (m: ViewMode) => void;
+}) {
+  return (
+    <div className="flex h-screen flex-col">
+      <Header
+        snapshot={null}
+        onDiscoverClick={() => {}}
+        mode={mode}
+        onModeChange={onModeChange}
+        showRecordingControls={false}
+      />
+      <ReviewPage />
     </div>
   );
 }

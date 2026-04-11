@@ -6,6 +6,8 @@ Endpoints:
 - **MJPEG** ``/stream/video/{stream_id}`` — continuous JPEG frames
 - **SSE** ``/stream/sensor/{stream_id}`` — sensor channel push (~10 Hz)
 - **REST** ``/api/status``, ``/api/discover``, ``/api/streams/{id}`` — one-shot queries
+- **Episodes** ``/api/episodes``, ``/api/episodes/{id}``, ``/api/episodes/{id}/video/{file}`` — episode review
+- **Sync** ``/api/episodes/{id}/sync``, ``/api/episodes/{id}/sync-status/{job_id}`` — sync orchestration
 - **Static** ``/*`` — built React SPA (production) or proxied Vite dev server
 
 The server holds a direct reference to the :class:`SessionOrchestrator` and
@@ -29,7 +31,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from starlette.responses import StreamingResponse
+from starlette.responses import FileResponse, StreamingResponse
 
 from syncfield.orchestrator import SessionOrchestrator
 from syncfield.viewer.poller import SessionPoller
@@ -98,6 +100,75 @@ def snapshot_to_dict(snapshot: SessionSnapshot) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Episode helpers
+# ---------------------------------------------------------------------------
+
+
+def _scan_episodes(data_dir: Path) -> List[Dict[str, Any]]:
+    """Scan a directory for ``ep_*`` episode subdirectories.
+
+    Parses the timestamp embedded in the directory name, checks for
+    ``manifest.json`` and ``sync_report.json`` / ``synced/`` artefacts,
+    and returns summaries sorted newest-first.
+    """
+    episodes: List[Dict[str, Any]] = []
+    if not data_dir.is_dir():
+        return episodes
+
+    for entry in data_dir.iterdir():
+        if not entry.is_dir() or not entry.name.startswith("ep_"):
+            continue
+
+        ep_id = entry.name
+        manifest_path = entry / "manifest.json"
+        has_manifest = manifest_path.exists()
+        synced_dir = entry / "synced"
+        sync_report_path = entry / "sync_report.json"
+        if not sync_report_path.exists():
+            sync_report_path = synced_dir / "sync_report.json"
+        has_sync = sync_report_path.exists() or synced_dir.exists()
+
+        # Parse created_at from directory name: ep_YYYYMMDD_HHMMSS_*
+        created_at: Optional[str] = None
+        parts = ep_id.split("_")
+        if len(parts) >= 3:
+            try:
+                date_str = parts[1]  # YYYYMMDD
+                time_str = parts[2]  # HHMMSS
+                created_at = (
+                    f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:8]}"
+                    f"T{time_str[:2]}:{time_str[2:4]}:{time_str[4:6]}"
+                )
+            except (IndexError, ValueError):
+                pass
+
+        stream_count = 0
+        host_id: Optional[str] = None
+        if has_manifest:
+            try:
+                with open(manifest_path) as f:
+                    manifest = json.load(f)
+                host_id = manifest.get("host_id")
+                stream_count = len(manifest.get("streams", {}))
+            except Exception:
+                pass
+
+        episodes.append({
+            "id": ep_id,
+            "path": str(entry),
+            "has_manifest": has_manifest,
+            "has_sync": has_sync,
+            "stream_count": stream_count,
+            "host_id": host_id,
+            "created_at": created_at,
+        })
+
+    # Sort newest first
+    episodes.sort(key=lambda e: e.get("created_at") or "", reverse=True)
+    return episodes
+
+
+# ---------------------------------------------------------------------------
 # Server class
 # ---------------------------------------------------------------------------
 
@@ -115,15 +186,18 @@ class ViewerServer:
         poller: SessionPoller,
         *,
         title: str = "SyncField",
+        sync_endpoint: str = "http://localhost:8080",
     ) -> None:
         self._session = session
         self._poller = poller
         self._title = title
+        self._sync_endpoint = sync_endpoint.rstrip("/")
         self._ws_clients: Set[WebSocket] = set()
 
         self.app = FastAPI(title=title, docs_url=None, redoc_url=None)
         self._setup_middleware()
         self._setup_routes()
+        self._setup_episode_routes()
         self._setup_static()
 
     # ------------------------------------------------------------------
@@ -276,6 +350,273 @@ class ViewerServer:
                 return JSONResponse({"status": "removed", "id": stream_id})
             except Exception as exc:
                 return JSONResponse({"error": str(exc)}, status_code=400)
+
+    # ------------------------------------------------------------------
+    # Episode review & sync routes
+    # ------------------------------------------------------------------
+
+    def _setup_episode_routes(self) -> None:
+        app = self.app
+
+        @app.get("/api/episodes")
+        async def api_list_episodes() -> JSONResponse:
+            """List all episodes in the data root directory."""
+            try:
+                data_dir = self._session.output_dir.parent
+                episodes = await asyncio.to_thread(_scan_episodes, data_dir)
+                return JSONResponse({"episodes": episodes})
+            except Exception as exc:
+                logger.exception("Failed to list episodes")
+                return JSONResponse(
+                    {"episodes": [], "error": str(exc)}, status_code=500,
+                )
+
+        @app.get("/api/episodes/{episode_id}")
+        async def api_episode_detail(episode_id: str) -> JSONResponse:
+            """Return episode manifest and sync report."""
+            ep_dir = self._session.output_dir.parent / episode_id
+            if not ep_dir.is_dir():
+                return JSONResponse(
+                    {"error": f"Episode {episode_id!r} not found"},
+                    status_code=404,
+                )
+            try:
+                manifest: Optional[Dict[str, Any]] = None
+                manifest_path = ep_dir / "manifest.json"
+                if manifest_path.exists():
+                    raw = await asyncio.to_thread(manifest_path.read_text)
+                    manifest = json.loads(raw)
+
+                sync_report: Optional[Dict[str, Any]] = None
+                for candidate in (
+                    ep_dir / "sync_report.json",
+                    ep_dir / "synced" / "sync_report.json",
+                ):
+                    if candidate.exists():
+                        raw = await asyncio.to_thread(candidate.read_text)
+                        sync_report = json.loads(raw)
+                        break
+
+                synced_dir = ep_dir / "synced"
+                has_synced_videos = synced_dir.is_dir() and any(
+                    f.suffix.lower() in {".mp4", ".mov", ".avi"}
+                    for f in synced_dir.iterdir()
+                    if f.is_file()
+                )
+
+                streams: List[str] = []
+                if manifest and "streams" in manifest:
+                    streams = list(manifest["streams"].keys())
+
+                return JSONResponse({
+                    "id": episode_id,
+                    "manifest": manifest,
+                    "sync_report": sync_report,
+                    "has_synced_videos": has_synced_videos,
+                    "streams": streams,
+                })
+            except Exception as exc:
+                logger.exception("Failed to read episode %s", episode_id)
+                return JSONResponse({"error": str(exc)}, status_code=500)
+
+        @app.get("/api/episodes/{episode_id}/video/{filename:path}")
+        async def api_episode_video(
+            episode_id: str, filename: str,
+        ) -> Any:
+            """Serve a video file, preferring the synced version."""
+            ep_dir = self._session.output_dir.parent / episode_id
+            if not ep_dir.is_dir():
+                return JSONResponse(
+                    {"error": f"Episode {episode_id!r} not found"},
+                    status_code=404,
+                )
+
+            # Prefer synced/ version
+            synced_path = ep_dir / "synced" / filename
+            root_path = ep_dir / filename
+
+            file_path: Optional[Path] = None
+            if synced_path.is_file():
+                file_path = synced_path
+            elif root_path.is_file():
+                file_path = root_path
+
+            if file_path is None:
+                return JSONResponse(
+                    {"error": f"Video file {filename!r} not found"},
+                    status_code=404,
+                )
+
+            ext = file_path.suffix.lower()
+            media_types = {
+                ".mp4": "video/mp4",
+                ".mov": "video/quicktime",
+                ".avi": "video/x-msvideo",
+            }
+            media_type = media_types.get(ext, "application/octet-stream")
+            return FileResponse(str(file_path), media_type=media_type)
+
+        @app.post("/api/episodes/{episode_id}/sync")
+        async def api_trigger_sync(episode_id: str) -> JSONResponse:
+            """Trigger sync via Docker container."""
+            ep_dir = self._session.output_dir.parent / episode_id
+            if not ep_dir.is_dir():
+                return JSONResponse(
+                    {"error": f"Episode {episode_id!r} not found"},
+                    status_code=404,
+                )
+
+            manifest_path = ep_dir / "manifest.json"
+            if not manifest_path.exists():
+                return JSONResponse(
+                    {"error": "manifest.json not found"}, status_code=400,
+                )
+
+            try:
+                raw = await asyncio.to_thread(manifest_path.read_text)
+                manifest = json.loads(raw)
+            except Exception as exc:
+                return JSONResponse(
+                    {"error": f"Failed to read manifest: {exc}"},
+                    status_code=500,
+                )
+
+            host_id = manifest.get("host_id", "unknown")
+            streams_cfg = manifest.get("streams", {})
+
+            api_streams: List[Dict[str, Any]] = []
+            first_video = True
+            for stream_id, meta in streams_cfg.items():
+                kind = meta.get("kind", "video")
+                entry: Dict[str, Any] = {
+                    "stream_id": stream_id,
+                    "kind": kind,
+                }
+                if kind == "video":
+                    # Resolve video file path
+                    video_path = meta.get("path")
+                    if video_path is None:
+                        video_path = str(ep_dir / f"{stream_id}.mp4")
+                    entry["path"] = video_path
+                    # Timestamps file
+                    ts_path = ep_dir / f"{stream_id}.timestamps.jsonl"
+                    if ts_path.exists():
+                        entry["timestamps_path"] = str(ts_path)
+                    if first_video:
+                        entry["is_primary"] = True
+                        first_video = False
+                elif kind == "sensor":
+                    sensor_path = meta.get("path")
+                    if sensor_path is None:
+                        sensor_path = str(ep_dir / f"{stream_id}.jsonl")
+                    entry["path"] = sensor_path
+
+                api_streams.append(entry)
+
+            payload = json.dumps({
+                "hosts": [{
+                    "host_id": host_id,
+                    "streams": api_streams,
+                }],
+                "confidence_threshold": 0.4,
+                "reencode": True,
+                "aggregation": "nearest",
+            }).encode("utf-8")
+
+            url = f"{self._sync_endpoint}/api/v1/sync"
+            try:
+                import urllib.request
+                import urllib.error
+
+                req = urllib.request.Request(
+                    url,
+                    data=payload,
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+
+                def _do_post():
+                    with urllib.request.urlopen(req, timeout=30) as resp:
+                        return json.loads(resp.read().decode("utf-8"))
+
+                result = await asyncio.to_thread(_do_post)
+                return JSONResponse(result)
+            except urllib.error.HTTPError as exc:
+                body = exc.read().decode("utf-8", errors="replace")
+                logger.error("Sync request failed (%s): %s", exc.code, body)
+                return JSONResponse(
+                    {"error": f"Sync service returned {exc.code}", "detail": body},
+                    status_code=502,
+                )
+            except Exception as exc:
+                logger.exception("Sync request failed")
+                return JSONResponse(
+                    {"error": str(exc)}, status_code=502,
+                )
+
+        @app.get("/api/episodes/{episode_id}/sync-status/{job_id}")
+        async def api_sync_status(
+            episode_id: str, job_id: str,
+        ) -> JSONResponse:
+            """Proxy sync job status from the Docker container."""
+            url = f"{self._sync_endpoint}/api/v1/jobs/{job_id}"
+            try:
+                import urllib.request
+                import urllib.error
+
+                req = urllib.request.Request(url, method="GET")
+
+                def _do_get():
+                    with urllib.request.urlopen(req, timeout=15) as resp:
+                        return json.loads(resp.read().decode("utf-8"))
+
+                result = await asyncio.to_thread(_do_get)
+                return JSONResponse(result)
+            except urllib.error.HTTPError as exc:
+                body = exc.read().decode("utf-8", errors="replace")
+                return JSONResponse(
+                    {"error": f"Sync service returned {exc.code}", "detail": body},
+                    status_code=502,
+                )
+            except Exception as exc:
+                logger.exception("Failed to poll sync status")
+                return JSONResponse({"error": str(exc)}, status_code=502)
+
+        @app.get("/api/episodes/{episode_id}/frame-map")
+        async def api_frame_map(episode_id: str) -> JSONResponse:
+            """Parse and return frame_map.jsonl for the episode."""
+            ep_dir = self._session.output_dir.parent / episode_id
+            if not ep_dir.is_dir():
+                return JSONResponse(
+                    {"error": f"Episode {episode_id!r} not found"},
+                    status_code=404,
+                )
+
+            frame_map_path: Optional[Path] = None
+            for candidate in (
+                ep_dir / "frame_map.jsonl",
+                ep_dir / "synced" / "frame_map.jsonl",
+            ):
+                if candidate.exists():
+                    frame_map_path = candidate
+                    break
+
+            if frame_map_path is None:
+                return JSONResponse({"frames": [], "error": "not available"})
+
+            try:
+                raw = await asyncio.to_thread(frame_map_path.read_text)
+                frames: List[Dict[str, Any]] = []
+                for line in raw.strip().splitlines():
+                    line = line.strip()
+                    if line:
+                        frames.append(json.loads(line))
+                return JSONResponse({"frames": frames})
+            except Exception as exc:
+                logger.exception("Failed to read frame_map.jsonl")
+                return JSONResponse(
+                    {"frames": [], "error": str(exc)}, status_code=500,
+                )
 
     # ------------------------------------------------------------------
     # Static files (built React app)
@@ -447,5 +788,7 @@ def _guess_media_type(path: str) -> str:
         ".ico": "image/x-icon",
         ".woff": "font/woff",
         ".woff2": "font/woff2",
+        ".mp4": "video/mp4",
+        ".mov": "video/quicktime",
     }
     return types.get(ext, "application/octet-stream")
