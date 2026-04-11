@@ -5,6 +5,8 @@ import { cn } from "@/lib/utils";
 interface SyncQualityPanelProps {
   report: SyncReport | null;
   streams: string[];
+  primaryStream?: string;
+  onStreamClick?: (streamId: string) => void;
 }
 
 const GRADE_COLORS: Record<string, string> = {
@@ -26,6 +28,8 @@ const GRADE_BG: Record<string, string> = {
 export function SyncQualityPanel({
   report,
   streams,
+  primaryStream,
+  onStreamClick,
 }: SyncQualityPanelProps) {
   return (
     <div className="space-y-4 p-4">
@@ -46,11 +50,19 @@ export function SyncQualityPanel({
         <h4 className="mb-2 text-[10px] font-medium uppercase tracking-wider text-muted">
           Streams
         </h4>
-        <ul className="space-y-1.5">
+        <ul className="space-y-1">
           {streams.map((sid) => {
             const streamResult = report?.streams[sid];
+            const isPrimary = sid === primaryStream;
+            const isClickable = !isPrimary && onStreamClick != null && report != null;
             return (
-              <StreamRow key={sid} streamId={sid} result={streamResult} />
+              <StreamRow
+                key={sid}
+                streamId={sid}
+                result={streamResult}
+                isClickable={isClickable}
+                onClick={isClickable ? () => onStreamClick(sid) : undefined}
+              />
             );
           })}
         </ul>
@@ -119,13 +131,17 @@ function SyncedInfo({ report }: { report: SyncReport }) {
 function StreamRow({
   streamId,
   result,
+  isClickable,
+  onClick,
 }: {
   streamId: string;
   result?: SyncStreamResult;
+  isClickable?: boolean;
+  onClick?: () => void;
 }) {
   if (!result) {
     return (
-      <li className="flex items-center gap-2 text-xs">
+      <li className="flex items-center gap-2 rounded-md px-2 py-1.5 text-xs">
         <span className="h-2 w-2 rounded-full bg-muted" />
         <span className="font-mono">{streamId}</span>
       </li>
@@ -135,20 +151,22 @@ function StreamRow({
   const grade = syncGrade(result);
   const isPrimary = result.role === "primary";
 
-  return (
-    <li className="flex items-center gap-2 text-xs">
+  const content = (
+    <>
       <span
         className={cn(
-          "h-2 w-2 rounded-full",
-          isPrimary ? "bg-primary" : GRADE_COLORS[grade]?.replace("text-", "bg-") ?? "bg-muted",
+          "h-2 w-2 shrink-0 rounded-full",
+          isPrimary
+            ? "bg-blue-500"
+            : GRADE_COLORS[grade]?.replace("text-", "bg-") ?? "bg-muted",
         )}
       />
       <span className="font-mono">{streamId}</span>
       {isPrimary ? (
-        <span className="text-[10px] text-muted">(REF)</span>
+        <span className="text-[10px] text-blue-500">REF</span>
       ) : (
         <>
-          <span className="font-mono text-muted">
+          <span className="ml-auto font-mono text-muted">
             {result.offset_ms != null
               ? `${result.offset_ms > 0 ? "+" : ""}${result.offset_ms.toFixed(1)}ms`
               : ""}
@@ -160,6 +178,36 @@ function StreamRow({
           )}
         </>
       )}
+      {isClickable && (
+        <svg
+          width="10"
+          height="10"
+          viewBox="0 0 16 16"
+          fill="none"
+          className="ml-auto shrink-0 text-muted"
+        >
+          <path
+            d="M6 4L10 8L6 12"
+            stroke="currentColor"
+            strokeWidth="1.5"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          />
+        </svg>
+      )}
+    </>
+  );
+
+  return (
+    <li
+      className={cn(
+        "flex items-center gap-2 rounded-md px-2 py-1.5 text-xs",
+        isClickable &&
+          "cursor-pointer transition-colors hover:bg-foreground/5",
+      )}
+      onClick={onClick}
+    >
+      {content}
     </li>
   );
 }

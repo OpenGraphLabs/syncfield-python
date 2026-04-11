@@ -1,4 +1,5 @@
 import { useEffect, useRef } from "react";
+import { cn } from "@/lib/utils";
 
 interface ReviewVideoPlayerProps {
   episodeId: string;
@@ -7,6 +8,8 @@ interface ReviewVideoPlayerProps {
   videoRef?: (el: HTMLVideoElement | null) => void;
   syncTime?: number;
   driftMs?: number;
+  /** Click handler for opening sync comparison (secondary streams only). */
+  onClick?: () => void;
 }
 
 export function ReviewVideoPlayer({
@@ -16,6 +19,7 @@ export function ReviewVideoPlayer({
   videoRef,
   syncTime,
   driftMs,
+  onClick,
 }: ReviewVideoPlayerProps) {
   const localRef = useRef<HTMLVideoElement | null>(null);
 
@@ -43,9 +47,16 @@ export function ReviewVideoPlayer({
   }, []);
 
   const src = `/api/episodes/${episodeId}/video/${streamId}.mp4`;
+  const isClickable = !isPrimary && onClick != null;
 
   return (
-    <div className="relative flex-1 overflow-hidden rounded-lg bg-black">
+    <div
+      className={cn(
+        "relative flex-1 overflow-hidden rounded-lg bg-black",
+        isClickable && "cursor-pointer ring-transparent transition-all hover:ring-2 hover:ring-primary/40",
+      )}
+      onClick={isClickable ? onClick : undefined}
+    >
       <video
         ref={(el) => {
           localRef.current = el;
@@ -64,11 +75,22 @@ export function ReviewVideoPlayer({
           <span className="ml-1 text-white/40">REF</span>
         )}
       </div>
-      {/* Drift badge */}
+      {/* Drift badge + click hint */}
       {!isPrimary && driftMs != null && (
-        <div className="absolute bottom-2 right-2 rounded bg-black/60 px-1.5 py-0.5 font-mono text-[10px] text-success">
-          {driftMs > 0 ? "+" : ""}
-          {driftMs.toFixed(1)}ms
+        <div className="absolute bottom-2 right-2 flex items-center gap-1.5">
+          {isClickable && (
+            <span className="rounded bg-black/40 px-1 py-0.5 text-[9px] text-white/50">
+              Click to compare
+            </span>
+          )}
+          <span className={cn(
+            "rounded bg-black/60 px-1.5 py-0.5 font-mono text-[10px]",
+            Math.abs(driftMs) < 5 ? "text-success" :
+            Math.abs(driftMs) < 20 ? "text-warning" :
+            "text-destructive",
+          )}>
+            {driftMs > 0 ? "+" : ""}{driftMs.toFixed(1)}ms
+          </span>
         </div>
       )}
     </div>

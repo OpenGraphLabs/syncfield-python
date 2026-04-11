@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useEpisode } from "@/hooks/use-episode";
 import { useSync } from "@/hooks/use-sync";
 import { usePlayback } from "@/hooks/use-playback";
@@ -8,6 +8,7 @@ import { SyncQualityPanel } from "./sync-quality-panel";
 import { ReviewVideoPlayer } from "./review-video-player";
 import { ReviewTimeline } from "./review-timeline";
 import { DriftChart } from "./drift-chart";
+import { SyncComparisonModal } from "./sync-comparison-modal";
 
 interface EpisodeDetailProps {
   episodeId: string;
@@ -20,6 +21,9 @@ export function EpisodeDetail({ episodeId, onBack }: EpisodeDetailProps) {
   const { driftData, isLoading: driftLoading } = useDriftData(episodeId);
   const playback = usePlayback();
 
+  // Sync comparison modal state
+  const [compareStream, setCompareStream] = useState<string | null>(null);
+
   // Auto-refresh episode data when sync completes
   const prevSyncing = useRef(false);
   useEffect(() => {
@@ -28,6 +32,10 @@ export function EpisodeDetail({ episodeId, onBack }: EpisodeDetailProps) {
     }
     prevSyncing.current = isSyncing;
   }, [isSyncing, jobStatus, refresh]);
+
+  const handleStreamClick = useCallback((streamId: string) => {
+    setCompareStream(streamId);
+  }, []);
 
   if (isLoading) {
     return (
@@ -40,7 +48,9 @@ export function EpisodeDetail({ episodeId, onBack }: EpisodeDetailProps) {
   if (error || !episode) {
     return (
       <div className="flex h-full flex-col items-center justify-center gap-2">
-        <p className="text-sm text-destructive">{error ?? "Episode not found"}</p>
+        <p className="text-sm text-destructive">
+          {error ?? "Episode not found"}
+        </p>
         <button
           onClick={onBack}
           className="rounded-lg border px-3 py-1 text-xs font-medium hover:bg-foreground/5"
@@ -52,9 +62,17 @@ export function EpisodeDetail({ episodeId, onBack }: EpisodeDetailProps) {
   }
 
   const streams = episode.streams;
+  const syncReport = episode.sync_report;
   const primaryStream =
-    episode.sync_report?.summary.primary_stream ?? streams[0] ?? "";
+    syncReport?.summary.primary_stream ?? streams[0] ?? "";
   const secondaryStreams = streams.filter((s) => s !== primaryStream);
+  const fps = syncReport?.summary.actual_mean_fps ?? 30;
+
+  // Get drift for the compare target
+  const compareResult = compareStream
+    ? syncReport?.streams[compareStream]
+    : null;
+  const compareDriftMs = compareResult?.offset_ms ?? 0;
 
   return (
     <div className="flex h-full flex-col">
@@ -77,7 +95,7 @@ export function EpisodeDetail({ episodeId, onBack }: EpisodeDetailProps) {
         <SyncButton
           jobStatus={jobStatus}
           isSyncing={isSyncing}
-          hasSyncReport={episode.sync_report !== null}
+          hasSyncReport={syncReport !== null}
           onSync={() => triggerSync(episodeId)}
         />
       </div>
@@ -116,7 +134,7 @@ export function EpisodeDetail({ episodeId, onBack }: EpisodeDetailProps) {
               />
             )}
             {secondaryStreams.map((sid) => {
-              const streamResult = episode.sync_report?.streams[sid];
+              const streamResult = syncReport?.streams[sid];
               return (
                 <ReviewVideoPlayer
                   key={sid}
@@ -125,6 +143,9 @@ export function EpisodeDetail({ episodeId, onBack }: EpisodeDetailProps) {
                   isPrimary={false}
                   syncTime={playback.currentTime}
                   driftMs={streamResult?.offset_ms}
+                  onClick={
+                    syncReport ? () => handleStreamClick(sid) : undefined
+                  }
                 />
               );
             })}
@@ -151,9 +172,26 @@ export function EpisodeDetail({ episodeId, onBack }: EpisodeDetailProps) {
 
         {/* Right sidebar */}
         <div className="w-64 shrink-0 overflow-y-auto border-l">
-          <SyncQualityPanel report={episode.sync_report} streams={streams} />
+          <SyncQualityPanel
+            report={syncReport}
+            streams={streams}
+            primaryStream={primaryStream}
+            onStreamClick={syncReport ? handleStreamClick : undefined}
+          />
         </div>
       </div>
+
+      {/* Sync comparison modal */}
+      {compareStream && (
+        <SyncComparisonModal
+          streamId={compareStream}
+          episodeId={episodeId}
+          driftMs={compareDriftMs}
+          fps={fps}
+          currentTime={playback.currentTime}
+          onClose={() => setCompareStream(null)}
+        />
+      )}
     </div>
   );
 }
