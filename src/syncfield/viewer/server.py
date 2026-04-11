@@ -458,7 +458,11 @@ class ViewerServer:
 
         @app.post("/api/episodes/{episode_id}/sync")
         async def api_trigger_sync(episode_id: str) -> JSONResponse:
-            """Trigger sync via Docker container."""
+            """Trigger sync via Docker container using multipart upload.
+
+            Uses the ``/sync/upload`` endpoint so the Docker container
+            doesn't need volume access to the host filesystem.
+            """
             ep_dir = self._session.output_dir.parent / episode_id
             if not ep_dir.is_dir():
                 return JSONResponse(
@@ -481,89 +485,141 @@ class ViewerServer:
                     status_code=500,
                 )
 
-            host_id = manifest.get("host_id", "unknown")
             streams_cfg = manifest.get("streams", {})
 
-            api_streams: List[Dict[str, Any]] = []
-            first_video = True
+            # Collect files and metadata for the multipart upload
+            stream_ids: List[str] = []
+            file_paths: List[Path] = []
+            timestamp_paths: List[Path] = []
+            primary_id: Optional[str] = None
+
             for stream_id, meta in streams_cfg.items():
                 kind = meta.get("kind", "video")
-                entry: Dict[str, Any] = {
-                    "stream_id": stream_id,
-                    "kind": kind,
-                }
+
+                # Find the data file
                 if kind == "video":
-                    # Resolve video file path
-                    video_path = meta.get("path")
-                    if video_path is None:
-                        video_path = str(ep_dir / f"{stream_id}.mp4")
-                    entry["path"] = video_path
-                    # Timestamps file
-                    ts_path = ep_dir / f"{stream_id}.timestamps.jsonl"
-                    if ts_path.exists():
-                        entry["timestamps_path"] = str(ts_path)
-                    if first_video:
-                        entry["is_primary"] = True
-                        first_video = False
+                    file_path = Path(meta["path"]) if "path" in meta else ep_dir / f"{stream_id}.mp4"
                 elif kind == "sensor":
-                    sensor_path = meta.get("path")
-                    if sensor_path is None:
-                        sensor_path = str(ep_dir / f"{stream_id}.jsonl")
-                    entry["path"] = sensor_path
+                    file_path = Path(meta["path"]) if "path" in meta else ep_dir / f"{stream_id}.jsonl"
+                else:
+                    continue
 
-                api_streams.append(entry)
+                if not file_path.exists():
+                    continue
 
-            payload = json.dumps({
-                "hosts": [{
-                    "host_id": host_id,
-                    "streams": api_streams,
-                }],
-                "confidence_threshold": 0.4,
-                "reencode": True,
-                "aggregation": "nearest",
-            }).encode("utf-8")
+                stream_ids.append(stream_id)
+                file_paths.append(file_path)
 
-            url = f"{self._sync_endpoint}/api/v1/sync"
-            try:
-                import urllib.request
-                import urllib.error
+                # Primary = first video stream
+                if kind == "video" and primary_id is None:
+                    primary_id = stream_id
 
-                req = urllib.request.Request(
-                    url,
-                    data=payload,
-                    headers={"Content-Type": "application/json"},
-                    method="POST",
+                # Timestamps file
+                ts_path = ep_dir / f"{stream_id}.timestamps.jsonl"
+                if ts_path.exists():
+                    timestamp_paths.append(ts_path)
+
+            if len(file_paths) < 2:
+                return JSONResponse(
+                    {"error": "At least 2 streams required for sync"},
+                    status_code=400,
                 )
 
-                def _do_post():
-                    with urllib.request.urlopen(req, timeout=30) as resp:
+            url = f"{self._sync_endpoint}/api/v1/sync/upload"
+
+            try:
+                def _do_upload() -> dict:
+                    import urllib.request
+                    import urllib.error
+
+                    boundary = f"----SyncFieldBoundary{id(file_paths)}"
+                    body_parts: List[bytes] = []
+
+                    # Stream IDs field
+                    body_parts.append(
+                        f"--{boundary}\r\n"
+                        f'Content-Disposition: form-data; name="stream_ids"\r\n\r\n'
+                        f"{','.join(stream_ids)}\r\n".encode()
+                    )
+
+                    # Primary ID field
+                    if primary_id:
+                        body_parts.append(
+                            f"--{boundary}\r\n"
+                            f'Content-Disposition: form-data; name="primary_id"\r\n\r\n'
+                            f"{primary_id}\r\n".encode()
+                        )
+
+                    # Config fields
+                    for name, value in [
+                        ("confidence_threshold", "0.4"),
+                        ("reencode", "true"),
+                        ("aggregation", "nearest"),
+                    ]:
+                        body_parts.append(
+                            f"--{boundary}\r\n"
+                            f'Content-Disposition: form-data; name="{name}"\r\n\r\n'
+                            f"{value}\r\n".encode()
+                        )
+
+                    # Data files
+                    for fp in file_paths:
+                        body_parts.append(
+                            f"--{boundary}\r\n"
+                            f'Content-Disposition: form-data; name="files"; '
+                            f'filename="{fp.name}"\r\n'
+                            f"Content-Type: application/octet-stream\r\n\r\n".encode()
+                        )
+                        body_parts.append(fp.read_bytes())
+                        body_parts.append(b"\r\n")
+
+                    # Timestamp files
+                    for tp in timestamp_paths:
+                        body_parts.append(
+                            f"--{boundary}\r\n"
+                            f'Content-Disposition: form-data; name="timestamp_files"; '
+                            f'filename="{tp.name}"\r\n'
+                            f"Content-Type: application/octet-stream\r\n\r\n".encode()
+                        )
+                        body_parts.append(tp.read_bytes())
+                        body_parts.append(b"\r\n")
+
+                    body_parts.append(f"--{boundary}--\r\n".encode())
+                    body = b"".join(body_parts)
+
+                    req = urllib.request.Request(
+                        url,
+                        data=body,
+                        headers={
+                            "Content-Type": f"multipart/form-data; boundary={boundary}",
+                        },
+                        method="POST",
+                    )
+                    with urllib.request.urlopen(req, timeout=120) as resp:
                         return json.loads(resp.read().decode("utf-8"))
 
-                result = await asyncio.to_thread(_do_post)
+                result = await asyncio.to_thread(_do_upload)
                 return JSONResponse(result)
-            except urllib.error.HTTPError as exc:
-                body = exc.read().decode("utf-8", errors="replace")
-                logger.error("Sync request failed (%s): %s", exc.code, body)
-                return JSONResponse(
-                    {"error": f"Sync service returned {exc.code}", "detail": body},
-                    status_code=502,
-                )
             except Exception as exc:
-                logger.exception("Sync request failed")
+                detail = str(exc)
+                if hasattr(exc, "read"):
+                    detail = exc.read().decode("utf-8", errors="replace")  # type: ignore[union-attr]
+                logger.exception("Sync upload failed")
                 return JSONResponse(
-                    {"error": str(exc)}, status_code=502,
+                    {"error": f"Failed to trigger sync ({detail})"},
+                    status_code=502,
                 )
 
         @app.get("/api/episodes/{episode_id}/sync-status/{job_id}")
         async def api_sync_status(
             episode_id: str, job_id: str,
         ) -> JSONResponse:
-            """Proxy sync job status from the Docker container."""
+            """Proxy sync job status and download results when complete."""
+            import urllib.request
+            import urllib.error
+
             url = f"{self._sync_endpoint}/api/v1/jobs/{job_id}"
             try:
-                import urllib.request
-                import urllib.error
-
                 req = urllib.request.Request(url, method="GET")
 
                 def _do_get():
@@ -571,6 +627,15 @@ class ViewerServer:
                         return json.loads(resp.read().decode("utf-8"))
 
                 result = await asyncio.to_thread(_do_get)
+
+                # When sync is complete, download results into episode dir
+                if result.get("status") == "complete":
+                    ep_dir = self._session.output_dir.parent / episode_id
+                    await asyncio.to_thread(
+                        _download_sync_results,
+                        self._sync_endpoint, job_id, result, ep_dir,
+                    )
+
                 return JSONResponse(result)
             except urllib.error.HTTPError as exc:
                 body = exc.read().decode("utf-8", errors="replace")
@@ -772,6 +837,43 @@ class ViewerServer:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _download_sync_results(
+    sync_endpoint: str, job_id: str, result: dict, ep_dir: Path,
+) -> None:
+    """Download sync output files into the episode directory.
+
+    Called when sync status reaches ``complete``. Downloads
+    ``sync_report.json``, ``frame_map.jsonl``, and synced videos
+    into ``ep_dir/synced/``.
+    """
+    import urllib.request
+
+    synced_dir = ep_dir / "synced"
+    synced_dir.mkdir(exist_ok=True)
+
+    sync_result = result.get("result", {})
+    files_to_download: List[str] = []
+
+    # Always try sync_report.json and frame_map.jsonl
+    if sync_result.get("sync_report"):
+        files_to_download.append(sync_result["sync_report"])
+    if sync_result.get("frame_map"):
+        files_to_download.append(sync_result["frame_map"])
+    # Synced videos
+    for vid in sync_result.get("synced_videos", []):
+        files_to_download.append(vid)
+
+    for filepath in files_to_download:
+        try:
+            url = f"{sync_endpoint}/api/v1/jobs/{job_id}/download/{filepath}"
+            local_path = ep_dir / filepath
+            local_path.parent.mkdir(parents=True, exist_ok=True)
+            urllib.request.urlretrieve(url, str(local_path))
+            logger.info("Downloaded sync result: %s", local_path)
+        except Exception:
+            logger.warning("Failed to download sync file: %s", filepath)
 
 
 def _guess_media_type(path: str) -> str:
