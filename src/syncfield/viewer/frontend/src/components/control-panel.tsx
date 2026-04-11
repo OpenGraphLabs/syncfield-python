@@ -41,20 +41,13 @@ export function ControlPanel({ state, hasTask, onCommand }: ControlPanelProps) {
       <div className="mx-2 h-4 w-px bg-border" />
 
       {/* Recording group */}
-      <div className="relative">
-        <Button
-          onClick={() => onCommand("record", { countdown_s: 3 })}
-          disabled={!canRecord}
-          variant="primary"
-        >
-          Record
-        </Button>
-        {state === "connected" && !hasTask && (
-          <span className="absolute -bottom-4 left-0 whitespace-nowrap text-[9px] text-destructive">
-            Select a task first
-          </span>
-        )}
-      </div>
+      <Button
+        onClick={() => onCommand("record", { countdown_s: 3 })}
+        disabled={!canRecord}
+        variant="primary"
+      >
+        Record
+      </Button>
       <Button
         onClick={() => onCommand("stop")}
         disabled={!canStop}

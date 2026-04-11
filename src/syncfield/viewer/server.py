@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
 import cv2
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -382,7 +382,7 @@ class ViewerServer:
             return JSONResponse({"tasks": tasks})
 
         @app.post("/api/tasks")
-        async def api_create_task(request: Any) -> JSONResponse:
+        async def api_create_task(request: Request) -> JSONResponse:
             body = await request.json()
             name = body.get("name", "").strip()
             if not name:
@@ -403,7 +403,7 @@ class ViewerServer:
             return JSONResponse(task, status_code=201)
 
         @app.put("/api/tasks/{task_name}")
-        async def api_update_task(task_name: str, request: Any) -> JSONResponse:
+        async def api_update_task(task_name: str, request: Request) -> JSONResponse:
             body = await request.json()
 
             def _update():
@@ -439,7 +439,7 @@ class ViewerServer:
             return JSONResponse({"status": "deleted"})
 
         @app.post("/api/task/select")
-        async def api_select_task(request: Any) -> JSONResponse:
+        async def api_select_task(request: Request) -> JSONResponse:
             """Set the current task for the next recording."""
             body = await request.json()
             task = body.get("task", None)
