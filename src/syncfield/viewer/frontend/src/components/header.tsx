@@ -2,7 +2,7 @@ import type { SessionSnapshot } from "@/lib/types";
 import { formatElapsed } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import { Logo } from "./logo";
-import { SegmentControl, type ViewMode } from "./segment-control";
+import { NavLinks, type ViewMode } from "./segment-control";
 
 interface HeaderProps {
   snapshot: SessionSnapshot | null;
@@ -68,8 +68,8 @@ export function Header({
       {/* OpenGraph Labs logo */}
       <Logo className="h-4 shrink-0" />
 
-      {/* Mode switcher */}
-      <SegmentControl mode={mode} onChange={onModeChange} />
+      {/* Mode navigation */}
+      <NavLinks mode={mode} onChange={onModeChange} />
 
       {/* Recording-specific info */}
       {showRecordingControls && (

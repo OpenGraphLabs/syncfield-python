@@ -12,7 +12,7 @@ interface EpisodeListProps {
 
 export function EpisodeList({ onSelect }: EpisodeListProps) {
   const { episodes, isLoading, error, refresh } = useEpisodes();
-  const [viewMode, setViewMode] = useState<ListViewMode>("grid");
+  const [viewMode, setViewMode] = useState<ListViewMode>("table");
 
   if (isLoading) {
     return (
@@ -80,7 +80,7 @@ export function EpisodeList({ onSelect }: EpisodeListProps) {
       {/* Content */}
       <div className="flex-1 overflow-y-auto p-4">
         {viewMode === "grid" ? (
-          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
+          <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 2xl:grid-cols-6">
             {episodes.map((ep) => (
               <EpisodeCard
                 key={ep.id}

@@ -14,14 +14,39 @@ import { ReviewPage } from "@/components/review/review-page";
 import type { ViewMode } from "@/components/segment-control";
 
 // ---------------------------------------------------------------------------
+// URL-based routing: /record and /review
+// ---------------------------------------------------------------------------
+
+function getModeFromUrl(): ViewMode {
+  const path = window.location.pathname;
+  if (path.startsWith("/review")) return "review";
+  return "record";
+}
+
+function useUrlMode() {
+  const [mode, setModeState] = useState<ViewMode>(getModeFromUrl);
+
+  useEffect(() => {
+    const onPop = () => setModeState(getModeFromUrl());
+    window.addEventListener("popstate", onPop);
+    return () => window.removeEventListener("popstate", onPop);
+  }, []);
+
+  const setMode = useCallback((m: ViewMode) => {
+    const path = m === "review" ? "/review" : "/record";
+    window.history.pushState(null, "", path);
+    setModeState(m);
+  }, []);
+
+  return [mode, setMode] as const;
+}
+
+// ---------------------------------------------------------------------------
 // App
-//
-// Two modes: Record (live session monitoring) and Review (episode browsing
-// + sync analysis). Switched via the header segment control.
 // ---------------------------------------------------------------------------
 
 export function App() {
-  const [mode, setMode] = useState<ViewMode>("record");
+  const [mode, setMode] = useUrlMode();
 
   return mode === "record" ? (
     <RecordView mode={mode} onModeChange={setMode} />
@@ -31,7 +56,7 @@ export function App() {
 }
 
 // ---------------------------------------------------------------------------
-// Record view (existing functionality)
+// Record view
 // ---------------------------------------------------------------------------
 
 function RecordView({

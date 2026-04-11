@@ -13,18 +13,18 @@ export function EpisodeCard({ episode, onClick }: EpisodeCardProps) {
     <button
       onClick={onClick}
       className={cn(
-        "w-full overflow-hidden rounded-xl border bg-card text-left transition-all",
+        "w-full overflow-hidden rounded-lg border bg-card text-left transition-all",
         "hover:border-foreground/20 hover:shadow-sm",
       )}
     >
       {/* Thumbnail area */}
-      <div className="flex aspect-video items-center justify-center bg-black/90 p-4">
-        <div className="flex gap-1.5">
+      <div className="flex h-20 items-center justify-center bg-black/90 p-3">
+        <div className="flex gap-1">
           {Array.from({ length: Math.min(episode.stream_count, 4) }).map(
             (_, i) => (
               <div
                 key={i}
-                className="aspect-video w-16 rounded-sm bg-white/10"
+                className="aspect-video w-10 rounded-sm bg-white/10"
               />
             ),
           )}
@@ -32,7 +32,7 @@ export function EpisodeCard({ episode, onClick }: EpisodeCardProps) {
       </div>
 
       {/* Info */}
-      <div className="p-3">
+      <div className="p-2.5">
         <div className="flex items-start justify-between gap-2">
           <div className="min-w-0">
             <p className="truncate font-mono text-xs font-medium">
