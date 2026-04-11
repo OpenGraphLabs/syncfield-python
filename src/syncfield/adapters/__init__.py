@@ -27,11 +27,17 @@ from the caller.
 """
 
 from syncfield.adapters.jsonl_file import JSONLFileStream
+from syncfield.adapters.meta_quest import MetaQuestHandStream
 from syncfield.adapters.polling_sensor import PollingSensorStream
 from syncfield.adapters.push_sensor import PushSensorStream
 from syncfield.discovery import register_discoverer
 
-__all__ = ["JSONLFileStream", "PollingSensorStream", "PushSensorStream"]
+__all__ = [
+    "JSONLFileStream",
+    "MetaQuestHandStream",
+    "PollingSensorStream",
+    "PushSensorStream",
+]
 
 
 def _safe_register(cls) -> None:
