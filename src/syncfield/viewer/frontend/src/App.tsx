@@ -12,6 +12,7 @@ import { DiscoveryModal } from "@/components/discovery-modal";
 import { Footer } from "@/components/footer";
 import { StopResultBanner } from "@/components/stop-result-banner";
 import { TaskSelector } from "@/components/task-selector";
+import { useTasks } from "@/hooks/use-tasks";
 import { ReviewPage } from "@/components/review/review-page";
 import type { ViewMode } from "@/components/segment-control";
 
@@ -70,6 +71,7 @@ function RecordView({
 }) {
   const { snapshot, countdown, stopResult, sendCommand, dismissStopResult } =
     useSession();
+  const { currentTask } = useTasks();
   const discovery = useDiscovery();
   const [discoveryOpen, setDiscoveryOpen] = useState(false);
 
@@ -106,7 +108,7 @@ function RecordView({
         onModeChange={onModeChange}
       />
 
-      <ControlPanel state={state} onCommand={sendCommand} />
+      <ControlPanel state={state} hasTask={currentTask !== null} onCommand={sendCommand} />
       <TaskSelector />
       <SessionClock snapshot={snapshot} />
 

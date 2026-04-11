@@ -3,19 +3,20 @@ import { cn } from "@/lib/utils";
 
 interface ControlPanelProps {
   state: SessionState;
+  hasTask: boolean;
   onCommand: (action: ControlAction, data?: Record<string, unknown>) => void;
 }
 
 /**
  * Session control buttons — Connect, Disconnect, Record, Stop, Cancel.
  *
- * Button enable/disable logic mirrors the DearPyGui viewer exactly:
- * each action is only available in the states where it makes sense.
+ * Record is disabled unless a task is selected (hasTask=true).
+ * Cancel stops recording and discards the episode.
  */
-export function ControlPanel({ state, onCommand }: ControlPanelProps) {
+export function ControlPanel({ state, hasTask, onCommand }: ControlPanelProps) {
   const canConnect = state === "idle" || state === "stopped";
   const canDisconnect = state === "connected" || state === "stopped";
-  const canRecord = state === "connected";
+  const canRecord = state === "connected" && hasTask;
   const canStop = state === "recording";
   const canCancel = state === "recording" || state === "stopping";
 
@@ -40,13 +41,20 @@ export function ControlPanel({ state, onCommand }: ControlPanelProps) {
       <div className="mx-2 h-4 w-px bg-border" />
 
       {/* Recording group */}
-      <Button
-        onClick={() => onCommand("record", { countdown_s: 3 })}
-        disabled={!canRecord}
-        variant="primary"
-      >
-        Record
-      </Button>
+      <div className="relative">
+        <Button
+          onClick={() => onCommand("record", { countdown_s: 3 })}
+          disabled={!canRecord}
+          variant="primary"
+        >
+          Record
+        </Button>
+        {state === "connected" && !hasTask && (
+          <span className="absolute -bottom-4 left-0 whitespace-nowrap text-[9px] text-destructive">
+            Select a task first
+          </span>
+        )}
+      </div>
       <Button
         onClick={() => onCommand("stop")}
         disabled={!canStop}
@@ -64,10 +72,6 @@ export function ControlPanel({ state, onCommand }: ControlPanelProps) {
     </div>
   );
 }
-
-// ---------------------------------------------------------------------------
-// Internal button component (thin wrapper, not a shared UI primitive)
-// ---------------------------------------------------------------------------
 
 type ButtonVariant = "default" | "primary" | "destructive" | "ghost";
 

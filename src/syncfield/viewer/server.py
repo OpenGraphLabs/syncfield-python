@@ -875,6 +875,12 @@ class ViewerServer:
             await self._stop_and_report()
         elif action == "cancel":
             await asyncio.to_thread(self._session.cancel)
+            await self._broadcast_message({
+                "type": "stop_result",
+                "status": "success",
+                "cancelled": True,
+                "streams": {},
+            })
         else:
             logger.warning("Unknown action: %s", action)
 

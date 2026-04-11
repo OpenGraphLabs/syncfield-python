@@ -791,6 +791,58 @@ class SessionOrchestrator:
                 role=role_str,
             )
 
+    def cancel(self) -> None:
+        """Cancel recording and discard the episode.
+
+        Stops all streams without playing a stop chirp, removes the
+        episode directory entirely (including any partial files), and
+        generates a fresh episode path for the next recording.
+
+        Transitions ``RECORDING`` → ``CONNECTED`` (or ``STOPPED`` for
+        legacy one-shot callers), same as :meth:`stop`.
+
+        Raises:
+            RuntimeError: If state is not ``RECORDING``.
+        """
+        import shutil
+
+        with self._lock:
+            if self._state is not SessionState.RECORDING:
+                raise RuntimeError(
+                    f"cancel() requires RECORDING state; current state is "
+                    f"{self._state.value}"
+                )
+            self._transition(SessionState.STOPPING)
+
+            # Stop all streams without chirp — just tear down
+            for stream in self._connected_streams:
+                try:
+                    stream.stop_recording()
+                except Exception:
+                    logger.debug("Stream %s stop_recording failed during cancel", stream.id)
+
+            self._close_sample_writers()
+
+            # Delete the episode directory
+            if self._output_dir.exists():
+                try:
+                    shutil.rmtree(self._output_dir)
+                    logger.info("Cancelled recording — deleted %s", self._output_dir)
+                except Exception as exc:
+                    logger.warning("Failed to delete episode dir: %s", exc)
+
+            # Generate a new episode path for the next recording
+            self._output_dir = _generate_episode_path(self._data_root)
+            self._episode_dir_created = False
+
+            if self._auto_connected:
+                self._transition(SessionState.STOPPED)
+                if self._log_writer is not None:
+                    self._log_writer.close()
+                    self._log_writer = None
+            else:
+                self._transition(SessionState.CONNECTED)
+
     # ------------------------------------------------------------------
     # Lifecycle — disconnect
     # ------------------------------------------------------------------
