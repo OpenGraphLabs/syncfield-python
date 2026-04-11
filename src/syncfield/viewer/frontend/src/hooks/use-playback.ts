@@ -13,11 +13,16 @@ interface UsePlaybackReturn {
   videoRef: (el: HTMLVideoElement | null) => void;
 }
 
+// Throttle React state updates to ~15 Hz for smooth UI without
+// causing 60 re-renders/sec that would stutter secondary video sync.
+const STATE_UPDATE_INTERVAL_MS = 66;
+
 /**
  * Central playback state for the review video player.
  *
- * Uses requestAnimationFrame during playback for smooth timeline
- * updates (~60 Hz), falling back to event handlers for state changes.
+ * The primary `<video>` element handles its own decoding and rendering
+ * natively (no React interference). This hook only syncs the timeline
+ * display at ~15 Hz to avoid excessive re-renders.
  */
 export function usePlayback(): UsePlaybackReturn {
   const [currentTime, setCurrentTime] = useState(0);
@@ -27,16 +32,20 @@ export function usePlayback(): UsePlaybackReturn {
 
   const videoElRef = useRef<HTMLVideoElement | null>(null);
   const rafRef = useRef<number | null>(null);
-  const playingRef = useRef(false);
+  const lastUpdateRef = useRef(0);
 
-  // Smooth time sync loop during playback
   const startTimeSync = useCallback(() => {
-    const tick = () => {
+    const tick = (now: number) => {
       const el = videoElRef.current;
-      if (el && playingRef.current) {
+      if (!el) return;
+
+      // Throttle React state updates
+      if (now - lastUpdateRef.current >= STATE_UPDATE_INTERVAL_MS) {
         setCurrentTime(el.currentTime);
-        rafRef.current = requestAnimationFrame(tick);
+        lastUpdateRef.current = now;
       }
+
+      rafRef.current = requestAnimationFrame(tick);
     };
     rafRef.current = requestAnimationFrame(tick);
   }, []);
@@ -46,56 +55,54 @@ export function usePlayback(): UsePlaybackReturn {
       cancelAnimationFrame(rafRef.current);
       rafRef.current = null;
     }
-    // One final sync
+    // Final sync on pause
     const el = videoElRef.current;
     if (el) setCurrentTime(el.currentTime);
   }, []);
 
-  const videoRef = useCallback((el: HTMLVideoElement | null) => {
-    const prev = videoElRef.current;
-
-    if (prev) {
-      prev.onplay = null;
-      prev.onpause = null;
-      prev.onended = null;
-      prev.onloadedmetadata = null;
-      prev.ondurationchange = null;
-      prev.onseeked = null;
-      stopTimeSync();
-    }
-
-    videoElRef.current = el;
-
-    if (el) {
-      el.onplay = () => {
-        playingRef.current = true;
-        setIsPlaying(true);
-        startTimeSync();
-      };
-      el.onpause = () => {
-        playingRef.current = false;
-        setIsPlaying(false);
+  const videoRef = useCallback(
+    (el: HTMLVideoElement | null) => {
+      const prev = videoElRef.current;
+      if (prev) {
+        prev.onplay = null;
+        prev.onpause = null;
+        prev.onended = null;
+        prev.onloadedmetadata = null;
+        prev.ondurationchange = null;
+        prev.onseeked = null;
         stopTimeSync();
-      };
-      el.onended = () => {
-        playingRef.current = false;
-        setIsPlaying(false);
-        stopTimeSync();
-      };
-      el.onloadedmetadata = () => setDuration(el.duration);
-      el.ondurationchange = () => setDuration(el.duration);
-      el.onseeked = () => setCurrentTime(el.currentTime);
+      }
 
-      if (el.duration) setDuration(el.duration);
-      setCurrentTime(el.currentTime);
-      const wasPlaying = !el.paused;
-      playingRef.current = wasPlaying;
-      setIsPlaying(wasPlaying);
-      if (wasPlaying) startTimeSync();
-    }
-  }, [startTimeSync, stopTimeSync]);
+      videoElRef.current = el;
 
-  // Cleanup on unmount
+      if (el) {
+        el.onplay = () => {
+          setIsPlaying(true);
+          startTimeSync();
+        };
+        el.onpause = () => {
+          setIsPlaying(false);
+          stopTimeSync();
+        };
+        el.onended = () => {
+          setIsPlaying(false);
+          stopTimeSync();
+        };
+        el.onloadedmetadata = () => setDuration(el.duration);
+        el.ondurationchange = () => setDuration(el.duration);
+        el.onseeked = () => setCurrentTime(el.currentTime);
+
+        if (el.duration) setDuration(el.duration);
+        setCurrentTime(el.currentTime);
+        if (!el.paused) {
+          setIsPlaying(true);
+          startTimeSync();
+        }
+      }
+    },
+    [startTimeSync, stopTimeSync],
+  );
+
   useEffect(() => {
     return () => {
       if (rafRef.current !== null) cancelAnimationFrame(rafRef.current);

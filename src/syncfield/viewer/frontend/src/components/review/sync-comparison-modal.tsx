@@ -131,7 +131,7 @@ export function SyncComparisonModal({
             </div>
             <div
               ref={containerRef}
-              className="relative aspect-video w-full overflow-hidden"
+              className="relative aspect-video w-full cursor-ew-resize overflow-hidden"
               onPointerDown={handlePointerDown}
               onPointerMove={handlePointerMove}
               onPointerUp={handlePointerUp}

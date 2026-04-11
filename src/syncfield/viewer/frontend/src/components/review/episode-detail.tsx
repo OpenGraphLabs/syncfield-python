@@ -162,23 +162,23 @@ export function EpisodeDetail({ episodeId, onBack }: EpisodeDetailProps) {
             onToggle={playback.toggle}
             onSetRate={playback.setPlaybackRate}
           />
-
-          {/* Drift chart */}
-          {(episode.has_synced_videos || driftData) && (
-            <div className="border-t">
-              <DriftChart data={driftData} isLoading={driftLoading} />
-            </div>
-          )}
         </div>
 
         {/* Right sidebar */}
-        <div className="w-64 shrink-0 overflow-y-auto border-l">
+        <div className="w-72 shrink-0 overflow-y-auto border-l">
           <SyncQualityPanel
             report={syncReport}
             streams={streams}
             primaryStream={primaryStream}
             onStreamClick={syncReport ? handleStreamClick : undefined}
           />
+
+          {/* Drift chart in sidebar */}
+          {(episode.has_synced_videos || driftData) && (
+            <div className="border-t">
+              <DriftChart data={driftData} isLoading={driftLoading} />
+            </div>
+          )}
         </div>
       </div>
 
