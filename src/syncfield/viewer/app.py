@@ -32,6 +32,7 @@ import dearpygui.dearpygui as dpg
 
 from syncfield.orchestrator import SessionOrchestrator
 from syncfield.viewer import theme
+from syncfield.viewer.fonts import FontRegistry, load_fonts
 from syncfield.viewer.poller import SessionPoller
 from syncfield.viewer.widgets.layout import ViewerLayout
 
@@ -162,6 +163,7 @@ class ViewerApp:
         self._viewport_pos = viewport_pos
         self._poller = SessionPoller(session)
         self._layout: Optional[ViewerLayout] = None
+        self._fonts: FontRegistry = FontRegistry()
         self._running = False
         self._setup_done = False
         self._close_requested = False
@@ -185,6 +187,13 @@ class ViewerApp:
             resizable=True,
         )
 
+        # Load system fonts into the DPG registry before any widget is
+        # created — otherwise the first frame renders with the default
+        # ASCII-only bitmap font and every non-ASCII glyph flashes as '?'.
+        self._fonts = load_fonts()
+        if self._fonts.ui is not None:
+            dpg.bind_font(self._fonts.ui)
+
         # Bind the global theme before any widgets are created so the
         # first frame doesn't flash with the default dark theme.
         global_theme_tag = theme.build_theme()
@@ -196,7 +205,7 @@ class ViewerApp:
             [c / 255 for c in theme.BG_APP]
         )
 
-        self._layout = ViewerLayout(self._session)
+        self._layout = ViewerLayout(self._session, fonts=self._fonts)
         self._layout.build()
 
         dpg.setup_dearpygui()
@@ -240,10 +249,20 @@ class ViewerApp:
         dpg.render_dearpygui_frame()
 
     def close(self) -> None:
-        """Stop the poller and destroy the DPG context."""
+        """Stop the poller, tear down the session, and destroy the DPG context."""
         if self._close_requested:
             return
         self._close_requested = True
+
+        # Return the session to IDLE before tearing down DPG so any
+        # connected devices are released cleanly. Runs on the caller's
+        # thread (typically the main thread during app shutdown).
+        if self._layout is not None:
+            try:
+                self._layout.teardown_session()
+            except Exception:
+                logger.exception("Viewer session teardown failed")
+
         self._poller.stop()
         try:
             if dpg.is_dearpygui_running():

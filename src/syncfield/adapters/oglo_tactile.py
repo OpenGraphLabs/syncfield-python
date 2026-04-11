@@ -31,6 +31,31 @@ The MCU hardware clock is **linearly interpolated** across the batch
 (10 samples × 10 ms) so consumers see uniform 100 Hz spacing instead of a
 cluster at every batch boundary — critical for downstream jitter analysis.
 
+Lifecycle
+---------
+
+This adapter implements the 4-phase :class:`~syncfield.Stream` SPI so
+the viewer can plot live FSR values **before** Record is pressed:
+
+* ``prepare()``       — resolve the target peripheral (explicit address
+  or name scan).
+* ``connect()``       — open the BLE client, subscribe to the notify
+  characteristic, and start the background asyncio loop. Samples
+  begin flowing into :meth:`_handle_payload` which emits
+  :class:`SampleEvent` unconditionally so the viewer's sensor card
+  updates its plot even during the preview phase.
+* ``start_recording()`` — flip the ``_recording`` flag so incoming
+  samples also advance the finalization counters.
+* ``stop_recording()`` — flip ``_recording`` back off, snapshot the
+  counters into a :class:`FinalizationReport`. The BLE session
+  stays live so the plot keeps updating.
+* ``disconnect()``    — signal the asyncio loop to stop, release the
+  BLE client.
+
+Legacy ``start()`` / ``stop()`` still work — they collapse the new
+lifecycle into a ``connect + start_recording`` / ``stop_recording +
+disconnect`` pair for 0.1-era callers.
+
 Requires the optional ``ble`` extra::
 
     pip install 'syncfield[ble]'
@@ -147,24 +172,40 @@ class OgloTactileStream(StreamBase):
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
 
+        # True while the capture loop should count samples toward the
+        # finalization report. ``connect()`` leaves this False so the
+        # CONNECTED preview phase still drives the viewer plot (samples
+        # are emitted unconditionally via ``_emit_sample``) without
+        # polluting the recording's frame counters.
+        self._recording = False
         self._frame_count = 0
         self._first_at: Optional[int] = None
         self._last_at: Optional[int] = None
 
     # ------------------------------------------------------------------
-    # Stream SPI
+    # Stream SPI — 4-phase lifecycle
     # ------------------------------------------------------------------
 
     def prepare(self) -> None:
-        """Resolve the target device (explicit address or name scan)."""
+        """Resolve the target device (explicit address or name scan).
+
+        Heavy connect work (opening the BleakClient, subscribing to
+        notifications) happens in :meth:`connect` so the viewer can
+        show live sensor values as soon as the session enters
+        ``CONNECTED``. This step is cheap and idempotent — repeated
+        calls are safe.
+        """
         if self._address is not None:
             # bleak accepts either a BLEDevice or a plain address string.
             self._device = self._address
             return
 
+        if self._device is not None:
+            return
+
         # Name-filtered scan. Run synchronously by spinning a throwaway
-        # asyncio loop — prepare() is called once, before the capture
-        # loop starts, so it's OK to block here briefly.
+        # asyncio loop — prepare() runs once before connect() and the
+        # scan budget is bounded by ``scan_timeout``.
         self._device = asyncio.run(self._scan_for_glove())
         if self._device is None:
             raise RuntimeError(
@@ -172,8 +213,28 @@ class OgloTactileStream(StreamBase):
                 f"(name filter={self._ble_name!r}, timeout={self._scan_timeout}s)"
             )
 
-    def start(self, session_clock: SessionClock) -> None:
-        """Kick off the background asyncio loop that drives the BLE client."""
+    def connect(self) -> None:
+        """Open the BLE session and start the background asyncio loop.
+
+        After this call the ``_on_notify`` handler is subscribed to the
+        glove's notify characteristic and decoded samples flow through
+        :meth:`_handle_payload` — which emits :class:`SampleEvent`
+        unconditionally so the viewer's sensor card's live plot starts
+        updating immediately, even while the session is still in
+        ``CONNECTED`` (pre-record) state.
+
+        Idempotent — a second call while the loop thread is already
+        running is a no-op.
+        """
+        if self._thread is not None and self._thread.is_alive():
+            return
+        if self._device is None:
+            self.prepare()
+
+        self._recording = False
+        self._frame_count = 0
+        self._first_at = None
+        self._last_at = None
         self._stop_event.clear()
         self._thread = threading.Thread(
             target=self._run_event_loop,
@@ -182,12 +243,32 @@ class OgloTactileStream(StreamBase):
         )
         self._thread.start()
 
-    def stop(self) -> FinalizationReport:
-        """Signal the loop to exit and collect the finalization report."""
-        self._stop_event.set()
-        if self._thread is not None:
-            self._thread.join(timeout=3.0)
+    def start_recording(self, session_clock: SessionClock) -> None:
+        """Begin counting incoming samples toward the recording report.
 
+        The asyncio loop is already running from :meth:`connect`, so
+        this is just a boolean flip. The first sample that arrives
+        after this call lands at ``frame_count == 1``; samples that
+        arrived during the preview phase are discarded for the
+        finalization report but were already visible on the live plot
+        through the ``on_sample`` callbacks.
+
+        If the caller skipped :meth:`connect` (legacy 0.1 ``start()``
+        path), the BLE session is started here first so the recording
+        has a data source.
+        """
+        if self._thread is None or not self._thread.is_alive():
+            self.connect()
+        self._recording = True
+
+    def stop_recording(self) -> FinalizationReport:
+        """Flip recording off and snapshot the finalization report.
+
+        The BLE session **stays live** so the viewer plot keeps
+        updating and the operator can start another recording on the
+        same session without rescanning or reconnecting.
+        """
+        self._recording = False
         return FinalizationReport(
             stream_id=self.id,
             status="completed",
@@ -198,6 +279,38 @@ class OgloTactileStream(StreamBase):
             health_events=list(self._collected_health),
             error=None,
         )
+
+    def disconnect(self) -> None:
+        """Signal the asyncio loop to stop and release the BLE client.
+
+        Called when the session returns to ``IDLE``. Idempotent — a
+        second call on an already-disconnected stream is a no-op.
+        After this call the adapter holds no BLE handles.
+        """
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=3.0)
+            self._thread = None
+
+    # ------------------------------------------------------------------
+    # Legacy one-shot lifecycle
+    # ------------------------------------------------------------------
+
+    def start(self, session_clock: SessionClock) -> None:
+        """Legacy one-shot start — ``connect() + start_recording()``.
+
+        Exists so 0.1-era scripts that called ``prepare() → start() →
+        stop()`` keep running unchanged. New callers should use
+        :meth:`connect` + :meth:`start_recording` directly.
+        """
+        self.connect()
+        self.start_recording(session_clock)
+
+    def stop(self) -> FinalizationReport:
+        """Legacy one-shot stop — ``stop_recording() + disconnect()``."""
+        report = self.stop_recording()
+        self.disconnect()
+        return report
 
     # ------------------------------------------------------------------
     # Async runtime on the background thread
@@ -243,13 +356,26 @@ class OgloTactileStream(StreamBase):
         self._handle_payload(bytes(payload))
 
     async def _scan_for_glove(self) -> Any:
-        """Scan for a peripheral whose advertised name contains ``ble_name``."""
+        """Scan for a peripheral whose advertised name contains ``ble_name``.
+
+        Matches against **both** the bleak device ``name`` (which is the
+        hardware module's peripheral name — on the OGLO board that's
+        ``"nimble"``) and the advertisement data's ``local_name``
+        (which is what the firmware sets to ``"OGLO"``). Checking only
+        one of the two misses real hardware in the wild.
+        """
         filter_lower = self._ble_name.lower()
-        devices = await bleak.BleakScanner.discover(timeout=self._scan_timeout)
-        for device in devices:
-            name = (getattr(device, "name", None) or "").lower()
-            if filter_lower in name:
-                return device
+        results = await bleak.BleakScanner.discover(
+            timeout=self._scan_timeout, return_adv=True
+        )
+        for address, (device, adv) in results.items():
+            candidates = [
+                (getattr(device, "name", None) or ""),
+                (getattr(adv, "local_name", None) or ""),
+            ]
+            for candidate in candidates:
+                if filter_lower in candidate.lower():
+                    return device
         return None
 
     # ------------------------------------------------------------------
@@ -296,6 +422,13 @@ class OgloTactileStream(StreamBase):
         # full 100 Hz rate. The MCU hardware clock is linearly interpolated
         # across the batch so downstream consumers see uniform 10 ms
         # spacing instead of a cluster at every batch boundary.
+        #
+        # Samples are emitted unconditionally so the viewer's sensor
+        # card plot updates during both the CONNECTED preview phase
+        # and the RECORDING phase. Finalization counters
+        # (``_frame_count`` / ``_first_at`` / ``_last_at``) only
+        # advance while ``_recording`` is True — so the preview
+        # samples never contaminate the recording's frame total.
         for i in range(count):
             offset = _HEADER_SIZE + i * _SAMPLE_SIZE
             values = struct.unpack(
@@ -308,15 +441,23 @@ class OgloTactileStream(StreamBase):
                 (timestamp_us + i * _SAMPLE_PERIOD_US) * 1000
             )
 
-            if self._first_at is None:
-                self._first_at = recv_ns
-            self._last_at = recv_ns
-            self._frame_count += 1
+            if self._recording:
+                if self._first_at is None:
+                    self._first_at = recv_ns
+                self._last_at = recv_ns
+                self._frame_count += 1
+                frame_number = self._frame_count - 1
+            else:
+                # Preview phase — pass through a synthetic, ever-
+                # increasing frame number so subscribers that rely
+                # on monotonic numbering don't see duplicates, but
+                # don't advance the real counter.
+                frame_number = -1
 
             self._emit_sample(
                 SampleEvent(
                     stream_id=self.id,
-                    frame_number=self._frame_count - 1,
+                    frame_number=frame_number,
                     capture_ns=recv_ns,
                     channels=channels,
                     uncertainty_ns=500_000,  # ~0.5 ms — MCU clock precision

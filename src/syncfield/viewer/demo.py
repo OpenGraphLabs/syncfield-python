@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 import sys
 import threading
 import time
@@ -48,7 +49,11 @@ class SyntheticVideoStream(StreamBase):
 
     Exposes ``latest_frame`` the same way :class:`UVCWebcamStream` and
     :class:`OakCameraStream` do, so the viewer's video card renders it
-    correctly without any mocking on the viewer side.
+    correctly without any mocking on the viewer side. Implements the
+    full 4-phase lifecycle: the gradient loop runs during ``CONNECTED``
+    so preview is live *before* Record is pressed, and ``_recording``
+    gates the ``SampleEvent`` emission so only frames captured while
+    the session is in ``RECORDING`` count toward the finalization.
     """
 
     def __init__(
@@ -76,26 +81,39 @@ class SyntheticVideoStream(StreamBase):
         self._hue_shift = hue_shift
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        # `_recording` toggles whether the capture loop counts frames
+        # and emits sample events. While False the loop still produces
+        # `latest_frame` so the viewer has something to show.
+        self._recording = False
         self._frame_count = 0
         self._first_at: int | None = None
         self._last_at: int | None = None
         self._latest_frame: Any = None
         self._frame_lock = threading.Lock()
 
-    def prepare(self) -> None:
-        pass
+    # -- 4-phase lifecycle --------------------------------------------------
 
-    def start(self, session_clock) -> None:  # type: ignore[override]
+    def connect(self) -> None:
+        """Spawn the capture loop so preview frames are available."""
+        if self._thread is not None and self._thread.is_alive():
+            return
         self._stop.clear()
+        self._recording = False
+        self._frame_count = 0
+        self._first_at = None
+        self._last_at = None
         self._thread = threading.Thread(
             target=self._generate_loop, name=f"synth-vid-{self.id}", daemon=True
         )
         self._thread.start()
 
-    def stop(self) -> FinalizationReport:
-        self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=2.0)
+    def start_recording(self, session_clock) -> None:  # type: ignore[override]
+        """Flip the recording flag — atomic and fast."""
+        self._recording = True
+
+    def stop_recording(self) -> FinalizationReport:
+        """Stop emitting samples but leave the capture loop running."""
+        self._recording = False
         return FinalizationReport(
             stream_id=self.id,
             status="completed",
@@ -107,6 +125,31 @@ class SyntheticVideoStream(StreamBase):
             error=None,
         )
 
+    def disconnect(self) -> None:
+        """Tear down the capture loop."""
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+            self._thread = None
+
+    # -- Legacy one-shot compatibility -------------------------------------
+
+    def prepare(self) -> None:
+        pass
+
+    def start(self, session_clock) -> None:  # type: ignore[override]
+        # Compatibility path for any caller still using the legacy
+        # one-shot lifecycle: connect + start_recording in one call.
+        self.connect()
+        self.start_recording(session_clock)
+
+    def stop(self) -> FinalizationReport:
+        report = self.stop_recording()
+        self.disconnect()
+        return report
+
+    # -- Viewer integration ------------------------------------------------
+
     @property
     def latest_frame(self) -> Any:
         with self._frame_lock:
@@ -117,7 +160,9 @@ class SyntheticVideoStream(StreamBase):
 
         The frame is a smooth sinusoidal pattern that drifts across the
         image — visually distinctive enough that screenshots show real
-        motion but cheap enough to compute at 30 fps.
+        motion but cheap enough to compute at 30 fps. Runs continuously
+        while connected; sample events are only emitted during
+        ``_recording`` so the frame count reflects recorded frames only.
         """
         xs = np.linspace(0, 2 * math.pi, self._width, dtype=np.float32)
         ys = np.linspace(0, 2 * math.pi, self._height, dtype=np.float32)
@@ -138,18 +183,22 @@ class SyntheticVideoStream(StreamBase):
             with self._frame_lock:
                 self._latest_frame = bgr
 
-            if self._first_at is None:
-                self._first_at = capture_ns
-            self._last_at = capture_ns
-            self._frame_count += 1
-            self._emit_sample(
-                SampleEvent(
-                    stream_id=self.id,
-                    frame_number=frame_number,
-                    capture_ns=capture_ns,
+            # Preview-only frames never touch the counters or the sample
+            # stream — they just update `latest_frame`. Recording frames
+            # do both.
+            if self._recording:
+                if self._first_at is None:
+                    self._first_at = capture_ns
+                self._last_at = capture_ns
+                self._frame_count += 1
+                self._emit_sample(
+                    SampleEvent(
+                        stream_id=self.id,
+                        frame_number=frame_number,
+                        capture_ns=capture_ns,
+                    )
                 )
-            )
-            frame_number += 1
+                frame_number += 1
             self._stop.wait(self._period_s)
 
 
@@ -159,7 +208,14 @@ class SyntheticVideoStream(StreamBase):
 
 
 class SyntheticImuStream(StreamBase):
-    """Fake 9-DOF IMU that produces smooth sinusoidal channels at 100 Hz."""
+    """Fake 9-DOF IMU that produces smooth sinusoidal channels at 100 Hz.
+
+    Like :class:`SyntheticVideoStream`, the sample loop runs during
+    ``CONNECTED`` so the viewer can plot live values before Record is
+    pressed. Only frames captured while ``_recording`` is ``True`` are
+    counted into the finalization report and emitted as
+    :class:`SampleEvent`.
+    """
 
     def __init__(self, id: str) -> None:
         super().__init__(
@@ -174,24 +230,31 @@ class SyntheticImuStream(StreamBase):
         )
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._recording = False
         self._frame_count = 0
         self._first_at: int | None = None
         self._last_at: int | None = None
 
-    def prepare(self) -> None:
-        pass
+    # -- 4-phase lifecycle -------------------------------------------------
 
-    def start(self, session_clock) -> None:  # type: ignore[override]
+    def connect(self) -> None:
+        if self._thread is not None and self._thread.is_alive():
+            return
         self._stop.clear()
+        self._recording = False
+        self._frame_count = 0
+        self._first_at = None
+        self._last_at = None
         self._thread = threading.Thread(
             target=self._loop, name=f"synth-imu-{self.id}", daemon=True
         )
         self._thread.start()
 
-    def stop(self) -> FinalizationReport:
-        self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=2.0)
+    def start_recording(self, session_clock) -> None:  # type: ignore[override]
+        self._recording = True
+
+    def stop_recording(self) -> FinalizationReport:
+        self._recording = False
         return FinalizationReport(
             stream_id=self.id,
             status="completed",
@@ -203,16 +266,34 @@ class SyntheticImuStream(StreamBase):
             error=None,
         )
 
+    def disconnect(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+            self._thread = None
+
+    # -- Legacy one-shot compatibility -------------------------------------
+
+    def prepare(self) -> None:
+        pass
+
+    def start(self, session_clock) -> None:  # type: ignore[override]
+        self.connect()
+        self.start_recording(session_clock)
+
+    def stop(self) -> FinalizationReport:
+        report = self.stop_recording()
+        self.disconnect()
+        return report
+
+    # -- Capture loop ------------------------------------------------------
+
     def _loop(self) -> None:
         period = 0.01  # 100 Hz
         t0 = time.monotonic()
         while not self._stop.is_set():
             t = time.monotonic() - t0
             capture_ns = time.monotonic_ns()
-            if self._first_at is None:
-                self._first_at = capture_ns
-            self._last_at = capture_ns
-            self._frame_count += 1
             channels = {
                 "ax": math.sin(t * 1.3) * 0.8 + math.sin(t * 7.0) * 0.1,
                 "ay": math.cos(t * 1.6) * 0.6,
@@ -221,35 +302,41 @@ class SyntheticImuStream(StreamBase):
                 "gy": math.cos(t * 2.3) * 0.5,
                 "gz": math.sin(t * 3.1) * 0.3,
             }
-            self._emit_sample(
-                SampleEvent(
-                    stream_id=self.id,
-                    frame_number=self._frame_count - 1,
-                    capture_ns=capture_ns,
-                    channels=channels,
-                )
-            )
 
-            # Sprinkle in a health event occasionally so the health table
-            # actually has content in screenshots.
-            if self._frame_count == 150:
-                self._emit_health(
-                    HealthEvent(
+            if self._recording:
+                if self._first_at is None:
+                    self._first_at = capture_ns
+                self._last_at = capture_ns
+                self._frame_count += 1
+                self._emit_sample(
+                    SampleEvent(
                         stream_id=self.id,
-                        kind=HealthEventKind.WARNING,
-                        at_ns=capture_ns,
-                        detail="synthetic jitter above threshold",
+                        frame_number=self._frame_count - 1,
+                        capture_ns=capture_ns,
+                        channels=channels,
                     )
                 )
-            if self._frame_count == 320:
-                self._emit_health(
-                    HealthEvent(
-                        stream_id=self.id,
-                        kind=HealthEventKind.RECONNECT,
-                        at_ns=capture_ns,
-                        detail=None,
+
+                # Sprinkle in a health event occasionally so the health
+                # table actually has content in screenshots.
+                if self._frame_count == 150:
+                    self._emit_health(
+                        HealthEvent(
+                            stream_id=self.id,
+                            kind=HealthEventKind.WARNING,
+                            at_ns=capture_ns,
+                            detail="synthetic jitter above threshold",
+                        )
                     )
-                )
+                if self._frame_count == 320:
+                    self._emit_health(
+                        HealthEvent(
+                            stream_id=self.id,
+                            kind=HealthEventKind.RECONNECT,
+                            at_ns=capture_ns,
+                            detail=None,
+                        )
+                    )
 
             self._stop.wait(period)
 
@@ -389,18 +476,48 @@ def main(argv: Optional[List[str]] = None) -> int:
         import subprocess
 
         def _capture_window_screenshot() -> None:
-            """Capture the viewer window via AppleScript window discovery.
+            """Capture the viewer window to a PNG via ``screencapture``.
 
-            On macOS 'screencapture -l <window_id>' grabs a specific window
-            by its CoreGraphics window id. The id is resolved via
-            AppleScript by matching the frontmost process's window title
-            against 'SyncField'. This avoids manual coordinate math and
-            Retina scaling entirely.
+            The demo is launched from a terminal, so by the time the
+            timer fires the frontmost app may still be the shell or the
+            editor that kicked off the run — not the DPG window. Before
+            capturing we ask the current Python process (which owns the
+            viewer window) to activate itself via AppleScript. That
+            guarantees the window is on top of whatever was previously
+            frontmost, so the region capture at ``(60, 60)`` lines up
+            with the pinned viewport.
             """
             args.screenshot.parent.mkdir(parents=True, exist_ok=True)
 
-            # Step 1: ask macOS for the window id of the 'SyncField' window
-            osa = """
+            # Step 1: force the SyncField window to the front. We look
+            # up "python" (which owns this process) and send an 'activate'
+            # event. Falls through silently if System Events is
+            # unreachable — the capture will still run, it just may
+            # grab whatever is on top of the viewer.
+            activate_script = """
+                tell application "System Events"
+                    set pyProcs to every application process whose unix id is %d
+                    if (count of pyProcs) > 0 then
+                        set frontmost of (item 1 of pyProcs) to true
+                    end if
+                end tell
+            """ % os.getpid()
+            try:
+                subprocess.run(
+                    ["osascript", "-e", activate_script],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+            except Exception as exc:
+                print(f"viewer activate failed: {exc}", file=sys.stderr)
+
+            # Small settle so the window manager finishes raising the
+            # viewer above whatever was in front of it before.
+            time.sleep(0.3)
+
+            # Step 2: log the frontmost window title for debugging.
+            probe = """
                 tell application "System Events"
                     set frontApp to first application process whose frontmost is true
                     set frontWin to window 1 of frontApp
@@ -409,13 +526,16 @@ def main(argv: Optional[List[str]] = None) -> int:
             """
             try:
                 result = subprocess.run(
-                    ["osascript", "-e", osa],
+                    ["osascript", "-e", probe],
                     capture_output=True,
                     text=True,
                     check=True,
                     timeout=5,
                 )
-                print(f"frontmost window title: {result.stdout.strip()!r}", file=sys.stderr)
+                print(
+                    f"frontmost window title: {result.stdout.strip()!r}",
+                    file=sys.stderr,
+                )
             except Exception as exc:
                 print(f"title probe failed: {exc}", file=sys.stderr)
 
@@ -438,8 +558,15 @@ def main(argv: Optional[List[str]] = None) -> int:
             try:
                 from syncfield.viewer import theme
 
+                # The viewer is pinned at (60, 60) by the screenshot
+                # harness. macOS window chrome adds a ~28 px title bar
+                # above the DPG content — we pad the capture region by
+                # the same amount at the bottom to guarantee the full
+                # content area is visible even after the viewport grows.
+                _TITLE_BAR_PX = 28
                 x, y = 60, 60
-                w, h = theme.VIEWPORT_WIDTH, theme.VIEWPORT_HEIGHT
+                w = theme.VIEWPORT_WIDTH
+                h = theme.VIEWPORT_HEIGHT + _TITLE_BAR_PX
                 subprocess.run(
                     [
                         "screencapture",

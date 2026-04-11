@@ -114,6 +114,6 @@ def scan_peripherals(timeout: float = 5.0) -> List[Any]:
 def clear_cache() -> None:
     """Invalidate the shared BLE scan cache. Primarily a test hook."""
     global _cache, _cache_time
-    with _cache_lock:
+    with _scan_lock:
         _cache = []
         _cache_time = 0.0

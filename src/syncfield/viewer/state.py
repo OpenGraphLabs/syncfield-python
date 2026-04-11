@@ -154,16 +154,28 @@ class StreamStatsBuffer:
         are bounded — truncation happens inside ``deque.append`` atomically
         and readers call :meth:`snapshot_fps` / :meth:`snapshot_plot` which
         make a list copy.
+
+        Auxiliary channels — timestamps, metadata, anything whose name
+        starts with ``_`` or contains ``timestamp`` — are skipped from
+        the plot buffer. Those values often live in the nanoseconds
+        range (~10¹⁸) and would otherwise dominate the auto-scaled Y
+        axis, squashing real sensor readings (0–65535 for OGLO FSRs)
+        flat against the baseline.
         """
         self._fps_window.append(capture_ns)
         self._plot_timestamps.append(capture_ns / 1e9)
 
         if channels:
+            plottable = {
+                name: value
+                for name, value in channels.items()
+                if isinstance(value, (int, float))
+                and not _is_auxiliary_channel(name)
+            }
+
             # Pad any missing channel to align lengths, then append numeric values.
             current_len = len(self._plot_timestamps)
-            for name, value in channels.items():
-                if not isinstance(value, (int, float)):
-                    continue
+            for name, value in plottable.items():
                 buf = self._plot_channels.get(name)
                 if buf is None:
                     buf = deque(maxlen=self.max_plot_samples)
@@ -177,7 +189,7 @@ class StreamStatsBuffer:
             # Any channel we already track but that's missing from this sample
             # gets a NaN so it doesn't drift out of alignment.
             for name, buf in self._plot_channels.items():
-                if name not in channels:
+                if name not in plottable:
                     buf.append(float("nan"))
 
     def observe_health(self, event: HealthEntry) -> None:
@@ -210,3 +222,38 @@ class StreamStatsBuffer:
 
     def snapshot_health(self) -> List[HealthEntry]:
         return list(self._health)
+
+
+# ---------------------------------------------------------------------------
+# Free helpers
+# ---------------------------------------------------------------------------
+
+
+def _is_auxiliary_channel(name: str) -> bool:
+    """Return True for channel names that shouldn't appear in the plot.
+
+    Adapters sometimes attach metadata channels alongside real sensor
+    readings — the OGLO tactile stream, for example, emits
+    ``device_timestamp_ns`` next to its thumb/index/middle/ring/pinky
+    FSR values so downstream consumers can recover the MCU hardware
+    clock. Those auxiliary values often sit in the nanoseconds range
+    (~10¹⁸) and, if plotted alongside the real 0–65535 readings on a
+    single auto-scaled Y axis, flatten every real reading into a
+    straight baseline.
+
+    The rule is deliberately simple so third-party adapters can opt
+    channels out of plotting by convention alone — without any API
+    hook — by:
+
+    * prefixing the channel name with an underscore (``_raw``,
+      ``_calibration``, …), or
+    * including the substring ``timestamp`` in the channel name
+      (``device_timestamp_ns``, ``capture_timestamp_us``, …).
+    """
+    if not name:
+        return False
+    if name.startswith("_"):
+        return True
+    if "timestamp" in name.lower():
+        return True
+    return False

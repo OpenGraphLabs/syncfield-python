@@ -190,7 +190,25 @@ class StreamCapabilities:
 
 
 class SessionState(Enum):
-    """Lifecycle state of a SessionOrchestrator."""
+    """Lifecycle state of a SessionOrchestrator.
+
+    A SyncField session walks a small state machine. The 0.2 release
+    adds a ``CONNECTED`` state so devices can stream live preview data
+    before the user hits Record — the viewer and CLI both sit in this
+    state to show frames and sensor values. A brief ``COUNTDOWN`` state
+    fires between Record-click and actual recording so the user sees a
+    3 / 2 / 1 indicator and has time to flick a glance at the rig.
+
+    Typical single-recording transitions::
+
+        IDLE → CONNECTED → COUNTDOWN → RECORDING → STOPPING → CONNECTED …
+
+    Calling ``disconnect()`` from ``CONNECTED`` returns the session to
+    ``IDLE``. Applications that want the legacy one-shot behavior can
+    still call ``start()`` straight from ``IDLE`` — the orchestrator
+    auto-connects, records, and ``stop()`` runs to ``STOPPED`` at the
+    end.
+    """
 
     IDLE = "idle"
     CONNECTING = "connecting"
