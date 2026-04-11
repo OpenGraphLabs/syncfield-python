@@ -10,6 +10,7 @@ import { HealthTable } from "@/components/health-table";
 import { CountdownOverlay } from "@/components/countdown-overlay";
 import { DiscoveryModal } from "@/components/discovery-modal";
 import { Footer } from "@/components/footer";
+import { StopResultBanner } from "@/components/stop-result-banner";
 import { ReviewPage } from "@/components/review/review-page";
 import type { ViewMode } from "@/components/segment-control";
 
@@ -66,7 +67,8 @@ function RecordView({
   mode: ViewMode;
   onModeChange: (m: ViewMode) => void;
 }) {
-  const { snapshot, countdown, sendCommand } = useSession();
+  const { snapshot, countdown, stopResult, sendCommand, dismissStopResult } =
+    useSession();
   const discovery = useDiscovery();
   const [discoveryOpen, setDiscoveryOpen] = useState(false);
 
@@ -105,6 +107,11 @@ function RecordView({
 
       <ControlPanel state={state} onCommand={sendCommand} />
       <SessionClock snapshot={snapshot} />
+
+      {/* Stop result banner */}
+      {stopResult && (
+        <StopResultBanner result={stopResult} onDismiss={dismissStopResult} />
+      )}
 
       <div className="flex flex-1 overflow-hidden">
         <div className="flex-1 overflow-y-auto p-4">

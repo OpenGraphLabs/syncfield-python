@@ -52,7 +52,27 @@ export interface CountdownEvent {
   count: number;
 }
 
-export type ServerMessage = SessionSnapshot | CountdownEvent;
+export interface StopResultEvent {
+  type: "stop_result";
+  status: "saving" | "success" | "partial" | "error";
+  output_dir?: string;
+  manifest_ok?: boolean;
+  sync_point_ok?: boolean;
+  error?: string;
+  streams?: Record<
+    string,
+    {
+      status: string;
+      frame_count: number;
+      file_exists?: boolean;
+      has_output?: boolean;
+      error?: string;
+      warning?: string;
+    }
+  >;
+}
+
+export type ServerMessage = SessionSnapshot | CountdownEvent | StopResultEvent;
 
 // ---------------------------------------------------------------------------
 // Control commands (client → server)
@@ -103,4 +123,8 @@ export function isSnapshot(msg: ServerMessage): msg is SessionSnapshot {
 
 export function isCountdown(msg: ServerMessage): msg is CountdownEvent {
   return msg.type === "countdown";
+}
+
+export function isStopResult(msg: ServerMessage): msg is StopResultEvent {
+  return msg.type === "stop_result";
 }

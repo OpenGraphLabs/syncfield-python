@@ -773,7 +773,7 @@ class ViewerServer:
             countdown_s = msg.get("countdown_s", 3)
             await self._start_recording(countdown_s)
         elif action == "stop":
-            await asyncio.to_thread(self._session.stop)
+            await self._stop_and_report()
         elif action == "cancel":
             await asyncio.to_thread(self._session.cancel)
         else:
@@ -801,6 +801,90 @@ class ViewerServer:
             countdown_s=countdown_s,
             on_countdown_tick=_on_tick,
         )
+
+    async def _stop_and_report(self) -> None:
+        """Stop recording, validate output, and broadcast the result.
+
+        Sends a ``stop_result`` WebSocket message with per-stream
+        status so the viewer can show success/failure immediately.
+        """
+        # Broadcast "saving" state
+        await self._broadcast_message({
+            "type": "stop_result",
+            "status": "saving",
+        })
+
+        try:
+            report = await asyncio.to_thread(self._session.stop)
+        except Exception as exc:
+            await self._broadcast_message({
+                "type": "stop_result",
+                "status": "error",
+                "error": str(exc),
+                "streams": {},
+            })
+            return
+
+        # Validate output files on disk
+        output_dir = self._session.output_dir
+        stream_results: Dict[str, Any] = {}
+        all_ok = True
+
+        for fin in report.finalizations:
+            result: Dict[str, Any] = {
+                "status": fin.status,
+                "frame_count": fin.frame_count,
+            }
+
+            # Check expected output files exist on disk
+            if fin.file_path is not None:
+                file_exists = Path(fin.file_path).exists()
+                result["file_path"] = str(fin.file_path)
+                result["file_exists"] = file_exists
+                if not file_exists:
+                    result["status"] = "failed"
+                    result["error"] = f"Output file missing: {fin.file_path}"
+                    all_ok = False
+            else:
+                # Sensor streams: check for timestamps JSONL
+                ts_path = output_dir / f"{fin.stream_id}.timestamps.jsonl"
+                jsonl_path = output_dir / f"{fin.stream_id}.jsonl"
+                has_output = ts_path.exists() or jsonl_path.exists()
+                result["has_output"] = has_output
+
+            if fin.status == "failed":
+                all_ok = False
+                result["error"] = fin.error
+
+            if fin.frame_count == 0 and fin.status == "completed":
+                result["warning"] = "No frames captured"
+
+            stream_results[fin.stream_id] = result
+
+        # Check manifest and sync_point were written
+        manifest_ok = (output_dir / "manifest.json").exists()
+        sync_point_ok = (output_dir / "sync_point.json").exists()
+
+        await self._broadcast_message({
+            "type": "stop_result",
+            "status": "success" if all_ok else "partial",
+            "output_dir": str(output_dir),
+            "manifest_ok": manifest_ok,
+            "sync_point_ok": sync_point_ok,
+            "streams": stream_results,
+        })
+
+    async def _broadcast_message(self, message: dict) -> None:
+        """Send a JSON message to all connected WebSocket clients."""
+        text = json.dumps(message)
+        disconnected: List[WebSocket] = []
+        for ws in self._ws_clients:
+            try:
+                await ws.send_text(text)
+            except Exception:
+                disconnected.append(ws)
+        for ws in disconnected:
+            self._ws_clients.discard(ws)
 
     # ------------------------------------------------------------------
     # MJPEG generator
