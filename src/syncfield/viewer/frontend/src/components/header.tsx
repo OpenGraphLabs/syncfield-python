@@ -1,5 +1,5 @@
 import type { SessionSnapshot } from "@/lib/types";
-import { formatElapsed, stateLabel } from "@/lib/format";
+import { formatElapsed } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import { Logo } from "./logo";
 
@@ -8,16 +8,38 @@ interface HeaderProps {
   onDiscoverClick: () => void;
 }
 
-const STATE_COLORS: Record<string, string> = {
-  idle: "bg-muted",
-  connecting: "bg-warning",
-  connected: "bg-success",
-  starting: "bg-warning",
+/** Dot color by session state. */
+const STATE_DOT: Record<string, string> = {
   recording: "bg-recording animate-pulse-recording",
-  stopping: "bg-warning",
-  stopped: "bg-muted",
+  countdown: "bg-warning",
+  preparing: "bg-warning",
+  connecting: "bg-warning",
   disconnecting: "bg-warning",
+  stopping: "bg-warning",
 };
+
+/** User-friendly labels — idle-like states show "Ready". */
+function friendlyState(state: string): string {
+  switch (state) {
+    case "idle":
+    case "connected":
+    case "stopped":
+      return "Ready";
+    case "recording":
+      return "Recording";
+    case "countdown":
+    case "preparing":
+      return "Starting…";
+    case "connecting":
+      return "Connecting…";
+    case "stopping":
+      return "Saving…";
+    case "disconnecting":
+      return "Disconnecting…";
+    default:
+      return state;
+  }
+}
 
 export function Header({ snapshot, onDiscoverClick }: HeaderProps) {
   const state = snapshot?.state ?? "idle";
@@ -47,7 +69,7 @@ export function Header({ snapshot, onDiscoverClick }: HeaderProps) {
         <span
           className={cn(
             "inline-block h-2 w-2 rounded-full",
-            STATE_COLORS[state],
+            STATE_DOT[state] ?? "bg-success",
           )}
         />
         <span
@@ -56,7 +78,7 @@ export function Header({ snapshot, onDiscoverClick }: HeaderProps) {
             isRecording ? "text-recording" : "text-muted",
           )}
         >
-          {stateLabel(state)}
+          {friendlyState(state)}
         </span>
       </div>
 

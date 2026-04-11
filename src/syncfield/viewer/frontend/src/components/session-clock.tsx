@@ -6,7 +6,7 @@ interface SessionClockProps {
 }
 
 /**
- * Session clock panel — shows sync point, chirp status, and tone config.
+ * Session info bar — shows chirp status and stream count.
  */
 export function SessionClock({ snapshot }: SessionClockProps) {
   if (!snapshot) return null;
@@ -36,12 +36,6 @@ export function SessionClock({ snapshot }: SessionClockProps) {
         <span className="font-mono">
           {Object.keys(snapshot.streams).length}
         </span>
-      </div>
-
-      {/* Session state detail */}
-      <div className="flex items-center gap-2">
-        <span className="text-muted">State</span>
-        <span className="font-mono">{snapshot.state}</span>
       </div>
     </div>
   );
