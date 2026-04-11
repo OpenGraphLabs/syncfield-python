@@ -144,12 +144,14 @@ def _scan_episodes(data_dir: Path) -> List[Dict[str, Any]]:
 
         stream_count = 0
         host_id: Optional[str] = None
+        task: Optional[str] = None
         if has_manifest:
             try:
                 with open(manifest_path) as f:
                     manifest = json.load(f)
                 host_id = manifest.get("host_id")
                 stream_count = len(manifest.get("streams", {}))
+                task = manifest.get("task")
             except Exception:
                 pass
 
@@ -160,6 +162,7 @@ def _scan_episodes(data_dir: Path) -> List[Dict[str, Any]]:
             "has_sync": has_sync,
             "stream_count": stream_count,
             "host_id": host_id,
+            "task": task,
             "created_at": created_at,
         })
 
@@ -197,6 +200,7 @@ class ViewerServer:
         self.app = FastAPI(title=title, docs_url=None, redoc_url=None)
         self._setup_middleware()
         self._setup_routes()
+        self._setup_task_routes()
         self._setup_episode_routes()
         self._setup_static()
 
@@ -350,6 +354,101 @@ class ViewerServer:
                 return JSONResponse({"status": "removed", "id": stream_id})
             except Exception as exc:
                 return JSONResponse({"error": str(exc)}, status_code=400)
+
+    # ------------------------------------------------------------------
+    # Task management routes
+    # ------------------------------------------------------------------
+
+    def _setup_task_routes(self) -> None:
+        """CRUD for task list stored in the data root as tasks.json."""
+        app = self.app
+        data_root = self._session.output_dir.parent
+
+        def _tasks_path() -> Path:
+            return data_root / "tasks.json"
+
+        def _read_tasks() -> List[Dict[str, Any]]:
+            p = _tasks_path()
+            if not p.exists():
+                return []
+            return json.loads(p.read_text())
+
+        def _write_tasks(tasks: List[Dict[str, Any]]) -> None:
+            _tasks_path().write_text(json.dumps(tasks, indent=2))
+
+        @app.get("/api/tasks")
+        async def api_list_tasks() -> JSONResponse:
+            tasks = await asyncio.to_thread(_read_tasks)
+            return JSONResponse({"tasks": tasks})
+
+        @app.post("/api/tasks")
+        async def api_create_task(request: Any) -> JSONResponse:
+            body = await request.json()
+            name = body.get("name", "").strip()
+            if not name:
+                return JSONResponse({"error": "Task name is required"}, status_code=400)
+
+            def _create():
+                tasks = _read_tasks()
+                if any(t["name"] == name for t in tasks):
+                    return None  # duplicate
+                task = {"name": name, "description": body.get("description", "")}
+                tasks.append(task)
+                _write_tasks(tasks)
+                return task
+
+            task = await asyncio.to_thread(_create)
+            if task is None:
+                return JSONResponse({"error": f"Task '{name}' already exists"}, status_code=409)
+            return JSONResponse(task, status_code=201)
+
+        @app.put("/api/tasks/{task_name}")
+        async def api_update_task(task_name: str, request: Any) -> JSONResponse:
+            body = await request.json()
+
+            def _update():
+                tasks = _read_tasks()
+                for t in tasks:
+                    if t["name"] == task_name:
+                        if "name" in body:
+                            t["name"] = body["name"]
+                        if "description" in body:
+                            t["description"] = body["description"]
+                        _write_tasks(tasks)
+                        return t
+                return None
+
+            task = await asyncio.to_thread(_update)
+            if task is None:
+                return JSONResponse({"error": "Task not found"}, status_code=404)
+            return JSONResponse(task)
+
+        @app.delete("/api/tasks/{task_name}")
+        async def api_delete_task(task_name: str) -> JSONResponse:
+            def _delete():
+                tasks = _read_tasks()
+                new_tasks = [t for t in tasks if t["name"] != task_name]
+                if len(new_tasks) == len(tasks):
+                    return False
+                _write_tasks(new_tasks)
+                return True
+
+            deleted = await asyncio.to_thread(_delete)
+            if not deleted:
+                return JSONResponse({"error": "Task not found"}, status_code=404)
+            return JSONResponse({"status": "deleted"})
+
+        @app.post("/api/task/select")
+        async def api_select_task(request: Any) -> JSONResponse:
+            """Set the current task for the next recording."""
+            body = await request.json()
+            task = body.get("task", None)
+            self._session.task = task
+            return JSONResponse({"task": task})
+
+        @app.get("/api/task/current")
+        async def api_current_task() -> JSONResponse:
+            return JSONResponse({"task": self._session.task})
 
     # ------------------------------------------------------------------
     # Episode review & sync routes

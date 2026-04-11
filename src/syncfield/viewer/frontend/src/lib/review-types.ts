@@ -10,6 +10,7 @@ export interface EpisodeSummary {
   has_sync: boolean;
   stream_count: number;
   host_id: string | null;
+  task: string | null;
   created_at: string; // ISO datetime
 }
 

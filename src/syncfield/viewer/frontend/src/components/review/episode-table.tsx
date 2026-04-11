@@ -13,6 +13,7 @@ export function EpisodeTable({ episodes, onSelect }: EpisodeTableProps) {
         <thead>
           <tr className="border-b text-left text-muted">
             <th className="px-4 py-2.5 font-medium">Episode</th>
+            <th className="px-4 py-2.5 font-medium">Task</th>
             <th className="px-4 py-2.5 font-medium">Date</th>
             <th className="px-4 py-2.5 font-medium">Host</th>
             <th className="px-4 py-2.5 font-medium">Streams</th>
@@ -30,6 +31,7 @@ export function EpisodeTable({ episodes, onSelect }: EpisodeTableProps) {
               )}
             >
               <td className="px-4 py-2.5 font-mono font-medium">{ep.id}</td>
+              <td className="px-4 py-2.5 text-muted">{ep.task ?? "—"}</td>
               <td className="px-4 py-2.5 text-muted">
                 {formatCompact(ep.created_at)}
               </td>

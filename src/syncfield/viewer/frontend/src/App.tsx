@@ -11,6 +11,7 @@ import { CountdownOverlay } from "@/components/countdown-overlay";
 import { DiscoveryModal } from "@/components/discovery-modal";
 import { Footer } from "@/components/footer";
 import { StopResultBanner } from "@/components/stop-result-banner";
+import { TaskSelector } from "@/components/task-selector";
 import { ReviewPage } from "@/components/review/review-page";
 import type { ViewMode } from "@/components/segment-control";
 
@@ -106,6 +107,7 @@ function RecordView({
       />
 
       <ControlPanel state={state} onCommand={sendCommand} />
+      <TaskSelector />
       <SessionClock snapshot={snapshot} />
 
       {/* Stop result banner */}

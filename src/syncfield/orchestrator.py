@@ -276,6 +276,9 @@ class SessionOrchestrator:
         # Flipped to True when the episode dir has been created on disk.
         self._episode_dir_created = False
 
+        # Current task label — set by the viewer before recording.
+        self._task: Optional[str] = None
+
         # True when the operator used the legacy one-shot ``start()`` from
         # ``IDLE`` instead of explicitly calling ``connect()`` first.
         # In that case ``stop()`` also tears down the devices and lands
@@ -308,6 +311,15 @@ class SessionOrchestrator:
     @property
     def output_dir(self) -> Path:
         return self._output_dir
+
+    @property
+    def task(self) -> Optional[str]:
+        """Current task label for the next recording."""
+        return self._task
+
+    @task.setter
+    def task(self, value: Optional[str]) -> None:
+        self._task = value
 
     @property
     def role(self) -> Optional[Role]:
@@ -1029,6 +1041,7 @@ class SessionOrchestrator:
             session_id=self.session_id,
             role=role_str,
             leader_host_id=leader_host_id,
+            task=self._task,
         )
 
     # ------------------------------------------------------------------
