@@ -26,6 +26,11 @@ htmlcov/
 # Worktrees
 .worktrees/
 
+# Viewer frontend
+src/syncfield/viewer/static/
+src/syncfield/viewer/frontend/node_modules/
+src/syncfield/viewer/frontend/dist/
+
 # OS
 .DS_Store
 Thumbs.db

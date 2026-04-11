@@ -9,10 +9,6 @@ from __future__ import annotations
 
 import math
 
-import pytest
-
-pytest.importorskip("dearpygui.dearpygui")
-
 from syncfield.viewer.state import HealthEntry, StreamStatsBuffer
 
 

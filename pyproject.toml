@@ -36,12 +36,12 @@ ble = ["bleak>=0.21"]
 # extra's opencv-python for the MP4 writer. Install `syncfield[oak,uvc]`
 # (or `syncfield[all]`) for the full OAK capture path.
 oak = ["depthai>=3.0.0"]
-# The desktop viewer uses dearpygui (GPU-accelerated, light 1.8 MiB wheel).
-# It also reuses numpy from the audio extra when rendering video frames —
-# if you install ``syncfield[viewer]`` on its own, numpy is pulled in too.
+# The web viewer uses FastAPI + uvicorn and opens a browser tab.
+# opencv-python is needed for MJPEG encoding of video frames.
 viewer = [
-    "dearpygui>=2.0",
-    "numpy>=1.21",
+    "fastapi>=0.104.0",
+    "uvicorn[standard]>=0.24.0",
+    "opencv-python>=4.8.0",
 ]
 # mDNS-based multi-host session rendezvous (syncfield.multihost). Required
 # only when you want a leader/follower session discovered automatically
@@ -52,10 +52,11 @@ multihost = [
 all = [
     "sounddevice>=0.4.6",
     "numpy>=1.21",
-    "opencv-python>=4.5",
+    "opencv-python>=4.8.0",
     "bleak>=0.21",
     "depthai>=3.0.0",
-    "dearpygui>=2.0",
+    "fastapi>=0.104.0",
+    "uvicorn[standard]>=0.24.0",
     "zeroconf>=0.130",
 ]
 
@@ -67,6 +68,9 @@ Issues = "https://github.com/OpenGraphLabs/syncfield-python/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/syncfield"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"src/syncfield/viewer/static" = "syncfield/viewer/static"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
