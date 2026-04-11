@@ -29,10 +29,7 @@ class FakeSerial:
 
 
 def main() -> None:
-    output_dir = Path("./demo_session_polling")
-    output_dir.mkdir(exist_ok=True)
-
-    session = sf.SessionOrchestrator(host_id="demo", output_dir=output_dir)
+    session = sf.SessionOrchestrator(host_id="demo", output_dir=Path("./demo_data"))
 
     serial = FakeSerial()
     session.add(PollingSensorStream("fake_imu", read=serial.read_sample, hz=50))

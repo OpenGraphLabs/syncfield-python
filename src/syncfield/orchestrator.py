@@ -123,6 +123,24 @@ Role = Union[LeaderRole, FollowerRole]
 # ---------------------------------------------------------------------------
 
 
+def _make_episode_dir(data_dir: Path) -> Path:
+    """Create a timestamped episode directory inside *data_dir*.
+
+    Each recording session gets its own sub-directory named
+    ``ep_{YYYYMMDD}_{HHMMSS}_{6-char-hex}`` so episodes never collide
+    even when two sessions start in the same second.
+
+    Returns the newly created episode :class:`Path`.
+    """
+    import secrets
+    from datetime import datetime
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    episode = data_dir / f"ep_{stamp}_{secrets.token_hex(3)}"
+    episode.mkdir(parents=True, exist_ok=True)
+    return episode
+
+
 def _run_countdown(
     countdown_s: float,
     on_tick: Optional[Callable[[int], None]],
@@ -228,8 +246,7 @@ class SessionOrchestrator:
         role: Optional[Role] = None,
     ) -> None:
         self._host_id = host_id
-        self._output_dir = Path(output_dir)
-        self._output_dir.mkdir(parents=True, exist_ok=True)
+        self._output_dir = _make_episode_dir(Path(output_dir))
         self._sync_tone = sync_tone or SyncToneConfig.default()
         self._chirp_player = chirp_player or create_default_player()
         self._streams: Dict[str, Stream] = {}

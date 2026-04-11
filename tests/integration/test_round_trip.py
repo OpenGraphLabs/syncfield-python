@@ -42,8 +42,10 @@ def test_full_session_produces_valid_core_artifacts(tmp_path: Path):
 
     report = session.stop()
 
+    out = session.output_dir
+
     # --- sync_point.json --------------------------------------------------
-    sp = json.loads((tmp_path / "sync_point.json").read_text())
+    sp = json.loads((out / "sync_point.json").read_text())
     assert sp["host_id"] == "rig_01"
     assert isinstance(sp["monotonic_ns"], int)
     assert isinstance(sp["wall_clock_ns"], int)
@@ -52,7 +54,7 @@ def test_full_session_produces_valid_core_artifacts(tmp_path: Path):
     assert "chirp_start_ns" not in sp
 
     # --- manifest.json ----------------------------------------------------
-    manifest = json.loads((tmp_path / "manifest.json").read_text())
+    manifest = json.loads((out / "manifest.json").read_text())
     assert manifest["host_id"] == "rig_01"
     assert "cam_a" in manifest["streams"]
     assert "imu_a" in manifest["streams"]
@@ -64,7 +66,7 @@ def test_full_session_produces_valid_core_artifacts(tmp_path: Path):
     # --- session_log.jsonl ------------------------------------------------
     log_lines = [
         json.loads(line)
-        for line in (tmp_path / "session_log.jsonl")
+        for line in (out / "session_log.jsonl")
         .read_text()
         .strip()
         .split("\n")
@@ -93,7 +95,7 @@ def test_silent_session_omits_chirp_fields(tmp_path: Path):
     session.add(FakeStream("cam", provides_audio_track=True))
     session.start()
     session.stop()
-    sp = json.loads((tmp_path / "sync_point.json").read_text())
+    sp = json.loads((session.output_dir / "sync_point.json").read_text())
     assert "chirp_start_ns" not in sp
     assert "chirp_stop_ns" not in sp
     assert "chirp_spec" not in sp
@@ -109,8 +111,8 @@ def test_no_audio_stream_single_host_session_works_without_chirp(tmp_path: Path)
     session.add(FakeStream("imu_only"))
     session.start()
     session.stop()
-    sp = json.loads((tmp_path / "sync_point.json").read_text())
+    sp = json.loads((session.output_dir / "sync_point.json").read_text())
     assert "chirp_start_ns" not in sp
     # Session still completes cleanly
-    manifest = json.loads((tmp_path / "manifest.json").read_text())
+    manifest = json.loads((session.output_dir / "manifest.json").read_text())
     assert manifest["streams"]["imu_only"]["status"] == "completed"

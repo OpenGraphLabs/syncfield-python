@@ -26,6 +26,9 @@ htmlcov/
 # Worktrees
 .worktrees/
 
+# Example output data
+examples/*/output/
+
 # Viewer frontend
 src/syncfield/viewer/static/
 src/syncfield/viewer/frontend/node_modules/

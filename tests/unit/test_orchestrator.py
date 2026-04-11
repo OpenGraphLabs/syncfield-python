@@ -81,12 +81,15 @@ class TestConstruction:
     def test_output_dir_created(self, tmp_path):
         target = tmp_path / "sub" / "dir"
         assert not target.exists()
-        SessionOrchestrator(
+        session = SessionOrchestrator(
             host_id="h",
             output_dir=target,
             sync_tone=SyncToneConfig.silent(),
         )
+        # The orchestrator creates an episode subdir inside target.
         assert target.exists()
+        assert session.output_dir.parent == target
+        assert session.output_dir.name.startswith("ep_")
 
 
 class _DeviceKeyedFakeStream(FakeStream):
@@ -438,7 +441,7 @@ class TestStop:
         session.add(FakeStream("a"))
         session.start()
         session.stop()
-        sp = json.loads((tmp_path / "sync_point.json").read_text())
+        sp = json.loads((session.output_dir / "sync_point.json").read_text())
         assert sp["host_id"] == "rig_01"
         assert "monotonic_ns" in sp
         # Silent mode → no chirp fields
@@ -449,7 +452,7 @@ class TestStop:
         session.add(FakeStream("a", provides_audio_track=True))
         session.start()
         session.stop()
-        m = json.loads((tmp_path / "manifest.json").read_text())
+        m = json.loads((session.output_dir / "manifest.json").read_text())
         assert m["host_id"] == "rig_01"
         assert "a" in m["streams"]
         assert m["streams"]["a"]["capabilities"]["provides_audio_track"] is True
@@ -563,7 +566,7 @@ class TestChirpIntegration:
         session.add(FakeStream("a", provides_audio_track=True))
         session.start()
         session.stop()
-        sp = json.loads((tmp_path / "sync_point.json").read_text())
+        sp = json.loads((session.output_dir / "sync_point.json").read_text())
         assert "chirp_start_ns" in sp
         assert "chirp_stop_ns" in sp
         assert sp["chirp_start_ns"] > 0
@@ -608,7 +611,7 @@ class TestChirpEmissionPropagation:
         assert report.chirp_start_source == "hardware"
         assert report.chirp_stop_source == "hardware"
 
-        sp = json.loads((tmp_path / "sync_point.json").read_text())
+        sp = json.loads((session.output_dir / "sync_point.json").read_text())
         assert sp["chirp_start_source"] == "hardware"
         assert sp["chirp_stop_source"] == "hardware"
         assert sp["chirp_start_ns"] == 500
@@ -792,8 +795,8 @@ class TestLeaderRoleIntegration:
         session.start()
         session.stop()
 
-        sp = json.loads((tmp_path / "sync_point.json").read_text())
-        mf = json.loads((tmp_path / "manifest.json").read_text())
+        sp = json.loads((session.output_dir / "sync_point.json").read_text())
+        mf = json.loads((session.output_dir / "manifest.json").read_text())
         assert sp["session_id"] == "amber-tiger-042"
         assert sp["role"] == "leader"
         assert mf["session_id"] == "amber-tiger-042"
@@ -946,7 +949,7 @@ class TestFollowerRoleIntegration:
         session.start()
         session.stop()
 
-        mf = json.loads((tmp_path / "manifest.json").read_text())
+        mf = json.loads((session.output_dir / "manifest.json").read_text())
         assert mf["role"] == "follower"
         assert mf["session_id"] == "amber-tiger-042"
         assert mf["leader_host_id"] == "leader_host"
@@ -1026,7 +1029,7 @@ class TestSamplePersistence:
         cam.push_sample(frame_number=2, capture_ns=3_000_000)
         session.stop()
 
-        timestamps_path = tmp_path / "cam.timestamps.jsonl"
+        timestamps_path = session.output_dir / "cam.timestamps.jsonl"
         assert timestamps_path.exists(), (
             "orchestrator must persist SampleEvents to "
             "{stream_id}.timestamps.jsonl — they are the SDK→core sync handoff"
@@ -1096,7 +1099,7 @@ class TestSamplePersistence:
         imu.push(1, 110, {"ax": 0.15, "ay": -9.79})
         session.stop()
 
-        sensor_path = tmp_path / "torso_imu.jsonl"
+        sensor_path = session.output_dir / "torso_imu.jsonl"
         assert sensor_path.exists()
         lines = [
             json.loads(line)
@@ -1121,7 +1124,7 @@ class TestSamplePersistence:
 
         lines = [
             line
-            for line in (tmp_path / "cam.timestamps.jsonl").read_text().splitlines()
+            for line in (session.output_dir / "cam.timestamps.jsonl").read_text().splitlines()
             if line
         ]
         # Only the pre-stop sample made it to disk.
@@ -1135,7 +1138,7 @@ class TestSessionLog:
         session.start(countdown_s=0)
         session.stop()
 
-        log_path = tmp_path / "session_log.jsonl"
+        log_path = session.output_dir / "session_log.jsonl"
         assert log_path.exists()
         lines = [json.loads(l) for l in log_path.read_text().strip().split("\n")]
         transitions = [l for l in lines if l["kind"] == "state_transition"]
@@ -1158,7 +1161,7 @@ class TestSessionLog:
         session.add(FakeStream("a"))
         session.start(countdown_s=0)
         # Simulate "read the log while still RECORDING"
-        content = (tmp_path / "session_log.jsonl").read_text()
+        content = (session.output_dir / "session_log.jsonl").read_text()
         assert "preparing" in content
         assert "recording" in content
         session.stop()
@@ -1170,7 +1173,7 @@ class TestSessionLog:
         with pytest.raises(RuntimeError):
             session.start()
 
-        log_path = tmp_path / "session_log.jsonl"
+        log_path = session.output_dir / "session_log.jsonl"
         assert log_path.exists()
         lines = [json.loads(l) for l in log_path.read_text().strip().split("\n")]
         assert any(l["kind"] == "rollback" for l in lines)
@@ -1188,7 +1191,7 @@ class TestHealthRouting:
 
         lines = [
             json.loads(l)
-            for l in (tmp_path / "session_log.jsonl").read_text().strip().split("\n")
+            for l in (session.output_dir / "session_log.jsonl").read_text().strip().split("\n")
         ]
         health_lines = [l for l in lines if l["kind"] == "health"]
         assert len(health_lines) == 2
