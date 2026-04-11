@@ -1,4 +1,5 @@
 import type { HealthEntry } from "@/lib/types";
+import { cn } from "@/lib/utils";
 
 interface HealthTableProps {
   entries: HealthEntry[];
@@ -13,52 +14,46 @@ const KIND_COLORS: Record<string, string> = {
 };
 
 /**
- * Health event timeline — newest-first table of stream health events.
+ * Compact health event list for the sidebar — newest-first.
  */
 export function HealthTable({ entries }: HealthTableProps) {
   if (entries.length === 0) {
     return (
-      <div className="px-4 py-6 text-center text-xs text-muted">
+      <div className="px-3 py-8 text-center text-xs text-muted-foreground">
         No health events
       </div>
     );
   }
 
-  // Display newest first
   const sorted = [...entries].reverse();
 
   return (
-    <div className="overflow-auto">
-      <table className="w-full text-xs">
-        <thead>
-          <tr className="border-b text-left text-muted">
-            <th className="px-4 py-2 font-medium">Time</th>
-            <th className="px-4 py-2 font-medium">Stream</th>
-            <th className="px-4 py-2 font-medium">Kind</th>
-            <th className="px-4 py-2 font-medium">Detail</th>
-          </tr>
-        </thead>
-        <tbody>
-          {sorted.map((entry, i) => (
-            <tr key={i} className="border-b last:border-0">
-              <td className="whitespace-nowrap px-4 py-1.5 font-mono">
-                {entry.at_s.toFixed(3)}s
-              </td>
-              <td className="whitespace-nowrap px-4 py-1.5 font-mono">
-                {entry.stream_id}
-              </td>
-              <td className="whitespace-nowrap px-4 py-1.5">
-                <span className={KIND_COLORS[entry.kind] ?? "text-muted"}>
-                  {entry.kind}
-                </span>
-              </td>
-              <td className="px-4 py-1.5 text-muted">
-                {entry.detail ?? "—"}
-              </td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
+    <ul className="divide-y">
+      {sorted.map((entry, i) => (
+        <li key={i} className="px-3 py-2">
+          <div className="flex items-baseline justify-between gap-2">
+            <span
+              className={cn(
+                "text-[11px] font-medium",
+                KIND_COLORS[entry.kind] ?? "text-muted",
+              )}
+            >
+              {entry.kind}
+            </span>
+            <span className="shrink-0 font-mono text-[10px] text-muted">
+              {entry.at_s.toFixed(1)}s
+            </span>
+          </div>
+          <div className="mt-0.5 font-mono text-[11px] text-muted">
+            {entry.stream_id}
+          </div>
+          {entry.detail && (
+            <div className="mt-0.5 text-[10px] text-muted-foreground">
+              {entry.detail}
+            </div>
+          )}
+        </li>
+      ))}
+    </ul>
   );
 }

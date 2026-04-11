@@ -9,11 +9,11 @@ interface VideoPreviewProps {
  */
 export function VideoPreview({ streamId }: VideoPreviewProps) {
   return (
-    <div className="relative overflow-hidden rounded-lg bg-black">
+    <div className="relative overflow-hidden bg-black">
       <img
         src={`/stream/video/${streamId}`}
         alt={`${streamId} preview`}
-        className="h-[146px] w-full object-contain"
+        className="aspect-video w-full object-contain"
         loading="lazy"
       />
     </div>

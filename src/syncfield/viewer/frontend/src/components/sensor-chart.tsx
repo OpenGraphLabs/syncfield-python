@@ -32,7 +32,7 @@ export function SensorChart({ streamId }: SensorChartProps) {
 
   if (channelNames.length === 0) {
     return (
-      <div className="flex h-[146px] items-center justify-center text-xs text-muted">
+      <div className="flex aspect-video items-center justify-center text-xs text-muted">
         {isConnected ? "Waiting for data…" : "Connecting…"}
       </div>
     );
@@ -53,7 +53,7 @@ export function SensorChart({ streamId }: SensorChartProps) {
     PADDING.top + plotH - ((v - yMin) / yRange) * plotH;
 
   return (
-    <div className="h-[146px] px-2 py-1">
+    <div className="aspect-video px-3 py-2">
       <svg
         viewBox={`0 0 ${CHART_W} ${CHART_H}`}
         className="h-full w-full"

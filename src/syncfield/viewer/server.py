@@ -321,7 +321,7 @@ class ViewerServer:
             await asyncio.to_thread(self._session.disconnect)
         elif action == "record":
             countdown_s = msg.get("countdown_s", 3)
-            await self._start_with_countdown(countdown_s)
+            await self._start_recording(countdown_s)
         elif action == "stop":
             await asyncio.to_thread(self._session.stop)
         elif action == "cancel":
@@ -329,12 +329,28 @@ class ViewerServer:
         else:
             logger.warning("Unknown action: %s", action)
 
-    async def _start_with_countdown(self, countdown_s: int) -> None:
-        """Run countdown, then start recording."""
-        for i in range(countdown_s, 0, -1):
-            await self.broadcast_countdown(i)
-            await asyncio.sleep(1.0)
-        await asyncio.to_thread(self._session.start)
+    async def _start_recording(self, countdown_s: int) -> None:
+        """Start recording via the session's native countdown.
+
+        The session's ``start()`` owns the countdown timer, audio ticks,
+        and chirp playback.  We pass ``on_countdown_tick`` so each tick
+        also broadcasts a WebSocket event for the browser overlay — but
+        no audio is played from the browser side.
+        """
+        loop = asyncio.get_event_loop()
+
+        def _on_tick(n: int) -> None:
+            # Schedule the broadcast on the event loop from the
+            # session's calling thread.
+            asyncio.run_coroutine_threadsafe(
+                self.broadcast_countdown(n), loop,
+            )
+
+        await asyncio.to_thread(
+            self._session.start,
+            countdown_s=countdown_s,
+            on_countdown_tick=_on_tick,
+        )
 
     # ------------------------------------------------------------------
     # MJPEG generator

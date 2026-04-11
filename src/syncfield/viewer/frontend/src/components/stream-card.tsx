@@ -19,28 +19,28 @@ interface StreamCardProps {
  */
 export function StreamCard({ stream, canRemove, onRemove }: StreamCardProps) {
   return (
-    <div className="w-[260px] shrink-0 overflow-hidden rounded-xl border bg-card">
+    <div className="flex min-w-[320px] flex-1 flex-col overflow-hidden rounded-xl border bg-card">
       {/* Card header */}
-      <div className="flex items-center gap-2 px-3 py-2">
+      <div className="flex items-center gap-2 px-4 py-2.5">
         <span
           className={cn(
-            "inline-block h-2 w-2 shrink-0 rounded-full",
+            "inline-block h-2.5 w-2.5 shrink-0 rounded-full",
             stream.effective_hz > 0 ? "bg-success" : "bg-muted",
           )}
         />
-        <span className="truncate font-mono text-xs font-medium">
+        <span className="truncate font-mono text-sm font-medium">
           {stream.id}
         </span>
         <div className="flex-1" />
         {canRemove && (
           <button
             onClick={() => onRemove(stream.id)}
-            className="text-muted transition-colors hover:text-destructive"
+            className="rounded-md p-1 text-muted transition-colors hover:bg-foreground/5 hover:text-destructive"
             title={`Remove ${stream.id}`}
           >
-            <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
               <path
-                d="M3.5 3.5L10.5 10.5M10.5 3.5L3.5 10.5"
+                d="M4 4L12 12M12 4L4 12"
                 stroke="currentColor"
                 strokeWidth="1.5"
                 strokeLinecap="round"
@@ -51,32 +51,32 @@ export function StreamCard({ stream, canRemove, onRemove }: StreamCardProps) {
       </div>
 
       {/* Tags */}
-      <div className="flex gap-1.5 px-3 pb-1">
+      <div className="flex gap-1.5 px-4 pb-2">
         <Tag>{stream.kind}</Tag>
         {stream.provides_audio_track && <Tag>audio</Tag>}
         {stream.produces_file && <Tag>file</Tag>}
       </div>
 
       {/* Body — varies by stream kind */}
-      <div className="border-t">
+      <div className="flex-1 border-t">
         {stream.kind === "video" ? (
           <VideoPreview streamId={stream.id} />
         ) : stream.kind === "sensor" ? (
           <SensorChart streamId={stream.id} />
         ) : (
-          <div className="flex h-[146px] items-center justify-center text-xs text-muted">
+          <div className="flex h-full min-h-[180px] items-center justify-center text-xs text-muted">
             No preview
           </div>
         )}
       </div>
 
       {/* Footer stats */}
-      <div className="flex items-center gap-3 border-t px-3 py-2 text-[11px] text-muted">
-        <span>{formatCount(stream.frame_count)}</span>
+      <div className="flex items-center gap-3 border-t px-4 py-2.5 text-xs text-muted">
+        <span className="font-mono">{formatCount(stream.frame_count)}</span>
         <span className="h-3 w-px bg-border" />
-        <span>{formatHz(stream.effective_hz)}</span>
+        <span className="font-mono">{formatHz(stream.effective_hz)}</span>
         <span className="h-3 w-px bg-border" />
-        <span>{formatMsAgo(stream.last_sample_ms_ago)}</span>
+        <span className="font-mono">{formatMsAgo(stream.last_sample_ms_ago)}</span>
         {stream.health_count > 0 && (
           <>
             <span className="h-3 w-px bg-border" />
@@ -92,7 +92,7 @@ export function StreamCard({ stream, canRemove, onRemove }: StreamCardProps) {
 
 function Tag({ children }: { children: React.ReactNode }) {
   return (
-    <span className="rounded-md bg-foreground/5 px-1.5 py-0.5 text-[10px] font-medium text-muted">
+    <span className="rounded-md bg-foreground/5 px-2 py-0.5 text-[11px] font-medium text-muted">
       {children}
     </span>
   );
