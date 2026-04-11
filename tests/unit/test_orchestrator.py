@@ -78,7 +78,8 @@ class TestConstruction:
     def test_host_id_property(self, tmp_path):
         assert _session(tmp_path, host_id="rig_42").host_id == "rig_42"
 
-    def test_output_dir_created(self, tmp_path):
+    def test_output_dir_deferred(self, tmp_path):
+        """Episode dir is generated but NOT created until start()."""
         target = tmp_path / "sub" / "dir"
         assert not target.exists()
         session = SessionOrchestrator(
@@ -86,10 +87,11 @@ class TestConstruction:
             output_dir=target,
             sync_tone=SyncToneConfig.silent(),
         )
-        # The orchestrator creates an episode subdir inside target.
+        # Data root is created, but episode subdir is NOT yet on disk
         assert target.exists()
         assert session.output_dir.parent == target
         assert session.output_dir.name.startswith("ep_")
+        assert not session.output_dir.exists()  # Deferred
 
 
 class _DeviceKeyedFakeStream(FakeStream):

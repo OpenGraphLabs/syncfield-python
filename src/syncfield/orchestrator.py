@@ -123,41 +123,18 @@ Role = Union[LeaderRole, FollowerRole]
 # ---------------------------------------------------------------------------
 
 
-def _make_episode_dir(data_dir: Path) -> Path:
-    """Create a timestamped episode directory inside *data_dir*.
+def _generate_episode_path(data_dir: Path) -> Path:
+    """Generate a timestamped episode path inside *data_dir*.
 
-    Each recording session gets its own sub-directory named
-    ``ep_{YYYYMMDD}_{HHMMSS}_{6-char-hex}`` so episodes never collide
-    even when two sessions start in the same second.
-
-    Returns the newly created episode :class:`Path`.
+    Returns the path without creating the directory. The directory
+    is only created when recording actually starts, so viewer-only
+    sessions don't leave empty ``ep_*`` directories behind.
     """
     import secrets
     from datetime import datetime
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    episode = data_dir / f"ep_{stamp}_{secrets.token_hex(3)}"
-    episode.mkdir(parents=True, exist_ok=True)
-    return episode
-
-
-def _cleanup_empty_episode_dir(episode_dir: Path) -> None:
-    """Remove the episode directory if it contains no files.
-
-    Called when the session is destroyed without ever recording,
-    so empty ``ep_*`` directories don't pile up.
-    """
-    try:
-        if not episode_dir.exists():
-            return
-        # Check if the directory has any files (not just subdirs)
-        has_files = any(p.is_file() for p in episode_dir.rglob("*"))
-        if not has_files:
-            import shutil
-            shutil.rmtree(episode_dir, ignore_errors=True)
-            logger.debug("Cleaned up empty episode dir: %s", episode_dir)
-    except Exception:
-        pass  # Best-effort cleanup
+    return data_dir / f"ep_{stamp}_{secrets.token_hex(3)}"
 
 
 def _run_countdown(
@@ -265,7 +242,9 @@ class SessionOrchestrator:
         role: Optional[Role] = None,
     ) -> None:
         self._host_id = host_id
-        self._output_dir = _make_episode_dir(Path(output_dir))
+        self._data_root = Path(output_dir)
+        self._data_root.mkdir(parents=True, exist_ok=True)
+        self._output_dir = _generate_episode_path(self._data_root)
         self._sync_tone = sync_tone or SyncToneConfig.default()
         self._chirp_player = chirp_player or create_default_player()
         self._streams: Dict[str, Stream] = {}
@@ -294,9 +273,8 @@ class SessionOrchestrator:
         # be removed on disconnect.
         self._auto_audio_stream: Optional[Stream] = None
 
-        # Flipped to True when at least one recording has been made.
-        # Used to decide whether to clean up the empty episode dir.
-        self._has_recorded = False
+        # Flipped to True when the episode dir has been created on disk.
+        self._episode_dir_created = False
 
         # True when the operator used the legacy one-shot ``start()`` from
         # ``IDLE`` instead of explicitly calling ``connect()`` first.
@@ -314,11 +292,6 @@ class SessionOrchestrator:
         # ``write()`` against a closed writer.
         self._sample_writers: Dict[str, SampleWriter] = {}
         self._sample_handler_active: Dict[str, List[bool]] = {}
-
-    def __del__(self) -> None:
-        """Clean up empty episode directory if no recording was made."""
-        if not self._has_recorded:
-            _cleanup_empty_episode_dir(self._output_dir)
 
     # ------------------------------------------------------------------
     # Public properties
@@ -507,12 +480,6 @@ class SessionOrchestrator:
             if not self._streams:
                 raise RuntimeError("cannot connect() with no streams registered")
 
-            # Open the crash-safe session log BEFORE any mutation so even
-            # a failure during the connect phase leaves a forensic trail.
-            if self._log_writer is None:
-                self._log_writer = SessionLogWriter(self._output_dir)
-                self._log_writer.open()
-
             self._transition(SessionState.CONNECTING)
 
             connected: List[Stream] = []
@@ -598,6 +565,17 @@ class SessionOrchestrator:
                 )
             else:
                 self._auto_connected = False
+
+            # Create the episode directory on disk — deferred from
+            # __init__ so viewer-only sessions don't leave empty dirs.
+            if not self._episode_dir_created:
+                self._output_dir.mkdir(parents=True, exist_ok=True)
+                self._episode_dir_created = True
+
+            # Open session log now that the directory exists.
+            if self._log_writer is None:
+                self._log_writer = SessionLogWriter(self._output_dir)
+                self._log_writer.open()
 
             # Multi-host: advertise PREPARING / wait for leader. Moved
             # out of the legacy PREPARING branch because CONNECTED
@@ -687,7 +665,6 @@ class SessionOrchestrator:
             # the recorded audio track, so we wait until every stream
             # has enabled file writing before playing it.
             self._maybe_play_start_chirp()
-            self._has_recorded = True
             self._transition(SessionState.RECORDING)
 
             # Leader only: flip the advertised status to `recording`
