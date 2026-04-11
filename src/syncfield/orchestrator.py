@@ -141,6 +141,25 @@ def _make_episode_dir(data_dir: Path) -> Path:
     return episode
 
 
+def _cleanup_empty_episode_dir(episode_dir: Path) -> None:
+    """Remove the episode directory if it contains no files.
+
+    Called when the session is destroyed without ever recording,
+    so empty ``ep_*`` directories don't pile up.
+    """
+    try:
+        if not episode_dir.exists():
+            return
+        # Check if the directory has any files (not just subdirs)
+        has_files = any(p.is_file() for p in episode_dir.rglob("*"))
+        if not has_files:
+            import shutil
+            shutil.rmtree(episode_dir, ignore_errors=True)
+            logger.debug("Cleaned up empty episode dir: %s", episode_dir)
+    except Exception:
+        pass  # Best-effort cleanup
+
+
 def _run_countdown(
     countdown_s: float,
     on_tick: Optional[Callable[[int], None]],
@@ -275,6 +294,10 @@ class SessionOrchestrator:
         # be removed on disconnect.
         self._auto_audio_stream: Optional[Stream] = None
 
+        # Flipped to True when at least one recording has been made.
+        # Used to decide whether to clean up the empty episode dir.
+        self._has_recorded = False
+
         # True when the operator used the legacy one-shot ``start()`` from
         # ``IDLE`` instead of explicitly calling ``connect()`` first.
         # In that case ``stop()`` also tears down the devices and lands
@@ -291,6 +314,11 @@ class SessionOrchestrator:
         # ``write()`` against a closed writer.
         self._sample_writers: Dict[str, SampleWriter] = {}
         self._sample_handler_active: Dict[str, List[bool]] = {}
+
+    def __del__(self) -> None:
+        """Clean up empty episode directory if no recording was made."""
+        if not self._has_recorded:
+            _cleanup_empty_episode_dir(self._output_dir)
 
     # ------------------------------------------------------------------
     # Public properties
@@ -659,6 +687,7 @@ class SessionOrchestrator:
             # the recorded audio track, so we wait until every stream
             # has enabled file writing before playing it.
             self._maybe_play_start_chirp()
+            self._has_recorded = True
             self._transition(SessionState.RECORDING)
 
             # Leader only: flip the advertised status to `recording`
