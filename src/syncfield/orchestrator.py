@@ -381,6 +381,12 @@ class SessionOrchestrator:
         self._streams[stream.id] = stream
         stream.on_health(self._on_stream_health)
 
+        # After the first non-audio stream is registered, check whether
+        # to pre-register a host audio stream so it appears in the
+        # viewer immediately (before Connect/Record is pressed).
+        if self._auto_audio_stream is None and not stream.capabilities.provides_audio_track:
+            self._maybe_preregister_host_audio()
+
     def remove(self, stream_id: str) -> None:
         """Unregister a previously added stream.
 
@@ -1074,17 +1080,41 @@ class SessionOrchestrator:
     # Host audio auto-injection
     # ------------------------------------------------------------------
 
+    def _maybe_preregister_host_audio(self) -> None:
+        """Pre-register a :class:`HostAudioStream` so it shows in the viewer.
+
+        Called from :meth:`add` after the first non-audio stream is
+        registered. Only registers the stream (no device open) so the
+        viewer can display the audio card immediately. The actual device
+        connection happens in :meth:`connect` along with all other streams.
+        """
+        try:
+            from syncfield.adapters.host_audio import (
+                HostAudioStream,
+                is_audio_available,
+            )
+        except ImportError:
+            return
+
+        if not is_audio_available():
+            return
+
+        try:
+            audio = HostAudioStream("host_audio", output_dir=self._output_dir)
+            self._streams[audio.id] = audio
+            audio.on_health(self._on_stream_health)
+            self._auto_audio_stream = audio
+            logger.info("Pre-registered host audio stream (mic detected)")
+        except Exception as exc:
+            logger.debug("Failed to pre-register host audio: %s", exc)
+
     def _maybe_inject_host_audio(self) -> None:
-        """Auto-add a :class:`HostAudioStream` if no audio track exists.
+        """Ensure the auto audio stream is connected during connect().
 
-        Called at the end of :meth:`connect`, after all user-registered
-        streams are connected. If no stream declares
-        ``provides_audio_track=True``, this method tries to detect a
-        host microphone and inject a recording stream so multi-host
-        cross-correlation has an acoustic anchor.
-
-        The injected stream is tracked in ``_auto_audio_stream`` and
-        automatically removed on :meth:`disconnect`.
+        If ``_maybe_preregister_host_audio`` already added the stream,
+        this is a no-op (connect loop handles it). If not yet added
+        (e.g. user skipped add() and went straight to connect()), this
+        adds and connects it now.
         """
         has_audio = any(
             s.capabilities.provides_audio_track
@@ -1093,19 +1123,19 @@ class SessionOrchestrator:
         if has_audio:
             return
 
+        # Already pre-registered? connect() loop will handle it.
+        if self._auto_audio_stream is not None:
+            return
+
         try:
             from syncfield.adapters.host_audio import (
                 HostAudioStream,
                 is_audio_available,
             )
         except ImportError:
-            logger.debug(
-                "Audio extra not installed — skipping host audio auto-capture"
-            )
             return
 
         if not is_audio_available():
-            logger.debug("No audio input device detected — skipping host audio")
             return
 
         try:

@@ -26,11 +26,11 @@ class TestAutoAudioInjection:
     def test_injects_when_no_audio_stream(self, tmp_path: Path):
         """Should auto-inject HostAudioStream when no audio track exists."""
         session = _session(tmp_path)
-        session.add(FakeStream("cam"))  # No audio track
 
         mock_info = {"name": "Test Mic", "max_input_channels": 1}
         with patch("syncfield.adapters.host_audio.is_audio_available", return_value=True), \
              patch("sounddevice.query_devices", return_value=mock_info):
+            session.add(FakeStream("cam"))  # triggers pre-registration
             session.connect()
 
         assert "host_audio" in session._streams
@@ -54,14 +54,10 @@ class TestAutoAudioInjection:
     def test_skips_when_no_sounddevice(self, tmp_path: Path):
         """Should gracefully skip when audio extra is not installed."""
         session = _session(tmp_path)
-        session.add(FakeStream("cam"))
 
-        with patch.dict("sys.modules", {"sounddevice": None}), \
-             patch(
-                 "syncfield.orchestrator.SessionOrchestrator._maybe_inject_host_audio",
-                 wraps=session._maybe_inject_host_audio,
-             ):
-            # The import inside _maybe_inject_host_audio will fail
+        # Patch before add() so pre-registration is also blocked
+        with patch.dict("sys.modules", {"syncfield.adapters.host_audio": None}):
+            session.add(FakeStream("cam"))
             session.connect()
 
         assert "host_audio" not in session._streams
@@ -70,9 +66,9 @@ class TestAutoAudioInjection:
     def test_skips_when_no_mic_detected(self, tmp_path: Path):
         """Should skip when is_audio_available returns False."""
         session = _session(tmp_path)
-        session.add(FakeStream("cam"))
 
         with patch("syncfield.adapters.host_audio.is_audio_available", return_value=False):
+            session.add(FakeStream("cam"))
             session.connect()
 
         assert "host_audio" not in session._streams
@@ -80,11 +76,11 @@ class TestAutoAudioInjection:
     def test_removed_on_disconnect(self, tmp_path: Path):
         """Auto-injected stream should be removed on disconnect."""
         session = _session(tmp_path)
-        session.add(FakeStream("cam"))
 
         mock_info = {"name": "Test Mic", "max_input_channels": 1}
         with patch("syncfield.adapters.host_audio.is_audio_available", return_value=True), \
              patch("sounddevice.query_devices", return_value=mock_info):
+            session.add(FakeStream("cam"))
             session.connect()
 
         assert "host_audio" in session._streams
