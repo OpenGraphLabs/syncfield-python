@@ -27,8 +27,6 @@ from __future__ import annotations
 
 import logging
 import math
-import struct
-import threading
 import time
 import wave
 from pathlib import Path
@@ -89,6 +87,12 @@ class HostAudioStream(StreamBase):
     These chirps serve as acoustic anchors for multi-host alignment
     via cross-correlation in the SyncField Docker container.
 
+    Lifecycle:
+    - ``connect()`` — open a preview input stream (metrics only, no file).
+    - ``start_recording()`` — start writing WAV + emitting recorded samples.
+    - ``stop_recording()`` — close WAV, stop recording. Preview continues.
+    - ``disconnect()`` — close the input stream entirely.
+
     Args:
         id: Stream identifier (e.g. ``"host_audio"``).
         output_dir: Episode directory where ``{id}.wav`` will be written.
@@ -134,69 +138,30 @@ class HostAudioStream(StreamBase):
 
         # Real-time level metrics
         self._last_metrics_time = 0.0
-        self._rms_accumulator: list[float] = []
 
     # ------------------------------------------------------------------
     # 4-phase lifecycle
     # ------------------------------------------------------------------
 
     def connect(self) -> None:
-        """Verify the audio input device is available."""
-        try:
-            import sounddevice as sd
-
-            if self._device is not None:
-                info = sd.query_devices(self._device, kind="input")
-            else:
-                info = sd.query_devices(kind="input")
-
-            if not info or info.get("max_input_channels", 0) < self._channels:
-                raise RuntimeError(
-                    f"Audio device has insufficient input channels "
-                    f"(need {self._channels}, have "
-                    f"{info.get('max_input_channels', 0) if info else 0})"
-                )
-
-            self._connected = True
-            logger.info(
-                "[%s] Audio input ready: %s (%d Hz, %d ch)",
-                self.id,
-                info.get("name", "unknown"),
-                self._sample_rate,
-                self._channels,
-            )
-
-        except ImportError:
-            raise ImportError(
-                "HostAudioStream requires the 'audio' extra. "
-                "Install with `pip install 'syncfield[audio]'`."
-            )
-
-    def start_recording(self, session_clock: SessionClock) -> None:
-        """Open the audio input stream and start writing WAV."""
+        """Open the audio input stream for live preview (no file writing)."""
         import numpy as np
         import sounddevice as sd
 
-        self._frame_count = 0
-        self._first_at = None
-        self._last_at = None
-        self._last_metrics_time = 0.0
-        self._rms_accumulator = []
+        if self._device is not None:
+            info = sd.query_devices(self._device, kind="input")
+        else:
+            info = sd.query_devices(kind="input")
 
-        # Open WAV file
-        self._output_dir.mkdir(parents=True, exist_ok=True)
-        self._wav_path = self._output_dir / f"{self.id}.wav"
-        self._wav_writer = wave.open(str(self._wav_path), "wb")
-        self._wav_writer.setnchannels(self._channels)
-        self._wav_writer.setsampwidth(2)  # 16-bit
-        self._wav_writer.setframerate(self._sample_rate)
-
-        self._recording = True
+        if not info or info.get("max_input_channels", 0) < self._channels:
+            raise RuntimeError(
+                f"Audio device has insufficient input channels "
+                f"(need {self._channels}, have "
+                f"{info.get('max_input_channels', 0) if info else 0})"
+            )
 
         # Audio callback — runs on PortAudio thread
         def _audio_callback(indata, frames, time_info, status):
-            if not self._recording:
-                return
             if status:
                 self._emit_health(HealthEvent(
                     self.id, HealthEventKind.WARNING,
@@ -204,18 +169,19 @@ class HostAudioStream(StreamBase):
                 ))
 
             capture_ns = time.monotonic_ns()
-            if self._first_at is None:
-                self._first_at = capture_ns
-            self._last_at = capture_ns
-            self._frame_count += frames
+            mono = indata[:, 0]
 
-            # Write PCM16 to WAV
-            pcm16 = (indata[:, 0] * 32767).astype(np.int16)
-            if self._wav_writer is not None:
+            # Write to WAV if recording
+            if self._recording and self._wav_writer is not None:
+                pcm16 = (mono * 32767).astype(np.int16)
                 self._wav_writer.writeframes(pcm16.tobytes())
+                if self._first_at is None:
+                    self._first_at = capture_ns
+                self._last_at = capture_ns
+                self._frame_count += frames
 
-            # Emit RMS/peak metrics at ~10 Hz
-            self._emit_audio_metrics(indata[:, 0], capture_ns)
+            # Always emit RMS/peak for viewer (preview + recording)
+            self._emit_audio_metrics(mono, capture_ns)
 
         self._stream = sd.InputStream(
             samplerate=self._sample_rate,
@@ -226,19 +192,33 @@ class HostAudioStream(StreamBase):
             blocksize=int(self._sample_rate * METRICS_INTERVAL_S),
         )
         self._stream.start()
+        self._connected = True
+
+        logger.info(
+            "[%s] Audio input connected: %s (%d Hz, %d ch)",
+            self.id, info.get("name", "unknown"),
+            self._sample_rate, self._channels,
+        )
+
+    def start_recording(self, session_clock: SessionClock) -> None:
+        """Start writing audio to WAV file."""
+        self._frame_count = 0
+        self._first_at = None
+        self._last_at = None
+
+        self._output_dir.mkdir(parents=True, exist_ok=True)
+        self._wav_path = self._output_dir / f"{self.id}.wav"
+        self._wav_writer = wave.open(str(self._wav_path), "wb")
+        self._wav_writer.setnchannels(self._channels)
+        self._wav_writer.setsampwidth(2)  # 16-bit
+        self._wav_writer.setframerate(self._sample_rate)
+
+        self._recording = True
         logger.info("[%s] Recording started → %s", self.id, self._wav_path)
 
     def stop_recording(self) -> FinalizationReport:
         """Stop recording, close WAV file, return report."""
         self._recording = False
-
-        if self._stream is not None:
-            try:
-                self._stream.stop()
-                self._stream.close()
-            except Exception:
-                pass
-            self._stream = None
 
         if self._wav_writer is not None:
             try:
@@ -264,7 +244,17 @@ class HostAudioStream(StreamBase):
         )
 
     def disconnect(self) -> None:
-        """Release audio device."""
+        """Close the audio input stream."""
+        self._recording = False
+
+        if self._stream is not None:
+            try:
+                self._stream.stop()
+                self._stream.close()
+            except Exception:
+                pass
+            self._stream = None
+
         self._connected = False
 
     # Legacy one-shot compatibility
@@ -294,11 +284,8 @@ class HostAudioStream(StreamBase):
         if len(samples) == 0:
             return
 
-        # RMS (root mean square) — overall volume level
         sq_sum = sum(float(s) * float(s) for s in samples)
         rms = math.sqrt(sq_sum / len(samples))
-
-        # Peak — maximum absolute amplitude
         peak = float(max(abs(float(s)) for s in samples))
 
         self._emit_sample(SampleEvent(

@@ -1,4 +1,3 @@
-import { useEffect, useRef, useState } from "react";
 import { useSensorStream } from "@/hooks/use-sensor-stream";
 
 interface AudioLevelChartProps {
@@ -8,47 +7,23 @@ interface AudioLevelChartProps {
 /**
  * Real-time audio level meter for Recording mode.
  *
- * Connects via SSE to the host_audio stream's RMS/peak channels
- * and renders a horizontal VU-meter bar with waveform history.
- * When no new data arrives for 1+ second, shows a faded idle state.
+ * Shows live waveform bars + VU meter when data flows (connected or
+ * recording). Falls back to "Microphone ready" only when no SSE
+ * connection is established.
  */
 export function AudioLevelChart({ streamId }: AudioLevelChartProps) {
   const { channels, isConnected } = useSensorStream(streamId);
-  const [isActive, setIsActive] = useState(false);
-  const prevLenRef = useRef(0);
-  const idleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const rmsValues = channels["rms"] ?? [];
   const peakValues = channels["peak"] ?? [];
   const rms = rmsValues.length > 0 ? rmsValues[rmsValues.length - 1]! : 0;
   const peak = peakValues.length > 0 ? peakValues[peakValues.length - 1]! : 0;
 
-  // Detect whether new data is arriving
-  useEffect(() => {
-    if (rmsValues.length !== prevLenRef.current) {
-      prevLenRef.current = rmsValues.length;
-      setIsActive(true);
-      if (idleTimerRef.current) clearTimeout(idleTimerRef.current);
-      idleTimerRef.current = setTimeout(() => setIsActive(false), 1500);
-    }
-    return () => {
-      if (idleTimerRef.current) clearTimeout(idleTimerRef.current);
-    };
-  }, [rmsValues.length]);
-
   const rmsPercent = Math.min(100, rms * 200);
   const peakPercent = Math.min(100, peak * 100);
 
-  if (!isConnected) {
-    return (
-      <div className="flex aspect-video items-center justify-center text-xs text-muted">
-        Connecting…
-      </div>
-    );
-  }
-
-  // Idle state — mic detected but not recording
-  if (!isActive) {
+  // No connection or no data yet — show idle mic icon
+  if (!isConnected || rmsValues.length === 0) {
     return (
       <div className="flex aspect-video flex-col items-center justify-center gap-2 px-4 text-muted">
         <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
