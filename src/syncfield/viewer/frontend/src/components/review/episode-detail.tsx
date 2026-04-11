@@ -110,19 +110,19 @@ export function EpisodeDetail({ episodeId, onBack }: EpisodeDetailProps) {
       {/* Sync error banner */}
       {syncError && (
         <div className="border-b border-destructive/20 bg-destructive/5 px-4 py-3">
-          <p className="text-xs font-medium text-destructive">
-            Sync failed: {syncError}
-          </p>
-          <p className="mt-1 text-[11px] text-muted">
-            Make sure the SyncField container is running locally (
-            <code className="rounded bg-foreground/5 px-1 py-0.5 font-mono text-[10px]">
-              docker compose up
-            </code>
-            ), or configure a remote endpoint via{" "}
-            <code className="rounded bg-foreground/5 px-1 py-0.5 font-mono text-[10px]">
-              viewer.launch(session, sync_endpoint="https://...")
-            </code>
-          </p>
+          <p className="text-xs font-medium text-destructive">{syncError}</p>
+          {syncError.includes("502") && (
+            <p className="mt-1 text-[11px] text-muted">
+              Make sure the SyncField container is running locally (
+              <code className="rounded bg-foreground/5 px-1 py-0.5 font-mono text-[10px]">
+                docker compose up
+              </code>
+              ), or configure a remote endpoint via{" "}
+              <code className="rounded bg-foreground/5 px-1 py-0.5 font-mono text-[10px]">
+                viewer.launch(session, sync_endpoint="https://...")
+              </code>
+            </p>
+          )}
         </div>
       )}
 

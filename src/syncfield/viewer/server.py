@@ -473,7 +473,8 @@ class ViewerServer:
             manifest_path = ep_dir / "manifest.json"
             if not manifest_path.exists():
                 return JSONResponse(
-                    {"error": "manifest.json not found"}, status_code=400,
+                    {"error": "No recorded data in this episode (manifest.json not found). Record a session first."},
+                    status_code=400,
                 )
 
             try:

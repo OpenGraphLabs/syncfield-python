@@ -66,7 +66,9 @@ export function useSync(): UseSyncReturn {
           method: "POST",
         });
         if (!res.ok) {
-          throw new Error(`Failed to trigger sync (${res.status})`);
+          const body = await res.json().catch(() => null);
+          const msg = body?.error ?? `Failed to trigger sync (${res.status})`;
+          throw new Error(msg);
         }
         const data: SyncJobStatus = await res.json();
         if (!mountedRef.current) return;
