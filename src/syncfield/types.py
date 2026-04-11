@@ -193,7 +193,10 @@ class SessionState(Enum):
     """Lifecycle state of a SessionOrchestrator."""
 
     IDLE = "idle"
+    CONNECTING = "connecting"
+    CONNECTED = "connected"
     PREPARING = "preparing"
+    COUNTDOWN = "countdown"
     RECORDING = "recording"
     STOPPING = "stopping"
     STOPPED = "stopped"
@@ -301,6 +304,75 @@ class ChirpSpec:
         }
 
 
+ChirpSource = Literal["hardware", "software_fallback", "silent"]
+"""Provenance tag for a :class:`ChirpEmission` timestamp.
+
+- ``"hardware"``: ``hardware_ns`` was derived from the audio backend's
+  DAC presentation timestamp (e.g. PortAudio ``outputBufferDacTime``).
+  This is the best timestamp SyncField can produce.
+- ``"software_fallback"``: the backend was real but could not supply a
+  DAC time, so ``hardware_ns`` is ``None`` and the caller should use
+  ``software_ns`` instead. Precision floor rises to ~1 ms jitter.
+- ``"silent"``: no audio was actually played (``SilentChirpPlayer``,
+  chirp disabled, or headless machine with no audio path). Chirp-anchored
+  sync cannot use this host as a shared acoustic reference.
+"""
+
+_VALID_CHIRP_SOURCES = frozenset({"hardware", "software_fallback", "silent"})
+
+
+@dataclass(frozen=True)
+class ChirpEmission:
+    """Result of playing a sync chirp: when it actually hit the DAC.
+
+    The SDK prefers ``hardware_ns`` — captured from the audio driver's
+    DAC presentation timestamp — and falls back to ``software_ns``
+    (sampled immediately before the play call) when the backend cannot
+    supply one. The ``source`` field tags which timestamp is
+    authoritative so the downstream sync core can decide how much
+    precision to claim for this host's chirp anchor.
+
+    Attributes:
+        software_ns: ``time.monotonic_ns()`` sampled by the caller right
+            before handing the chirp to the audio backend. Always present.
+        hardware_ns: Monotonic nanosecond estimate of when the first
+            chirp sample will actually be clocked out of the DAC.
+            ``None`` when the backend does not expose a hardware
+            presentation time (e.g. silent player, or PortAudio backends
+            without DAC time on the current host).
+        source: Provenance tag, see :data:`ChirpSource`.
+    """
+
+    software_ns: int
+    hardware_ns: int | None
+    source: ChirpSource
+
+    def __post_init__(self) -> None:
+        if self.source not in _VALID_CHIRP_SOURCES:
+            raise ValueError(
+                "ChirpEmission.source must be one of "
+                f"{sorted(_VALID_CHIRP_SOURCES)}; got {self.source!r}"
+            )
+
+    @property
+    def best_ns(self) -> int:
+        """Return ``hardware_ns`` when present, else ``software_ns``.
+
+        This is the value the orchestrator persists into
+        ``sync_point.json`` as ``chirp_start_ns`` / ``chirp_stop_ns``.
+        """
+        return self.hardware_ns if self.hardware_ns is not None else self.software_ns
+
+    def to_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {
+            "software_ns": self.software_ns,
+            "source": self.source,
+        }
+        if self.hardware_ns is not None:
+            d["hardware_ns"] = self.hardware_ns
+        return d
+
+
 @dataclass
 class SessionReport:
     """Aggregated result of a completed session.
@@ -308,11 +380,24 @@ class SessionReport:
     Attributes:
         host_id: Host identifier.
         finalizations: Per-stream finalization reports.
-        chirp_start_ns: Monotonic ns when start chirp was played (or None).
-        chirp_stop_ns: Monotonic ns when stop chirp was played (or None).
+        chirp_start_ns: Best-available monotonic ns when the start chirp
+            reached the DAC (hardware if available, else software
+            fallback). ``None`` if no chirp was played.
+        chirp_stop_ns: Best-available monotonic ns for the stop chirp.
+        chirp_start_source: Provenance of ``chirp_start_ns`` — one of
+            ``"hardware"``, ``"software_fallback"``, ``"silent"``, or
+            ``None`` when no chirp was played.
+        chirp_stop_source: Provenance of ``chirp_stop_ns``.
+        session_id: Multi-host session identifier (from the attached
+            role config), ``None`` for single-host sessions.
+        role: ``"leader"``, ``"follower"``, or ``None`` for single-host.
     """
 
     host_id: str
     finalizations: list[FinalizationReport]
     chirp_start_ns: int | None
     chirp_stop_ns: int | None
+    chirp_start_source: str | None = None
+    chirp_stop_source: str | None = None
+    session_id: str | None = None
+    role: str | None = None

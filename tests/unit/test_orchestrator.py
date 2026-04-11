@@ -11,15 +11,51 @@ from syncfield.clock import SessionClock
 from syncfield.orchestrator import SessionOrchestrator
 from syncfield.testing import FakeStream
 from syncfield.tone import ChirpPlayer, ChirpSpec, SyncToneConfig
-from syncfield.types import HealthEventKind, SessionState
+from syncfield.types import ChirpEmission, HealthEventKind, SessionState
+
+
+def _mk_emission(
+    software_ns: int = 1_000_000,
+    hardware_ns: int | None = None,
+    source: str = "software_fallback",
+) -> ChirpEmission:
+    """Build a ``ChirpEmission`` for tests that mock ``ChirpPlayer.play``."""
+    return ChirpEmission(
+        software_ns=software_ns,
+        hardware_ns=hardware_ns,
+        source=source,  # type: ignore[arg-type]
+    )
+
+
+def _mock_player() -> MagicMock:
+    """Build a ``MagicMock`` spec'd on :class:`ChirpPlayer` that returns
+    distinct :class:`ChirpEmission` values for successive ``play`` calls.
+
+    Most tests don't care about the exact numeric values as long as they
+    differ so ``chirp_stop_ns > chirp_start_ns`` assertions hold.
+    """
+    player = MagicMock(spec=ChirpPlayer)
+    player.is_silent.return_value = False
+    player.play.side_effect = [
+        _mk_emission(software_ns=1_000_000),
+        _mk_emission(software_ns=2_000_000),
+    ]
+    return player
 
 
 def _fast_chirp_config() -> SyncToneConfig:
-    """Very short chirp + margins — keeps orchestrator tests snappy."""
+    """Very short chirp + margins — keeps orchestrator tests snappy.
+
+    ``countdown_tick`` is intentionally disabled so the mock chirp
+    player only gets called twice (start + stop chirp). Tests that
+    want to exercise the countdown beep explicitly construct their
+    own :class:`SyncToneConfig` with a tick spec.
+    """
     return SyncToneConfig(
         enabled=True,
         start_chirp=ChirpSpec(400, 2500, 10, 0.8, 2),
         stop_chirp=ChirpSpec(2500, 400, 10, 0.8, 2),
+        countdown_tick=None,
         post_start_stabilization_ms=5,
         pre_stop_tail_margin_ms=5,
     )
@@ -53,6 +89,22 @@ class TestConstruction:
         assert target.exists()
 
 
+class _DeviceKeyedFakeStream(FakeStream):
+    """FakeStream variant that advertises a physical device key.
+
+    Used to exercise :meth:`SessionOrchestrator.add` duplicate-device
+    detection without needing real hardware adapters.
+    """
+
+    def __init__(self, id, device_key, **kwargs):
+        super().__init__(id=id, **kwargs)
+        self._device_key = device_key
+
+    @property
+    def device_key(self):
+        return self._device_key
+
+
 class TestAdd:
     def test_add_stream_in_idle_state(self, tmp_path):
         session = _session(tmp_path)
@@ -64,6 +116,102 @@ class TestAdd:
         session.add(FakeStream("cam"))
         with pytest.raises(ValueError, match="duplicate stream id"):
             session.add(FakeStream("cam"))
+
+    def test_rejects_duplicate_physical_device(self, tmp_path):
+        """Same (adapter_type, device_id) cannot be registered twice.
+
+        Regression for the case where a user registered a camera in
+        code and then ran Discover devices in the viewer — both paths
+        succeeded and the session ended up with two cards for the
+        same physical webcam.
+        """
+        session = _session(tmp_path)
+        session.add(
+            _DeviceKeyedFakeStream("mac_webcam", ("uvc_webcam", "0"))
+        )
+        with pytest.raises(ValueError, match="already registered as stream"):
+            session.add(
+                _DeviceKeyedFakeStream("macbook_pro", ("uvc_webcam", "0"))
+            )
+
+    def test_different_device_keys_are_not_duplicates(self, tmp_path):
+        """Two streams on different device indices register cleanly."""
+        session = _session(tmp_path)
+        session.add(
+            _DeviceKeyedFakeStream("mac_webcam", ("uvc_webcam", "0"))
+        )
+        session.add(
+            _DeviceKeyedFakeStream("iphone", ("uvc_webcam", "1"))
+        )
+        assert len(session._streams) == 2
+
+    def test_none_device_keys_fall_back_to_id_uniqueness(self, tmp_path):
+        """Streams with no hardware identity (device_key == None) are
+        only compared on stream id — two unique-id FakeStreams with
+        no device_key must both register.
+        """
+        session = _session(tmp_path)
+        session.add(FakeStream("a"))  # FakeStream default device_key == None
+        session.add(FakeStream("b"))
+        assert len(session._streams) == 2
+
+
+class TestRemove:
+    def test_remove_from_idle_state(self, tmp_path):
+        session = _session(tmp_path)
+        session.add(FakeStream("cam"))
+        assert "cam" in session._streams
+        session.remove("cam")
+        assert "cam" not in session._streams
+        assert session.state is SessionState.IDLE
+
+    def test_remove_unknown_stream_raises_key_error(self, tmp_path):
+        session = _session(tmp_path)
+        with pytest.raises(KeyError, match="unknown stream id"):
+            session.remove("ghost")
+
+    def test_remove_rejected_during_recording(self, tmp_path):
+        """Tearing a stream out of a live recording is not allowed."""
+        session = _session(tmp_path)
+        session.add(FakeStream("a"))
+        session.add(FakeStream("b"))
+        session.start()
+        try:
+            with pytest.raises(RuntimeError, match="remove.*requires"):
+                session.remove("a")
+            # Stream is still there after the failed remove.
+            assert "a" in session._streams
+        finally:
+            session.stop()
+
+    def test_remove_after_stop_allowed(self, tmp_path):
+        """STOPPED is a valid state for removal — the session can be
+        rebuilt with a different set of streams after one recording.
+        """
+        session = _session(tmp_path)
+        session.add(FakeStream("a"))
+        session.add(FakeStream("b"))
+        session.start()
+        session.stop()
+        assert session.state is SessionState.STOPPED
+        session.remove("a")
+        assert "a" not in session._streams
+        assert "b" in session._streams
+
+    def test_remove_frees_device_key_for_re_add(self, tmp_path):
+        """After removing a stream its device_key should free up so a
+        fresh stream can grab the same hardware.
+        """
+        session = _session(tmp_path)
+        session.add(
+            _DeviceKeyedFakeStream("mac_webcam", ("uvc_webcam", "0"))
+        )
+        session.remove("mac_webcam")
+        # Same device_key is no longer claimed.
+        session.add(
+            _DeviceKeyedFakeStream("mac_webcam_v2", ("uvc_webcam", "0"))
+        )
+        assert "mac_webcam_v2" in session._streams
 
 
 class TestStartHappyPath:
@@ -142,6 +290,16 @@ class TestStartRollback:
         assert session.state is SessionState.IDLE
 
     def test_failure_during_prepare_stops_earlier_streams(self, tmp_path):
+        """A failure in ``prepare()`` happens during the connect phase,
+        which runs all preparations before any stream starts recording.
+        The rollback therefore calls ``disconnect()`` on streams that
+        connected — and ``start()`` is never reached on any of them.
+
+        This differs from the 0.1 behaviour where ``prepare()`` and
+        ``start()`` interleaved per stream; the 0.2 orchestrator splits
+        the two phases so all devices connect before any begin writing,
+        matching the egonaut lab recorder's 2-phase model.
+        """
         session = _session(tmp_path)
         good = FakeStream("a")
         bad = FakeStream("b", fail_on_prepare=True)
@@ -151,13 +309,92 @@ class TestStartRollback:
         with pytest.raises(RuntimeError, match="fake failure in prepare"):
             session.start()
 
+        # prepare() ran on both in the connect phase
         assert good.prepare_calls == 1
-        assert good.start_calls == 1  # fully started
-        assert good.stop_calls == 1  # then rolled back
         assert bad.prepare_calls == 1
-        assert bad.start_calls == 0  # never reached start
-
+        # start_recording() was never invoked because the connect phase failed
+        assert good.start_calls == 0
+        assert bad.start_calls == 0
+        # Rollback returned the auto-connected session to IDLE
         assert session.state is SessionState.IDLE
+
+
+class TestFourPhaseLifecycle:
+    """Cover the 0.2 explicit ``connect → start → stop → disconnect`` path.
+
+    The legacy one-shot ``start() / stop()`` path is still exercised by
+    :class:`TestStartHappyPath` and :class:`TestStop`. This class pins
+    the newer semantics down:
+
+    * ``connect()`` transitions ``IDLE → CONNECTING → CONNECTED`` and
+      calls each stream's ``prepare()`` and ``connect()`` methods.
+    * ``start(countdown_s=0)`` walks ``CONNECTED → PREPARING →
+      COUNTDOWN → RECORDING`` and calls ``start_recording()`` on
+      every stream (which routes to ``start()`` on a legacy
+      :class:`FakeStream`).
+    * ``stop()`` returns to ``CONNECTED`` (not ``STOPPED``) so the
+      operator can record another episode without reopening devices.
+    * ``disconnect()`` brings the session back to ``IDLE``.
+    """
+
+    def test_connect_start_stop_disconnect_happy_path(self, tmp_path):
+        session = _session(tmp_path)
+        fs = FakeStream("cam")
+        session.add(fs)
+
+        session.connect()
+        assert session.state is SessionState.CONNECTED
+        assert fs.prepare_calls == 1
+
+        session.start(countdown_s=0)
+        assert session.state is SessionState.RECORDING
+        assert fs.start_calls == 1  # start_recording() → legacy start()
+
+        report = session.stop()
+        # Explicit-connect path stays in CONNECTED after stop so the
+        # operator can record the next episode immediately.
+        assert session.state is SessionState.CONNECTED
+        assert fs.stop_calls == 1  # stop_recording() → legacy stop()
+        assert report.host_id == "rig_01"
+
+        session.disconnect()
+        assert session.state is SessionState.IDLE
+
+    def test_start_from_connected_does_not_auto_disconnect_on_stop(self, tmp_path):
+        """Explicit connect + stop leaves devices open; a new start works."""
+        session = _session(tmp_path)
+        fs = FakeStream("cam")
+        session.add(fs)
+
+        session.connect()
+        session.start(countdown_s=0)
+        session.stop()
+        assert session.state is SessionState.CONNECTED
+
+        # Second recording — no reconnect needed.
+        session.start(countdown_s=0)
+        assert session.state is SessionState.RECORDING
+        # Stream saw two recording cycles (two start+stop pairs).
+        assert fs.start_calls == 2
+        session.stop()
+        assert fs.stop_calls == 2
+        session.disconnect()
+
+    def test_countdown_tick_callback_fires(self, tmp_path):
+        """The ``on_countdown_tick`` callback should fire for each second."""
+        session = _session(tmp_path)
+        session.add(FakeStream("cam"))
+        session.connect()
+
+        seen = []
+        session.start(
+            countdown_s=3,
+            on_countdown_tick=lambda n: seen.append(n),
+        )
+        # Ticks go 3 → 2 → 1 in descending order
+        assert seen == [3, 2, 1]
+        session.stop()
+        session.disconnect()
 
 
 class TestStop:
@@ -238,25 +475,31 @@ class TestStop:
 
 
 class TestChirpIntegration:
-    def test_chirp_skipped_when_no_audio_capable_stream(self, tmp_path, caplog):
-        player = MagicMock(spec=ChirpPlayer)
-        player.is_silent.return_value = False
+    def test_chirp_plays_even_when_no_stream_captures_audio(self, tmp_path):
+        """Regression test for the 0.2 audio-track gate removal.
+
+        Pre-0.2.1 the orchestrator silently skipped chirps when no
+        stream had ``provides_audio_track=True``. That surprised
+        operators driving plain webcam rigs — they pressed Record and
+        heard nothing. The fix was to play chirps whenever
+        :class:`SyncToneConfig` is enabled; this test pins the new
+        behaviour down so it doesn't regress.
+        """
+        player = _mock_player()
         session = SessionOrchestrator(
             host_id="h",
             output_dir=tmp_path,
-            sync_tone=SyncToneConfig.default(),
+            sync_tone=_fast_chirp_config(),
             chirp_player=player,
         )
         session.add(FakeStream("a", provides_audio_track=False))
-        with caplog.at_level("INFO", logger="syncfield.orchestrator"):
-            session.start()
+        session.start()
         session.stop()
-        player.play.assert_not_called()
-        assert "cannot participate" in caplog.text.lower()
+        # Start chirp + stop chirp = 2 calls even with no audio stream.
+        assert player.play.call_count == 2
 
     def test_chirp_played_when_audio_capable_stream_exists(self, tmp_path):
-        player = MagicMock(spec=ChirpPlayer)
-        player.is_silent.return_value = False
+        player = _mock_player()
         session = SessionOrchestrator(
             host_id="h",
             output_dir=tmp_path,
@@ -268,8 +511,36 @@ class TestChirpIntegration:
         session.stop()
         assert player.play.call_count == 2  # start + stop chirp
 
-    def test_silent_tone_never_plays_chirp(self, tmp_path):
+    def test_countdown_tick_plays_once_per_tick(self, tmp_path):
+        """A 3-second countdown fires exactly 3 tick beeps."""
         player = MagicMock(spec=ChirpPlayer)
+        player.is_silent.return_value = False
+        # 3 countdown ticks + start chirp + stop chirp = 5 calls total.
+        player.play.side_effect = [
+            _mk_emission(software_ns=n) for n in (1, 2, 3, 4, 5)
+        ]
+        session = SessionOrchestrator(
+            host_id="h",
+            output_dir=tmp_path,
+            sync_tone=SyncToneConfig(
+                enabled=True,
+                start_chirp=ChirpSpec(400, 2500, 10, 0.8, 2),
+                stop_chirp=ChirpSpec(2500, 400, 10, 0.8, 2),
+                countdown_tick=ChirpSpec(1000, 1000, 10, 0.5, 2),
+                post_start_stabilization_ms=5,
+                pre_stop_tail_margin_ms=5,
+            ),
+            chirp_player=player,
+        )
+        session.add(FakeStream("a"))
+        session.connect()
+        session.start(countdown_s=3)
+        session.stop()
+        session.disconnect()
+        assert player.play.call_count == 5
+
+    def test_silent_tone_never_plays_chirp(self, tmp_path):
+        player = _mock_player()
         session = SessionOrchestrator(
             host_id="h",
             output_dir=tmp_path,
@@ -282,8 +553,7 @@ class TestChirpIntegration:
         player.play.assert_not_called()
 
     def test_chirp_fields_written_to_sync_point_json(self, tmp_path):
-        player = MagicMock(spec=ChirpPlayer)
-        player.is_silent.return_value = False
+        player = _mock_player()
         session = SessionOrchestrator(
             host_id="h",
             output_dir=tmp_path,
@@ -301,8 +571,7 @@ class TestChirpIntegration:
         assert sp["chirp_spec"]["from_hz"] == 400
 
     def test_session_report_carries_chirp_timestamps(self, tmp_path):
-        player = MagicMock(spec=ChirpPlayer)
-        player.is_silent.return_value = False
+        player = _mock_player()
         session = SessionOrchestrator(
             host_id="h",
             output_dir=tmp_path,
@@ -316,11 +585,554 @@ class TestChirpIntegration:
         assert report.chirp_stop_ns is not None
 
 
+class TestChirpEmissionPropagation:
+    def test_hardware_emission_surfaces_in_session_report(self, tmp_path):
+        player = MagicMock(spec=ChirpPlayer)
+        player.is_silent.return_value = False
+        player.play.side_effect = [
+            ChirpEmission(software_ns=100, hardware_ns=500, source="hardware"),
+            ChirpEmission(software_ns=200, hardware_ns=700, source="hardware"),
+        ]
+        session = SessionOrchestrator(
+            host_id="h",
+            output_dir=tmp_path,
+            sync_tone=_fast_chirp_config(),
+            chirp_player=player,
+        )
+        session.add(FakeStream("a", provides_audio_track=True))
+        session.start()
+        report = session.stop()
+
+        assert report.chirp_start_ns == 500
+        assert report.chirp_stop_ns == 700
+        assert report.chirp_start_source == "hardware"
+        assert report.chirp_stop_source == "hardware"
+
+        sp = json.loads((tmp_path / "sync_point.json").read_text())
+        assert sp["chirp_start_source"] == "hardware"
+        assert sp["chirp_stop_source"] == "hardware"
+        assert sp["chirp_start_ns"] == 500
+        assert sp["chirp_stop_ns"] == 700
+
+    def test_software_fallback_emission_surfaces_in_report(self, tmp_path):
+        player = MagicMock(spec=ChirpPlayer)
+        player.is_silent.return_value = False
+        player.play.side_effect = [
+            ChirpEmission(
+                software_ns=1_000, hardware_ns=None, source="software_fallback"
+            ),
+            ChirpEmission(
+                software_ns=2_000, hardware_ns=None, source="software_fallback"
+            ),
+        ]
+        session = SessionOrchestrator(
+            host_id="h",
+            output_dir=tmp_path,
+            sync_tone=_fast_chirp_config(),
+            chirp_player=player,
+        )
+        session.add(FakeStream("a", provides_audio_track=True))
+        session.start()
+        report = session.stop()
+
+        assert report.chirp_start_ns == 1_000
+        assert report.chirp_stop_ns == 2_000
+        assert report.chirp_start_source == "software_fallback"
+        assert report.chirp_stop_source == "software_fallback"
+
+
+# ---------------------------------------------------------------------------
+# Multi-host leader / follower role integration
+# ---------------------------------------------------------------------------
+
+
+class _FakeAdvertiser:
+    """Stand-in for :class:`syncfield.multihost.SessionAdvertiser`."""
+
+    instances: list["_FakeAdvertiser"] = []
+
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+        self.started = False
+        self.closed = False
+        self.status_calls: list[tuple[str, int | None]] = []
+        _FakeAdvertiser.instances.append(self)
+
+    @property
+    def session_id(self) -> str:
+        return self.kwargs["session_id"]
+
+    def start(self) -> None:
+        self.started = True
+
+    def update_status(self, status: str, *, started_at_ns=None) -> None:
+        self.status_calls.append((status, started_at_ns))
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _FakeBrowser:
+    """Stand-in for :class:`syncfield.multihost.SessionBrowser`.
+
+    Scripted by setting :attr:`wait_recording_result` (either a
+    :class:`SessionAnnouncement` to return or an :class:`Exception` to
+    raise) before ``start()`` is called on the orchestrator.
+    """
+
+    instances: list["_FakeBrowser"] = []
+
+    wait_recording_result: object = None
+    wait_stopped_result: object = None
+
+    def __init__(self, session_id=None):
+        self.session_id = session_id
+        self.started = False
+        self.closed = False
+        self.wait_recording_calls: list[float] = []
+        self.wait_stopped_calls: list[float] = []
+        _FakeBrowser.instances.append(self)
+
+    def start(self) -> None:
+        self.started = True
+
+    def wait_for_recording(self, timeout: float):
+        self.wait_recording_calls.append(timeout)
+        result = type(self).wait_recording_result
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    def wait_for_stopped(self, timeout: float):
+        self.wait_stopped_calls.append(timeout)
+        result = type(self).wait_stopped_result
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    def close(self) -> None:
+        self.closed = True
+
+
+@pytest.fixture
+def fake_multihost(monkeypatch):
+    """Patch the orchestrator's SessionAdvertiser + SessionBrowser symbols."""
+    _FakeAdvertiser.instances.clear()
+    _FakeBrowser.instances.clear()
+    _FakeBrowser.wait_recording_result = None
+    _FakeBrowser.wait_stopped_result = None
+    monkeypatch.setattr(
+        "syncfield.orchestrator.SessionAdvertiser", _FakeAdvertiser
+    )
+    monkeypatch.setattr(
+        "syncfield.orchestrator.SessionBrowser", _FakeBrowser
+    )
+    yield
+    _FakeAdvertiser.instances.clear()
+    _FakeBrowser.instances.clear()
+
+
+class TestLeaderRoleIntegration:
+    def test_start_constructs_and_starts_advertiser(self, tmp_path, fake_multihost):
+        from syncfield.roles import LeaderRole
+
+        session = SessionOrchestrator(
+            host_id="leader_host",
+            output_dir=tmp_path,
+            sync_tone=SyncToneConfig.silent(),
+            role=LeaderRole(session_id="amber-tiger-042"),
+        )
+        session.add(FakeStream("cam"))
+        session.start()
+
+        assert len(_FakeAdvertiser.instances) == 1
+        adv = _FakeAdvertiser.instances[0]
+        assert adv.kwargs["session_id"] == "amber-tiger-042"
+        assert adv.kwargs["host_id"] == "leader_host"
+        assert adv.kwargs["chirp_enabled"] is False  # silent config
+        assert adv.started is True
+        # One update to `recording` after streams start.
+        assert adv.status_calls == [("recording", session._sync_point.monotonic_ns)]
+
+        session.stop()
+        # Second update: stopped. Then close.
+        assert ("stopped", None) in adv.status_calls
+        assert adv.closed is True
+
+    def test_stop_returns_session_report_with_leader_metadata(
+        self, tmp_path, fake_multihost
+    ):
+        from syncfield.roles import LeaderRole
+
+        session = SessionOrchestrator(
+            host_id="leader_host",
+            output_dir=tmp_path,
+            sync_tone=SyncToneConfig.silent(),
+            role=LeaderRole(session_id="amber-tiger-042"),
+        )
+        session.add(FakeStream("cam"))
+        session.start()
+        report = session.stop()
+
+        assert report.role == "leader"
+        assert report.session_id == "amber-tiger-042"
+
+    def test_manifest_and_sync_point_include_session_id(
+        self, tmp_path, fake_multihost
+    ):
+        from syncfield.roles import LeaderRole
+
+        session = SessionOrchestrator(
+            host_id="leader_host",
+            output_dir=tmp_path,
+            sync_tone=SyncToneConfig.silent(),
+            role=LeaderRole(session_id="amber-tiger-042"),
+        )
+        session.add(FakeStream("cam"))
+        session.start()
+        session.stop()
+
+        sp = json.loads((tmp_path / "sync_point.json").read_text())
+        mf = json.loads((tmp_path / "manifest.json").read_text())
+        assert sp["session_id"] == "amber-tiger-042"
+        assert sp["role"] == "leader"
+        assert mf["session_id"] == "amber-tiger-042"
+        assert mf["role"] == "leader"
+        assert "leader_host_id" not in mf  # leader has no leader_host_id
+
+    def test_auto_generates_session_id(self, tmp_path, fake_multihost):
+        from syncfield.roles import LeaderRole
+
+        role = LeaderRole()  # no session_id
+        session = SessionOrchestrator(
+            host_id="h",
+            output_dir=tmp_path,
+            sync_tone=SyncToneConfig.silent(),
+            role=role,
+        )
+        session.add(FakeStream("cam"))
+        session.start()
+        session.stop()
+
+        assert role.session_id is not None
+        assert session.session_id == role.session_id
+
+    def test_chirp_chirp_enabled_flag_matches_sync_tone(
+        self, tmp_path, fake_multihost
+    ):
+        """Leader with chirps enabled must advertise chirp_enabled=True."""
+        from syncfield.roles import LeaderRole
+
+        player = _mock_player()
+        session = SessionOrchestrator(
+            host_id="leader_host",
+            output_dir=tmp_path,
+            sync_tone=_fast_chirp_config(),
+            chirp_player=player,
+            role=LeaderRole(session_id="amber-tiger-042"),
+        )
+        session.add(FakeStream("cam", provides_audio_track=True))
+        session.start()
+        session.stop()
+
+        adv = _FakeAdvertiser.instances[0]
+        assert adv.kwargs["chirp_enabled"] is True
+        # Leader DID play both chirps (start + stop).
+        assert player.play.call_count == 2
+
+
+class TestFollowerRoleIntegration:
+    def _leader_announcement(self) -> "SessionAnnouncement":
+        from syncfield.multihost.types import SessionAnnouncement
+
+        return SessionAnnouncement(
+            session_id="amber-tiger-042",
+            host_id="leader_host",
+            status="recording",
+            sdk_version="0.2.0",
+            chirp_enabled=True,
+            started_at_ns=1234,
+        )
+
+    def test_start_blocks_for_leader_then_proceeds(
+        self, tmp_path, fake_multihost
+    ):
+        from syncfield.roles import FollowerRole
+
+        _FakeBrowser.wait_recording_result = self._leader_announcement()
+
+        session = SessionOrchestrator(
+            host_id="follower_host",
+            output_dir=tmp_path,
+            sync_tone=SyncToneConfig.silent(),
+            role=FollowerRole(session_id="amber-tiger-042"),
+        )
+        session.add(FakeStream("cam"))
+        session.start()
+
+        assert len(_FakeBrowser.instances) == 1
+        browser = _FakeBrowser.instances[0]
+        assert browser.session_id == "amber-tiger-042"
+        assert browser.started is True
+        assert browser.wait_recording_calls == [60.0]  # default timeout
+
+        assert session.observed_leader is not None
+        assert session.observed_leader.host_id == "leader_host"
+        assert session.session_id == "amber-tiger-042"
+
+        report = session.stop()
+        assert report.role == "follower"
+        assert report.session_id == "amber-tiger-042"
+        assert browser.closed is True
+
+    def test_follower_never_plays_chirp_even_with_audio_stream(
+        self, tmp_path, fake_multihost
+    ):
+        from syncfield.roles import FollowerRole
+
+        _FakeBrowser.wait_recording_result = self._leader_announcement()
+
+        player = _mock_player()
+        session = SessionOrchestrator(
+            host_id="follower_host",
+            output_dir=tmp_path,
+            sync_tone=_fast_chirp_config(),
+            chirp_player=player,
+            role=FollowerRole(session_id="amber-tiger-042"),
+        )
+        # Audio-capable stream would normally trigger chirps — but the
+        # follower role must override that.
+        session.add(FakeStream("audio_cam", provides_audio_track=True))
+        session.start()
+        session.stop()
+
+        player.play.assert_not_called()
+
+    def test_follower_leader_timeout_propagates_and_cleans_up(
+        self, tmp_path, fake_multihost
+    ):
+        from syncfield.roles import FollowerRole
+
+        _FakeBrowser.wait_recording_result = TimeoutError("no leader")
+
+        session = SessionOrchestrator(
+            host_id="follower_host",
+            output_dir=tmp_path,
+            sync_tone=SyncToneConfig.silent(),
+            role=FollowerRole(
+                session_id="amber-tiger-042", leader_wait_timeout_sec=0.05
+            ),
+        )
+        session.add(FakeStream("cam"))
+        with pytest.raises(TimeoutError):
+            session.start()
+
+        assert session.state is SessionState.IDLE
+        # Browser was cleaned up on failure.
+        assert _FakeBrowser.instances[0].closed is True
+
+    def test_manifest_records_leader_host_id(self, tmp_path, fake_multihost):
+        from syncfield.roles import FollowerRole
+
+        _FakeBrowser.wait_recording_result = self._leader_announcement()
+
+        session = SessionOrchestrator(
+            host_id="follower_host",
+            output_dir=tmp_path,
+            sync_tone=SyncToneConfig.silent(),
+            role=FollowerRole(session_id="amber-tiger-042"),
+        )
+        session.add(FakeStream("cam"))
+        session.start()
+        session.stop()
+
+        mf = json.loads((tmp_path / "manifest.json").read_text())
+        assert mf["role"] == "follower"
+        assert mf["session_id"] == "amber-tiger-042"
+        assert mf["leader_host_id"] == "leader_host"
+
+    def test_wait_for_leader_stopped_delegates_to_browser(
+        self, tmp_path, fake_multihost
+    ):
+        from syncfield.multihost.types import SessionAnnouncement
+        from syncfield.roles import FollowerRole
+
+        _FakeBrowser.wait_recording_result = self._leader_announcement()
+        _FakeBrowser.wait_stopped_result = SessionAnnouncement(
+            session_id="amber-tiger-042",
+            host_id="leader_host",
+            status="stopped",
+            sdk_version="0.2.0",
+            chirp_enabled=True,
+            started_at_ns=1234,
+        )
+
+        session = SessionOrchestrator(
+            host_id="follower_host",
+            output_dir=tmp_path,
+            sync_tone=SyncToneConfig.silent(),
+            role=FollowerRole(session_id="amber-tiger-042"),
+        )
+        session.add(FakeStream("cam"))
+        session.start()
+        observed_stop = session.wait_for_leader_stopped(timeout=1.5)
+        assert observed_stop.status == "stopped"
+        assert _FakeBrowser.instances[0].wait_stopped_calls == [1.5]
+        session.stop()
+
+    def test_wait_for_leader_stopped_requires_follower_role(self, tmp_path):
+        """Calling on a single-host session must raise."""
+        session = SessionOrchestrator(
+            host_id="h",
+            output_dir=tmp_path,
+            sync_tone=SyncToneConfig.silent(),
+        )
+        session.add(FakeStream("cam"))
+        session.start()
+        with pytest.raises(RuntimeError, match="FollowerRole"):
+            session.wait_for_leader_stopped()
+        session.stop()
+
+    def test_wait_for_leader_stopped_before_start_raises(
+        self, tmp_path, fake_multihost
+    ):
+        from syncfield.roles import FollowerRole
+
+        session = SessionOrchestrator(
+            host_id="h",
+            output_dir=tmp_path,
+            sync_tone=SyncToneConfig.silent(),
+            role=FollowerRole(session_id="amber-tiger-042"),
+        )
+        with pytest.raises(RuntimeError, match="start"):
+            session.wait_for_leader_stopped()
+
+
+class TestSamplePersistence:
+    """Every recording session must persist the capture timestamps to
+    disk as ``{stream_id}.timestamps.jsonl`` (video/audio/custom) or
+    ``{stream_id}.jsonl`` (sensor). These files are the SDK→core
+    handoff — without them the sync service has nothing to align
+    against regardless of whether the MP4s landed correctly.
+    """
+
+    def test_video_stream_writes_timestamps_jsonl(self, tmp_path):
+        session = _session(tmp_path)
+        cam = FakeStream("cam")
+        session.add(cam)
+        session.start(countdown_s=0)
+        cam.push_sample(frame_number=0, capture_ns=1_000_000)
+        cam.push_sample(frame_number=1, capture_ns=2_000_000)
+        cam.push_sample(frame_number=2, capture_ns=3_000_000)
+        session.stop()
+
+        timestamps_path = tmp_path / "cam.timestamps.jsonl"
+        assert timestamps_path.exists(), (
+            "orchestrator must persist SampleEvents to "
+            "{stream_id}.timestamps.jsonl — they are the SDK→core sync handoff"
+        )
+        lines = [
+            json.loads(line)
+            for line in timestamps_path.read_text().splitlines()
+            if line
+        ]
+        assert len(lines) == 3
+        assert lines[0]["frame_number"] == 0
+        assert lines[0]["capture_ns"] == 1_000_000
+        assert lines[2]["frame_number"] == 2
+        assert lines[2]["capture_ns"] == 3_000_000
+        # Every emitted sample carries the session host id in
+        # ``clock_domain`` so the core can group streams by host later.
+        assert all(line["clock_domain"] == "rig_01" for line in lines)
+
+    def test_sensor_stream_writes_channel_jsonl(self, tmp_path):
+        """Sensor streams write ``{id}.jsonl`` including channel data."""
+        from syncfield.stream import StreamBase
+        from syncfield.types import (
+            FinalizationReport as _FR,
+            SampleEvent as _SE,
+            StreamCapabilities as _SC,
+        )
+
+        class _SensorFake(StreamBase):
+            def __init__(self, id):
+                super().__init__(
+                    id=id,
+                    kind="sensor",
+                    capabilities=_SC(),
+                )
+
+            def prepare(self):
+                pass
+
+            def start(self, clock):
+                pass
+
+            def stop(self):
+                return _FR(
+                    stream_id=self.id,
+                    status="completed",
+                    frame_count=0,
+                    file_path=None,
+                    first_sample_at_ns=None,
+                    last_sample_at_ns=None,
+                    health_events=[],
+                    error=None,
+                )
+
+            def push(self, frame_number, capture_ns, channels):
+                self._emit_sample(_SE(
+                    stream_id=self.id,
+                    frame_number=frame_number,
+                    capture_ns=capture_ns,
+                    channels=channels,
+                ))
+
+        session = _session(tmp_path)
+        imu = _SensorFake("torso_imu")
+        session.add(imu)
+        session.start(countdown_s=0)
+        imu.push(0, 100, {"ax": 0.1, "ay": -9.8})
+        imu.push(1, 110, {"ax": 0.15, "ay": -9.79})
+        session.stop()
+
+        sensor_path = tmp_path / "torso_imu.jsonl"
+        assert sensor_path.exists()
+        lines = [
+            json.loads(line)
+            for line in sensor_path.read_text().splitlines()
+            if line
+        ]
+        assert len(lines) == 2
+        assert lines[0]["channels"] == {"ax": 0.1, "ay": -9.8}
+        assert lines[1]["frame_number"] == 1
+
+    def test_samples_after_stop_do_not_race_closed_writer(self, tmp_path):
+        """The handler's ``active`` flag must neutralize trailing events."""
+        session = _session(tmp_path)
+        cam = FakeStream("cam")
+        session.add(cam)
+        session.start(countdown_s=0)
+        cam.push_sample(0, 100)
+        session.stop()
+        # Trailing emission AFTER stop() — the handler must no-op,
+        # not raise or write to the (now-closed) jsonl file.
+        cam.push_sample(1, 200)
+
+        lines = [
+            line
+            for line in (tmp_path / "cam.timestamps.jsonl").read_text().splitlines()
+            if line
+        ]
+        # Only the pre-stop sample made it to disk.
+        assert len(lines) == 1
+
+
 class TestSessionLog:
     def test_session_log_captures_state_transitions(self, tmp_path):
         session = _session(tmp_path)
         session.add(FakeStream("a"))
-        session.start()
+        session.start(countdown_s=0)
         session.stop()
 
         log_path = tmp_path / "session_log.jsonl"
@@ -328,8 +1140,15 @@ class TestSessionLog:
         lines = [json.loads(l) for l in log_path.read_text().strip().split("\n")]
         transitions = [l for l in lines if l["kind"] == "state_transition"]
         edges = {(t["from"], t["to"]) for t in transitions}
-        assert ("idle", "preparing") in edges
-        assert ("preparing", "recording") in edges
+        # 0.2 four-phase lifecycle: IDLE → CONNECTING → CONNECTED →
+        # PREPARING → COUNTDOWN → RECORDING → STOPPING → STOPPED
+        # (the auto-connect path used by the legacy one-shot
+        # start()/stop() still lands in STOPPED at the end).
+        assert ("idle", "connecting") in edges
+        assert ("connecting", "connected") in edges
+        assert ("connected", "preparing") in edges
+        assert ("preparing", "countdown") in edges
+        assert ("countdown", "recording") in edges
         assert ("recording", "stopping") in edges
         assert ("stopping", "stopped") in edges
 
@@ -337,7 +1156,7 @@ class TestSessionLog:
         """A crash between start() and stop() must leave a readable log."""
         session = _session(tmp_path)
         session.add(FakeStream("a"))
-        session.start()
+        session.start(countdown_s=0)
         # Simulate "read the log while still RECORDING"
         content = (tmp_path / "session_log.jsonl").read_text()
         assert "preparing" in content

@@ -166,20 +166,33 @@ def write_sync_point(
     output_dir: Path,
     chirp_start_ns: Optional[int] = None,
     chirp_stop_ns: Optional[int] = None,
+    chirp_start_source: Optional[str] = None,
+    chirp_stop_source: Optional[str] = None,
     chirp_spec: Optional[ChirpSpec] = None,
+    session_id: Optional[str] = None,
+    role: Optional[str] = None,
 ) -> Path:
     """Write ``sync_point.json`` to *output_dir* and return the path.
 
-    Chirp-related fields are **omitted entirely** when ``None`` so single-host
-    sessions and sessions configured with ``SyncToneConfig.silent()`` produce
-    clean output that the sync core can ingest without special-casing.
+    All optional fields are **omitted entirely** when ``None`` so
+    single-host sessions and sessions configured with
+    :meth:`syncfield.tone.SyncToneConfig.silent` produce clean output
+    that the sync core can ingest without special-casing missing keys.
 
     Args:
         sync_point: Captured session sync point.
         output_dir: Directory in which to write ``sync_point.json``.
-        chirp_start_ns: Monotonic ns of the start chirp (if played), else None.
-        chirp_stop_ns: Monotonic ns of the stop chirp (if played), else None.
-        chirp_spec: Parameters of the chirp that was played, for reproducibility.
+        chirp_start_ns: Best-available monotonic ns for the start chirp
+            (hardware if available, else software fallback).
+        chirp_stop_ns: Best-available monotonic ns for the stop chirp.
+        chirp_start_source: Provenance of ``chirp_start_ns`` — one of
+            ``"hardware"``, ``"software_fallback"``, ``"silent"``.
+        chirp_stop_source: Provenance of ``chirp_stop_ns``.
+        chirp_spec: Parameters of the chirp that was played, for
+            reproducibility.
+        session_id: Multi-host session identifier (from
+            :class:`LeaderRole` / :class:`FollowerRole`).
+        role: ``"leader"`` or ``"follower"`` for multi-host sessions.
 
     Returns:
         Absolute path to the written file.
@@ -187,10 +200,18 @@ def write_sync_point(
     path = output_dir / "sync_point.json"
     data: dict[str, Any] = {"sdk_version": _pkg_version("syncfield")}
     data.update(sync_point.to_dict())
+    if session_id is not None:
+        data["session_id"] = session_id
+    if role is not None:
+        data["role"] = role
     if chirp_start_ns is not None:
         data["chirp_start_ns"] = chirp_start_ns
     if chirp_stop_ns is not None:
         data["chirp_stop_ns"] = chirp_stop_ns
+    if chirp_start_source is not None:
+        data["chirp_start_source"] = chirp_start_source
+    if chirp_stop_source is not None:
+        data["chirp_stop_source"] = chirp_stop_source
     if chirp_spec is not None:
         data["chirp_spec"] = chirp_spec.to_dict()
     with open(path, "w") as f:
@@ -203,13 +224,21 @@ def write_manifest(
     host_id: str,
     streams: dict[str, dict[str, Any]],
     output_dir: Path,
+    *,
+    session_id: Optional[str] = None,
+    role: Optional[str] = None,
+    leader_host_id: Optional[str] = None,
 ) -> Path:
     """Write ``manifest.json`` to *output_dir* and return the path.
 
-    The ``streams`` argument is written verbatim under the ``"streams"`` key,
-    so callers may include any additional per-stream metadata — including
-    ``"capabilities"`` dictionaries produced by
+    The ``streams`` argument is written verbatim under the ``"streams"``
+    key, so callers may include any additional per-stream metadata —
+    including ``"capabilities"`` dictionaries produced by
     :meth:`syncfield.types.StreamCapabilities.to_dict`.
+
+    Multi-host fields (``session_id``, ``role``, ``leader_host_id``)
+    are omitted entirely for single-host sessions so the manifest stays
+    clean of defaulted null fields.
     """
     path = output_dir / "manifest.json"
     manifest: dict[str, Any] = {
@@ -217,6 +246,12 @@ def write_manifest(
         "host_id": host_id,
         "streams": streams,
     }
+    if session_id is not None:
+        manifest["session_id"] = session_id
+    if role is not None:
+        manifest["role"] = role
+    if leader_host_id is not None:
+        manifest["leader_host_id"] = leader_host_id
     with open(path, "w") as f:
         json.dump(manifest, f, indent=2)
         f.write("\n")

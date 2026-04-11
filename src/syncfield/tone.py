@@ -18,12 +18,14 @@ from __future__ import annotations
 import logging
 import math
 import struct
+import threading
+import time
 import wave
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, List, Protocol, runtime_checkable
+from typing import Any, List, Optional, Protocol, runtime_checkable
 
-from syncfield.types import ChirpSpec
+from syncfield.types import ChirpEmission, ChirpSource, ChirpSpec
 
 logger = logging.getLogger(__name__)
 
@@ -211,15 +213,20 @@ class SyncToneConfig:
 class ChirpPlayer(Protocol):
     """Protocol for playing a chirp to the system audio output.
 
-    Implementations must be **non-blocking**: ``play()`` returns immediately
-    after scheduling the sound. The caller
-    (:class:`~syncfield.orchestrator.SessionOrchestrator`) is responsible for
-    all timing margins — it sleeps for the chirp's duration plus the
-    configured tail margin before stopping streams.
+    Implementations must be **non-blocking** for the full chirp duration:
+    ``play()`` may briefly block waiting for the audio backend's first
+    callback so it can capture a hardware DAC timestamp (typically a few
+    milliseconds), but must never block for the entire chirp. The
+    orchestrator handles all timing margins around the chirp.
+
+    Returns a :class:`~syncfield.types.ChirpEmission` so callers can
+    persist both the software send time and the best-available hardware
+    presentation time with each session — this is the foundation of
+    SyncField's chirp-anchored multi-host synchronization.
     """
 
-    def play(self, spec: ChirpSpec) -> None:
-        """Schedule playback of a chirp. Returns immediately."""
+    def play(self, spec: ChirpSpec) -> ChirpEmission:
+        """Schedule playback and return the emission record."""
         ...
 
     def is_silent(self) -> bool:
@@ -233,39 +240,92 @@ class SilentChirpPlayer:
     Emits an INFO log line on every ``play()`` so callers can see that a
     chirp was requested but not produced. Used automatically on headless
     lab machines where :func:`create_default_player` cannot import
-    ``sounddevice``.
+    ``sounddevice``. Returns a :class:`ChirpEmission` tagged ``"silent"``
+    so downstream sync tooling can distinguish "no audio path" from
+    "tried to play but the backend had no DAC timestamp".
     """
 
-    def play(self, spec: ChirpSpec) -> None:
+    def play(self, spec: ChirpSpec) -> ChirpEmission:
         logger.info(
             "SilentChirpPlayer.play(%s): chirp skipped (no audio output)", spec
+        )
+        return ChirpEmission(
+            software_ns=time.monotonic_ns(),
+            hardware_ns=None,
+            source="silent",
         )
 
     def is_silent(self) -> bool:
         return True
 
 
-class SoundDeviceChirpPlayer:
-    """Plays chirps via the optional ``sounddevice`` library, non-blocking.
+@dataclass
+class _ChirpPlaybackState:
+    """Shared state between :meth:`SoundDeviceChirpPlayer.play` and the
+    PortAudio callback thread.
 
-    ``sounddevice`` is an optional dependency (``pip install syncfield[audio]``).
-    Prefer :func:`create_default_player` over direct instantiation — it
-    chooses this backend when ``sounddevice`` imports successfully and falls
-    back to :class:`SilentChirpPlayer` otherwise.
+    Attributes:
+        position: Index of the next sample to copy into ``outdata``.
+        hardware_ns: Hardware DAC timestamp captured on first callback,
+            or ``None`` if the backend did not expose DAC time.
+        source: Provenance tag set on first callback.
+        first_callback: Event set as soon as the first callback runs,
+            unblocking :meth:`play`.
+    """
+
+    position: int = 0
+    hardware_ns: Optional[int] = None
+    source: ChirpSource = "software_fallback"
+    first_callback: threading.Event = field(default_factory=threading.Event)
+
+
+class SoundDeviceChirpPlayer:
+    """Plays chirps via ``sounddevice`` with hardware DAC timestamp capture.
+
+    On the first audio callback after :meth:`sounddevice.OutputStream.start`,
+    PortAudio hands us a ``time_info`` struct whose
+    ``outputBufferDacTime`` is the stream time at which the first sample
+    in the buffer will be clocked out of the DAC. We sample
+    ``time.monotonic_ns()`` inside the same callback and compute::
+
+        hardware_ns = monotonic_at_callback
+                      + (dac_time - current_time) * 1e9
+
+    :meth:`play` briefly blocks (default 100 ms) waiting for that first
+    callback so the returned :class:`ChirpEmission` can carry the
+    hardware timestamp. If PortAudio does not expose DAC time on the
+    current backend (``dac_time == current_time``) or the callback does
+    not fire within the timeout, the player falls back to the software
+    timestamp captured before ``stream.start()`` and tags the emission
+    as ``"software_fallback"``.
+
+    Active streams are pinned on :attr:`_active_streams` until their
+    ``finished_callback`` fires so Python GC cannot tear the audio
+    thread down while the chirp is still playing.
+
+    ``sounddevice`` is an optional dependency
+    (``pip install syncfield[audio]``). Prefer :func:`create_default_player`
+    over direct instantiation — it chooses this backend when
+    ``sounddevice`` imports successfully and falls back to
+    :class:`SilentChirpPlayer` otherwise.
 
     Args:
-        sample_rate: Sample rate used both for sample synthesis and for
-            the sounddevice stream. Default ``44100``.
+        sample_rate: Sample rate used for sample synthesis and the
+            PortAudio stream. Default ``44100``.
     """
+
+    #: Default wait for the first callback before falling back to software
+    #: timestamp. 100 ms comfortably covers default PortAudio buffer
+    #: latencies on macOS/Linux/Windows (typical: 5–30 ms).
+    DEFAULT_FIRST_CALLBACK_TIMEOUT_SEC = 0.1
 
     def __init__(self, sample_rate: int = 44100) -> None:
         self._sample_rate = sample_rate
+        self._active_streams: List[Any] = []
+        self._streams_lock = threading.Lock()
+        self._first_callback_timeout = self.DEFAULT_FIRST_CALLBACK_TIMEOUT_SEC
 
-    def play(self, spec: ChirpSpec) -> None:
-        # Lazy sounddevice import keeps this module importable on machines
-        # that lack the audio extras. sounddevice.play() internally requires
-        # numpy even if the caller passes a list, so we hand it a float32
-        # ndarray constructed from the module-level numpy reference.
+    def play(self, spec: ChirpSpec) -> ChirpEmission:
         import sounddevice as sd  # type: ignore[import-not-found]
 
         samples = generate_chirp_samples(spec, sample_rate=self._sample_rate)
@@ -273,14 +333,107 @@ class SoundDeviceChirpPlayer:
         if _np is not None:
             buffer = _np.asarray(samples, dtype=_np.float32)
         else:
-            # No numpy available — pass the raw list and let sounddevice
-            # raise its own ImportError at play time. Tests mock sd so this
-            # branch is only hit in real headful runs without numpy.
-            buffer = samples
-        sd.play(buffer, self._sample_rate)  # non-blocking: returns immediately
+            buffer = samples  # pragma: no cover - tested indirectly via fake sd
+        total = len(buffer)
+
+        state = _ChirpPlaybackState()
+
+        def callback(outdata: Any, frames: int, time_info: Any, status: Any) -> None:
+            if state.position == 0:
+                mono_ns = time.monotonic_ns()
+                try:
+                    dac_time = float(time_info.outputBufferDacTime)
+                    cur_time = float(time_info.currentTime)
+                except (AttributeError, TypeError, ValueError):
+                    dac_time = cur_time = 0.0
+                if dac_time > cur_time:
+                    offset_ns = int(
+                        round((dac_time - cur_time) * 1_000_000_000)
+                    )
+                    state.hardware_ns = mono_ns + offset_ns
+                    state.source = "hardware"
+                else:
+                    state.hardware_ns = None
+                    state.source = "software_fallback"
+                state.first_callback.set()
+
+            end = min(state.position + frames, total)
+            n = end - state.position
+            if n > 0:
+                outdata[:n, 0] = buffer[state.position:end]
+            if n < frames:
+                outdata[n:, 0] = 0.0
+                state.position = total
+                raise sd.CallbackStop
+            state.position = end
+
+        def finished_cb() -> None:
+            self._drop_stream(stream)
+
+        software_ns = time.monotonic_ns()
+        stream = sd.OutputStream(
+            samplerate=self._sample_rate,
+            channels=1,
+            callback=callback,
+            finished_callback=finished_cb,
+        )
+        with self._streams_lock:
+            self._active_streams.append(stream)
+        try:
+            stream.start()
+        except Exception:
+            self._drop_stream(stream)
+            raise
+
+        got_first = state.first_callback.wait(self._first_callback_timeout)
+        if not got_first:
+            return ChirpEmission(
+                software_ns=software_ns,
+                hardware_ns=None,
+                source="software_fallback",
+            )
+        return ChirpEmission(
+            software_ns=software_ns,
+            hardware_ns=state.hardware_ns,
+            source=state.source,
+        )
 
     def is_silent(self) -> bool:
         return False
+
+    def close(self) -> None:
+        """Force-close any streams still pinned in the active list.
+
+        Streams normally evict themselves via ``finished_callback`` when
+        playback ends naturally. This method exists for tests and
+        shutdown paths that need to force cleanup without waiting for
+        the audio thread to drain.
+        """
+        with self._streams_lock:
+            streams = list(self._active_streams)
+            self._active_streams.clear()
+        for s in streams:
+            try:
+                s.close()
+            except Exception:  # pragma: no cover - best-effort cleanup
+                pass
+
+    def _drop_stream(self, stream: Any) -> None:
+        """Remove *stream* from the active list and close it.
+
+        Called from the PortAudio ``finished_callback`` (audio thread)
+        and from :meth:`close` (user thread). The lock keeps the two
+        paths from racing on ``self._active_streams``.
+        """
+        with self._streams_lock:
+            try:
+                self._active_streams.remove(stream)
+            except ValueError:
+                pass
+        try:
+            stream.close()
+        except Exception:  # pragma: no cover - best-effort cleanup
+            pass
 
 
 def create_default_player(sample_rate: int = 44100) -> ChirpPlayer:

@@ -32,11 +32,31 @@ audio = [
 ]
 uvc = ["opencv-python>=4.5"]
 ble = ["bleak>=0.21"]
+# OakCameraStream uses depthai v3 for the pipeline and reuses the `uvc`
+# extra's opencv-python for the MP4 writer. Install `syncfield[oak,uvc]`
+# (or `syncfield[all]`) for the full OAK capture path.
+oak = ["depthai>=3.0.0"]
+# The desktop viewer uses dearpygui (GPU-accelerated, light 1.8 MiB wheel).
+# It also reuses numpy from the audio extra when rendering video frames —
+# if you install ``syncfield[viewer]`` on its own, numpy is pulled in too.
+viewer = [
+    "dearpygui>=2.0",
+    "numpy>=1.21",
+]
+# mDNS-based multi-host session rendezvous (syncfield.multihost). Required
+# only when you want a leader/follower session discovered automatically
+# on the local network — single-host sessions do not need this.
+multihost = [
+    "zeroconf>=0.130",
+]
 all = [
     "sounddevice>=0.4.6",
     "numpy>=1.21",
     "opencv-python>=4.5",
     "bleak>=0.21",
+    "depthai>=3.0.0",
+    "dearpygui>=2.0",
+    "zeroconf>=0.130",
 ]
 
 [project.urls]
@@ -50,8 +70,10 @@ packages = ["src/syncfield"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["src"]
 markers = [
     "hardware: tests that require physical hardware (cameras, BLE devices)",
+    "slow: integration tests that touch real IO (mDNS sockets, filesystem, etc.)",
 ]
 
 [dependency-groups]

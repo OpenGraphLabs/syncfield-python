@@ -109,3 +109,32 @@ def test_stream_base_exposes_id_kind_capabilities():
     assert demo.id == "sensor_42"
     assert demo.kind == "sensor"
     assert demo.capabilities.supports_precise_timestamps is True
+
+
+class TestDeviceKey:
+    """device_key is the physical-device identity used for dedup."""
+
+    def test_default_is_none(self):
+        """StreamBase subclasses without hardware default to None."""
+        assert _DemoStream("x").device_key is None
+
+    def test_override_returns_tuple(self):
+        """Adapters can advertise a stable (adapter_type, device_id) tuple."""
+
+        class _UvcLike(StreamBase):
+            def __init__(self, id: str, idx: int) -> None:
+                super().__init__(
+                    id=id,
+                    kind="video",
+                    capabilities=StreamCapabilities(),
+                )
+                self._idx = idx
+
+            @property
+            def device_key(self):
+                return ("uvc_webcam", str(self._idx))
+
+        assert _UvcLike("cam", 0).device_key == ("uvc_webcam", "0")
+        assert _UvcLike("cam", 1).device_key == ("uvc_webcam", "1")
+        # Same adapter, different indices → distinct keys.
+        assert _UvcLike("a", 0).device_key != _UvcLike("b", 1).device_key
