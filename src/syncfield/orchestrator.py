@@ -91,6 +91,7 @@ from syncfield.types import (
     FinalizationReport,
     FrameTimestamp,
     HealthEvent,
+    HealthEventKind,
     SampleEvent,
     SensorSample,
     SessionReport,
@@ -500,6 +501,14 @@ class SessionOrchestrator:
                     stream.prepare()
                     stream.connect()
                     connected.append(stream)
+                    # Emit a health event so the viewer's Health Events
+                    # panel confirms each device connected successfully.
+                    stream._emit_health(HealthEvent(
+                        stream_id=stream.id,
+                        kind=HealthEventKind.HEARTBEAT,
+                        at_ns=time.monotonic_ns(),
+                        detail="connected",
+                    ))
             except Exception as exc:
                 self._log_rollback(exc, len(connected))
                 _rollback_disconnect_streams(connected)
@@ -584,6 +593,7 @@ class SessionOrchestrator:
             if not self._episode_dir_created:
                 self._output_dir.mkdir(parents=True, exist_ok=True)
                 self._episode_dir_created = True
+                logger.info("Episode dir created: %s", self._output_dir)
 
             # Open session log now that the directory exists.
             if self._log_writer is None:

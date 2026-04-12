@@ -196,12 +196,22 @@ class StreamStatsBuffer:
         self._health.append(event)
 
     def snapshot_fps(self, now_ns: int) -> float:
-        """Effective Hz over the last second of samples, or 0 if no data."""
+        """Effective Hz over the last second of samples.
+
+        Computed from the time span between the oldest and newest
+        samples in the 1-second window, giving fractional precision
+        (e.g. 29.47 Hz instead of 29 or 30).
+        """
         if not self._fps_window:
             return 0.0
         window_start = now_ns - 1_000_000_000
         recent = [t for t in self._fps_window if t >= window_start]
-        return float(len(recent))
+        if len(recent) < 2:
+            return float(len(recent))
+        span_s = (max(recent) - min(recent)) / 1e9
+        if span_s <= 0:
+            return 0.0
+        return (len(recent) - 1) / span_s
 
     def snapshot_plot(self) -> Dict[str, Tuple[List[float], List[float]]]:
         """Copy plot buffers into plain lists safe for the render thread."""
