@@ -57,6 +57,14 @@ def snapshot_to_dict(snapshot: SessionSnapshot) -> Dict[str, Any]:
     now_ns = time.monotonic_ns()
 
     streams: Dict[str, Any] = {}
+    # Count non-heartbeat events per stream (heartbeats are informational)
+    problem_count_by_stream: Dict[str, int] = {}
+    for h in snapshot.health_log:
+        if h.kind != "heartbeat":
+            problem_count_by_stream[h.stream_id] = (
+                problem_count_by_stream.get(h.stream_id, 0) + 1
+            )
+
     for sid, s in snapshot.streams.items():
         last_sample_ms_ago: Optional[float] = None
         if s.last_sample_at_ns is not None:
@@ -71,6 +79,7 @@ def snapshot_to_dict(snapshot: SessionSnapshot) -> Dict[str, Any]:
             "provides_audio_track": s.provides_audio_track,
             "produces_file": s.produces_file,
             "health_count": s.health_count,
+            "problem_count": problem_count_by_stream.get(sid, 0),
         }
 
     health_log: List[Dict[str, Any]] = []

@@ -11,6 +11,8 @@ export interface StreamSnapshot {
   provides_audio_track: boolean;
   produces_file: boolean;
   health_count: number;
+  /** Count of non-heartbeat events (warnings/errors/drops). */
+  problem_count: number;
 }
 
 export interface ChirpInfo {

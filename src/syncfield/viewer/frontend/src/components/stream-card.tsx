@@ -78,11 +78,11 @@ export function StreamCard({ stream, canRemove, onRemove }: StreamCardProps) {
         <span className="font-mono">{formatCount(stream.frame_count)}</span>
         <span className="h-3 w-px bg-border" />
         <span className="font-mono">{formatHz(stream.effective_hz)}</span>
-        {stream.health_count > 0 && (
+        {stream.problem_count > 0 && (
           <>
             <span className="h-3 w-px bg-border" />
             <span className="text-destructive">
-              {stream.health_count} event{stream.health_count > 1 ? "s" : ""}
+              {stream.problem_count} issue{stream.problem_count > 1 ? "s" : ""}
             </span>
           </>
         )}

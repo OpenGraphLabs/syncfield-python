@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useMemo, useRef } from "react";
 import { cn } from "@/lib/utils";
 
 interface ReviewVideoPlayerProps {
@@ -65,7 +65,10 @@ export function ReviewVideoPlayer({
     return () => video.removeEventListener("loadeddata", showFirstFrame);
   }, []);
 
-  const src = `/api/episodes/${episodeId}/video/${streamId}.mp4`;
+  // Cache-bust: stable v= per component mount so the browser fetches
+  // fresh content after re-mount (e.g. after sync completes).
+  const mountToken = useMemo(() => Date.now(), []);
+  const src = `/api/episodes/${episodeId}/video/${streamId}.mp4?v=${mountToken}`;
   const isClickable = !isPrimary && onClick != null;
 
   return (
