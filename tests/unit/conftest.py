@@ -19,5 +19,7 @@ def _disable_audio_auto_inject():
     """
     with patch(
         "syncfield.orchestrator.SessionOrchestrator._maybe_preregister_host_audio"
+    ), patch(
+        "syncfield.orchestrator.SessionOrchestrator._maybe_inject_host_audio"
     ):
         yield

@@ -755,9 +755,6 @@ class SessionOrchestrator:
             self._persist_session_artifacts(finalizations)
 
             # --- Landing state -------------------------------------
-            # If the caller explicitly connected before calling start,
-            # keep devices open so they can record again. Otherwise
-            # (legacy one-shot) tear down fully and land in STOPPED.
             if self._auto_connected:
                 self._transition(SessionState.STOPPED)
                 if self._log_writer is not None:
@@ -768,11 +765,15 @@ class SessionOrchestrator:
                 self._stop_discovery_on_failure()
                 self._auto_connected = False
             else:
+                # Close the log writer for this episode.
+                if self._log_writer is not None:
+                    self._log_writer.close()
+                    self._log_writer = None
                 self._transition(SessionState.CONNECTED)
-                # Leave the session log open for the next recording in
-                # this connected session. It gets flushed on each
-                # transition.
                 self._stop_discovery_on_failure()
+
+            # Prepare a fresh episode path for the next recording.
+            self._prepare_next_episode()
 
             role_str = self._role.kind if self._role is not None else None
             return SessionReport(
@@ -847,19 +848,8 @@ class SessionOrchestrator:
                 except Exception as exc:
                     logger.warning("Failed to delete episode dir: %s", exc)
 
-            # Generate a new episode path for the next recording and
-            # update all stream adapters so they write to the new dir.
-            self._output_dir = _generate_episode_path(self._data_root)
-            self._episode_dir_created = False
-            for stream in self._streams.values():
-                if hasattr(stream, "_output_dir"):
-                    stream._output_dir = self._output_dir
-                if hasattr(stream, "_file_path"):
-                    stream._file_path = self._output_dir / f"{stream.id}.mp4"
-                if hasattr(stream, "_wav_path"):
-                    stream._wav_path = None  # Will be set in start_recording
-                if hasattr(stream, "_mp4_path"):
-                    stream._mp4_path = self._output_dir / f"{stream.id}.mp4"
+            # Prepare a fresh episode path for the next recording.
+            self._prepare_next_episode()
 
             if self._auto_connected:
                 self._transition(SessionState.STOPPED)
@@ -1166,6 +1156,30 @@ class SessionOrchestrator:
         """
         if self._log_writer is not None:
             self._log_writer.log_health(event)
+
+    # ------------------------------------------------------------------
+    # Episode lifecycle
+    # ------------------------------------------------------------------
+
+    def _prepare_next_episode(self) -> None:
+        """Generate a fresh episode path and update all stream adapters.
+
+        Called after ``stop()`` and ``cancel()`` so the next ``start()``
+        writes to a new directory. Every stream adapter that holds a
+        reference to the output path is updated to the new location.
+        """
+        self._output_dir = _generate_episode_path(self._data_root)
+        self._episode_dir_created = False
+
+        for stream in self._streams.values():
+            if hasattr(stream, "_output_dir"):
+                stream._output_dir = self._output_dir
+            if hasattr(stream, "_file_path"):
+                stream._file_path = self._output_dir / f"{stream.id}.mp4"
+            if hasattr(stream, "_mp4_path"):
+                stream._mp4_path = self._output_dir / f"{stream.id}.mp4"
+            if hasattr(stream, "_wav_path"):
+                stream._wav_path = None
 
     # ------------------------------------------------------------------
     # Host audio auto-injection
