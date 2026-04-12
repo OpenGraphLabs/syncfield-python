@@ -135,12 +135,12 @@ class UVCWebcamStream(StreamBase):
     # ------------------------------------------------------------------
 
     def prepare(self) -> None:
-        """Create the output directory and open ``cv2.VideoCapture``.
+        """Open ``cv2.VideoCapture``.
 
         Called once by the orchestrator before ``connect()``. The
         device handle stays open from here until ``disconnect()``.
+        Output directory is created later in ``start_recording()``.
         """
-        self._output_dir.mkdir(parents=True, exist_ok=True)
         if self._capture is None:
             self._capture = cv2.VideoCapture(self._device_index)
         if not self._capture.isOpened():
@@ -191,6 +191,7 @@ class UVCWebcamStream(StreamBase):
         """
         if self._thread is None or not self._thread.is_alive():
             self.connect()
+        self._output_dir.mkdir(parents=True, exist_ok=True)
         width, height, fps = self._resolve_frame_geometry()
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         self._writer = cv2.VideoWriter(
