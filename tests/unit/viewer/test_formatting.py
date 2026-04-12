@@ -1,16 +1,12 @@
 """Unit tests for the viewer's formatting helpers.
 
-These tests exercise pure-Python logic that has no DearPyGui dependency,
+These tests exercise pure-Python logic with no external dependencies,
 so they run in any environment.
 """
 
 from __future__ import annotations
 
-import pytest
-
-pytest.importorskip("dearpygui.dearpygui")
-
-from syncfield.viewer.widgets.formatting import (
+from syncfield.viewer.formatting import (
     format_chirp_pair,
     format_count,
     format_elapsed,

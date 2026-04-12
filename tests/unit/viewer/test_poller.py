@@ -9,10 +9,6 @@ from __future__ import annotations
 
 import time
 
-import pytest
-
-pytest.importorskip("dearpygui.dearpygui")
-
 import syncfield as sf
 from syncfield.testing import FakeStream
 from syncfield.types import HealthEventKind

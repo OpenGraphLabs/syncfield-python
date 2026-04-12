@@ -1,40 +1,30 @@
-"""Desktop viewer application — MuJoCo-style launcher for SyncField sessions.
+"""Web viewer application — FastAPI + uvicorn + browser launcher.
 
-This module owns the top-level DearPyGui context, the render loop, and the
-small lifecycle machinery that makes :func:`launch` / :func:`launch_passive`
-feel natural. The actual widget construction lives in
-:mod:`syncfield.viewer.widgets` to keep this file focused on "how the app
-runs" rather than "what each panel looks like".
+Replaces the DearPyGui desktop viewer with a browser-based UI. The
+public API (:func:`launch` / :func:`launch_passive`) has the same
+signature so user scripts are unchanged.
 
 Thread model:
 
-- **Main thread** runs the DearPyGui render loop.
-- **Poller thread** (daemon, started by :class:`SessionPoller`) populates
-  :class:`SessionSnapshot`\\ s at 10 Hz.
-- **Control worker thread** (daemon, started on button click) runs
-  ``session.start()`` / ``session.stop()`` so the UI never blocks on SDK
-  lifecycle calls.
-
-DearPyGui itself is single-threaded for all UI mutation — the render loop
-is the only thing that calls ``dpg.set_value`` / ``dpg.configure_item``.
-Snapshots flow main thread via a single lock-guarded read.
+- **Main thread** (blocking mode): runs ``uvicorn.run()``.
+- **Background thread** (passive mode): runs uvicorn via a separate
+  ``asyncio`` event loop so the caller keeps control.
+- **Poller thread** (daemon): same as before — 10 Hz snapshot polling.
 """
 
 from __future__ import annotations
 
 import logging
 import threading
-import time
+import webbrowser
 from contextlib import contextmanager
 from typing import Iterator, Optional
 
-import dearpygui.dearpygui as dpg
+import uvicorn
 
 from syncfield.orchestrator import SessionOrchestrator
-from syncfield.viewer import theme
-from syncfield.viewer.fonts import FontRegistry, load_fonts
 from syncfield.viewer.poller import SessionPoller
-from syncfield.viewer.widgets.layout import ViewerLayout
+from syncfield.viewer.server import ViewerServer
 
 logger = logging.getLogger(__name__)
 
@@ -47,23 +37,19 @@ logger = logging.getLogger(__name__)
 class ViewerHandle:
     """Minimal handle exposed by :func:`launch_passive`.
 
-    Mirrors the shape of ``mujoco.viewer.launch_passive`` so callers coming
-    from the MuJoCo / rerun worlds have zero friction.
+    Mirrors the shape of the previous DearPyGui handle so callers
+    coming from the desktop viewer have zero friction.
     """
 
     def __init__(self, app: "ViewerApp") -> None:
         self._app = app
 
     def is_running(self) -> bool:
-        """Return True while the viewer window is still open."""
+        """Return True while the web server is still running."""
         return self._app.is_running()
 
-    def sync(self) -> None:
-        """Render one frame. Use in passive mode when you own the loop."""
-        self._app.render_one_frame()
-
     def close(self) -> None:
-        """Close the viewer window and stop the poller."""
+        """Stop the web server and the poller."""
         self._app.close()
 
 
@@ -75,23 +61,29 @@ class ViewerHandle:
 def launch(
     session: SessionOrchestrator,
     *,
+    host: str = "127.0.0.1",
+    port: int = 8420,
     title: str = "SyncField",
 ) -> None:
-    """Open the viewer and block until the window is closed.
+    """Start the web viewer and block until Ctrl+C.
 
-    In blocking mode the viewer *owns* the session lifecycle — the user
-    clicks Record / Stop / Cancel in the UI, and the worker threads call
-    the corresponding ``SessionOrchestrator`` methods. When the window
-    closes, any in-progress recording is stopped cleanly.
+    Opens a browser tab pointing at the viewer. In blocking mode the
+    viewer *owns* the session lifecycle — the user clicks Record / Stop
+    in the browser, and the server dispatches the corresponding
+    ``SessionOrchestrator`` methods.
 
     Args:
         session: The orchestrator to observe and control.
-        title: Window title. Default ``"SyncField"``.
+        host: Bind address. Default ``"127.0.0.1"`` (localhost only).
+        port: Bind port. Default ``8420``.
+        title: Browser tab title. Default ``"SyncField"``.
     """
-    app = ViewerApp(session, title=title)
+    app = ViewerApp(session, host=host, port=port, title=title)
     try:
         app.setup()
         app.run()
+    except KeyboardInterrupt:
+        pass
     finally:
         app.close()
 
@@ -100,14 +92,16 @@ def launch(
 def launch_passive(
     session: SessionOrchestrator,
     *,
+    host: str = "127.0.0.1",
+    port: int = 8420,
     title: str = "SyncField",
 ) -> Iterator[ViewerHandle]:
     """Open the viewer in **passive** mode and return a handle.
 
     Use this when the caller owns the session lifecycle — e.g. a script
-    that wants the GUI as an observer while it runs its own start/stop
-    logic. The viewer's render loop runs on a background thread so the
-    caller keeps control of the main thread.
+    that wants the web UI as an observer while it runs its own start/stop
+    logic. The web server runs on a background thread so the caller keeps
+    control of the main thread.
 
     Example::
 
@@ -116,15 +110,8 @@ def launch_passive(
             while viewer.is_running():
                 time.sleep(0.1)
             session.stop()
-
-    Note:
-        Passive mode runs the DearPyGui render loop on a background
-        thread. DPG is designed for a single UI thread and this works
-        reliably on macOS and Linux in practice, but the blocking
-        :func:`launch` path is the "MuJoCo-canonical" one if you don't
-        need to share the main thread.
     """
-    app = ViewerApp(session, title=title)
+    app = ViewerApp(session, host=host, port=port, title=title)
     app.setup()
 
     bg_thread = threading.Thread(
@@ -145,164 +132,91 @@ def launch_passive(
 
 
 class ViewerApp:
-    """Owns the DearPyGui context and render loop for one viewer window.
-
-    Separated from the module-level helpers so it can be instantiated
-    directly in tests (or, in the future, embedded in a larger GUI).
-    """
+    """Owns the FastAPI server and uvicorn lifecycle for one viewer session."""
 
     def __init__(
         self,
         session: SessionOrchestrator,
         *,
+        host: str = "127.0.0.1",
+        port: int = 8420,
         title: str = "SyncField",
-        viewport_pos: Optional[tuple] = None,
     ) -> None:
         self._session = session
+        self._host = host
+        self._port = port
         self._title = title
-        self._viewport_pos = viewport_pos
         self._poller = SessionPoller(session)
-        self._layout: Optional[ViewerLayout] = None
-        self._fonts: FontRegistry = FontRegistry()
+        self._server: Optional[ViewerServer] = None
+        self._uvicorn_server: Optional[uvicorn.Server] = None
         self._running = False
         self._setup_done = False
-        self._close_requested = False
 
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
     def setup(self) -> None:
-        """Create the DPG context, build the layout, and start the poller."""
+        """Create the FastAPI app and start the poller."""
         if self._setup_done:
             return
-
-        dpg.create_context()
-        dpg.create_viewport(
-            title=self._title,
-            width=theme.VIEWPORT_WIDTH,
-            height=theme.VIEWPORT_HEIGHT,
-            small_icon="",
-            large_icon="",
-            resizable=True,
+        self._server = ViewerServer(
+            self._session, self._poller, title=self._title,
         )
-
-        # Load system fonts into the DPG registry before any widget is
-        # created — otherwise the first frame renders with the default
-        # ASCII-only bitmap font and every non-ASCII glyph flashes as '?'.
-        self._fonts = load_fonts()
-        if self._fonts.ui is not None:
-            dpg.bind_font(self._fonts.ui)
-
-        # Bind the global theme before any widgets are created so the
-        # first frame doesn't flash with the default dark theme.
-        global_theme_tag = theme.build_theme()
-        dpg.bind_theme(global_theme_tag)
-
-        # Viewport clear color matches the app background so the window
-        # chrome edge doesn't leak through.
-        dpg.set_viewport_clear_color(
-            [c / 255 for c in theme.BG_APP]
-        )
-
-        self._layout = ViewerLayout(self._session, fonts=self._fonts)
-        self._layout.build()
-
-        dpg.setup_dearpygui()
-        dpg.show_viewport()
-
-        # Pin the viewport to a specific on-screen position when the caller
-        # supplies one (used by the screenshot harness to place the window
-        # at a known coordinate).
-        if self._viewport_pos is not None:
-            try:
-                dpg.set_viewport_pos(self._viewport_pos)
-            except Exception:
-                pass
-
-        # Make the primary window fill the viewport so resizing feels
-        # native. The layout's main window is tagged "main_window".
-        dpg.set_primary_window("main_window", True)
-
         self._poller.start()
         self._setup_done = True
 
     def run(self) -> None:
-        """Run the render loop on the calling thread.
+        """Run uvicorn on the calling thread (blocking).
 
-        Exits when the viewport is closed or :meth:`close` is called.
+        Opens a browser tab after a short delay to let the server bind.
         """
         if not self._setup_done:
             self.setup()
+
+        assert self._server is not None
+
+        url = f"http://{self._host}:{self._port}"
+        print(f"\n  SyncField Viewer running at: {url}\n")
+        logger.info("Viewer started at %s", url)
+
+        # Open browser in a background thread after a short delay
+        threading.Thread(
+            target=self._open_browser, args=(url,), daemon=True,
+        ).start()
+
         self._running = True
+        config = uvicorn.Config(
+            app=self._server.app,
+            host=self._host,
+            port=self._port,
+            log_level="warning",
+        )
+        self._uvicorn_server = uvicorn.Server(config)
         try:
-            while dpg.is_dearpygui_running() and not self._close_requested:
-                self.render_one_frame()
+            self._uvicorn_server.run()
         finally:
             self._running = False
 
-    def render_one_frame(self) -> None:
-        """Render a single DPG frame after syncing from the latest snapshot."""
-        snapshot = self._poller.get_snapshot()
-        if snapshot is not None and self._layout is not None:
-            self._layout.update(snapshot)
-        dpg.render_dearpygui_frame()
-
     def close(self) -> None:
-        """Stop the poller, tear down the session, and destroy the DPG context."""
-        if self._close_requested:
-            return
-        self._close_requested = True
-
-        # Return the session to IDLE before tearing down DPG so any
-        # connected devices are released cleanly. Runs on the caller's
-        # thread (typically the main thread during app shutdown).
-        if self._layout is not None:
-            try:
-                self._layout.teardown_session()
-            except Exception:
-                logger.exception("Viewer session teardown failed")
+        """Stop uvicorn, the poller, and tear down the session."""
+        # Signal uvicorn to shut down
+        if self._uvicorn_server is not None:
+            self._uvicorn_server.should_exit = True
 
         self._poller.stop()
-        try:
-            if dpg.is_dearpygui_running():
-                dpg.stop_dearpygui()
-        except Exception:
-            pass
-        try:
-            dpg.destroy_context()
-        except Exception:
-            pass
+        self._running = False
         self._setup_done = False
 
     def is_running(self) -> bool:
-        return self._running and not self._close_requested
-
-    # ------------------------------------------------------------------
-    # Session control (called from widget callbacks)
-    # ------------------------------------------------------------------
-
-    def request_start(self) -> None:
-        """Kick off ``session.start()`` on a worker thread so the UI stays live."""
-        threading.Thread(
-            target=self._safe_call,
-            args=(self._session.start,),
-            name="syncfield-viewer-start",
-            daemon=True,
-        ).start()
-
-    def request_stop(self) -> None:
-        """Kick off ``session.stop()`` on a worker thread."""
-        threading.Thread(
-            target=self._safe_call,
-            args=(self._session.stop,),
-            name="syncfield-viewer-stop",
-            daemon=True,
-        ).start()
+        return self._running
 
     @staticmethod
-    def _safe_call(fn) -> None:
+    def _open_browser(url: str) -> None:
+        """Open the viewer URL in the default browser after a brief settle."""
+        import time
+        time.sleep(0.8)
         try:
-            fn()
+            webbrowser.open(url)
         except Exception:
-            logger.exception("Viewer session control call failed")
+            logger.debug("Could not open browser — visit %s manually", url)

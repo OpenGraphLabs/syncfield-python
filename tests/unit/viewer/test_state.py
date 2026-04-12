@@ -11,8 +11,6 @@ import math
 
 import pytest
 
-pytest.importorskip("dearpygui.dearpygui")
-
 from syncfield.viewer.state import HealthEntry, StreamStatsBuffer
 
 
@@ -25,20 +23,22 @@ class TestStreamStatsBufferSamples:
     def test_samples_within_window_count_toward_fps(self):
         buf = StreamStatsBuffer()
         now = 2_000_000_000  # 2s
-        # 5 samples in the last second
+        # 5 samples at 100ms intervals → 4 intervals in 400ms → 10 Hz
         for i in range(5):
             buf.observe_sample(now - (i * 100_000_000), channels=None)
-        assert buf.snapshot_fps(now) == 5.0
+        fps = buf.snapshot_fps(now)
+        assert fps == pytest.approx(10.0, abs=0.1)
 
     def test_samples_outside_window_excluded(self):
         buf = StreamStatsBuffer()
         now = 5_000_000_000  # 5s
-        # 3 very old samples + 2 recent
+        # 3 very old samples + 2 recent (400ms apart → 2.5 Hz)
         for i in range(3):
             buf.observe_sample(1_000_000_000 + i, channels=None)
         buf.observe_sample(4_500_000_000, channels=None)
         buf.observe_sample(4_900_000_000, channels=None)
-        assert buf.snapshot_fps(now) == 2.0
+        fps = buf.snapshot_fps(now)
+        assert fps == pytest.approx(2.5, abs=0.1)
 
     def test_plot_buffers_one_channel(self):
         buf = StreamStatsBuffer()

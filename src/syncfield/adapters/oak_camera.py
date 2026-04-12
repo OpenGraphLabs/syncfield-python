@@ -173,14 +173,15 @@ class OakCameraStream(StreamBase):
     # ------------------------------------------------------------------
 
     def prepare(self) -> None:
-        """Create the output directory.
+        """Validate the adapter is ready to connect.
 
         The heavy lifting — device discovery, pipeline build, pipeline
         start — happens in :meth:`connect` so the viewer can show a
         live preview as soon as the session enters the ``CONNECTED``
         state. ``prepare()`` stays cheap and idempotent.
+        Output directory is created later in ``start_recording()``.
         """
-        self._output_dir.mkdir(parents=True, exist_ok=True)
+        pass
 
     #: How many times to poll ``dai.Device.getAllAvailableDevices()``
     #: before giving up. The first call often returns only a subset on
@@ -303,6 +304,7 @@ class OakCameraStream(StreamBase):
         """
         if self._thread is None or not self._thread.is_alive():
             self.connect()
+        self._output_dir.mkdir(parents=True, exist_ok=True)
 
         width, height = self._rgb_resolution
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")

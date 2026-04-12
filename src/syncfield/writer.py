@@ -228,6 +228,7 @@ def write_manifest(
     session_id: Optional[str] = None,
     role: Optional[str] = None,
     leader_host_id: Optional[str] = None,
+    task: Optional[str] = None,
 ) -> Path:
     """Write ``manifest.json`` to *output_dir* and return the path.
 
@@ -252,6 +253,8 @@ def write_manifest(
         manifest["role"] = role
     if leader_host_id is not None:
         manifest["leader_host_id"] = leader_host_id
+    if task is not None:
+        manifest["task"] = task
     with open(path, "w") as f:
         json.dump(manifest, f, indent=2)
         f.write("\n")

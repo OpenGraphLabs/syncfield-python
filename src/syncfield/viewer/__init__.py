@@ -1,4 +1,4 @@
-"""SyncField desktop viewer — a MuJoCo-style bundled GUI.
+"""SyncField web viewer — browser-based session monitor and control.
 
 Usage::
 
@@ -8,7 +8,7 @@ Usage::
     session = sf.SessionOrchestrator(host_id="rig_01", output_dir="./data")
     session.add(...)
 
-    # Blocking mode — opens the window, returns when it closes
+    # Blocking mode — opens browser, returns on Ctrl+C
     syncfield.viewer.launch(session)
 
     # Passive mode — context manager, caller keeps control of the session
@@ -18,26 +18,23 @@ Usage::
             time.sleep(0.1)
         session.stop()
 
-The viewer renders in the same process as the SDK. No HTTP, no IPC — the
-poller holds a reference to the :class:`SessionOrchestrator` and reads its
-state directly. Video frames are published by each adapter via a
-thread-safe ``latest_frame`` property and uploaded to the GPU as raw
-textures.
+The viewer starts a FastAPI server and opens a browser tab. The React
+frontend connects via WebSocket for real-time state updates, MJPEG for
+video preview, and SSE for sensor chart data.
 
 Requires the ``viewer`` extra::
 
     pip install 'syncfield[viewer]'
 
-which installs ``dearpygui`` and ``numpy``. The SDK core stays stdlib-only
-for users who never open the GUI.
+which installs ``fastapi``, ``uvicorn``, and ``opencv-python``.
 """
 
 from __future__ import annotations
 
 try:
-    import dearpygui.dearpygui as _dpg  # noqa: F401
-    import numpy as _np  # noqa: F401
-except ImportError as exc:  # pragma: no cover - exercised at import time on CI
+    import fastapi as _fastapi  # noqa: F401
+    import uvicorn as _uvicorn  # noqa: F401
+except ImportError as exc:  # pragma: no cover
     raise ImportError(
         "syncfield.viewer requires the 'viewer' extra. "
         "Install with `pip install 'syncfield[viewer]'`."

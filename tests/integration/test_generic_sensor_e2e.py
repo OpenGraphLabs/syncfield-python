@@ -68,8 +68,8 @@ def test_orchestrator_with_polling_and_push_helpers(tmp_path: Path):
     assert push_fin.file_path is None
 
     # ── Verify JSONL files (written by orchestrator) ─────────────
-    poll_path = tmp_path / "poll_imu.jsonl"
-    push_path = tmp_path / "push_imu.jsonl"
+    poll_path = session.output_dir / "poll_imu.jsonl"
+    push_path = session.output_dir / "push_imu.jsonl"
     assert poll_path.exists(), "orchestrator should create poll_imu.jsonl"
     assert push_path.exists(), "orchestrator should create push_imu.jsonl"
 
@@ -86,7 +86,7 @@ def test_orchestrator_with_polling_and_push_helpers(tmp_path: Path):
     assert first_poll["clock_source"] == "host_monotonic"
 
     # ── Verify manifest ──────────────────────────────────────────
-    manifest_path = tmp_path / "manifest.json"
+    manifest_path = session.output_dir / "manifest.json"
     assert manifest_path.exists()
     manifest = json.loads(manifest_path.read_text())
     assert "poll_imu" in manifest["streams"]

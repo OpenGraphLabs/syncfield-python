@@ -26,6 +26,14 @@ htmlcov/
 # Worktrees
 .worktrees/
 
+# Example output data
+examples/*/output/
+
+# Viewer frontend
+src/syncfield/viewer/static/
+src/syncfield/viewer/frontend/node_modules/
+src/syncfield/viewer/frontend/dist/
+
 # OS
 .DS_Store
 Thumbs.db

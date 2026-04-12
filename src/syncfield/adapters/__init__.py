@@ -27,11 +27,24 @@ from the caller.
 """
 
 from syncfield.adapters.jsonl_file import JSONLFileStream
+from syncfield.adapters.meta_quest import MetaQuestHandStream
 from syncfield.adapters.polling_sensor import PollingSensorStream
 from syncfield.adapters.push_sensor import PushSensorStream
 from syncfield.discovery import register_discoverer
 
-__all__ = ["JSONLFileStream", "PollingSensorStream", "PushSensorStream"]
+__all__ = [
+    "JSONLFileStream",
+    "MetaQuestHandStream",
+    "PollingSensorStream",
+    "PushSensorStream",
+]
+
+# HostAudioStream requires the 'audio' extra (sounddevice + numpy).
+try:
+    from syncfield.adapters.host_audio import HostAudioStream  # noqa: F401
+    __all__.append("HostAudioStream")
+except ImportError:
+    pass
 
 
 def _safe_register(cls) -> None:

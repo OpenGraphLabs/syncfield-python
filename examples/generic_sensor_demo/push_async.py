@@ -13,10 +13,7 @@ from syncfield.adapters import PushSensorStream
 
 
 def main() -> None:
-    output_dir = Path("./demo_session_push")
-    output_dir.mkdir(exist_ok=True)
-
-    session = sf.SessionOrchestrator(host_id="demo", output_dir=output_dir)
+    session = sf.SessionOrchestrator(host_id="demo", output_dir=Path("./demo_data"))
 
     loop_holder: dict = {}
     stop_event = asyncio.Event()

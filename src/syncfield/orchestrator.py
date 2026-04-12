@@ -91,6 +91,7 @@ from syncfield.types import (
     FinalizationReport,
     FrameTimestamp,
     HealthEvent,
+    HealthEventKind,
     SampleEvent,
     SensorSample,
     SessionReport,
@@ -121,6 +122,20 @@ Role = Union[LeaderRole, FollowerRole]
 # ---------------------------------------------------------------------------
 # Module-level helpers used by SessionOrchestrator.start() / stop() / connect()
 # ---------------------------------------------------------------------------
+
+
+def _generate_episode_path(data_dir: Path) -> Path:
+    """Generate a timestamped episode path inside *data_dir*.
+
+    Returns the path without creating the directory. The directory
+    is only created when recording actually starts, so viewer-only
+    sessions don't leave empty ``ep_*`` directories behind.
+    """
+    import secrets
+    from datetime import datetime
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return data_dir / f"ep_{stamp}_{secrets.token_hex(3)}"
 
 
 def _run_countdown(
@@ -228,8 +243,9 @@ class SessionOrchestrator:
         role: Optional[Role] = None,
     ) -> None:
         self._host_id = host_id
-        self._output_dir = Path(output_dir)
-        self._output_dir.mkdir(parents=True, exist_ok=True)
+        self._data_root = Path(output_dir)
+        self._data_root.mkdir(parents=True, exist_ok=True)
+        self._output_dir = _generate_episode_path(self._data_root)
         self._sync_tone = sync_tone or SyncToneConfig.default()
         self._chirp_player = chirp_player or create_default_player()
         self._streams: Dict[str, Stream] = {}
@@ -253,6 +269,16 @@ class SessionOrchestrator:
         # on a partial failure only tears down the ones that actually
         # opened a device.
         self._connected_streams: List[Stream] = []
+
+        # Auto-injected host audio stream (if any). Tracked so it can
+        # be removed on disconnect.
+        self._auto_audio_stream: Optional[Stream] = None
+
+        # Flipped to True when the episode dir has been created on disk.
+        self._episode_dir_created = False
+
+        # Current task label — set by the viewer before recording.
+        self._task: Optional[str] = None
 
         # True when the operator used the legacy one-shot ``start()`` from
         # ``IDLE`` instead of explicitly calling ``connect()`` first.
@@ -286,6 +312,15 @@ class SessionOrchestrator:
     @property
     def output_dir(self) -> Path:
         return self._output_dir
+
+    @property
+    def task(self) -> Optional[str]:
+        """Current task label for the next recording."""
+        return self._task
+
+    @task.setter
+    def task(self, value: Optional[str]) -> None:
+        self._task = value
 
     @property
     def role(self) -> Optional[Role]:
@@ -359,6 +394,12 @@ class SessionOrchestrator:
                     )
         self._streams[stream.id] = stream
         stream.on_health(self._on_stream_health)
+
+        # After the first non-audio stream is registered, check whether
+        # to pre-register a host audio stream so it appears in the
+        # viewer immediately (before Connect/Record is pressed).
+        if self._auto_audio_stream is None and not stream.capabilities.provides_audio_track:
+            self._maybe_preregister_host_audio()
 
     def remove(self, stream_id: str) -> None:
         """Unregister a previously added stream.
@@ -452,12 +493,6 @@ class SessionOrchestrator:
             if not self._streams:
                 raise RuntimeError("cannot connect() with no streams registered")
 
-            # Open the crash-safe session log BEFORE any mutation so even
-            # a failure during the connect phase leaves a forensic trail.
-            if self._log_writer is None:
-                self._log_writer = SessionLogWriter(self._output_dir)
-                self._log_writer.open()
-
             self._transition(SessionState.CONNECTING)
 
             connected: List[Stream] = []
@@ -466,6 +501,14 @@ class SessionOrchestrator:
                     stream.prepare()
                     stream.connect()
                     connected.append(stream)
+                    # Emit a health event so the viewer's Health Events
+                    # panel confirms each device connected successfully.
+                    stream._emit_health(HealthEvent(
+                        stream_id=stream.id,
+                        kind=HealthEventKind.HEARTBEAT,
+                        at_ns=time.monotonic_ns(),
+                        detail="connected",
+                    ))
             except Exception as exc:
                 self._log_rollback(exc, len(connected))
                 _rollback_disconnect_streams(connected)
@@ -476,6 +519,12 @@ class SessionOrchestrator:
                 raise
 
             self._connected_streams = connected
+
+            # Auto-inject host audio if no stream provides an audio track.
+            # This enables multi-host cross-correlation sync without the
+            # user having to add an audio stream manually.
+            self._maybe_inject_host_audio()
+
             self._transition(SessionState.CONNECTED)
 
     # ------------------------------------------------------------------
@@ -537,6 +586,19 @@ class SessionOrchestrator:
                 )
             else:
                 self._auto_connected = False
+
+            # Create the episode directory on first recording.
+            # The path was generated in __init__ and shared with streams
+            # via output_dir, so we must NOT regenerate it here.
+            if not self._episode_dir_created:
+                self._output_dir.mkdir(parents=True, exist_ok=True)
+                self._episode_dir_created = True
+                logger.info("Episode dir created: %s", self._output_dir)
+
+            # Open session log now that the directory exists.
+            if self._log_writer is None:
+                self._log_writer = SessionLogWriter(self._output_dir)
+                self._log_writer.open()
 
             # Multi-host: advertise PREPARING / wait for leader. Moved
             # out of the legacy PREPARING branch because CONNECTED
@@ -693,9 +755,6 @@ class SessionOrchestrator:
             self._persist_session_artifacts(finalizations)
 
             # --- Landing state -------------------------------------
-            # If the caller explicitly connected before calling start,
-            # keep devices open so they can record again. Otherwise
-            # (legacy one-shot) tear down fully and land in STOPPED.
             if self._auto_connected:
                 self._transition(SessionState.STOPPED)
                 if self._log_writer is not None:
@@ -706,11 +765,15 @@ class SessionOrchestrator:
                 self._stop_discovery_on_failure()
                 self._auto_connected = False
             else:
+                # Close the log writer for this episode.
+                if self._log_writer is not None:
+                    self._log_writer.close()
+                    self._log_writer = None
                 self._transition(SessionState.CONNECTED)
-                # Leave the session log open for the next recording in
-                # this connected session. It gets flushed on each
-                # transition.
                 self._stop_discovery_on_failure()
+
+            # Prepare a fresh episode path for the next recording.
+            self._prepare_next_episode()
 
             role_str = self._role.kind if self._role is not None else None
             return SessionReport(
@@ -740,6 +803,59 @@ class SessionOrchestrator:
                 role=role_str,
             )
 
+    def cancel(self) -> None:
+        """Cancel recording and discard the episode.
+
+        Stops all streams without playing a stop chirp, removes the
+        episode directory entirely (including any partial files), and
+        generates a fresh episode path for the next recording.
+
+        Transitions ``RECORDING`` → ``CONNECTED`` (or ``STOPPED`` for
+        legacy one-shot callers), same as :meth:`stop`.
+
+        Raises:
+            RuntimeError: If state is not ``RECORDING``.
+        """
+        import shutil
+
+        with self._lock:
+            if self._state is not SessionState.RECORDING:
+                raise RuntimeError(
+                    f"cancel() requires RECORDING state; current state is "
+                    f"{self._state.value}"
+                )
+            self._transition(SessionState.STOPPING)
+
+            # Stop all streams without chirp — just tear down
+            for stream in self._connected_streams:
+                try:
+                    stream.stop_recording()
+                except Exception:
+                    logger.debug("Stream %s stop_recording failed during cancel", stream.id)
+
+            self._close_sample_writers()
+
+            # Close log writer BEFORE rmtree so no open file handles
+            if self._log_writer is not None:
+                self._log_writer.close()
+                self._log_writer = None
+
+            # Delete the episode directory and all contents
+            if self._output_dir.exists():
+                try:
+                    shutil.rmtree(self._output_dir)
+                    logger.info("Cancelled recording — deleted %s", self._output_dir)
+                except Exception as exc:
+                    logger.warning("Failed to delete episode dir: %s", exc)
+
+            # Prepare a fresh episode path for the next recording.
+            self._prepare_next_episode()
+
+            if self._auto_connected:
+                self._transition(SessionState.STOPPED)
+            else:
+                self._transition(SessionState.CONNECTED)
+
     # ------------------------------------------------------------------
     # Lifecycle — disconnect
     # ------------------------------------------------------------------
@@ -766,6 +882,10 @@ class SessionOrchestrator:
                 )
             _rollback_disconnect_streams(self._connected_streams)
             self._connected_streams = []
+
+            # Keep auto-injected audio stream registered (visible in viewer)
+            # but disconnected. It will be reconnected on next connect().
+
             self._transition(SessionState.IDLE)
             if self._log_writer is not None:
                 self._log_writer.close()
@@ -986,6 +1106,7 @@ class SessionOrchestrator:
             session_id=self.session_id,
             role=role_str,
             leader_host_id=leader_host_id,
+            task=self._task,
         )
 
     # ------------------------------------------------------------------
@@ -1035,6 +1156,103 @@ class SessionOrchestrator:
         """
         if self._log_writer is not None:
             self._log_writer.log_health(event)
+
+    # ------------------------------------------------------------------
+    # Episode lifecycle
+    # ------------------------------------------------------------------
+
+    def _prepare_next_episode(self) -> None:
+        """Generate a fresh episode path and update all stream adapters.
+
+        Called after ``stop()`` and ``cancel()`` so the next ``start()``
+        writes to a new directory. Every stream adapter that holds a
+        reference to the output path is updated to the new location.
+        """
+        self._output_dir = _generate_episode_path(self._data_root)
+        self._episode_dir_created = False
+
+        for stream in self._streams.values():
+            if hasattr(stream, "_output_dir"):
+                stream._output_dir = self._output_dir
+            if hasattr(stream, "_file_path"):
+                stream._file_path = self._output_dir / f"{stream.id}.mp4"
+            if hasattr(stream, "_mp4_path"):
+                stream._mp4_path = self._output_dir / f"{stream.id}.mp4"
+            if hasattr(stream, "_wav_path"):
+                stream._wav_path = None
+
+    # ------------------------------------------------------------------
+    # Host audio auto-injection
+    # ------------------------------------------------------------------
+
+    def _maybe_preregister_host_audio(self) -> None:
+        """Pre-register a :class:`HostAudioStream` so it shows in the viewer.
+
+        Called from :meth:`add` after the first non-audio stream is
+        registered. Only registers the stream (no device open) so the
+        viewer can display the audio card immediately. The actual device
+        connection happens in :meth:`connect` along with all other streams.
+        """
+        try:
+            from syncfield.adapters.host_audio import (
+                HostAudioStream,
+                is_audio_available,
+            )
+        except ImportError:
+            return
+
+        if not is_audio_available():
+            return
+
+        try:
+            audio = HostAudioStream("host_audio", output_dir=self._output_dir)
+            self._streams[audio.id] = audio
+            audio.on_health(self._on_stream_health)
+            self._auto_audio_stream = audio
+            logger.info("Pre-registered host audio stream (mic detected)")
+        except Exception as exc:
+            logger.debug("Failed to pre-register host audio: %s", exc)
+
+    def _maybe_inject_host_audio(self) -> None:
+        """Ensure the auto audio stream is connected during connect().
+
+        If ``_maybe_preregister_host_audio`` already added the stream,
+        this is a no-op (connect loop handles it). If not yet added
+        (e.g. user skipped add() and went straight to connect()), this
+        adds and connects it now.
+        """
+        has_audio = any(
+            s.capabilities.provides_audio_track
+            for s in self._streams.values()
+        )
+        if has_audio:
+            return
+
+        # Already pre-registered? connect() loop will handle it.
+        if self._auto_audio_stream is not None:
+            return
+
+        try:
+            from syncfield.adapters.host_audio import (
+                HostAudioStream,
+                is_audio_available,
+            )
+        except ImportError:
+            return
+
+        if not is_audio_available():
+            return
+
+        try:
+            audio = HostAudioStream("host_audio", output_dir=self._output_dir)
+            audio.prepare()
+            audio.connect()
+            self._streams[audio.id] = audio
+            self._connected_streams.append(audio)
+            self._auto_audio_stream = audio
+            logger.info("Auto-injected host audio stream (mic detected)")
+        except Exception as exc:
+            logger.warning("Failed to auto-inject host audio: %s", exc)
 
     # ------------------------------------------------------------------
     # Chirp injection
