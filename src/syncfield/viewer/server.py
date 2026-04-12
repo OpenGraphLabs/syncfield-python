@@ -392,7 +392,7 @@ class ViewerServer:
                 tasks = _read_tasks()
                 if any(t["name"] == name for t in tasks):
                     return None  # duplicate
-                task = {"name": name, "description": body.get("description", "")}
+                task = {"name": name}
                 tasks.append(task)
                 _write_tasks(tasks)
                 return task
@@ -412,8 +412,6 @@ class ViewerServer:
                     if t["name"] == task_name:
                         if "name" in body:
                             t["name"] = body["name"]
-                        if "description" in body:
-                            t["description"] = body["description"]
                         _write_tasks(tasks)
                         return t
                 return None

@@ -2,7 +2,6 @@ import { useCallback, useEffect, useState } from "react";
 
 export interface Task {
   name: string;
-  description: string;
 }
 
 interface UseTasksReturn {
@@ -10,7 +9,7 @@ interface UseTasksReturn {
   currentTask: string | null;
   isLoading: boolean;
   refresh: () => Promise<void>;
-  createTask: (name: string, description?: string) => Promise<boolean>;
+  createTask: (name: string) => Promise<boolean>;
   deleteTask: (name: string) => Promise<boolean>;
   selectTask: (name: string | null) => Promise<void>;
 }
@@ -47,11 +46,11 @@ export function useTasks(): UseTasksReturn {
   }, [refresh]);
 
   const createTask = useCallback(
-    async (name: string, description = ""): Promise<boolean> => {
+    async (name: string): Promise<boolean> => {
       const res = await fetch("/api/tasks", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name, description }),
+        body: JSON.stringify({ name }),
       });
       if (res.ok) {
         await refresh();

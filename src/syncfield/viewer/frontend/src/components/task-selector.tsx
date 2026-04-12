@@ -5,7 +5,7 @@ import { cn } from "@/lib/utils";
 interface TaskSelectorProps {
   tasks: Task[];
   currentTask: string | null;
-  createTask: (name: string, description?: string) => Promise<boolean>;
+  createTask: (name: string) => Promise<boolean>;
   deleteTask: (name: string) => Promise<boolean>;
   selectTask: (name: string | null) => Promise<void>;
 }
