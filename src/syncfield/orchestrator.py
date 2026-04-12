@@ -578,9 +578,12 @@ class SessionOrchestrator:
             else:
                 self._auto_connected = False
 
-            # Create the episode directory on disk — deferred from
-            # __init__ so viewer-only sessions don't leave empty dirs.
+            # Generate a fresh episode path with the current timestamp
+            # and create the directory. This ensures the ep_ name reflects
+            # when the recording actually started, not when the session
+            # object was constructed.
             if not self._episode_dir_created:
+                self._output_dir = _generate_episode_path(self._data_root)
                 self._output_dir.mkdir(parents=True, exist_ok=True)
                 self._episode_dir_created = True
 

@@ -71,7 +71,7 @@ function RecordView({
 }) {
   const { snapshot, countdown, stopResult, sendCommand, dismissStopResult } =
     useSession();
-  const { currentTask } = useTasks();
+  const taskState = useTasks();
   const discovery = useDiscovery();
   const [discoveryOpen, setDiscoveryOpen] = useState(false);
 
@@ -108,8 +108,14 @@ function RecordView({
         onModeChange={onModeChange}
       />
 
-      <ControlPanel state={state} hasTask={currentTask !== null} onCommand={sendCommand} />
-      <TaskSelector />
+      <ControlPanel state={state} hasTask={taskState.currentTask !== null} onCommand={sendCommand} />
+      <TaskSelector
+        tasks={taskState.tasks}
+        currentTask={taskState.currentTask}
+        createTask={taskState.createTask}
+        deleteTask={taskState.deleteTask}
+        selectTask={taskState.selectTask}
+      />
       <SessionClock snapshot={snapshot} />
 
       {/* Stop result banner */}
@@ -155,7 +161,7 @@ function RecordView({
         )}
       </div>
 
-      <Footer outputDir={snapshot?.output_dir ?? ""} />
+      <Footer outputDir={isRecording || state === "stopping" || state === "stopped" ? (snapshot?.output_dir ?? "") : ""} />
 
       {countdown !== null && <CountdownOverlay count={countdown} />}
 

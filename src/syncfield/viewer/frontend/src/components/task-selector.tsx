@@ -1,17 +1,28 @@
 import { useCallback, useState } from "react";
-import { useTasks } from "@/hooks/use-tasks";
+import type { Task } from "@/hooks/use-tasks";
 import { cn } from "@/lib/utils";
+
+interface TaskSelectorProps {
+  tasks: Task[];
+  currentTask: string | null;
+  createTask: (name: string, description?: string) => Promise<boolean>;
+  deleteTask: (name: string) => Promise<boolean>;
+  selectTask: (name: string | null) => Promise<void>;
+}
 
 /**
  * Task selector for Recording mode.
  *
- * Compact inline dropdown with task selection and creation.
- * The Record button is disabled until a task is selected,
- * so this component's empty state naturally guides the user.
+ * Receives task state from the parent so it shares the same hook
+ * instance as the Record button's hasTask gate.
  */
-export function TaskSelector() {
-  const { tasks, currentTask, createTask, deleteTask, selectTask } =
-    useTasks();
+export function TaskSelector({
+  tasks,
+  currentTask,
+  createTask,
+  deleteTask,
+  selectTask,
+}: TaskSelectorProps) {
   const [isOpen, setIsOpen] = useState(false);
   const [newTaskName, setNewTaskName] = useState("");
 

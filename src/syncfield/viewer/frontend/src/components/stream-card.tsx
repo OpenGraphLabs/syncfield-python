@@ -54,7 +54,7 @@ export function StreamCard({ stream, canRemove, onRemove }: StreamCardProps) {
       {/* Tags */}
       <div className="flex gap-1.5 px-4 pb-2">
         <Tag>{stream.kind}</Tag>
-        {stream.provides_audio_track && <Tag>audio</Tag>}
+        {stream.provides_audio_track && stream.kind !== "audio" && <Tag>audio</Tag>}
         {stream.produces_file && <Tag>file</Tag>}
       </div>
 
