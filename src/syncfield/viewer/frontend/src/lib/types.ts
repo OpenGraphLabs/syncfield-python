@@ -55,6 +55,7 @@ export interface CountdownEvent {
 export interface StopResultEvent {
   type: "stop_result";
   status: "saving" | "success" | "partial" | "error";
+  cancelled?: boolean;
   output_dir?: string;
   manifest_ok?: boolean;
   sync_point_ok?: boolean;

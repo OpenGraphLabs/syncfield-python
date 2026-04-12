@@ -826,7 +826,12 @@ class SessionOrchestrator:
 
             self._close_sample_writers()
 
-            # Delete the episode directory
+            # Close log writer BEFORE rmtree so no open file handles
+            if self._log_writer is not None:
+                self._log_writer.close()
+                self._log_writer = None
+
+            # Delete the episode directory and all contents
             if self._output_dir.exists():
                 try:
                     shutil.rmtree(self._output_dir)
@@ -840,9 +845,6 @@ class SessionOrchestrator:
 
             if self._auto_connected:
                 self._transition(SessionState.STOPPED)
-                if self._log_writer is not None:
-                    self._log_writer.close()
-                    self._log_writer = None
             else:
                 self._transition(SessionState.CONNECTED)
 

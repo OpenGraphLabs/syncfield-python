@@ -24,7 +24,8 @@ export function StopResultBanner({ result, onDismiss }: StopResultBannerProps) {
     );
   }
 
-  const isSuccess = result.status === "success";
+  const isCancelled = result.cancelled === true;
+  const isSuccess = result.status === "success" && !isCancelled;
   const isError = result.status === "error";
   const streams = result.streams ?? {};
 
@@ -32,6 +33,7 @@ export function StopResultBanner({ result, onDismiss }: StopResultBannerProps) {
     <div
       className={cn(
         "border-b px-4 py-3",
+        isCancelled && "border-muted/20 bg-foreground/3",
         isSuccess && "border-success/20 bg-success/5",
         result.status === "partial" && "border-warning/20 bg-warning/5",
         isError && "border-destructive/20 bg-destructive/5",
@@ -43,11 +45,13 @@ export function StopResultBanner({ result, onDismiss }: StopResultBannerProps) {
           <p
             className={cn(
               "text-xs font-medium",
+              isCancelled && "text-muted",
               isSuccess && "text-success",
               result.status === "partial" && "text-warning",
               isError && "text-destructive",
             )}
           >
+            {isCancelled && "Recording cancelled — data discarded"}
             {isSuccess && "Recording saved successfully"}
             {result.status === "partial" && "Recording saved with issues"}
             {isError && `Recording failed: ${result.error}`}
