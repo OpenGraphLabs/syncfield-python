@@ -22,7 +22,7 @@ export interface ChirpInfo {
 export interface HealthEntry {
   stream_id: string;
   kind: string;
-  at_s: number;
+  ago_s: number;
   detail: string | null;
 }
 

@@ -5,22 +5,30 @@ interface HealthTableProps {
   entries: HealthEntry[];
 }
 
+const KIND_ICONS: Record<string, string> = {
+  heartbeat: "●",
+  warning: "⚠",
+  error: "✗",
+  drop: "↓",
+  reconnect: "↻",
+};
+
 const KIND_COLORS: Record<string, string> = {
   error: "text-destructive",
   warning: "text-warning",
   drop: "text-destructive",
   reconnect: "text-success",
-  heartbeat: "text-muted",
+  heartbeat: "text-success",
 };
 
 /**
- * Compact health event list for the sidebar — newest-first.
+ * Compact health event timeline for the sidebar.
  */
 export function HealthTable({ entries }: HealthTableProps) {
   if (entries.length === 0) {
     return (
       <div className="px-3 py-8 text-center text-xs text-muted-foreground">
-        No health events
+        No events yet
       </div>
     );
   }
@@ -28,32 +36,44 @@ export function HealthTable({ entries }: HealthTableProps) {
   const sorted = [...entries].reverse();
 
   return (
-    <ul className="divide-y">
+    <ul className="divide-y divide-border/50">
       {sorted.map((entry, i) => (
-        <li key={i} className="px-3 py-2">
-          <div className="flex items-baseline justify-between gap-2">
-            <span
-              className={cn(
-                "text-[11px] font-medium",
-                KIND_COLORS[entry.kind] ?? "text-muted",
-              )}
-            >
-              {entry.kind}
-            </span>
-            <span className="shrink-0 font-mono text-[10px] text-muted">
-              {entry.at_s.toFixed(1)}s
-            </span>
-          </div>
-          <div className="mt-0.5 font-mono text-[11px] text-muted">
-            {entry.stream_id}
-          </div>
-          {entry.detail && (
-            <div className="mt-0.5 text-[10px] text-muted-foreground">
-              {entry.detail}
+        <li key={i} className="flex items-start gap-2 px-3 py-2">
+          {/* Icon */}
+          <span
+            className={cn(
+              "mt-0.5 shrink-0 text-[10px]",
+              KIND_COLORS[entry.kind] ?? "text-muted",
+            )}
+          >
+            {KIND_ICONS[entry.kind] ?? "·"}
+          </span>
+
+          {/* Content */}
+          <div className="min-w-0 flex-1">
+            <div className="flex items-baseline justify-between gap-1">
+              <span className="font-mono text-[11px] font-medium">
+                {entry.stream_id}
+              </span>
+              <span className="shrink-0 text-[9px] text-muted">
+                {formatAgo(entry.ago_s)}
+              </span>
             </div>
-          )}
+            {entry.detail && (
+              <div className="text-[10px] text-muted">
+                {entry.detail}
+              </div>
+            )}
+          </div>
         </li>
       ))}
     </ul>
   );
+}
+
+function formatAgo(seconds: number): string {
+  if (seconds < 1) return "just now";
+  if (seconds < 60) return `${Math.round(seconds)}s ago`;
+  if (seconds < 3600) return `${Math.round(seconds / 60)}m ago`;
+  return `${Math.round(seconds / 3600)}h ago`;
 }

@@ -75,11 +75,12 @@ def snapshot_to_dict(snapshot: SessionSnapshot) -> Dict[str, Any]:
 
     health_log: List[Dict[str, Any]] = []
     for h in snapshot.health_log:
-        at_s = round(h.at_ns / 1e9, 3) if h.at_ns else 0
+        # Convert monotonic ns to "seconds ago" for display
+        ago_s = round((now_ns - h.at_ns) / 1e9, 1) if h.at_ns else 0
         health_log.append({
             "stream_id": h.stream_id,
             "kind": h.kind,
-            "at_s": at_s,
+            "ago_s": ago_s,
             "detail": h.detail,
         })
 

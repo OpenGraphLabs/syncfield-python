@@ -847,9 +847,19 @@ class SessionOrchestrator:
                 except Exception as exc:
                     logger.warning("Failed to delete episode dir: %s", exc)
 
-            # Generate a new episode path for the next recording
+            # Generate a new episode path for the next recording and
+            # update all stream adapters so they write to the new dir.
             self._output_dir = _generate_episode_path(self._data_root)
             self._episode_dir_created = False
+            for stream in self._streams.values():
+                if hasattr(stream, "_output_dir"):
+                    stream._output_dir = self._output_dir
+                if hasattr(stream, "_file_path"):
+                    stream._file_path = self._output_dir / f"{stream.id}.mp4"
+                if hasattr(stream, "_wav_path"):
+                    stream._wav_path = None  # Will be set in start_recording
+                if hasattr(stream, "_mp4_path"):
+                    stream._mp4_path = self._output_dir / f"{stream.id}.mp4"
 
             if self._auto_connected:
                 self._transition(SessionState.STOPPED)
