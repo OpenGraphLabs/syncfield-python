@@ -22,7 +22,11 @@ jobs:
       - name: Build viewer frontend
         working-directory: src/syncfield/viewer/frontend
         run: |
-          npm ci
+          # Use npm install rather than npm ci to sidestep the rollup
+          # cross-platform optional-deps bug
+          # (https://github.com/npm/cli/issues/4828) when a macOS-generated
+          # lockfile is installed on Linux runners.
+          npm install --no-audit --no-fund
           npm run build
 
       - name: Set up Python
