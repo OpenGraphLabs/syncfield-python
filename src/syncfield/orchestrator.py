@@ -1298,6 +1298,7 @@ class SessionOrchestrator:
                 self._maybe_start_advertising()
                 self._maybe_wait_for_leader()
                 self._rewrite_output_dir_for_observed_session()
+                self._maybe_start_follower_advertising_post_observation()
                 self._fetch_config_from_leader()
             except Exception:
                 self._stop_discovery_on_failure()
@@ -2089,22 +2090,42 @@ class SessionOrchestrator:
     # ------------------------------------------------------------------
 
     def _maybe_start_advertising(self) -> None:
-        """Leader-only: open an advertiser in the ``preparing`` state.
+        """Start mDNS advertisement for this host.
 
-        No-op for follower and single-host sessions. Called from
-        :meth:`start` inside the ``PREPARING`` transition so followers
-        already on the network can see the session coming up before
-        streams actually begin recording.
+        Leaders advertise as soon as :meth:`start` enters ``PREPARING``.
+        Followers also advertise — so the leader's discovery helpers
+        inside :meth:`_distribute_config_to_followers` and
+        :meth:`collect_from_followers` can find them — BUT only when
+        their ``session_id`` is known. Auto-discover followers, whose
+        session id is unknown until ``_maybe_wait_for_leader`` observes
+        a leader, defer their advertiser start to
+        :meth:`_maybe_start_follower_advertising_post_observation`.
+
+        No-op for single-host sessions.
         """
-        if not isinstance(self._role, LeaderRole):
+        if self._role is None:
             return
-        assert self._role.session_id is not None  # post_init guarantees
+        # Auto-discover follower pre-observation: session_id unknown.
+        # Caller will re-invoke after _maybe_wait_for_leader.
+        if self.session_id is None:
+            return
+        self._start_advertiser_now(self.session_id)
+
+    def _start_advertiser_now(self, session_id: str) -> None:
+        """Construct and start the :class:`SessionAdvertiser` now.
+
+        Used by :meth:`_maybe_start_advertising` (leader and pre-shared
+        follower paths) and by
+        :meth:`_maybe_start_follower_advertising_post_observation`
+        (auto-discover follower path).
+        """
+        graceful = getattr(self._role, "graceful_shutdown_ms", 1000)
         self._advertiser = SessionAdvertiser(
-            session_id=self._role.session_id,
+            session_id=session_id,
             host_id=self._host_id,
             sdk_version=_pkg_version("syncfield"),
             chirp_enabled=self._sync_tone.enabled,
-            graceful_shutdown_ms=self._role.graceful_shutdown_ms,
+            graceful_shutdown_ms=graceful,
             control_plane_port=(
                 self._control_plane.actual_port
                 if self._control_plane is not None
@@ -2112,6 +2133,28 @@ class SessionOrchestrator:
             ),
         )
         self._advertiser.start()
+
+    def _maybe_start_follower_advertising_post_observation(self) -> None:
+        """Start a follower's advertiser after the leader is observed.
+
+        For an auto-discover :class:`FollowerRole`, ``session_id`` only
+        becomes known after :meth:`_maybe_wait_for_leader` populates
+        ``self._observed_leader``. This helper is called from
+        :meth:`start` immediately after
+        :meth:`_rewrite_output_dir_for_observed_session` so the
+        follower publishes itself before the leader's
+        :meth:`_distribute_config_to_followers` browser sweep.
+
+        No-op if the advertiser is already running (pre-shared follower
+        path) or if this host isn't a follower at all.
+        """
+        if not isinstance(self._role, FollowerRole):
+            return
+        if self._advertiser is not None:
+            return  # already up (pre-shared follower started in _maybe_start_advertising)
+        if self.session_id is None:
+            return  # _maybe_wait_for_leader should have set this; defensive guard
+        self._start_advertiser_now(self.session_id)
 
     def _maybe_update_advert_recording(self) -> None:
         """Leader-only: flip the advert status to ``recording``.

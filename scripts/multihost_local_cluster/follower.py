@@ -13,8 +13,8 @@ from syncfield.testing import FakeStream
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--host-id", default="mac_b")
-    parser.add_argument("--session-id", default=None,
-                        help="If set, pre-shared session_id; else auto-discover.")
+    parser.add_argument("--session-id", default="local-test-cluster",
+                        help="Pre-shared session_id. Pass empty string '' for auto-discover.")
     parser.add_argument("--output-dir", default="./data_follower")
     parser.add_argument("--control-plane-port", type=int, default=0,
                         help="0 means OS-assigned (avoids collisions on localhost).")
@@ -25,7 +25,7 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
 
     role = sf.FollowerRole(
-        session_id=args.session_id,
+        session_id=args.session_id or None,
         leader_wait_timeout_sec=args.leader_wait_timeout_sec,
         control_plane_port=args.control_plane_port,
         keep_alive_after_stop_sec=args.keep_alive_sec,

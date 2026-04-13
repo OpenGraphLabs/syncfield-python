@@ -542,3 +542,86 @@ class TestFollowerPostPropagatesToOrchestrator:
             assert follower._applied_session_config.session_name == "amber-tiger-042"
         finally:
             follower._stop_control_plane_only_for_tests()
+
+
+class TestFollowerAdvertising:
+    def test_preshared_follower_advertises_at_start(self, tmp_path, monkeypatch):
+        """Regression: followers with pre-shared session_id must advertise
+        themselves on mDNS so the leader can discover them."""
+        from unittest.mock import MagicMock
+        import syncfield as sf
+        from syncfield.multihost import advertiser as adv_module
+        from tests.unit.conftest import FakeStream
+
+        created_advertisers = []
+
+        class _FakeAdvertiser:
+            def __init__(self, **kwargs):
+                created_advertisers.append(kwargs)
+                self.kwargs = kwargs
+            def start(self): pass
+            def update_status(self, *a, **kw): pass
+            def close(self): pass
+
+        monkeypatch.setattr(adv_module, "SessionAdvertiser", _FakeAdvertiser)
+        # Also patch the symbol in orchestrator.py's namespace if the
+        # orchestrator does `from syncfield.multihost.advertiser import SessionAdvertiser`.
+        import syncfield.orchestrator as orch_mod
+        monkeypatch.setattr(orch_mod, "SessionAdvertiser", _FakeAdvertiser, raising=False)
+
+        follower = sf.SessionOrchestrator(
+            host_id="mac_b",
+            output_dir=tmp_path,
+            role=sf.FollowerRole(session_id="amber-tiger-042", control_plane_port=0),
+        )
+        follower.add(FakeStream("cam"))
+        mic = FakeStream("mic"); mic.kind = "audio"
+        follower.add(mic)
+
+        # Trigger the advertiser-start code path without running a real
+        # session.start() (which would block waiting for a leader).
+        follower._start_control_plane_only_for_tests()
+        try:
+            follower._maybe_start_advertising()
+
+            assert len(created_advertisers) == 1
+            kwargs = created_advertisers[0]
+            assert kwargs["session_id"] == "amber-tiger-042"
+            assert kwargs["host_id"] == "mac_b"
+            assert kwargs["control_plane_port"] == follower._control_plane.actual_port
+        finally:
+            follower._stop_control_plane_only_for_tests()
+
+    def test_auto_discover_follower_does_not_advertise_pre_observation(
+        self, tmp_path, monkeypatch
+    ):
+        """Auto-discover follower must NOT start its advertiser until
+        _maybe_wait_for_leader has observed the leader."""
+        import syncfield as sf
+        import syncfield.orchestrator as orch_mod
+        from tests.unit.conftest import FakeStream
+
+        class _FakeAdvertiser:
+            created = 0
+            def __init__(self, **kwargs):
+                _FakeAdvertiser.created += 1
+            def start(self): pass
+            def close(self): pass
+
+        monkeypatch.setattr(orch_mod, "SessionAdvertiser", _FakeAdvertiser, raising=False)
+
+        follower = sf.SessionOrchestrator(
+            host_id="mac_b",
+            output_dir=tmp_path,
+            role=sf.FollowerRole(control_plane_port=0),  # no session_id
+        )
+        follower.add(FakeStream("cam"))
+        mic = FakeStream("mic"); mic.kind = "audio"
+        follower.add(mic)
+
+        follower._start_control_plane_only_for_tests()
+        try:
+            follower._maybe_start_advertising()  # session_id still None
+            assert _FakeAdvertiser.created == 0
+        finally:
+            follower._stop_control_plane_only_for_tests()
