@@ -22,10 +22,13 @@ jobs:
       - name: Build viewer frontend
         working-directory: src/syncfield/viewer/frontend
         run: |
-          # Use npm install rather than npm ci to sidestep the rollup
-          # cross-platform optional-deps bug
-          # (https://github.com/npm/cli/issues/4828) when a macOS-generated
-          # lockfile is installed on Linux runners.
+          # Remove the macOS-generated lockfile before install — npm has
+          # a long-running bug (https://github.com/npm/cli/issues/4828)
+          # where optional platform-specific deps (e.g. rollup's
+          # @rollup/rollup-linux-x64-gnu) aren't re-resolved when a
+          # lockfile generated on one platform is consumed on another.
+          # Regenerating from package.json on the CI platform works.
+          rm -f package-lock.json
           npm install --no-audit --no-fund
           npm run build
 
