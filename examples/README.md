@@ -1,96 +1,61 @@
-# SyncField SDK Examples
+# SyncField Examples — Quick Start
 
-Runnable end-to-end recipes showing real SDK setups. Each subdirectory is a self-contained example with a `README.md` explaining the hardware + setup, a `record.py` script you can run directly, and a description of what output it produces.
-
-Start with the simplest example that matches hardware you actually have, then scale up by swapping or adding one adapter at a time.
-
-## Catalog
-
-| Example | Hardware | What it shows |
-|---|---|---|
-| [`iphone_mac_webcam/`](./iphone_mac_webcam/) | Mac built-in webcam + iPhone (Continuity Camera) | Shortest end-to-end recipe: two OpenCV video streams through `UVCWebcamStream`, live preview in the desktop viewer, MP4 + timestamps written to disk |
-| [`mac_iphone_dual_oak/`](./mac_iphone_dual_oak/) | Mac webcam + iPhone + OAK-D-Lite + OAK-D-S2 | Four video streams on one host: two `UVCWebcamStream`s and two `OakCameraStream`s, each OAK pinned to its DepthAI serial. Optional stereo depth flags on either OAK. |
-| [`full_rig/`](./full_rig/) | Mac webcam + iPhone + OAK-D-Lite + OAK-D-S2 + OGLO glove (BLE) | Mixes four video streams with a 100 Hz tactile sensor stream: same four cameras as above plus an `OgloTactileStream` that renders a 5-finger FSR plot card in the viewer. Shows how video + sensor streams share one atomic session. |
-
-More recipes will be added as the rigs they target come online. Expected next:
-
-- **`iphone_imu/`** — iPhone + BLE IMU (`BLEImuGenericStream`) showing mixed video + sensor streams
-- **`tactile_rig/`** — webcam + tactile sensor via `OgloTactileStream` showing custom-adapter integration
-- **`multi_host_pair/`** — two Macs on the same WiFi recording together with `LeaderRole` / `FollowerRole`
-
-## Run any example (`uv run`)
-
-Every example is a plain Python script inside this repo, so the easiest way to run one is with `uv run` from the repo root — no virtualenv setup, no `pip install` step. `uv` resolves the extras you pass with `--extra` against the root `pyproject.toml` and executes the script in a temporary env:
+## 1. 새 PC 에서 한 번만
 
 ```bash
-# iphone_mac_webcam — Mac webcam + iPhone Continuity Camera
-uv run --extra uvc --extra audio --extra viewer \
-    python examples/iphone_mac_webcam/record.py
-
-# mac_iphone_dual_oak — Mac webcam + iPhone + OAK-D-Lite + OAK-D-S2
-uv run --extra uvc --extra oak --extra audio --extra viewer \
-    python examples/mac_iphone_dual_oak/record.py
-
-# full_rig — dual_oak + OGLO tactile glove over BLE
-uv run --extra uvc --extra oak --extra ble --extra audio --extra viewer \
-    python examples/full_rig/record.py
+git clone https://github.com/OpenGraphLabs/syncfield-python.git
+cd syncfield-python
+uv sync --all-extras
 ```
 
-The first run for each extra set downloads the wheels into the uv cache (~10–30 s); every subsequent run is instant.
+## 2. 예제 실행 (둘 중 아무 방식이나)
 
-> **Why `audio` is always there.** SyncField plays a 3/2/1 countdown tick and start/stop sync chirps through `sounddevice`. Without the `audio` extra installed the session runs in total silence and the console prints a WARNING telling you to add it. Every example in this directory includes `audio` in its recommended extras for that reason.
+**A. Repo 안에서 직접:**
+```bash
+uv run python examples/<예제>/record.py
+```
 
-### Common flags
+**B. PyPI 에서 설치 후:**
+```bash
+pip install "syncfield[all]"
+python examples/<예제>/record.py
+```
 
-Every `record.py` accepts at least:
+## 3. 예제 카탈로그
+
+| 예제 | 커맨드 | 필요 하드웨어 |
+|------|--------|-------------|
+| **Mac 웹캠 + iPhone** | `uv run python examples/iphone_mac_webcam/record.py` | Mac + iPhone (Continuity Camera) |
+| **4대 카메라 (Mac+iPhone+OAK×2)** | `uv run python examples/mac_iphone_dual_oak/record.py` | 위 + OAK-D-Lite + OAK-D-S2 |
+| **Full rig (5 streams)** | `uv run python examples/full_rig/record.py` | 위 + OGLO BLE 촉각 글러브 |
+| **센서 폴링 데모** | `uv run python examples/generic_sensor_demo/polling_serial.py` | Serial 센서 |
+| **센서 push 데모** | `uv run python examples/generic_sensor_demo/push_async.py` | 없음 (fake) |
+| **Multi-host 리더** | `uv run python examples/multihost_lab/leader.py` | Mac + iPhone |
+| **Multi-host 팔로워** | `uv run python examples/multihost_lab/follower.py` | Mac + iPhone |
+
+## 4. Multi-host (맥북 2대)
+
+**같은 WiFi, 같은 LAN 에서:**
 
 ```bash
---output-dir ./my_recording   # where to write session artifacts (default ./output)
+# 맥북 A (leader)
+uv run python examples/multihost_lab/leader.py
+# 녹화 중… Ctrl-C 로 stop → 자동으로 follower 파일 pull
+
+# 맥북 B (follower)
+uv run python examples/multihost_lab/follower.py
+# 리더 자동 발견 → 동기 녹화 → 리더 stop 감지 → 자기도 stop
 ```
 
-Individual examples have their own extra flags — see the per-example README.
+Follower 여러 대면 각자 `follower.py` 안의 `host_id="mac_b"` 를 `mac_c`, `mac_d` 등으로 수정.
 
-### Alternative: install once, then `python`
+## 5. 결과 위치
 
-If you'd rather install the package into a persistent environment and run `python record.py` directly (closer to how end-users would ship it), use either of:
+- Single-host: `examples/<예제>/output/ep_<timestamp>/`
+- Multi-host (leader 에 집약): `examples/multihost_lab/output/<session_id>/<leader_episode>/<host>.<filename>`
 
-```bash
-# Plain pip + venv
-python -m venv .venv && source .venv/bin/activate
-pip install "syncfield[uvc,oak,audio,viewer]"
-python examples/mac_iphone_dual_oak/record.py
+## 참고
 
-# uv sync
-uv sync --extra uvc --extra oak --extra audio --extra viewer
-uv run python examples/mac_iphone_dual_oak/record.py
-```
-
-Inside the viewer, click **Record** to start the session, **Stop** to finish, and close the window to exit. Output files land in `./output/` by default; every example accepts `--output-dir` if you want a different location.
-
-## Architecture shared by every example
-
-Whatever the hardware, every recipe builds the same three-step pipeline:
-
-```
-1. Construct one SessionOrchestrator
-      ↓
-2. Register one Stream per capture source (session.add(...))
-      ↓
-3. Launch the viewer — it drives start() / stop() from the UI buttons
-```
-
-Swapping or adding streams is always a one-line change, which is the whole point of the `Stream` SPI — the orchestrator doesn't know or care whether a stream is a webcam, a depth camera, or a tactile sensor.
-
-See the [**Python SDK docs**](https://opengraphlabs.com/sdk/python) for the full API reference and the [**Concepts**](https://opengraphlabs.com/concepts) page for how these recipes fit into the larger capture-then-sync workflow.
-
-## Adding your own example
-
-New examples go into their own subdirectory:
-
-```
-examples/your_recipe/
-├── README.md    # Hardware checklist, install, run, output, troubleshooting
-└── record.py    # One runnable script — keep it under ~200 lines
-```
-
-Keep each `record.py` self-contained (no shared helpers across examples) so readers can copy-paste one file and have it work. Prefer clarity over cleverness: comments that explain *why*, not *what*.
+- 예제별 상세: 각 폴더의 `README.md`
+- 카메라/센서 하드웨어 자동 탐색: `uv run python -m syncfield.discovery`
+- Audio extra 는 항상 권장 (chirp + countdown 소리용)
