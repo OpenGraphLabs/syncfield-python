@@ -20,13 +20,14 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import io
 import json
 import logging
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
-import cv2
+from PIL import Image
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -1650,11 +1651,12 @@ class ViewerServer:
                 stream = snapshot.streams.get(stream_id)
                 if stream is not None and stream.latest_frame is not None:
                     try:
-                        _, jpeg = cv2.imencode(
-                            ".jpg", stream.latest_frame,
-                            [cv2.IMWRITE_JPEG_QUALITY, 80],
-                        )
-                        frame_bytes = jpeg.tobytes()
+                        # BGR numpy → PIL Image (PIL expects RGB, so reverse the last axis).
+                        rgb = stream.latest_frame[:, :, ::-1]
+                        img = Image.fromarray(rgb)
+                        buf = io.BytesIO()
+                        img.save(buf, format="JPEG", quality=80)
+                        frame_bytes = buf.getvalue()
                         yield (
                             b"--frame\r\n"
                             b"Content-Type: image/jpeg\r\n"

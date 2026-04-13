@@ -1,10 +1,9 @@
 """Tests for the multi-host cluster endpoints on the viewer server.
 
-The viewer's ``server.py`` imports ``cv2`` at module load time for
-MJPEG encoding — a dependency that isn't declared for the unit-test
-extra (it ships with the ``viewer`` optional extra). To keep these
-tests environment-agnostic we pre-register a stub ``cv2`` module in
-``sys.modules`` before importing the server, then dispatch the
+The viewer's ``server.py`` imports ``PIL`` at module load time for
+MJPEG encoding — a dependency that ships with the ``viewer`` optional
+extra. Since ``Pillow`` is widely available and present in the dev
+install, the real module is used; no stub is needed. We dispatch the
 cluster endpoints through FastAPI's :class:`TestClient` against a
 fake orchestrator. The test covers the acceptance criteria:
 
@@ -23,29 +22,16 @@ that lives in the orchestrator-level integration test suite.
 
 from __future__ import annotations
 
-import sys
-import types
 from typing import Any, Dict, List, Optional
 
 import pytest
 
-# ---------------------------------------------------------------------------
-# cv2 stub must land in sys.modules BEFORE syncfield.viewer.server imports it.
-# ---------------------------------------------------------------------------
+from fastapi.testclient import TestClient
 
-if "cv2" not in sys.modules:
-    _cv2 = types.ModuleType("cv2")
-    _cv2.imencode = lambda *a, **kw: (True, b"")  # type: ignore[attr-defined]
-    _cv2.IMWRITE_JPEG_QUALITY = 1  # type: ignore[attr-defined]
-    sys.modules["cv2"] = _cv2
-
-
-from fastapi.testclient import TestClient  # noqa: E402
-
-from syncfield.multihost.types import SessionAnnouncement  # noqa: E402
-from syncfield.roles import FollowerRole, LeaderRole  # noqa: E402
-from syncfield.types import SessionState  # noqa: E402
-from syncfield.viewer.server import ViewerServer  # noqa: E402
+from syncfield.multihost.types import SessionAnnouncement
+from syncfield.roles import FollowerRole, LeaderRole
+from syncfield.types import SessionState
+from syncfield.viewer.server import ViewerServer
 
 
 # ---------------------------------------------------------------------------
