@@ -118,6 +118,12 @@ class SessionBrowser:
                 logger.warning("Zeroconf.close failed: %s", exc)
             self._zc = None
             self._browser = None
+        # Wake any threads blocked inside wait_for_observation /
+        # wait_for_recording / wait_for_stopped so they can exit cleanly
+        # instead of hanging on the condition variable forever (relevant
+        # when a caller passed timeout=float("inf")).
+        with self._update_event:
+            self._update_event.notify_all()
 
     # ------------------------------------------------------------------
     # Public observation API
@@ -150,20 +156,34 @@ class SessionBrowser:
         browser has ANY matching announcement (preparing, recording, or
         stopped). Callers use this to detect a leader's presence without
         waiting for its session to actually start recording.
+
+        Pass ``timeout=float("inf")`` to wait indefinitely — the
+        follower's background observer thread uses this to sit on the
+        condition variable for the entire duration of the connected
+        session. In that mode no ``TimeoutError`` is ever raised; the
+        only way out is an observation or a call to :meth:`close`.
         """
-        deadline = time.monotonic() + timeout
+        deadline = (
+            time.monotonic() + timeout if timeout != float("inf") else None
+        )
         with self._update_event:
             while True:
                 match = self._find_any_match()
                 if match is not None:
                     return match
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise TimeoutError(
-                        f"no matching leader observed within {timeout:.1f}s "
-                        f"(filter session_id={self._session_id_filter!r})"
-                    )
-                self._update_event.wait(timeout=remaining)
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError(
+                            f"no matching leader observed within {timeout:.1f}s "
+                            f"(filter session_id={self._session_id_filter!r})"
+                        )
+                    self._update_event.wait(timeout=remaining)
+                else:
+                    # Infinite wait — condition variable will wake us
+                    # when the browser observes a matching announcement
+                    # or when close() notifies waiters.
+                    self._update_event.wait()
 
     def _find_any_match(self) -> Optional[SessionAnnouncement]:
         """Return any announcement matching the session_id filter, regardless of status.

@@ -1350,7 +1350,7 @@ wheels = [
 
 [[package]]
 name = "syncfield"
-version = "0.2.0"
+version = "0.3.4"
 source = { editable = "." }
 
 [package.optional-dependencies]

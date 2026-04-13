@@ -300,6 +300,12 @@ class SessionOrchestrator:
         self._advertiser: Optional[SessionAdvertiser] = None
         self._browser: Optional[SessionBrowser] = None
         self._observed_leader: Optional[SessionAnnouncement] = None
+        # Background thread a follower uses to block on
+        # ``SessionBrowser.wait_for_observation`` without stalling
+        # :meth:`connect`. Populated by
+        # :meth:`_maybe_start_follower_browser_in_background` and
+        # cleared by :meth:`disconnect`.
+        self._follower_observer_thread: Optional[threading.Thread] = None
         # Operator-injected peer list that bypasses mDNS discovery.
         # Populated via :meth:`set_static_peers`; consumed by
         # :meth:`_discover_followers_in_preparing` and
@@ -1214,9 +1220,13 @@ class SessionOrchestrator:
         #    closed file.
         self._close_sample_writers()
 
-        # 3. Tear down control plane + discovery.
-        self._force_stop_control_plane()
-        self._stop_discovery_on_failure()
+        # 3. Tear down control plane + discovery ONLY in the auto-connect
+        #    path; explicit-connect callers keep their connect()-time
+        #    multi-host infrastructure live so they can retry start()
+        #    without re-opening hardware or re-advertising on mDNS.
+        if self._auto_connected:
+            self._force_stop_control_plane()
+            self._stop_discovery_on_failure()
 
         # 4. Reset sync_point / chirp state so a later retry doesn't
         #    reuse stale anchors.
@@ -1487,6 +1497,70 @@ class SessionOrchestrator:
             # user having to add an audio stream manually.
             self._maybe_inject_host_audio()
 
+            # Multi-host: bring the cluster-formation machinery up NOW
+            # so the operator can see who's connected in the viewer
+            # cluster panel BEFORE clicking Record. Previously this
+            # work happened inside start(), which meant the leader only
+            # appeared on mDNS after a recording began — late discovery
+            # that confused operators running multi-rig research labs.
+            #
+            # Order matters here:
+            # 1. Validate audio — cheapest, catches mis-configured host
+            #    before we allocate any network resources.
+            # 2. Control plane — must be up before the advertiser so the
+            #    advertiser can publish the real (possibly OS-assigned)
+            #    control-plane port in its TXT record.
+            # 3. Advertiser — leaders always advertise at connect;
+            #    pre-shared followers also advertise; auto-discover
+            #    followers defer to post-observation.
+            # 4. Follower's background browser — starts a daemon thread
+            #    that blocks on wait_for_observation(inf). This thread
+            #    sets _observed_leader and kicks off the follower's
+            #    own advertiser as soon as any leader appears on mDNS,
+            #    with no impact on connect() latency.
+            #
+            # On any failure during the multi-host bringup, tear down
+            # whatever did come up and roll all the way back to IDLE
+            # with devices closed (so the caller sees the same state
+            # they had before connect()).
+            if self._role is not None:
+                try:
+                    self._validate_multihost_audio_requirement()
+                    self._start_control_plane()
+                    self._maybe_start_advertising()
+                    self._maybe_start_follower_browser_in_background()
+                except Exception as exc:
+                    self._log_rollback(exc, len(connected))
+                    # Tear down any multi-host infrastructure that did
+                    # come up before the failure.
+                    if self._advertiser is not None:
+                        try:
+                            self._advertiser.close()
+                        except Exception as adv_exc:  # pragma: no cover
+                            logger.warning(
+                                "advertiser.close failed during connect rollback: %s",
+                                adv_exc,
+                            )
+                        self._advertiser = None
+                    if self._browser is not None:
+                        try:
+                            self._browser.close()
+                        except Exception as br_exc:  # pragma: no cover
+                            logger.warning(
+                                "browser.close failed during connect rollback: %s",
+                                br_exc,
+                            )
+                        self._browser = None
+                    self._force_stop_control_plane()
+                    # Close the streams we just opened.
+                    _rollback_disconnect_streams(connected)
+                    self._connected_streams = []
+                    self._transition(SessionState.IDLE)
+                    if self._log_writer is not None:
+                        self._log_writer.close()
+                        self._log_writer = None
+                    raise
+
             self._transition(SessionState.CONNECTED)
 
     # ------------------------------------------------------------------
@@ -1549,28 +1623,33 @@ class SessionOrchestrator:
             else:
                 self._auto_connected = False
 
-            if self._role is not None:
-                self._validate_multihost_audio_requirement()
-                self._start_control_plane()
+            # NOTE: multi-host machinery (audio validation, control
+            # plane, advertiser, follower browser) was already brought
+            # up in connect(). start() now focuses exclusively on the
+            # recording transition so the cluster can form well before
+            # the operator clicks Record.
 
-            # Multi-host: advertise PREPARING / wait for leader BEFORE
-            # touching the filesystem, so an auto-discover follower
-            # never mkdirs the `_pending_session` placeholder path.
+            # Multi-host: wait for leader BEFORE touching the
+            # filesystem, so an auto-discover follower never mkdirs
+            # the `_pending_session` placeholder path.
             self._transition(SessionState.PREPARING)
             try:
-                self._maybe_start_advertising()
                 self._maybe_wait_for_leader()
                 self._rewrite_output_dir_for_observed_session()
                 self._maybe_start_follower_advertising_post_observation()
                 self._fetch_config_from_leader()
             except Exception:
-                self._stop_discovery_on_failure()
-                self._force_stop_control_plane()
                 # Auto-connected sessions tear all the way back to IDLE
-                # on multi-host failure; explicit-connect sessions stay
-                # in CONNECTED so the caller can retry without
-                # re-opening hardware.
+                # on multi-host failure, including the advertiser,
+                # control plane, and follower browser that connect()
+                # brought up. Explicit-connect sessions stay in
+                # CONNECTED with the multi-host infrastructure still
+                # live — the operator may simply have clicked Record
+                # before every rig finished attaching, and a retry
+                # shouldn't have to re-open devices or re-advertise.
                 if self._auto_connected:
+                    self._stop_discovery_on_failure()
+                    self._force_stop_control_plane()
                     _rollback_disconnect_streams(self._connected_streams)
                     self._connected_streams = []
                     self._auto_connected = False
@@ -1638,14 +1717,17 @@ class SessionOrchestrator:
                 # the happy stop() flow takes, so trailing samples
                 # from rolled-back streams don't race a closed file.
                 self._close_sample_writers()
-                self._stop_discovery_on_failure()
 
                 # If the user took the legacy one-shot path through
-                # IDLE, tear down devices too and land in IDLE to
-                # preserve 0.1 rollback semantics. Explicit connect
-                # callers stay in CONNECTED so they can retry without
-                # re-opening hardware.
+                # IDLE, tear down devices + discovery + control plane
+                # and land in IDLE to preserve 0.1 rollback semantics.
+                # Explicit connect callers keep the multi-host
+                # infrastructure (advertiser, control plane, follower
+                # browser) live and stay in CONNECTED so they can
+                # retry without re-opening hardware or re-advertising.
                 if self._auto_connected:
+                    self._stop_discovery_on_failure()
+                    self._force_stop_control_plane()
                     _rollback_disconnect_streams(self._connected_streams)
                     self._connected_streams = []
                     self._auto_connected = False
@@ -1743,6 +1825,11 @@ class SessionOrchestrator:
 
             # --- Landing state -------------------------------------
             if self._auto_connected:
+                # Legacy one-shot path (IDLE → start → STOPPED). The
+                # user never called connect() explicitly, so they also
+                # won't call disconnect(); tear down EVERYTHING here,
+                # including the multi-host infrastructure connect()
+                # brought up on their behalf.
                 self._transition(SessionState.STOPPED)
                 if self._log_writer is not None:
                     self._log_writer.close()
@@ -1752,12 +1839,17 @@ class SessionOrchestrator:
                 self._stop_discovery_on_failure()
                 self._auto_connected = False
             else:
-                # Close the log writer for this episode.
+                # Explicit connect path. The advertiser just flipped to
+                # ``stopped`` and stays up so followers (and the viewer)
+                # can still observe the cluster. The follower's browser
+                # also stays up — if the operator starts another
+                # recording, start() reuses both instead of re-bringing
+                # them up. disconnect() is the only place that tears
+                # multi-host infrastructure down in this path.
                 if self._log_writer is not None:
                     self._log_writer.close()
                     self._log_writer = None
                 self._transition(SessionState.CONNECTED)
-                self._stop_discovery_on_failure()
 
             # Prepare a fresh episode path for the next recording.
             self._prepare_next_episode()
@@ -1877,6 +1969,31 @@ class SessionOrchestrator:
 
             # Keep auto-injected audio stream registered (visible in viewer)
             # but disconnected. It will be reconnected on next connect().
+
+            # Tear down multi-host infrastructure that connect() brought
+            # up. We do this AFTER disconnecting streams but BEFORE
+            # transitioning to IDLE so observers of the state change
+            # see a fully torn-down session. Each step is best-effort;
+            # a single failing close must not leave another subsystem
+            # running.
+            if self._role is not None:
+                if self._browser is not None:
+                    try:
+                        self._browser.close()
+                    except Exception as exc:  # pragma: no cover
+                        logger.warning("browser.close failed: %s", exc)
+                    self._browser = None
+                if self._advertiser is not None:
+                    try:
+                        self._advertiser.close()
+                    except Exception as exc:  # pragma: no cover
+                        logger.warning("advertiser.close failed: %s", exc)
+                    self._advertiser = None
+                self._force_stop_control_plane()
+                # Clear observation state so a subsequent connect()
+                # starts fresh rather than re-using a stale leader.
+                self._observed_leader = None
+                self._follower_observer_thread = None
 
             self._transition(SessionState.IDLE)
             if self._log_writer is not None:
@@ -2397,27 +2514,95 @@ class SessionOrchestrator:
         )
         self._advertiser.start()
 
+    def _maybe_start_follower_browser_in_background(self) -> None:
+        """Spin up the follower's mDNS browser on a background daemon thread.
+
+        Called from :meth:`connect` so the follower can begin watching
+        for the leader the moment its devices are open — well before
+        the operator clicks Record. Critically, this MUST NOT block:
+        :meth:`connect` needs to return quickly so the viewer can
+        render live preview frames. The browser itself runs inside
+        zeroconf's own worker thread; we additionally spawn a tiny
+        observer thread that blocks on :meth:`SessionBrowser.wait_for_observation`
+        with ``timeout=float("inf")``. As soon as any matching leader
+        appears (in any status), the observer thread records it on
+        :attr:`_observed_leader` and, if this is an auto-discover
+        follower that was waiting for a session_id, starts its own
+        advertiser so the leader can discover it in return.
+
+        No-op for leaders and single-host sessions, and no-op if the
+        browser is already running (so calling this twice is safe).
+        """
+        if not isinstance(self._role, FollowerRole):
+            return
+        if self._browser is not None:
+            return  # already started by a previous connect() or start() path
+
+        role_session_id = getattr(self._role, "session_id", None)
+        browser = SessionBrowser(session_id=role_session_id)
+        browser.start()
+        self._browser = browser
+
+        def _watch_for_leader() -> None:
+            # Daemon thread — must never raise into the interpreter top.
+            # Any zeroconf / wait-condition error is logged and swallowed.
+            try:
+                ann = browser.wait_for_observation(timeout=float("inf"))
+            except Exception as exc:  # pragma: no cover - best-effort
+                logger.warning(
+                    "follower background observation failed: %s", exc
+                )
+                return
+            if ann is None:
+                # wait_for_observation always returns a SessionAnnouncement
+                # or raises; guard anyway so a future signature change
+                # doesn't silently set _observed_leader to None.
+                return
+            self._observed_leader = ann
+            # Auto-discover followers only learn their session_id now,
+            # which unblocks their advertiser. For pre-shared followers
+            # the advertiser is already running and this is a no-op.
+            try:
+                self._maybe_start_follower_advertising_post_observation()
+            except Exception as exc:  # pragma: no cover
+                logger.warning(
+                    "follower advertiser start post-observation failed: %s",
+                    exc,
+                )
+
+        t = threading.Thread(
+            target=_watch_for_leader,
+            name=f"follower-observer-{self._host_id}",
+            daemon=True,
+        )
+        t.start()
+        self._follower_observer_thread = t
+
     def _maybe_start_follower_advertising_post_observation(self) -> None:
         """Start a follower's advertiser after the leader is observed.
 
         For an auto-discover :class:`FollowerRole`, ``session_id`` only
-        becomes known after :meth:`_maybe_wait_for_leader` populates
-        ``self._observed_leader``. This helper is called from
-        :meth:`start` immediately after
-        :meth:`_rewrite_output_dir_for_observed_session` so the
-        follower publishes itself before the leader's
-        :meth:`_distribute_config_to_followers` browser sweep.
+        becomes known after the browser populates
+        ``self._observed_leader``. Both the background observer thread
+        (started in :meth:`connect`) and :meth:`start` call into this
+        helper — the orchestrator's :class:`~threading.RLock` serializes
+        those concurrent attempts so exactly one advertiser instance is
+        constructed.
 
         No-op if the advertiser is already running (pre-shared follower
         path) or if this host isn't a follower at all.
         """
         if not isinstance(self._role, FollowerRole):
             return
-        if self._advertiser is not None:
-            return  # already up (pre-shared follower started in _maybe_start_advertising)
-        if self.session_id is None:
-            return  # _maybe_wait_for_leader should have set this; defensive guard
-        self._start_advertiser_now(self.session_id)
+        # Serialize concurrent callers (background observer vs
+        # start()'s main thread). RLock is reentrant so nested calls
+        # from within start() do not self-deadlock.
+        with self._lock:
+            if self._advertiser is not None:
+                return  # already up (pre-shared or another caller won the race)
+            if self.session_id is None:
+                return  # observation hasn't landed yet; defensive guard
+            self._start_advertiser_now(self.session_id)
 
     def _maybe_update_advert_recording(self) -> None:
         """Leader-only: flip the advert status to ``recording``.
@@ -2450,15 +2635,17 @@ class SessionOrchestrator:
     def _maybe_wait_for_leader(self) -> None:
         """Follower-only: block until a leader is advertising recording.
 
-        Opens a :class:`SessionBrowser`, waits up to
-        ``leader_wait_timeout_sec``, and stores the observed
-        announcement on :attr:`_observed_leader`. No-op for leader
-        and single-host sessions.
+        The browser itself is started at :meth:`connect` time (via
+        :meth:`_maybe_start_follower_browser_in_background`) so
+        operators see the cluster populate in the viewer before
+        clicking Record. The background observer thread may have
+        already set :attr:`_observed_leader` by the time this runs;
+        in that case we only need to wait for the status to flip to
+        ``recording``. No-op for leader and single-host sessions.
 
         Raises:
             TimeoutError: If no leader reaches ``recording`` before
-                the deadline. Caller (``start()``) is responsible
-                for cleaning up discovery state.
+                the deadline.
         """
         if not isinstance(self._role, FollowerRole):
             return
@@ -2474,21 +2661,43 @@ class SessionOrchestrator:
             self._observed_leader = self._static_leader
             return
 
-        self._browser = SessionBrowser(session_id=self._role.session_id)
-        self._browser.start()
-        timeout = self._role.leader_wait_timeout_sec
-        deadline = time.monotonic() + timeout
+        # Browser was normally started by connect() via
+        # :meth:`_maybe_start_follower_browser_in_background`. Guard
+        # defensively — if someone called start() without connecting
+        # (legacy one-shot path from IDLE) we may already be inside
+        # the auto-connect call that set the browser up; but if a
+        # future code path bypasses connect, start the browser now.
+        if self._browser is None:
+            self._maybe_start_follower_browser_in_background()
 
-        # Phase 1: observe leader ASAP (any status).
-        # Sets self._observed_leader so the follower can now advertise
-        # itself, which makes it discoverable by the leader's distribute
-        # and by the operator's viewer cluster panel.
-        first = self._browser.wait_for_observation(timeout=timeout)
-        self._observed_leader = first
+        assert self._browser is not None  # set by the helper above
+
+        timeout = getattr(self._role, "leader_wait_timeout_sec", 60.0)
+
+        # If the background observer thread already populated
+        # _observed_leader, we've already crossed Phase 1; skip straight
+        # to waiting for RECORDING.
+        if self._observed_leader is None:
+            deadline = time.monotonic() + timeout
+            # Phase 1: observe leader ASAP (any status). The background
+            # thread is blocked on the same event with timeout=inf; we
+            # race it to the match but with a bounded deadline so a
+            # truly missing leader still surfaces as TimeoutError here.
+            first = self._browser.wait_for_observation(timeout=timeout)
+            self._observed_leader = first
+            remaining = max(0.1, deadline - time.monotonic())
+        else:
+            remaining = timeout
+
+        # Advertiser may still not be up if the background observer
+        # raced us to setting _observed_leader but this main-thread
+        # path hadn't yet reached post-observation (or the background
+        # thread called it and got a stale None session_id). Calling
+        # here is idempotent — the helper's `if self._advertiser is
+        # not None: return` guard makes it a no-op on the second call.
         self._maybe_start_follower_advertising_post_observation()
 
         # Phase 2: wait for leader to actually reach recording status.
-        remaining = max(0.1, deadline - time.monotonic())
         recording_ann = self._browser.wait_for_recording(timeout=remaining)
         # Refresh to latest (status changed).
         self._observed_leader = recording_ann

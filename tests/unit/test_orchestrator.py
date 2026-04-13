@@ -946,10 +946,11 @@ class TestFollowerRoleIntegration:
         browser = _FakeBrowser.instances[0]
         assert browser.session_id == "amber-tiger-042"
         assert browser.started is True
-        # Observation wait gets the full timeout; recording wait gets
-        # whatever is left of the 60s deadline after observation returned
-        # (slightly less than 60 due to monotonic clock tick).
-        assert browser.wait_observation_calls == [60.0]
+        # After the connect()-time refactor the follower's browser is
+        # opened at connect() and a background daemon thread blocks on
+        # wait_for_observation(inf) until a leader appears. start()
+        # then just waits for the leader to reach RECORDING.
+        assert browser.wait_observation_calls == [float("inf")]
         assert len(browser.wait_recording_calls) == 1
         assert 0.0 < browser.wait_recording_calls[0] <= 60.0
 
@@ -1101,6 +1102,66 @@ class TestFollowerRoleIntegration:
         )
         with pytest.raises(RuntimeError, match="start"):
             session.wait_for_leader_stopped()
+
+
+class TestLeaderOnMdnsAfterConnect:
+    """Regression: connect() must bring the leader onto mDNS before
+    start() is called, so the viewer cluster panel can show every
+    attached host as soon as they're connected.
+    """
+
+    def test_leader_advertises_at_connect_not_start(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """Leader's advertiser must be live after connect(), BEFORE
+        start(). Previously it only started inside start()."""
+        import syncfield as sf
+        import syncfield.orchestrator as orch_mod
+
+        started_advertisers: list = []
+
+        class _FakeAdvertiser:
+            def __init__(self, **kwargs):
+                started_advertisers.append(kwargs)
+            def start(self): pass
+            def update_status(self, *a, **kw): pass
+            def close(self): pass
+
+        monkeypatch.setattr(
+            orch_mod, "SessionAdvertiser", _FakeAdvertiser, raising=False
+        )
+
+        session = sf.SessionOrchestrator(
+            host_id="mac_a",
+            output_dir=tmp_path,
+            role=sf.LeaderRole(
+                session_id="sid", control_plane_port=0
+            ),
+        )
+        session.add(FakeStream("cam"))
+        mic = FakeStream("mic")
+        mic.kind = "audio"
+        session.add(mic)
+
+        # No advertiser constructed yet — connect() is what brings it up.
+        assert len(started_advertisers) == 0
+
+        session.connect()
+        try:
+            # After connect: advertiser MUST be live.
+            assert len(started_advertisers) == 1
+            assert started_advertisers[0]["session_id"] == "sid"
+            assert started_advertisers[0]["host_id"] == "mac_a"
+            # Control plane is also up (so the advertiser could embed
+            # its actual port in the TXT record).
+            assert session._control_plane is not None
+        finally:
+            session.disconnect()
+
+        # After disconnect: advertiser + control plane torn down so the
+        # next connect() can bring fresh instances online.
+        assert session._advertiser is None
+        assert session._control_plane is None
 
 
 class TestSamplePersistence:
