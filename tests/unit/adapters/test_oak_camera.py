@@ -7,6 +7,7 @@ import sys
 import time
 from unittest.mock import MagicMock
 
+import numpy as np
 import pytest
 
 from syncfield.clock import SessionClock
@@ -36,10 +37,11 @@ def _build_fake_depthai() -> MagicMock:
     # --- Fake frame object with numpy-shaped data ------------------------
     class _FakeFrame:
         def __init__(self) -> None:
-            self._cv_frame = MagicMock()
-            self._cv_frame.shape = (1080, 1920, 3)
+            # Real BGR ndarray so the real VideoEncoder.write() path
+            # (via av.VideoFrame.from_ndarray) accepts it cleanly.
+            self._cv_frame = np.zeros((1080, 1920, 3), dtype=np.uint8)
 
-        def getCvFrame(self) -> MagicMock:
+        def getCvFrame(self) -> np.ndarray:
             return self._cv_frame
 
     # --- Fake output queue: unlimited stream of frames ------------------
@@ -86,22 +88,21 @@ def _build_fake_depthai() -> MagicMock:
 
 @pytest.fixture
 def mock_depthai(monkeypatch):
+    """Patch ``sys.modules['depthai']`` with a fake pipeline.
+
+    OAK tests that exercise the recording path must also inject
+    ``mock_av_generous`` (from ``conftest.py``) so the shared
+    ``VideoEncoder`` sees a fake ``av`` module.
+    """
     fake = _build_fake_depthai()
     monkeypatch.setitem(sys.modules, "depthai", fake)
-    # Also mock cv2 since the adapter uses it for the VideoWriter
-    fake_cv2 = MagicMock()
-    fake_cv2.VideoWriter_fourcc = lambda *args: 0
-    fake_cv2.VideoWriter.return_value = MagicMock()
-    monkeypatch.setitem(sys.modules, "cv2", fake_cv2)
-    # Force re-import so the adapter binds to the fake modules
     sys.modules.pop("syncfield.adapters.oak_camera", None)
-    importlib.import_module("syncfield.adapters.oak_camera")
-    yield fake, fake_cv2
+    yield fake
     sys.modules.pop("syncfield.adapters.oak_camera", None)
 
 
 class TestCapabilities:
-    def test_capabilities(self, mock_depthai, tmp_path):
+    def test_capabilities(self, mock_depthai, mock_av_generous, tmp_path):
         from syncfield.adapters.oak_camera import OakCameraStream
 
         stream = OakCameraStream("oak", output_dir=tmp_path)
@@ -120,8 +121,10 @@ class TestLifecycle:
     is pressed. These tests pin that split down.
     """
 
-    def test_connect_builds_and_starts_pipeline(self, mock_depthai, tmp_path):
-        fake, _ = mock_depthai
+    def test_connect_builds_and_starts_pipeline(
+        self, mock_depthai, mock_av_generous, tmp_path
+    ):
+        fake = mock_depthai
         from syncfield.adapters.oak_camera import OakCameraStream
 
         stream = OakCameraStream("oak", output_dir=tmp_path)
@@ -140,8 +143,10 @@ class TestLifecycle:
         finally:
             stream.disconnect()
 
-    def test_connect_raises_when_no_devices(self, mock_depthai, tmp_path):
-        fake, _ = mock_depthai
+    def test_connect_raises_when_no_devices(
+        self, mock_depthai, mock_av_generous, tmp_path
+    ):
+        fake = mock_depthai
         fake.Device.getAllAvailableDevices.return_value = []
         from syncfield.adapters.oak_camera import OakCameraStream
 
@@ -150,7 +155,9 @@ class TestLifecycle:
         with pytest.raises(RuntimeError, match="No OAK devices"):
             stream.connect()
 
-    def test_full_lifecycle_produces_file_path(self, mock_depthai, tmp_path):
+    def test_full_lifecycle_produces_file_path(
+        self, mock_depthai, mock_av_generous, tmp_path
+    ):
         from syncfield.adapters.oak_camera import OakCameraStream
 
         stream = OakCameraStream("oak", output_dir=tmp_path)
@@ -166,8 +173,10 @@ class TestLifecycle:
         assert report.file_path is not None
         assert report.frame_count >= 1
 
-    def test_disconnect_releases_pipeline(self, mock_depthai, tmp_path):
-        fake, _ = mock_depthai
+    def test_disconnect_releases_pipeline(
+        self, mock_depthai, mock_av_generous, tmp_path
+    ):
+        fake = mock_depthai
         from syncfield.adapters.oak_camera import OakCameraStream
 
         stream = OakCameraStream("oak", output_dir=tmp_path)
@@ -179,7 +188,9 @@ class TestLifecycle:
         pipeline = fake.Pipeline.return_value
         assert pipeline.stop.called
 
-    def test_legacy_start_stop_still_works(self, mock_depthai, tmp_path):
+    def test_legacy_start_stop_still_works(
+        self, mock_depthai, mock_av_generous, tmp_path
+    ):
         """Old 0.1-era ``prepare() → start() → stop()`` path stays valid."""
         from syncfield.adapters.oak_camera import OakCameraStream
 
@@ -195,9 +206,11 @@ class TestLifecycle:
 
 
 class TestDepthOption:
-    def test_depth_enabled_declares_depth_output(self, mock_depthai, tmp_path):
+    def test_depth_enabled_declares_depth_output(
+        self, mock_depthai, mock_av_generous, tmp_path
+    ):
         """When depth_enabled=True the pipeline builds a StereoDepth node."""
-        fake, _ = mock_depthai
+        fake = mock_depthai
         from syncfield.adapters.oak_camera import OakCameraStream
 
         stream = OakCameraStream(
@@ -214,9 +227,11 @@ class TestDepthOption:
         finally:
             stream.disconnect()
 
-    def test_depth_disabled_by_default(self, mock_depthai, tmp_path):
+    def test_depth_disabled_by_default(
+        self, mock_depthai, mock_av_generous, tmp_path
+    ):
         """Default config builds only the RGB camera node."""
-        fake, _ = mock_depthai
+        fake = mock_depthai
         from syncfield.adapters.oak_camera import OakCameraStream
 
         stream = OakCameraStream("oak", output_dir=tmp_path)
@@ -233,5 +248,7 @@ class TestImportGuard:
     def test_depthai_missing_raises_clear_install_hint(self, monkeypatch):
         monkeypatch.setitem(sys.modules, "depthai", None)
         sys.modules.pop("syncfield.adapters.oak_camera", None)
+        import syncfield.adapters as _pkg
+        monkeypatch.delattr(_pkg, "oak_camera", raising=False)
         with pytest.raises(ImportError, match=r"syncfield\[oak\]"):
             importlib.import_module("syncfield.adapters.oak_camera")
