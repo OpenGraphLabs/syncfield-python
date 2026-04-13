@@ -77,7 +77,7 @@ import threading
 import time
 from importlib.metadata import version as _pkg_version
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Union
 
 from syncfield.clock import SessionClock
 from syncfield.multihost.advertiser import SessionAdvertiser
@@ -283,6 +283,8 @@ class SessionOrchestrator:
         self._advertiser: Optional[SessionAdvertiser] = None
         self._browser: Optional[SessionBrowser] = None
         self._observed_leader: Optional[SessionAnnouncement] = None
+        # Control plane (HTTP server) — populated on start() when role is set.
+        self._control_plane: Optional[Any] = None
 
         self._output_dir = self._compute_initial_output_dir()
         self._sync_tone = sync_tone or SyncToneConfig.default()
@@ -448,6 +450,75 @@ class SessionOrchestrator:
             f"Add a microphone stream (e.g. HostAudioStream) before "
             f"calling start()."
         )
+
+    def _build_control_plane_adapter(self):
+        """Return an object that the control-plane routes can consume.
+
+        The routes read a handful of simple attributes and call four
+        triggers. We expose them through an adapter object rather than
+        letting the routes reach into ``SessionOrchestrator`` privates
+        — this keeps the routes decoupled and the orchestrator surface
+        intentional.
+        """
+        # Self-import: _ControlPlaneOrchestratorAdapter is defined at
+        # the bottom of this same module. Resolving it lazily inside the
+        # method (rather than at module-load time) avoids a forward-
+        # reference issue during class body evaluation.
+        from syncfield.orchestrator import _ControlPlaneOrchestratorAdapter
+
+        return _ControlPlaneOrchestratorAdapter(self)
+
+    def _start_control_plane(self) -> None:
+        """Spin up the HTTP control plane on the configured port.
+
+        Called from :meth:`start` when ``self._role`` is not ``None``,
+        after audio validation, before the advertiser. Populates
+        ``self._control_plane`` and reads back the actual port so the
+        advertiser can publish it via mDNS.
+        """
+        from syncfield.multihost.control_plane import ControlPlaneServer
+
+        assert self._role is not None  # called only in multi-host path
+        role = self._role
+        self._control_plane = ControlPlaneServer(
+            orchestrator=self._build_control_plane_adapter(),
+            preferred_port=getattr(role, "control_plane_port", 7878),
+            keep_alive_after_stop_sec=getattr(
+                role, "keep_alive_after_stop_sec", 600.0
+            ),
+        )
+        self._control_plane.start()
+        logger.info(
+            "Control plane listening on :%d for session %s",
+            self._control_plane.actual_port,
+            self.session_id,
+        )
+
+    def _arm_control_plane_keep_alive(self) -> None:
+        """Arm the keep-alive timer after a successful stop()."""
+        if self._control_plane is not None:
+            self._control_plane.arm_keep_alive_shutdown()
+
+    def _force_stop_control_plane(self) -> None:
+        """Tear the control plane down immediately (error-path cleanup)."""
+        if self._control_plane is not None:
+            try:
+                self._control_plane.stop()
+            except Exception as exc:  # pragma: no cover - best-effort
+                logger.warning("ControlPlaneServer.stop() failed: %s", exc)
+            self._control_plane = None
+
+    # -- test integration helpers (invoked only by dedicated tests) -----
+
+    def _start_control_plane_only_for_tests(self) -> None:
+        """Bypass start() to exercise control-plane wiring in isolation."""
+        if self._role is None:
+            raise RuntimeError("role required")
+        self._validate_multihost_audio_requirement()
+        self._start_control_plane()
+
+    def _stop_control_plane_only_for_tests(self) -> None:
+        self._force_stop_control_plane()
 
     # ------------------------------------------------------------------
     # Public properties
@@ -741,6 +812,7 @@ class SessionOrchestrator:
 
             if self._role is not None:
                 self._validate_multihost_audio_requirement()
+                self._start_control_plane()
 
             # Multi-host: advertise PREPARING / wait for leader BEFORE
             # touching the filesystem, so an auto-discover follower
@@ -752,6 +824,7 @@ class SessionOrchestrator:
                 self._rewrite_output_dir_for_observed_session()
             except Exception:
                 self._stop_discovery_on_failure()
+                self._force_stop_control_plane()
                 # Auto-connected sessions tear all the way back to IDLE
                 # on multi-host failure; explicit-connect sessions stay
                 # in CONNECTED so the caller can retry without
@@ -934,6 +1007,11 @@ class SessionOrchestrator:
 
             # Prepare a fresh episode path for the next recording.
             self._prepare_next_episode()
+
+            # Control plane stays up for keep_alive_after_stop_sec seconds
+            # so the leader (or the local viewer) can pull files / view
+            # final metrics. DELETE /session preempts the timer.
+            self._arm_control_plane_keep_alive()
 
             role_str = self._role.kind if self._role is not None else None
             return SessionReport(
@@ -1532,6 +1610,11 @@ class SessionOrchestrator:
             sdk_version=_pkg_version("syncfield"),
             chirp_enabled=self._sync_tone.enabled,
             graceful_shutdown_ms=self._role.graceful_shutdown_ms,
+            control_plane_port=(
+                self._control_plane.actual_port
+                if self._control_plane is not None
+                else None
+            ),
         )
         self._advertiser.start()
 
@@ -1641,3 +1724,150 @@ class SessionOrchestrator:
                 "call start() first"
             )
         return self._browser.wait_for_stopped(timeout=timeout)
+
+
+class _ControlPlaneOrchestratorAdapter:
+    """Narrow adapter between SessionOrchestrator and FastAPI routes.
+
+    Routes never touch ``SessionOrchestrator`` directly. They go through
+    this adapter, which:
+
+    - exposes a stable set of attributes (``host_id``, ``session_id``,
+      ``role_kind``, ``state_name``, ``sdk_version``),
+    - snapshots per-stream metrics into plain dataclass instances so
+      the orchestrator's stream dict can keep mutating without confusing
+      the route,
+    - translates the route triggers (``trigger_start`` / ``trigger_stop``
+      / ``trigger_control_plane_shutdown``) into the appropriate
+      orchestrator methods.
+    """
+
+    def __init__(self, orchestrator: "SessionOrchestrator") -> None:
+        self._orch = orchestrator
+
+    # -- identity surface --
+
+    @property
+    def host_id(self) -> str:
+        return self._orch.host_id
+
+    @property
+    def session_id(self) -> str:
+        sid = self._orch.session_id
+        assert sid is not None, "control plane requires a session_id"
+        return sid
+
+    @property
+    def role_kind(self) -> Optional[str]:
+        return self._orch._role.kind if self._orch._role is not None else None
+
+    @property
+    def state_name(self) -> str:
+        return self._orch.state.value
+
+    @property
+    def sdk_version(self) -> str:
+        from importlib.metadata import version
+
+        return version("syncfield")
+
+    # -- metrics snapshot --
+
+    def snapshot_stream_metrics(self):
+        from syncfield.multihost.control_plane.routes import StreamHealth  # type: ignore[attr-defined]  # noqa: F401
+
+        # Pull whatever metrics each stream exposes. Phase 3 is
+        # intentionally minimal — we report id/kind and fill the rest
+        # with zeros when the stream doesn't track them. Future phases
+        # can extend the stream contract with a dedicated metrics API.
+        # TODO(phase-4+): extract a formal StreamMetrics Protocol on
+        # the adapter contract instead of duck-typing into per-adapter
+        # private fields. Current names ({_last_fps, _frame_count,
+        # _dropped_count, _last_frame_ns, _bytes_written}) encode
+        # an assumption that every adapter uses these exact private
+        # attributes; silent zeros slip in otherwise.
+        # Grab a list snapshot under the orchestrator lock so a
+        # concurrent ``add()`` / ``_prepare_next_episode`` can't
+        # raise "dictionary changed size during iteration" on the
+        # uvicorn worker thread. We release the lock before building
+        # the per-stream snapshots so their construction doesn't
+        # serialize with session state transitions.
+        with self._orch._lock:
+            streams = list(self._orch._streams.values())
+
+        out = []
+        for stream in streams:
+            out.append(
+                _StreamMetricsSnapshot(
+                    id=stream.id,
+                    kind=getattr(stream, "kind", "custom"),
+                    fps=float(getattr(stream, "_last_fps", 0.0) or 0.0),
+                    frames=int(getattr(stream, "_frame_count", 0) or 0),
+                    dropped=int(getattr(stream, "_dropped_count", 0) or 0),
+                    last_frame_ns=getattr(stream, "_last_frame_ns", None),
+                    bytes_written=int(getattr(stream, "_bytes_written", 0) or 0),
+                )
+            )
+        return out
+
+    # -- triggers --
+
+    def trigger_start(self) -> str:
+        """Idempotently start recording.
+
+        **Blocks the uvicorn worker thread** for the full duration of
+        :meth:`SessionOrchestrator.start` — countdown, chirp, log
+        writer initialization, and device readiness. Callers hitting
+        ``POST /session/start`` should set HTTP client timeouts
+        comfortably above the expected countdown duration plus a few
+        seconds for chirp emission and file I/O. A Phase-4 refactor
+        is expected to move this to a worker pool so the HTTP request
+        returns 202 immediately with the transition proceeding in
+        the background.
+        """
+        from syncfield.types import SessionState
+
+        if self._orch.state is SessionState.RECORDING:
+            return self._orch.state.value
+        self._orch.start()
+        return self._orch.state.value
+
+    def trigger_stop(self) -> str:
+        """Idempotently stop recording.
+
+        **Blocks the uvicorn worker thread** for the full duration of
+        :meth:`SessionOrchestrator.stop` — chirp emission, finalization,
+        and writer close. Same client-timeout guidance as
+        :meth:`trigger_start`.
+        """
+        from syncfield.types import SessionState
+
+        if self._orch.state in (SessionState.STOPPED, SessionState.IDLE):
+            return self._orch.state.value
+        self._orch.stop()
+        return self._orch.state.value
+
+    def trigger_control_plane_shutdown(self) -> None:
+        # Defer the actual shutdown — the route is currently handling
+        # a request on the uvicorn thread that would be killed. Schedule
+        # it on a short delay.
+        import threading
+
+        timer = threading.Timer(0.05, self._orch._force_stop_control_plane)
+        timer.daemon = True
+        timer.start()
+
+
+class _StreamMetricsSnapshot:
+    """Tiny value object shape the routes accept (see `StreamHealth` in schemas)."""
+
+    __slots__ = ("id", "kind", "fps", "frames", "dropped", "last_frame_ns", "bytes_written")
+
+    def __init__(self, *, id, kind, fps, frames, dropped, last_frame_ns, bytes_written):
+        self.id = id
+        self.kind = kind
+        self.fps = fps
+        self.frames = frames
+        self.dropped = dropped
+        self.last_frame_ns = last_frame_ns
+        self.bytes_written = bytes_written

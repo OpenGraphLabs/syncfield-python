@@ -13,8 +13,13 @@ from syncfield.multihost.types import SessionAnnouncement
 
 
 class _FakeServiceInfo:
-    def __init__(self, properties: Dict[bytes, bytes]) -> None:
+    def __init__(
+        self,
+        properties: Dict[bytes, bytes],
+        port: Optional[int] = None,
+    ) -> None:
         self.properties = properties
+        self.port = port
 
 
 class _FakeZeroconf:
@@ -91,9 +96,13 @@ def _announcement(
     )
 
 
-def _register(zc: _FakeZeroconf, ann: SessionAnnouncement) -> str:
+def _register(
+    zc: _FakeZeroconf,
+    ann: SessionAnnouncement,
+    port: Optional[int] = None,
+) -> str:
     name = f"{ann.session_id}._syncfield._tcp.local."
-    zc.register(name, _FakeServiceInfo(ann.to_txt_record()))
+    zc.register(name, _FakeServiceInfo(ann.to_txt_record(), port=port))
     return name
 
 
@@ -218,3 +227,64 @@ class TestWaitForStopped:
         threading.Thread(target=simulate, daemon=True).start()
         observed = browser.wait_for_stopped(timeout=1.0)
         assert observed.status == "stopped"
+
+
+class TestControlPlanePortParsing:
+    """Browser surfaces ServiceInfo.port on each announcement.
+
+    The advertiser publishes the control-plane TCP port as the SRV
+    record's port (see ``advertiser.py``). The browser must read
+    ``ServiceInfo.port`` and attach it to the parsed announcement so
+    downstream viewers can reach the control plane. The legacy
+    sentinel ``port=0`` means "no control plane" and must surface as
+    ``None`` so callers don't accidentally try to open a socket on
+    port zero.
+    """
+
+    def test_parses_service_info_port_into_announcement(self, fake_backend):
+        zc, browsers = fake_backend
+        browser = SessionBrowser()
+        browser.start()
+        try:
+            ann = _announcement("amber-tiger-042", "recording", started_at_ns=1)
+            name = _register(zc, ann, port=7878)
+            browsers[0].fire_add(name)
+
+            snapshot = browser.current_sessions()
+            assert len(snapshot) == 1
+            observed = snapshot[0]
+            assert observed.session_id == "amber-tiger-042"
+            assert observed.control_plane_port == 7878
+        finally:
+            browser.close()
+
+    def test_zero_port_is_translated_to_none(self, fake_backend):
+        zc, browsers = fake_backend
+        browser = SessionBrowser()
+        browser.start()
+        try:
+            ann = _announcement("sid", "preparing")
+            name = _register(zc, ann, port=0)
+            browsers[0].fire_add(name)
+
+            snapshot = browser.current_sessions()
+            assert len(snapshot) == 1
+            assert snapshot[0].control_plane_port is None
+        finally:
+            browser.close()
+
+    def test_missing_port_attribute_is_none(self, fake_backend):
+        """Defensive: if a fake/backend doesn't set ``port`` at all, surface None."""
+        zc, browsers = fake_backend
+        browser = SessionBrowser()
+        browser.start()
+        try:
+            ann = _announcement("sid", "preparing")
+            name = _register(zc, ann, port=None)
+            browsers[0].fire_add(name)
+
+            snapshot = browser.current_sessions()
+            assert len(snapshot) == 1
+            assert snapshot[0].control_plane_port is None
+        finally:
+            browser.close()

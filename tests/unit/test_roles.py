@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+import syncfield as sf
 from syncfield.roles import FollowerRole, LeaderRole
 
 
@@ -56,3 +57,45 @@ class TestFollowerRole:
 
     def test_wait_timeout_override(self):
         assert FollowerRole(leader_wait_timeout_sec=5.0).leader_wait_timeout_sec == 5.0
+
+
+class TestControlPlaneConfig:
+    def test_leader_role_defaults(self) -> None:
+        r = sf.LeaderRole(session_id="amber-tiger-042")
+        assert r.control_plane_port == 7878
+        assert r.keep_alive_after_stop_sec == 600.0
+
+    def test_leader_role_accepts_overrides(self) -> None:
+        r = sf.LeaderRole(
+            session_id="amber-tiger-042",
+            control_plane_port=9090,
+            keep_alive_after_stop_sec=120.0,
+        )
+        assert r.control_plane_port == 9090
+        assert r.keep_alive_after_stop_sec == 120.0
+
+    def test_follower_role_defaults(self) -> None:
+        r = sf.FollowerRole()
+        assert r.control_plane_port == 7878
+        assert r.keep_alive_after_stop_sec == 600.0
+
+    def test_follower_role_accepts_overrides(self) -> None:
+        r = sf.FollowerRole(
+            control_plane_port=0,  # pure OS-assigned
+            keep_alive_after_stop_sec=0.5,
+        )
+        assert r.control_plane_port == 0
+        assert r.keep_alive_after_stop_sec == 0.5
+
+
+class TestControlPlaneDefaultsStayInSync:
+    def test_role_defaults_match_control_plane_module(self) -> None:
+        from syncfield.multihost.control_plane import (
+            DEFAULT_CONTROL_PLANE_PORT,
+            DEFAULT_KEEP_ALIVE_AFTER_STOP_SEC,
+        )
+
+        assert sf.LeaderRole().control_plane_port == DEFAULT_CONTROL_PLANE_PORT
+        assert sf.LeaderRole().keep_alive_after_stop_sec == DEFAULT_KEEP_ALIVE_AFTER_STOP_SEC
+        assert sf.FollowerRole().control_plane_port == DEFAULT_CONTROL_PLANE_PORT
+        assert sf.FollowerRole().keep_alive_after_stop_sec == DEFAULT_KEEP_ALIVE_AFTER_STOP_SEC

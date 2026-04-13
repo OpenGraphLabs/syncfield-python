@@ -21,6 +21,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from dataclasses import replace
 from typing import Any, Callable, Dict, List, Optional
 
 from syncfield.multihost.advertiser import SERVICE_TYPE
@@ -243,6 +244,13 @@ class SessionBrowser:
         except Exception as exc:  # pragma: no cover - best-effort
             logger.warning("bad announcement on %s: %s", name, exc)
             return
+        # Translate the legacy sentinel (port=0) to None so downstream
+        # code can distinguish "no control plane" from "port 0".
+        raw_port = getattr(info, "port", None)
+        port: Optional[int] = (
+            raw_port if (raw_port is not None and raw_port > 0) else None
+        )
+        ann = replace(ann, control_plane_port=port)
         with self._update_event:
             self._sessions[name] = ann
             self._update_event.notify_all()

@@ -113,3 +113,43 @@ class TestSessionAnnouncement:
         )
         with pytest.raises(dataclasses.FrozenInstanceError):
             a.status = "recording"  # type: ignore[misc]
+
+
+class TestControlPlanePort:
+    def test_default_is_none(self) -> None:
+        a = SessionAnnouncement(
+            session_id="sid",
+            host_id="h",
+            status="preparing",
+            sdk_version="0.2.0",
+            chirp_enabled=True,
+        )
+        assert a.control_plane_port is None
+
+    def test_round_trip_when_set(self) -> None:
+        a = SessionAnnouncement(
+            session_id="sid",
+            host_id="h",
+            status="recording",
+            sdk_version="0.2.0",
+            chirp_enabled=True,
+            control_plane_port=7878,
+        )
+        record = a.to_txt_record()
+        # The port lives on ServiceInfo.port, not TXT — not present here.
+        assert b"control_plane_port" not in record
+
+        # Parsing doesn't touch TXT; from_txt_record leaves it None.
+        parsed = SessionAnnouncement.from_txt_record(record)
+        assert parsed.control_plane_port is None
+
+    def test_explicit_field_survives_construction(self) -> None:
+        a = SessionAnnouncement(
+            session_id="sid",
+            host_id="h",
+            status="preparing",
+            sdk_version="0.2.0",
+            chirp_enabled=True,
+            control_plane_port=55123,
+        )
+        assert a.control_plane_port == 55123

@@ -31,10 +31,12 @@ logger = logging.getLogger(__name__)
 #: mDNS service type used by every SyncField session advertisement.
 SERVICE_TYPE = "_syncfield._tcp.local."
 
-#: Port advertised in the service record. We never actually serve over
-#: this port — the TXT record carries the entire signaling payload —
-#: but ``zeroconf`` requires a numeric value, and ``0`` is accepted by
-#: every mDNS stack we target.
+#: Legacy sentinel used when the host exposes no control plane. When
+#: :class:`SessionAdvertiser` is constructed without ``control_plane_port``,
+#: this value is published as ``ServiceInfo.port``; the browser
+#: translates it back to ``None``. When ``control_plane_port`` is
+#: supplied, the real port is published instead — the mDNS port field
+#: is now meaningful, not just a formality.
 ADVERT_PORT = 0
 
 
@@ -80,6 +82,11 @@ class SessionAdvertiser:
             the final ``"stopped"`` status before unregistering the
             service. Default ``1000`` ms — enough for any follower on
             the same network to receive the update and begin stopping.
+        control_plane_port: TCP port the host's HTTP control plane
+            serves on. Published as the mDNS ``ServiceInfo.port`` so
+            followers can discover it without a second round-trip.
+            ``None`` (default) falls back to the legacy sentinel ``0``
+            for callers that do not run a control plane.
     """
 
     def __init__(
@@ -89,6 +96,7 @@ class SessionAdvertiser:
         sdk_version: str,
         chirp_enabled: bool,
         graceful_shutdown_ms: int = 1000,
+        control_plane_port: Optional[int] = None,
     ) -> None:
         if not is_valid_session_id(session_id):
             raise ValueError(
@@ -101,6 +109,7 @@ class SessionAdvertiser:
             status="preparing",
             sdk_version=sdk_version,
             chirp_enabled=chirp_enabled,
+            control_plane_port=control_plane_port,
         )
         self._graceful_shutdown_ms = graceful_shutdown_ms
         self._zc: Any = None
@@ -183,6 +192,7 @@ class SessionAdvertiser:
                     if started_at_ns is not None
                     else self._announcement.started_at_ns
                 ),
+                control_plane_port=self._announcement.control_plane_port,
             )
             self._info = self._build_service_info(self._announcement)
             self._zc.update_service(self._info)
@@ -201,10 +211,15 @@ class SessionAdvertiser:
         rather than through private attribute mutation.
         """
         info_cls = _get_service_info_cls()
+        port = (
+            announcement.control_plane_port
+            if announcement.control_plane_port is not None
+            else ADVERT_PORT
+        )
         return info_cls(
             SERVICE_TYPE,
             f"{announcement.session_id}.{SERVICE_TYPE}",
-            port=ADVERT_PORT,
+            port=port,
             properties=announcement.to_txt_record(),
             server=f"{socket.gethostname()}.local.",
         )

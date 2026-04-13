@@ -48,6 +48,9 @@ viewer = [
 # on the local network — single-host sessions do not need this.
 multihost = [
     "zeroconf>=0.130",
+    "fastapi>=0.104.0",
+    "uvicorn[standard]>=0.24.0",
+    "httpx>=0.25.0",
 ]
 all = [
     "sounddevice>=0.4.6",
@@ -58,6 +61,7 @@ all = [
     "fastapi>=0.104.0",
     "uvicorn[standard]>=0.24.0",
     "zeroconf>=0.130",
+    "httpx>=0.25.0",
 ]
 
 [project.urls]

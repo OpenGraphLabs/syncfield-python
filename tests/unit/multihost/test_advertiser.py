@@ -124,6 +124,35 @@ class TestUpdateStatus:
             ad.update_status("recording")
 
 
+class TestControlPlanePortPublishing:
+    def test_service_info_port_reflects_constructor_value(self, fake_backend):
+        ad = _make_advertiser(control_plane_port=7878)
+        ad.start()
+        assert len(fake_backend.registered) == 1
+        assert fake_backend.registered[0].port == 7878
+
+    def test_defaults_to_sentinel_zero_when_port_not_supplied(self, fake_backend):
+        ad = _make_advertiser()
+        ad.start()
+        assert len(fake_backend.registered) == 1
+        # Backwards compatibility: no port supplied = legacy sentinel.
+        assert fake_backend.registered[0].port == 0
+
+    def test_port_preserved_across_status_transitions(self, fake_backend) -> None:
+        ad = _make_advertiser(control_plane_port=7878)
+        ad.start()
+        ad.update_status("recording", started_at_ns=99)
+        ad.update_status("stopped")
+
+        # Initial registration preserves port.
+        assert fake_backend.registered[0].port == 7878
+        # Every status-update ServiceInfo keeps the port too.
+        assert all(info.port == 7878 for info in fake_backend.updated)
+        # Pre-condition on the test setup: both transitions actually
+        # registered updates (defense against a silently-stubbed fake).
+        assert len(fake_backend.updated) == 2
+
+
 class TestClose:
     def test_unregisters_and_closes_zeroconf(self, fake_backend):
         ad = _make_advertiser()

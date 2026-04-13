@@ -54,6 +54,17 @@ class LeaderRole:
     session_id: Optional[str] = None
     graceful_shutdown_ms: int = 1000
 
+    #: TCP port the control plane will prefer when it binds. ``7878``
+    #: matches ``syncfield.multihost.control_plane.DEFAULT_CONTROL_PLANE_PORT``
+    #: (hardcoded here to keep ``roles`` free of FastAPI imports; the
+    #: invariant is pinned by a tests/unit/test_roles.py assertion).
+    control_plane_port: int = 7878
+
+    #: Seconds the control plane stays up after ``stop()`` so the leader
+    #: can pull files from followers. Default mirrors
+    #: ``syncfield.multihost.control_plane.DEFAULT_KEEP_ALIVE_AFTER_STOP_SEC``.
+    keep_alive_after_stop_sec: float = 600.0
+
     def __post_init__(self) -> None:
         if self.session_id is None:
             self.session_id = generate_session_id()
@@ -87,6 +98,17 @@ class FollowerRole:
 
     session_id: Optional[str] = None
     leader_wait_timeout_sec: float = 60.0
+
+    #: TCP port the control plane will prefer when it binds. ``7878``
+    #: matches ``syncfield.multihost.control_plane.DEFAULT_CONTROL_PLANE_PORT``
+    #: (hardcoded here to keep ``roles`` free of FastAPI imports; the
+    #: invariant is pinned by a tests/unit/test_roles.py assertion).
+    control_plane_port: int = 7878
+
+    #: Seconds the control plane stays up after ``stop()`` so the leader
+    #: can pull files from followers. Default mirrors
+    #: ``syncfield.multihost.control_plane.DEFAULT_KEEP_ALIVE_AFTER_STOP_SEC``.
+    keep_alive_after_stop_sec: float = 600.0
 
     def __post_init__(self) -> None:
         if self.session_id is not None and not is_valid_session_id(

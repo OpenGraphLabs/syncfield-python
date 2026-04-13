@@ -61,6 +61,12 @@ class SessionAnnouncement:
             of the most recent TXT update that refreshed this
             announcement. The leader ignores this when building a
             record; the browser sets it when parsing one.
+        control_plane_port: Leader-side field set to the TCP port the
+            host's HTTP control plane is serving on. The advertiser
+            publishes it as ``ServiceInfo.port`` (not via the TXT
+            record), so ``to_txt_record`` / ``from_txt_record`` deliberately
+            ignore it. The browser populates this field on announcements
+            reconstructed from a live ``ServiceInfo``.
     """
 
     session_id: str
@@ -70,6 +76,7 @@ class SessionAnnouncement:
     chirp_enabled: bool
     started_at_ns: Optional[int] = None
     last_seen_ns: Optional[int] = None
+    control_plane_port: Optional[int] = None
 
     def __post_init__(self) -> None:
         if self.status not in _VALID_STATUSES:
