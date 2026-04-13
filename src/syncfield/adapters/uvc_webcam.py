@@ -232,10 +232,10 @@ class UVCWebcamStream(StreamBase):
         assert self._input is not None
         try:
             for frame in self._input.decode(video=0):
+                capture_ns = time.monotonic_ns()
                 if self._stop_event.is_set():
                     break
 
-                capture_ns = time.monotonic_ns()
                 frame_bgr = frame.to_ndarray(format="bgr24")
 
                 with self._frame_lock:
