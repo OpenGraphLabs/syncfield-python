@@ -28,6 +28,8 @@ htmlcov/
 
 # Example output data
 examples/*/output/
+data_leader/
+data_follower/
 
 # Viewer frontend
 src/syncfield/viewer/static/
