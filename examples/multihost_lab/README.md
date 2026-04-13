@@ -1,54 +1,66 @@
 # Multi-Host Lab Example
 
-Two MacBooks, one research-lab session, no manual coordination.
+Two MacBooks, one research-lab session, zero manual coordination.
 
-## Setup
+## Install
 
-Install syncfield with the `multihost` extra on **every** host:
+On **every** host, same LAN:
 
 ```bash
-pip install "syncfield[multihost,uvc,audio]"
+pip install "syncfield[multihost,uvc,audio,viewer]"
 ```
-
-Every host must be on the same local network (mDNS does not traverse routers).
 
 ## Run
 
-**Leader MacBook** (`mac_a`):
 ```bash
+# Leader MacBook (operator sits here — viewer opens in browser)
 python examples/multihost_lab/leader.py
-```
 
-**Follower MacBook(s)** (`mac_b`, `mac_c`, …):
-```bash
+# Follower MacBook (headless — change host_id inside follower.py per host)
 python examples/multihost_lab/follower.py
 ```
 
-The follower blocks until it sees the leader's mDNS advertisement.
-Once the leader calls `session.start()`, the follower proceeds
-automatically. Chirp-anchored sync and session config distribution
-happen under the hood.
+## UI — everything happens in the leader's viewer
 
-## What happens
+The leader script launches `syncfield.viewer`. In your browser:
 
-1. Each host's orchestrator spins up a local HTTP control plane on
-   port 7878 (or OS-assigned on collision) and advertises itself
-   via mDNS.
-2. Leader's `start()` plays a rising audio chirp. Every host's
-   microphone records it — that's the inter-host sync anchor.
-3. Leader pushes the session config (session name, chirp spec) to
-   every follower over HTTP. Followers validate and apply.
-4. Recording runs until the leader calls `stop()` (falling chirp).
-5. Each host has its local output under
-   `./data/<session_id>/<host_id>/ep_*`.
-6. After stop, the leader calls `session.collect_from_followers()`
-   to pull each follower's files into one canonical tree at
-   `./data/<session_id>/`.
+1. **Cluster panel (right sidebar)** auto-populates as followers come online via mDNS — shows each peer's host_id, role, live fps/dropped/disk, RTT.
+2. **Record button** — starts the whole cluster atomically: leader plays rising chirp, followers auto-attach, every host begins recording.
+3. **Stop button** — falling chirp, every host stops.
+4. **Collect Data button** (leader-only, appears in the cluster panel after stop) — pulls every follower's files into a flat `./output/<session_id>/<leader_ep>/` tree with `<host>.<filename>` naming.
 
-## What you need
+Followers have no UI — they just block until they see the leader, mirror its start/stop, and keep their control plane alive for ~10 min so the leader can pull files.
 
-- Each host: ≥1 audio-capable stream (microphone). Enforced at `start()`.
-- Leader only: working speaker (to emit the chirp).
-- All hosts: the same local network, IPv4 multicast enabled (default
-  home WiFi is fine; some corporate guest networks aren't — see the
-  Multi-Host Sessions doc for the AP isolation workaround).
+## What you get
+
+```
+examples/multihost_lab/output/
+└── lab_session/
+    ├── aggregated_manifest.json
+    └── ep_20260413_143022_abc123/           ← leader's episode (canonical)
+        ├── mac_a.mac_webcam.mp4
+        ├── mac_a.iphone.mp4
+        ├── mac_a.host_audio.wav             ← captured leader's own chirp
+        ├── mac_a.sync_point.json
+        ├── mac_a.manifest.json
+        ├── mac_b.mac_webcam.mp4             ← pulled from follower mac_b
+        ├── mac_b.iphone.mp4
+        ├── mac_b.host_audio.wav             ← captured leader's chirp through air
+        ├── mac_b.sync_point.json
+        └── mac_b.manifest.json
+```
+
+Each host's `sync_point.json` anchors that host's monotonic clock; each `host_audio.wav` contains the leader's chirp. The downstream sync service uses both for sub-5ms inter-host alignment.
+
+## Requirements
+
+- Same local network (mDNS doesn't traverse routers)
+- IPv4 multicast enabled (most home WiFi works; some corporate guest networks isolate clients — try a phone hotspot if mDNS silent-fails)
+- Each host: ≥1 audio device (SDK auto-injects a mic stream)
+- Leader: working speaker (for the chirp)
+
+## Troubleshooting
+
+- **Follower prints "waiting for leader…" forever** — follower can't see the leader's mDNS advertisement. Check same-WiFi, try `dns-sd -B _syncfield._tcp. local.` on each host.
+- **Collect returns empty hosts** — follower's control plane timed out (`keep_alive_after_stop_sec=600s` by default; should be plenty).
+- **Single-machine testing** — use `scripts/multihost_local_cluster/` instead; macOS can't resolve mDNS TXT records on loopback so real multi-machine flow needs 2+ hosts.
