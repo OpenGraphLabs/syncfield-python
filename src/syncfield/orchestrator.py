@@ -138,6 +138,32 @@ def _generate_episode_path(data_dir: Path) -> Path:
     return data_dir / f"ep_{stamp}_{secrets.token_hex(3)}"
 
 
+def _generate_multihost_episode_path(
+    data_dir: Path, *, session_id: str, host_id: str
+) -> Path:
+    """Generate a timestamped episode path nested under session + host.
+
+    Mirrors :func:`_generate_episode_path` but prefixes the episode
+    directory with ``<session_id>/<host_id>/`` so multi-host sessions
+    from several machines can share the same ``data_dir`` without
+    filename collisions. The directory is not created on disk — the
+    caller is responsible for ``mkdir`` at the moment recording starts,
+    identical to the single-host path helper.
+    """
+    return _generate_episode_path(data_dir / session_id / host_id)
+
+
+#: Placeholder ``session_id`` embedded in the output path when an
+#: auto-discover :class:`~syncfield.roles.FollowerRole` has not yet
+#: observed its leader. Rewritten in-place by
+#: :meth:`SessionOrchestrator._rewrite_output_dir_for_observed_session`
+#: once the real id is known, before any files land on disk. Defined
+#: as a module-level constant so the rewrite logic (Task 3) can compare
+#: against a single symbol instead of string-matching this literal in
+#: two places.
+_PENDING_SESSION_PLACEHOLDER = "_pending_session"
+
+
 def _run_countdown(
     countdown_s: float,
     on_tick: Optional[Callable[[int], None]],
@@ -245,18 +271,25 @@ class SessionOrchestrator:
         self._host_id = host_id
         self._data_root = Path(output_dir)
         self._data_root.mkdir(parents=True, exist_ok=True)
-        self._output_dir = _generate_episode_path(self._data_root)
+        self._role: Optional[Role] = role
+
+        # Multi-host infrastructure — populated only when a role is set.
+        # Any attribute read by _compute_initial_output_dir() or its
+        # helper _resolve_session_id_for_path (currently _observed_leader,
+        # via the auto-discover fallback) MUST be initialized above the
+        # self._output_dir = self._compute_initial_output_dir() line
+        # below. Moving that call without checking this invariant will
+        # raise AttributeError at __init__ time.
+        self._advertiser: Optional[SessionAdvertiser] = None
+        self._browser: Optional[SessionBrowser] = None
+        self._observed_leader: Optional[SessionAnnouncement] = None
+
+        self._output_dir = self._compute_initial_output_dir()
         self._sync_tone = sync_tone or SyncToneConfig.default()
         self._chirp_player = chirp_player or create_default_player()
         self._streams: Dict[str, Stream] = {}
         self._state = SessionState.IDLE
         self._lock = threading.RLock()
-        self._role: Optional[Role] = role
-
-        # Multi-host infrastructure — populated only when role is set.
-        self._advertiser: Optional[SessionAdvertiser] = None
-        self._browser: Optional[SessionBrowser] = None
-        self._observed_leader: Optional[SessionAnnouncement] = None
 
         # Populated during start(); consumed during stop().
         self._sync_point: Optional[SyncPoint] = None
@@ -296,6 +329,125 @@ class SessionOrchestrator:
         # ``write()`` against a closed writer.
         self._sample_writers: Dict[str, SampleWriter] = {}
         self._sample_handler_active: Dict[str, List[bool]] = {}
+
+    def _compute_initial_output_dir(self) -> Path:
+        """Return the episode directory path for this session.
+
+        - Single-host (``role is None``): ``<data_root>/ep_*`` (unchanged).
+        - Multi-host: ``<data_root>/<session_id>/<host_id>/ep_*``.
+
+        For a :class:`FollowerRole` that was constructed without a
+        ``session_id`` (auto-discover mode), the real id is unknown until
+        :meth:`start` observes the leader. A stable placeholder
+        (``_pending_session``) is used so that streams registered before
+        ``start()`` still have a predictable path; :meth:`start` calls
+        :meth:`_rewrite_output_dir_for_observed_session` to rewrite the
+        path once the id is known.
+        """
+        if self._role is None:
+            return _generate_episode_path(self._data_root)
+
+        session_id = self._resolve_session_id_for_path()
+        return _generate_multihost_episode_path(
+            self._data_root,
+            session_id=session_id,
+            host_id=self._host_id,
+        )
+
+    def _resolve_session_id_for_path(self) -> str:
+        """Return the session_id to embed in the output path.
+
+        Leaders and pre-shared followers know the id immediately. Auto-
+        discover followers use ``_pending_session`` until the leader is
+        observed; once ``_observed_leader`` is populated, subsequent
+        calls (e.g. from ``_prepare_next_episode`` for a second episode)
+        return the real session_id instead of the placeholder.
+        """
+        if isinstance(self._role, LeaderRole):
+            assert self._role.session_id is not None  # set in __post_init__
+            return self._role.session_id
+        if isinstance(self._role, FollowerRole) and self._role.session_id is not None:
+            return self._role.session_id
+        if (
+            isinstance(self._role, FollowerRole)
+            and self._observed_leader is not None
+        ):
+            return self._observed_leader.session_id
+        return _PENDING_SESSION_PLACEHOLDER
+
+    def _rewrite_output_dir_for_observed_session(self) -> None:
+        """Recompute ``self._output_dir`` now that the real session_id is known.
+
+        Called after a :class:`FollowerRole` finishes observing the leader
+        inside :meth:`start`. No-op for leaders, pre-shared followers, and
+        single-host sessions — they already know the correct path at
+        ``__init__`` time.
+        """
+        if not isinstance(self._role, FollowerRole):
+            return
+        if self._role.session_id is not None:
+            return  # pre-shared id already embedded at init
+        if self._observed_leader is None:
+            return  # nothing to rewrite against
+
+        real_session_id = self._observed_leader.session_id
+        self._output_dir = _generate_multihost_episode_path(
+            self._data_root,
+            session_id=real_session_id,
+            host_id=self._host_id,
+        )
+        self._rebind_stream_output_dirs()
+
+    def _rebind_stream_output_dirs(self) -> None:
+        """Propagate ``self._output_dir`` into streams that cached it at ``add()`` time.
+
+        Adapters cache their output directory (and derived video / audio
+        file paths) when a stream is registered. When the session's
+        output directory changes mid-flight — either because a multi-
+        host follower observed its leader (:meth:`_rewrite_output_dir_for_observed_session`)
+        or because a new episode was prepared (:meth:`_prepare_next_episode`)
+        — each stream's cached path needs to be rewritten to the new
+        directory. The attribute-level ``hasattr`` probing is duck-typed
+        because different adapter families cache different fields; the
+        contract is "if you cache it, we overwrite it."
+        """
+        for stream in self._streams.values():
+            if hasattr(stream, "_output_dir"):
+                stream._output_dir = self._output_dir
+            if hasattr(stream, "_file_path"):
+                stream._file_path = self._output_dir / f"{stream.id}.mp4"
+            if hasattr(stream, "_mp4_path"):
+                stream._mp4_path = self._output_dir / f"{stream.id}.mp4"
+            if hasattr(stream, "_wav_path"):
+                stream._wav_path = None
+
+    def _validate_multihost_audio_requirement(self) -> None:
+        """Raise ``ValueError`` if this multi-host host has no audio stream.
+
+        The chirp-based inter-host alignment requires every host to have
+        at least one audio-capable stream:
+
+        - Leader: must record the chirp it plays so the hardware DAC
+          timestamp can be recovered in post-processing.
+        - Follower: must record the leader's chirp arriving through the
+          air so audio cross-correlation can pin its clock.
+
+        Single-host sessions impose no such requirement.
+        """
+        if self._role is None:
+            return
+
+        has_audio = any(stream.kind == "audio" for stream in self._streams.values())
+        if has_audio:
+            return
+
+        raise ValueError(
+            f"multi-host role '{self._role.kind}' on host "
+            f"'{self._host_id}' requires at least one audio-capable "
+            f"stream; none of {list(self._streams)} qualify. "
+            f"Add a microphone stream (e.g. HostAudioStream) before "
+            f"calling start()."
+        )
 
     # ------------------------------------------------------------------
     # Public properties
@@ -587,26 +739,17 @@ class SessionOrchestrator:
             else:
                 self._auto_connected = False
 
-            # Create the episode directory on first recording.
-            # The path was generated in __init__ and shared with streams
-            # via output_dir, so we must NOT regenerate it here.
-            if not self._episode_dir_created:
-                self._output_dir.mkdir(parents=True, exist_ok=True)
-                self._episode_dir_created = True
-                logger.info("Episode dir created: %s", self._output_dir)
+            if self._role is not None:
+                self._validate_multihost_audio_requirement()
 
-            # Open session log now that the directory exists.
-            if self._log_writer is None:
-                self._log_writer = SessionLogWriter(self._output_dir)
-                self._log_writer.open()
-
-            # Multi-host: advertise PREPARING / wait for leader. Moved
-            # out of the legacy PREPARING branch because CONNECTED
-            # already lets us know devices are live.
+            # Multi-host: advertise PREPARING / wait for leader BEFORE
+            # touching the filesystem, so an auto-discover follower
+            # never mkdirs the `_pending_session` placeholder path.
             self._transition(SessionState.PREPARING)
             try:
                 self._maybe_start_advertising()
                 self._maybe_wait_for_leader()
+                self._rewrite_output_dir_for_observed_session()
             except Exception:
                 self._stop_discovery_on_failure()
                 # Auto-connected sessions tear all the way back to IDLE
@@ -618,12 +761,29 @@ class SessionOrchestrator:
                     self._connected_streams = []
                     self._auto_connected = False
                     self._transition(SessionState.IDLE)
+                    # After the Task 3 reorder, _log_writer is created
+                    # post-discovery, so on this failure path it is
+                    # typically None — keep the close() guard as defense-
+                    # in-depth in case a retry ever leaves a writer behind.
                     if self._log_writer is not None:
                         self._log_writer.close()
                         self._log_writer = None
                 else:
                     self._transition(SessionState.CONNECTED)
                 raise
+
+            # Create the episode directory on first recording. The path
+            # is now final: leaders and pre-shared followers had it at
+            # __init__; auto-discover followers had it rewritten above.
+            if not self._episode_dir_created:
+                self._output_dir.mkdir(parents=True, exist_ok=True)
+                self._episode_dir_created = True
+                logger.info("Episode dir created: %s", self._output_dir)
+
+            # Open session log now that the directory exists.
+            if self._log_writer is None:
+                self._log_writer = SessionLogWriter(self._output_dir)
+                self._log_writer.open()
 
             # --- Countdown -------------------------------------------
             # Wrap the caller's visual callback with the tick beep so a
@@ -1168,18 +1328,10 @@ class SessionOrchestrator:
         writes to a new directory. Every stream adapter that holds a
         reference to the output path is updated to the new location.
         """
-        self._output_dir = _generate_episode_path(self._data_root)
+        self._output_dir = self._compute_initial_output_dir()
         self._episode_dir_created = False
 
-        for stream in self._streams.values():
-            if hasattr(stream, "_output_dir"):
-                stream._output_dir = self._output_dir
-            if hasattr(stream, "_file_path"):
-                stream._file_path = self._output_dir / f"{stream.id}.mp4"
-            if hasattr(stream, "_mp4_path"):
-                stream._mp4_path = self._output_dir / f"{stream.id}.mp4"
-            if hasattr(stream, "_wav_path"):
-                stream._wav_path = None
+        self._rebind_stream_output_dirs()
 
     # ------------------------------------------------------------------
     # Host audio auto-injection

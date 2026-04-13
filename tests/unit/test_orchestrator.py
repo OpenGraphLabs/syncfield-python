@@ -748,6 +748,12 @@ class TestLeaderRoleIntegration:
             role=LeaderRole(session_id="amber-tiger-042"),
         )
         session.add(FakeStream("cam"))
+        # Multi-host audio requirement (Phase 1 spec §11): every host
+        # must register at least one audio-capable stream. FakeStream
+        # hard-codes kind="custom", so mutate the plain attribute.
+        audio_stream = FakeStream("mic_for_chirp")
+        audio_stream.kind = "audio"
+        session.add(audio_stream)
         session.start()
 
         assert len(_FakeAdvertiser.instances) == 1
@@ -776,6 +782,10 @@ class TestLeaderRoleIntegration:
             role=LeaderRole(session_id="amber-tiger-042"),
         )
         session.add(FakeStream("cam"))
+        # Multi-host audio requirement (Phase 1 spec §11).
+        audio_stream = FakeStream("mic_for_chirp")
+        audio_stream.kind = "audio"
+        session.add(audio_stream)
         session.start()
         report = session.stop()
 
@@ -794,6 +804,10 @@ class TestLeaderRoleIntegration:
             role=LeaderRole(session_id="amber-tiger-042"),
         )
         session.add(FakeStream("cam"))
+        # Multi-host audio requirement (Phase 1 spec §11).
+        audio_stream = FakeStream("mic_for_chirp")
+        audio_stream.kind = "audio"
+        session.add(audio_stream)
         session.start()
         session.stop()
 
@@ -816,6 +830,10 @@ class TestLeaderRoleIntegration:
             role=role,
         )
         session.add(FakeStream("cam"))
+        # Multi-host audio requirement (Phase 1 spec §11).
+        audio_stream = FakeStream("mic_for_chirp")
+        audio_stream.kind = "audio"
+        session.add(audio_stream)
         session.start()
         session.stop()
 
@@ -837,6 +855,12 @@ class TestLeaderRoleIntegration:
             role=LeaderRole(session_id="amber-tiger-042"),
         )
         session.add(FakeStream("cam", provides_audio_track=True))
+        # Multi-host audio requirement (Phase 1 spec §11): kind=="audio"
+        # is a stronger guarantee than provides_audio_track (video-with-
+        # embedded-audio). Add a dedicated audio stream.
+        audio_stream = FakeStream("mic_for_chirp")
+        audio_stream.kind = "audio"
+        session.add(audio_stream)
         session.start()
         session.stop()
 
@@ -873,6 +897,10 @@ class TestFollowerRoleIntegration:
             role=FollowerRole(session_id="amber-tiger-042"),
         )
         session.add(FakeStream("cam"))
+        # Multi-host audio requirement (Phase 1 spec §11).
+        audio_stream = FakeStream("mic_for_chirp")
+        audio_stream.kind = "audio"
+        session.add(audio_stream)
         session.start()
 
         assert len(_FakeBrowser.instances) == 1
@@ -908,6 +936,12 @@ class TestFollowerRoleIntegration:
         # Audio-capable stream would normally trigger chirps — but the
         # follower role must override that.
         session.add(FakeStream("audio_cam", provides_audio_track=True))
+        # Multi-host audio requirement (Phase 1 spec §11): a dedicated
+        # kind=="audio" stream is required regardless of whether another
+        # stream happens to carry an audio track.
+        audio_stream = FakeStream("mic_for_chirp")
+        audio_stream.kind = "audio"
+        session.add(audio_stream)
         session.start()
         session.stop()
 
@@ -929,6 +963,10 @@ class TestFollowerRoleIntegration:
             ),
         )
         session.add(FakeStream("cam"))
+        # Multi-host audio requirement (Phase 1 spec §11).
+        audio_stream = FakeStream("mic_for_chirp")
+        audio_stream.kind = "audio"
+        session.add(audio_stream)
         with pytest.raises(TimeoutError):
             session.start()
 
@@ -948,6 +986,10 @@ class TestFollowerRoleIntegration:
             role=FollowerRole(session_id="amber-tiger-042"),
         )
         session.add(FakeStream("cam"))
+        # Multi-host audio requirement (Phase 1 spec §11).
+        audio_stream = FakeStream("mic_for_chirp")
+        audio_stream.kind = "audio"
+        session.add(audio_stream)
         session.start()
         session.stop()
 
@@ -979,6 +1021,10 @@ class TestFollowerRoleIntegration:
             role=FollowerRole(session_id="amber-tiger-042"),
         )
         session.add(FakeStream("cam"))
+        # Multi-host audio requirement (Phase 1 spec §11).
+        audio_stream = FakeStream("mic_for_chirp")
+        audio_stream.kind = "audio"
+        session.add(audio_stream)
         session.start()
         observed_stop = session.wait_for_leader_stopped(timeout=1.5)
         assert observed_stop.status == "stopped"
