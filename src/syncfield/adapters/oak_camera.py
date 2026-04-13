@@ -2,15 +2,15 @@
 
 Supports OAK-1, OAK-D, OAK-D Lite, OAK-D S2 and related devices through the
 DepthAI v3 pipeline API. The adapter captures RGB frames to an MP4 file via
-``cv2.VideoWriter`` and, when ``depth_enabled=True``, also writes a raw uint16
-depth stream (little-endian, millimeters) to a sibling ``.depth.bin`` file.
+the shared :class:`~syncfield.adapters._video_encoder.VideoEncoder` (PyAV)
+and, when ``depth_enabled=True``, also writes a raw uint16 depth stream
+(little-endian, millimeters) to a sibling ``.depth.bin`` file.
 
-Requires two optional extras:
+Requires the ``oak`` optional extra:
 
     pip install syncfield[oak]     # depthai
-    pip install syncfield[uvc]     # opencv-python for the MP4 writer
 
-Both extras are available together via ``syncfield[all]``.
+The ``VideoEncoder`` dependency (PyAV) ships with the base package.
 
 Lifecycle
 ---------
@@ -60,13 +60,7 @@ except ImportError as exc:  # pragma: no cover - exercised via sys.modules patch
         "Install with `pip install syncfield[oak]`."
     ) from exc
 
-try:
-    import cv2  # type: ignore[import-not-found]
-except ImportError as exc:  # pragma: no cover - exercised via sys.modules patch
-    raise ImportError(
-        "OakCameraStream also requires opencv-python for the MP4 writer. "
-        "Install with `pip install syncfield[uvc]`."
-    ) from exc
+from syncfield.adapters._video_encoder import VideoEncoder
 
 from syncfield.clock import SessionClock
 from syncfield.stream import StreamBase
@@ -146,7 +140,7 @@ class OakCameraStream(StreamBase):
         # Recording state.
         self._mp4_path = self._output_dir / f"{id}.mp4"
         self._depth_path = self._output_dir / f"{id}.depth.bin"
-        self._video_writer: Any = None
+        self._video_writer: Optional[VideoEncoder] = None
         self._depth_file: Any = None
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
@@ -294,7 +288,7 @@ class OakCameraStream(StreamBase):
         """Open output files and flip the recording flag.
 
         The capture thread is already running from :meth:`connect`, so
-        this is a :class:`cv2.VideoWriter` construction plus a boolean
+        this is a :class:`VideoEncoder` construction plus a boolean
         flip — fast enough to run atomically across every stream in
         the orchestrator's start phase.
 
@@ -306,10 +300,19 @@ class OakCameraStream(StreamBase):
             self.connect()
         self._output_dir.mkdir(parents=True, exist_ok=True)
 
+        # Reset per-recording counters so a second recording in the same
+        # session starts clean.
+        self._frame_count = 0
+        self._depth_frame_count = 0
+        self._first_at = None
+        self._last_at = None
+
         width, height = self._rgb_resolution
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        self._video_writer = cv2.VideoWriter(
-            str(self._mp4_path), fourcc, float(self._rgb_fps), (width, height)
+        self._video_writer = VideoEncoder.open(
+            self._mp4_path,
+            width=width,
+            height=height,
+            fps=float(self._rgb_fps),
         )
         if self._depth_enabled:
             self._depth_file = open(self._depth_path, "wb")
@@ -425,7 +428,7 @@ class OakCameraStream(StreamBase):
           ``SampleEvent``. The capture runs continuously from the
           moment :meth:`connect` spawned this thread.
         * **Recording** (``_recording == True``) — same preview
-          publish, plus write to the ``VideoWriter``, advance
+          publish, plus write to the ``VideoEncoder``, advance
           ``_frame_count``, drain a depth tick, and emit
           ``SampleEvent``. The capture timestamp is sampled
           *immediately* after ``queue.get()`` so the jitter between
@@ -497,7 +500,7 @@ class OakCameraStream(StreamBase):
     def _release_writers(self) -> None:
         if self._video_writer is not None:
             try:
-                self._video_writer.release()
+                self._video_writer.close()
             except Exception:
                 pass
             self._video_writer = None
