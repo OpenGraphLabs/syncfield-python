@@ -259,9 +259,13 @@ class UVCWebcamStream(StreamBase):
         try:
             for frame in self._input.decode(video=0):
                 capture_ns = time.monotonic_ns()
-                if self._prev_capture_ns is not None:
-                    self._intervals_ns.append(capture_ns - self._prev_capture_ns)
-                self._prev_capture_ns = capture_ns
+                # Jitter collection runs only during the recording window so preview
+                # intervals don't pollute the report and so the capture thread never
+                # mutates the list while stop_recording() is reading it.
+                if self._recording:
+                    if self._prev_capture_ns is not None:
+                        self._intervals_ns.append(capture_ns - self._prev_capture_ns)
+                    self._prev_capture_ns = capture_ns
                 if self._stop_event.is_set():
                     break
 

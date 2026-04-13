@@ -453,9 +453,11 @@ class OakCameraStream(StreamBase):
             capture_ns = time.monotonic_ns()
             if rgb_msg is None:
                 continue
-            if self._prev_capture_ns is not None:
-                self._intervals_ns.append(capture_ns - self._prev_capture_ns)
-            self._prev_capture_ns = capture_ns
+            # Recording-window-only jitter collection (see UVC adapter for rationale).
+            if self._recording:
+                if self._prev_capture_ns is not None:
+                    self._intervals_ns.append(capture_ns - self._prev_capture_ns)
+                self._prev_capture_ns = capture_ns
 
             frame = rgb_msg.getCvFrame()
 
