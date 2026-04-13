@@ -323,18 +323,43 @@ class SessionBrowser:
                 )
                 return
 
-        if info is None:
-            logger.warning(
-                "_refresh: get_service_info still None after retry for %s — "
-                "peer not resolved",
-                name,
+        if info is None or not getattr(info, "properties", None):
+            # macOS fallback: try the system dns-sd before giving up.
+            from syncfield.multihost._dns_sd_fallback import (
+                is_macos,
+                resolve_via_dns_sd,
             )
-            return
-        if not getattr(info, "properties", None):
-            logger.warning(
-                "_refresh: %s has empty TXT record properties", name
-            )
-            return
+            if is_macos():
+                logger.info(
+                    "_refresh: get_service_info returned None/empty for %s; "
+                    "trying macOS dns-sd fallback...",
+                    name,
+                )
+                info = resolve_via_dns_sd(name, SERVICE_TYPE)
+                if info is None:
+                    logger.warning(
+                        "_refresh: macOS dns-sd fallback also failed for %s — "
+                        "peer not resolved",
+                        name,
+                    )
+                    return
+                logger.info(
+                    "_refresh: macOS dns-sd fallback resolved %s (port=%s)",
+                    name,
+                    info.port,
+                )
+            else:
+                if info is None:
+                    logger.warning(
+                        "_refresh: get_service_info still None after retry "
+                        "for %s — peer not resolved",
+                        name,
+                    )
+                else:
+                    logger.warning(
+                        "_refresh: %s has empty TXT record properties", name
+                    )
+                return
         try:
             ann = SessionAnnouncement.from_txt_record(
                 info.properties, last_seen_ns=time.monotonic_ns()
