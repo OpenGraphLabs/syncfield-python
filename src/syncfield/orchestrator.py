@@ -2247,10 +2247,15 @@ class _ControlPlaneOrchestratorAdapter:
         return self._orch.host_id
 
     @property
-    def session_id(self) -> str:
-        sid = self._orch.session_id
-        assert sid is not None, "control plane requires a session_id"
-        return sid
+    def session_id(self) -> Optional[str]:
+        """Current session_id, or ``None`` for an auto-discover follower
+        that hasn't observed its leader yet.
+
+        Requests received during the pre-observation window return 503
+        via :func:`~syncfield.multihost.control_plane.auth.verify_session_token`
+        — callers should retry after the follower has attached.
+        """
+        return self._orch.session_id
 
     @property
     def role_kind(self) -> Optional[str]:

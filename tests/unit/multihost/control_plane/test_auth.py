@@ -12,9 +12,14 @@ from fastapi.testclient import TestClient
 from syncfield.multihost.control_plane.auth import verify_session_token
 
 
+class _FakeOrch:
+    def __init__(self, sid):
+        self.session_id = sid
+
+
 def _make_app(session_id: str) -> FastAPI:
     app = FastAPI()
-    app.state.session_id = session_id
+    app.state.orchestrator = _FakeOrch(session_id)
 
     @app.get("/protected", dependencies=[Depends(verify_session_token)])
     def protected():
@@ -50,8 +55,8 @@ class TestVerifySessionToken:
         assert resp.status_code == 200
         assert resp.json() == {"ok": True}
 
-    def test_missing_app_state_session_id_returns_500(self) -> None:
-        # Misconfiguration path: app.state.session_id not set → server
+    def test_missing_orchestrator_returns_500(self) -> None:
+        # Misconfiguration path: app.state.orchestrator not set → server
         # error (not 401), because this is an auth-contract violation
         # on our side, not the client's.
         app = FastAPI()
@@ -65,3 +70,22 @@ class TestVerifySessionToken:
             "/protected", headers={"Authorization": "Bearer anything"}
         )
         assert resp.status_code == 500
+
+    def test_pre_observation_follower_session_id_none_returns_503(self) -> None:
+        # Orchestrator exists but session_id isn't known yet (auto-discover
+        # follower in the brief window before observing the leader).
+        app = FastAPI()
+
+        class _PreObservationOrchestrator:
+            session_id = None
+
+        app.state.orchestrator = _PreObservationOrchestrator()
+
+        @app.get("/protected", dependencies=[Depends(verify_session_token)])
+        def protected():
+            return {"ok": True}
+
+        client = TestClient(app)
+        resp = client.get("/protected", headers={"Authorization": "Bearer x"})
+        assert resp.status_code == 503
+        assert "Retry-After" in resp.headers

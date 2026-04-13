@@ -125,3 +125,58 @@ class TestControlPlaneSpinUp:
                 headers={"Authorization": "Bearer amber-tiger-042"},
                 timeout=0.5,
             )
+
+
+class TestAutoDiscoverFollowerControlPlane:
+    def test_follower_without_session_id_can_start_control_plane(self, tmp_path):
+        """Regression: auto-discover follower (FollowerRole() with no
+        session_id) used to crash on session.start() because the
+        control plane adapter asserted session_id is not None."""
+        session = sf.SessionOrchestrator(
+            host_id="mac_b",
+            output_dir=tmp_path,
+            role=sf.FollowerRole(
+                control_plane_port=0, keep_alive_after_stop_sec=0.5
+            ),
+            # No session_id — auto-discover mode.
+        )
+        session.add(FakeStream("cam"))
+        mic = FakeStream("mic")
+        mic.kind = "audio"
+        session.add(mic)
+
+        # Direct exercise of the wiring that was crashing.
+        session._start_control_plane_only_for_tests()
+        try:
+            assert session._control_plane is not None
+            assert session._control_plane.actual_port > 0
+        finally:
+            session._stop_control_plane_only_for_tests()
+
+    def test_pre_observation_requests_get_503(self, tmp_path):
+        """Auth returns 503 when session_id isn't known yet, not 401/500."""
+        session = sf.SessionOrchestrator(
+            host_id="mac_b",
+            output_dir=tmp_path,
+            role=sf.FollowerRole(
+                control_plane_port=0, keep_alive_after_stop_sec=0.5
+            ),
+        )
+        session.add(FakeStream("cam"))
+        mic = FakeStream("mic")
+        mic.kind = "audio"
+        session.add(mic)
+
+        session._start_control_plane_only_for_tests()
+        try:
+            port = session._control_plane.actual_port
+            # No bearer token, but auth runs first and should 503.
+            resp = httpx.get(
+                f"http://127.0.0.1:{port}/health",
+                headers={"Authorization": "Bearer anything"},
+                timeout=2.0,
+            )
+            assert resp.status_code == 503
+            assert "Retry-After" in resp.headers
+        finally:
+            session._stop_control_plane_only_for_tests()

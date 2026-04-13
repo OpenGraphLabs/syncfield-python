@@ -122,7 +122,6 @@ def build_control_plane_app(
     )
 
     app.state.orchestrator = orchestrator
-    app.state.session_id = orchestrator.session_id
     app.state.started_at_monotonic_s = (
         started_at_monotonic_s if started_at_monotonic_s is not None else time.monotonic()
     )

@@ -8,8 +8,10 @@ is "trusted local network, keep Rig A from accidentally hitting Rig B".
 
 The dependency reads the token from the standard ``Authorization:
 Bearer <token>`` header and compares it against
-``request.app.state.session_id``, which the orchestrator sets when it
-constructs the FastAPI app.
+``request.app.state.orchestrator.session_id`` — read live on each
+request so an auto-discover follower that observes its leader
+mid-flight picks up the newly-known session_id without rebuilding
+the app.
 """
 
 from __future__ import annotations
@@ -31,14 +33,21 @@ def verify_session_token(request: Request) -> None:
     """
     credentials = _extract_credentials(request)
 
-    expected = getattr(request.app.state, "session_id", None)
-    if expected is None:
-        # The orchestrator forgot to attach state.session_id. This is a
-        # server-side misconfiguration; return 500, not 401, so it
-        # doesn't masquerade as a client auth failure.
+    orch = getattr(request.app.state, "orchestrator", None)
+    if orch is None:
+        # No orchestrator wired at all — genuine server-side misconfig.
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="control plane misconfigured: app.state.session_id is unset",
+            detail="control plane misconfigured: app.state.orchestrator is unset",
+        )
+    expected = orch.session_id
+    if expected is None:
+        # Pre-observation follower — session_id isn't known yet. Bearer
+        # auth can't succeed until the follower has observed its leader.
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="session_id not yet known (auto-discover follower still attaching)",
+            headers={"Retry-After": "2"},
         )
 
     if credentials is None or credentials.scheme.lower() != "bearer":
