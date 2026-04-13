@@ -30,18 +30,19 @@ audio = [
     "sounddevice>=0.4.6",
     "numpy>=1.21",
 ]
-uvc = ["opencv-python>=4.5"]
+uvc = ["av>=12.0.0"]
 ble = ["bleak>=0.21"]
-# OakCameraStream uses depthai v3 for the pipeline and reuses the `uvc`
-# extra's opencv-python for the MP4 writer. Install `syncfield[oak,uvc]`
-# (or `syncfield[all]`) for the full OAK capture path.
-oak = ["depthai>=3.0.0"]
+# OakCameraStream uses depthai v3 for the pipeline and PyAV for the MP4
+# writer. Install `syncfield[oak]` for the full OAK capture path.
+oak = ["depthai>=3.0.0", "av>=12.0.0"]
 # The web viewer uses FastAPI + uvicorn and opens a browser tab.
-# opencv-python is needed for MJPEG encoding of video frames.
+# PyAV handles MJPEG encoding of video frames; Pillow is used for still
+# image conversions.
 viewer = [
     "fastapi>=0.104.0",
     "uvicorn[standard]>=0.24.0",
-    "opencv-python>=4.8.0",
+    "av>=12.0.0",
+    "Pillow>=10.0.0",
 ]
 # mDNS-based multi-host session rendezvous (syncfield.multihost). Required
 # only when you want a leader/follower session discovered automatically
@@ -55,7 +56,8 @@ multihost = [
 all = [
     "sounddevice>=0.4.6",
     "numpy>=1.21",
-    "opencv-python>=4.8.0",
+    "av>=12.0.0",
+    "Pillow>=10.0.0",
     "bleak>=0.21",
     "depthai>=3.0.0",
     "fastapi>=0.104.0",
