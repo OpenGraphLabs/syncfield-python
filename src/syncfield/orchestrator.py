@@ -302,6 +302,12 @@ class SessionOrchestrator:
         self._observed_leader: Optional[SessionAnnouncement] = None
         # Control plane (HTTP server) — populated on start() when role is set.
         self._control_plane: Optional[Any] = None
+        # Cached capability snapshot — set by _start_control_plane() before
+        # the HTTP server begins serving requests so adapter properties can
+        # answer route handlers without acquiring self._lock. Default False
+        # so any read before the control plane spins up is well-defined and
+        # never raises AttributeError. See _ControlPlaneOrchestratorAdapter.
+        self._has_audio_stream_at_start: bool = False
         # Session-global config this leader distributed (Phase 4).
         self._applied_session_config = None
 
@@ -899,6 +905,18 @@ class SessionOrchestrator:
 
         assert self._role is not None  # called only in multi-host path
         role = self._role
+        # Snapshot capability flags BEFORE the control plane starts
+        # serving requests. This avoids the route handlers needing to
+        # acquire self._lock while the main thread is holding it
+        # (which would deadlock — start() holds the lock through
+        # _maybe_wait_for_leader, and the leader's distribute POST
+        # arrives on the uvicorn worker thread). See
+        # _ControlPlaneOrchestratorAdapter.has_audio_stream for the
+        # corresponding lock-free read.
+        self._has_audio_stream_at_start = any(
+            getattr(s, "kind", "custom") == "audio"
+            for s in self._streams.values()
+        )
         self._control_plane = ControlPlaneServer(
             orchestrator=self._build_control_plane_adapter(),
             preferred_port=getattr(role, "control_plane_port", 7878),
@@ -2316,12 +2334,19 @@ class _ControlPlaneOrchestratorAdapter:
 
     @property
     def has_audio_stream(self) -> bool:
-        """Whether this host has at least one audio-capable stream registered."""
-        with self._orch._lock:
-            return any(
-                getattr(stream, "kind", "custom") == "audio"
-                for stream in self._orch._streams.values()
-            )
+        """Read the cached capability snapshot — lock-free.
+
+        Computed once at :meth:`SessionOrchestrator._start_control_plane`
+        time so the route handlers serving Phase 4's
+        ``POST /session/config`` don't need to acquire the orchestrator
+        lock. The main thread holds ``self._lock`` for the duration of
+        :meth:`SessionOrchestrator.start` (including
+        ``_maybe_wait_for_leader``), so a cross-thread acquisition from
+        the uvicorn worker would deadlock — leader's distribute POST
+        times out, follower's POST handler stays blocked, follower
+        never unblocks because the leader's status flip is delayed.
+        """
+        return getattr(self._orch, "_has_audio_stream_at_start", False)
 
     @property
     def supported_audio_range_hz(self):
@@ -2350,14 +2375,15 @@ class _ControlPlaneOrchestratorAdapter:
         # _dropped_count, _last_frame_ns, _bytes_written}) encode
         # an assumption that every adapter uses these exact private
         # attributes; silent zeros slip in otherwise.
-        # Grab a list snapshot under the orchestrator lock so a
-        # concurrent ``add()`` / ``_prepare_next_episode`` can't
-        # raise "dictionary changed size during iteration" on the
-        # uvicorn worker thread. We release the lock before building
-        # the per-stream snapshots so their construction doesn't
-        # serialize with session state transitions.
-        with self._orch._lock:
-            streams = list(self._orch._streams.values())
+        # Snapshot the stream list WITHOUT acquiring the orchestrator
+        # lock — see ``has_audio_stream`` for the deadlock rationale.
+        # ``_streams`` only mutates under ``add()``, which requires
+        # IDLE state and rejects in any other state. During
+        # PREPARING / RECORDING / STOPPED reads are race-free, and
+        # ``list(dict.values())`` produces an atomic copy under the
+        # GIL so a concurrent IDLE-time ``add()`` can't trip a
+        # "dictionary changed size during iteration" here either.
+        streams = list(self._orch._streams.values())
 
         out = []
         for stream in streams:
