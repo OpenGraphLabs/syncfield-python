@@ -15,6 +15,7 @@ All frames are assumed to be BGR24 (numpy ``uint8``, shape
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 from typing import Optional
 
@@ -109,3 +110,51 @@ class VideoEncoder:
             pass
         if flush_error is not None:
             raise flush_error
+
+
+def open_uvc_input(
+    *,
+    device_index: int,
+    width: int,
+    height: int,
+    fps: float,
+    device_name: Optional[str] = None,
+    pixel_format: str = "mjpeg",
+) -> "av.container.InputContainer":
+    """Open a UVC webcam as a PyAV input container.
+
+    Platform dispatch:
+
+    * macOS — ``avfoundation`` with URL ``"<video>:<audio>"``. We pass
+      ``"<index>:none"`` so no audio input is opened.
+    * Linux — ``v4l2`` with URL ``/dev/video<N>``.
+    * Windows — ``dshow`` with URL ``video=<device_name>``. The caller
+      must supply ``device_name`` (DirectShow has no index URL).
+
+    The returned container yields packets via ``.demux()`` which the
+    caller decodes frame-by-frame.
+    """
+    options = {
+        "video_size": f"{int(width)}x{int(height)}",
+        "framerate": str(int(round(fps))),
+        "pixel_format": pixel_format,
+    }
+
+    if sys.platform == "darwin":
+        url = f"{int(device_index)}:none"
+        fmt = "avfoundation"
+    elif sys.platform.startswith("linux"):
+        url = f"/dev/video{int(device_index)}"
+        fmt = "v4l2"
+    elif sys.platform.startswith("win"):
+        if not device_name:
+            raise ValueError(
+                "Windows UVC input requires `device_name` "
+                "(DirectShow has no device-index URL)."
+            )
+        url = f"video={device_name}"
+        fmt = "dshow"
+    else:
+        raise RuntimeError(f"Unsupported platform for UVC input: {sys.platform}")
+
+    return av.open(url, format=fmt, options=options)

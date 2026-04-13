@@ -57,8 +57,14 @@ def fake_av(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     av.codec = SimpleNamespace(Codec=MagicMock(side_effect=_codec))
 
     # Remove any cached import of the module under test so it picks up
-    # the fake ``av`` when re-imported.
+    # the fake ``av`` when re-imported. Also drop the attribute on the
+    # parent package, otherwise ``from syncfield.adapters import
+    # _video_encoder`` would resolve via the cached parent attribute and
+    # skip the reload.
     sys.modules.pop("syncfield.adapters._video_encoder", None)
+    parent = sys.modules.get("syncfield.adapters")
+    if parent is not None and hasattr(parent, "_video_encoder"):
+        monkeypatch.delattr(parent, "_video_encoder", raising=False)
     monkeypatch.setitem(sys.modules, "av", av)
     return SimpleNamespace(av=av, container=container, stream=stream, packet=packet)
 
@@ -142,3 +148,88 @@ def test_close_propagates_flush_error_but_closes_container(
     # Second close() is a no-op.
     enc.close()
     fake_av.container.close.assert_called_once()
+
+
+def test_open_uvc_input_macos(
+    monkeypatch: pytest.MonkeyPatch, fake_av: SimpleNamespace
+) -> None:
+    from syncfield.adapters import _video_encoder
+
+    monkeypatch.setattr(_video_encoder.sys, "platform", "darwin")
+    input_container = MagicMock(name="InputContainer")
+    fake_av.av.open.return_value = input_container
+
+    result = _video_encoder.open_uvc_input(
+        device_index=0, width=1280, height=720, fps=30.0
+    )
+
+    args, kwargs = fake_av.av.open.call_args
+    assert args[0] == "0:none"
+    assert kwargs.get("format") == "avfoundation"
+    assert kwargs.get("options", {}).get("video_size") == "1280x720"
+    assert kwargs.get("options", {}).get("framerate") == "30"
+    assert result is input_container
+
+
+def test_open_uvc_input_linux(
+    monkeypatch: pytest.MonkeyPatch, fake_av: SimpleNamespace
+) -> None:
+    from syncfield.adapters import _video_encoder
+
+    monkeypatch.setattr(_video_encoder.sys, "platform", "linux")
+    fake_av.av.open.return_value = MagicMock(name="InputContainer")
+
+    _video_encoder.open_uvc_input(
+        device_index=2, width=1280, height=720, fps=30.0
+    )
+
+    args, kwargs = fake_av.av.open.call_args
+    assert args[0] == "/dev/video2"
+    assert kwargs.get("format") == "v4l2"
+
+
+def test_open_uvc_input_windows(
+    monkeypatch: pytest.MonkeyPatch, fake_av: SimpleNamespace
+) -> None:
+    from syncfield.adapters import _video_encoder
+
+    monkeypatch.setattr(_video_encoder.sys, "platform", "win32")
+    fake_av.av.open.return_value = MagicMock(name="InputContainer")
+
+    _video_encoder.open_uvc_input(
+        device_index=0,
+        width=1280,
+        height=720,
+        fps=30.0,
+        device_name="Logitech BRIO",
+    )
+
+    args, kwargs = fake_av.av.open.call_args
+    assert args[0] == "video=Logitech BRIO"
+    assert kwargs.get("format") == "dshow"
+
+
+def test_open_uvc_input_windows_requires_device_name(
+    monkeypatch: pytest.MonkeyPatch, fake_av: SimpleNamespace
+) -> None:
+    from syncfield.adapters import _video_encoder
+
+    monkeypatch.setattr(_video_encoder.sys, "platform", "win32")
+
+    with pytest.raises(ValueError, match="device_name"):
+        _video_encoder.open_uvc_input(
+            device_index=0, width=1280, height=720, fps=30.0
+        )
+
+
+def test_open_uvc_input_unsupported_platform(
+    monkeypatch: pytest.MonkeyPatch, fake_av: SimpleNamespace
+) -> None:
+    from syncfield.adapters import _video_encoder
+
+    monkeypatch.setattr(_video_encoder.sys, "platform", "freebsd13")
+
+    with pytest.raises(RuntimeError, match="Unsupported platform"):
+        _video_encoder.open_uvc_input(
+            device_index=0, width=1280, height=720, fps=30.0
+        )
