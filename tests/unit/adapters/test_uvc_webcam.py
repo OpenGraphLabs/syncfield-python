@@ -74,58 +74,56 @@ def _build_fake_av(
     return av, input_container, output_stream
 
 
-@pytest.fixture
-def mock_av(monkeypatch):
-    """Patch ``sys.modules['av']`` with a fake and force-reimport the encoder."""
-    av, input_container, output_stream = _build_fake_av(frame_budget=3)
+def _install_fake_av(
+    monkeypatch, *, frame_budget: int, pace_seconds: float
+) -> SimpleNamespace:
+    """Install a fake ``av`` module, clear cached imports, and return the handle."""
+    av, input_container, output_stream = _build_fake_av(
+        frame_budget=frame_budget, pace_seconds=pace_seconds
+    )
     monkeypatch.setitem(sys.modules, "av", av)
-    # Clear cached imports so the adapter and encoder bind to the fake av.
-    sys.modules.pop("syncfield.adapters._video_encoder", None)
-    sys.modules.pop("syncfield.adapters.uvc_webcam", None)
-    # Drop parent-package cached attribute so ``from syncfield.adapters import _video_encoder`` reloads.
+    for mod in ("syncfield.adapters._video_encoder", "syncfield.adapters.uvc_webcam"):
+        sys.modules.pop(mod, None)
     import syncfield.adapters as _adapters_pkg
-    monkeypatch.delattr(_adapters_pkg, "_video_encoder", raising=False)
-    monkeypatch.delattr(_adapters_pkg, "uvc_webcam", raising=False)
-
+    for attr in ("_video_encoder", "uvc_webcam"):
+        monkeypatch.delattr(_adapters_pkg, attr, raising=False)
     importlib.import_module("syncfield.adapters._video_encoder")
     importlib.import_module("syncfield.adapters.uvc_webcam")
-    yield SimpleNamespace(
+    return SimpleNamespace(
         av=av,
         input_container=input_container,
         output_stream=output_stream,
     )
-    sys.modules.pop("syncfield.adapters.uvc_webcam", None)
-    sys.modules.pop("syncfield.adapters._video_encoder", None)
+
+
+def _evict_adapter_imports() -> None:
+    """Teardown helper — pop both adapter modules so the next test rebinds."""
+    for mod in ("syncfield.adapters.uvc_webcam", "syncfield.adapters._video_encoder"):
+        sys.modules.pop(mod, None)
+
+
+@pytest.fixture
+def mock_av(monkeypatch):
+    handle = _install_fake_av(monkeypatch, frame_budget=3, pace_seconds=0.0)
+    yield handle
+    _evict_adapter_imports()
 
 
 @pytest.fixture
 def mock_av_generous(monkeypatch):
-    """Same as ``mock_av`` but yields effectively unlimited frames so the
-    capture thread can run through both preview and recording phases
-    without exhausting the mocked ``decode()`` iterator.
+    """Like ``mock_av`` but paces the decode iterator (1 ms/frame) so the
+    capture thread stays alive across ``time.sleep()`` windows in the
+    4-phase lifecycle tests.
+
+    TODO(test-harness): ``pace_seconds`` is a pragmatic wall-clock
+    workaround. A deterministic ``threading.Event``-driven pump would
+    remove the wall-clock dependency entirely. Deferred because the
+    current pacing is stable and the OAK tests (Task 7) can inherit
+    the same pattern safely — revisit if CI flakes appear.
     """
-    # Pace the generator so the background thread doesn't exhaust the
-    # iterator during the test's ``time.sleep(...)`` windows — without
-    # pacing, 10_000 MagicMock frames complete in microseconds and the
-    # capture thread exits before ``start_recording()`` is called.
-    av, input_container, output_stream = _build_fake_av(
-        frame_budget=10_000, pace_seconds=0.001
-    )
-    monkeypatch.setitem(sys.modules, "av", av)
-    sys.modules.pop("syncfield.adapters._video_encoder", None)
-    sys.modules.pop("syncfield.adapters.uvc_webcam", None)
-    import syncfield.adapters as _adapters_pkg
-    monkeypatch.delattr(_adapters_pkg, "_video_encoder", raising=False)
-    monkeypatch.delattr(_adapters_pkg, "uvc_webcam", raising=False)
-    importlib.import_module("syncfield.adapters._video_encoder")
-    importlib.import_module("syncfield.adapters.uvc_webcam")
-    yield SimpleNamespace(
-        av=av,
-        input_container=input_container,
-        output_stream=output_stream,
-    )
-    sys.modules.pop("syncfield.adapters.uvc_webcam", None)
-    sys.modules.pop("syncfield.adapters._video_encoder", None)
+    handle = _install_fake_av(monkeypatch, frame_budget=10_000, pace_seconds=0.001)
+    yield handle
+    _evict_adapter_imports()
 
 
 # ---------------------------------------------------------------------------
@@ -235,7 +233,10 @@ class TestFourPhaseLifecycle:
         report = stream.stop_recording()
         try:
             assert frames_before == 0  # preview didn't advance the counter
-            assert report.frame_count >= 1  # recording did
+            # With pace_seconds=0.001 and 0.1s recording window we expect roughly
+            # ~100 frames. Assert a lower bound that's meaningful (>5) but a loose
+            # upper bound that tolerates CI jitter.
+            assert 5 <= report.frame_count <= 10_000
             assert report.file_path is not None
             # Stream stays connected after stop_recording — the thread
             # is still alive so the preview continues.
