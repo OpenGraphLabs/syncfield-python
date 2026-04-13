@@ -195,9 +195,11 @@ class SessionBrowser:
     # ------------------------------------------------------------------
 
     def add_service(self, zc: Any, type_: str, name: str) -> None:
+        logger.info("SessionBrowser add_service callback: %s", name)
         self._refresh(zc, name)
 
     def update_service(self, zc: Any, type_: str, name: str) -> None:
+        logger.info("SessionBrowser update_service callback: %s", name)
         self._refresh(zc, name)
 
     def remove_service(self, zc: Any, type_: str, name: str) -> None:
@@ -212,7 +214,7 @@ class SessionBrowser:
     #: resolved. Passing an explicit timeout tells zeroconf to wait
     #: for the full resolution before returning, which is what we
     #: want so the browser never sees a half-populated announcement.
-    _GET_INFO_TIMEOUT_MS = 3000
+    _GET_INFO_TIMEOUT_MS = 5000
 
     def _refresh(self, zc: Any, name: str) -> None:
         """Re-fetch the TXT record for *name* and update ``_sessions``.
@@ -230,6 +232,7 @@ class SessionBrowser:
         the keyword argument is forwarded via ``**kwargs`` so the
         fake only needs to accept what it cares about.
         """
+        logger.debug("_refresh: invoked for %s", name)
         try:
             try:
                 info = zc.get_service_info(
@@ -243,7 +246,38 @@ class SessionBrowser:
         except Exception as exc:  # pragma: no cover - best-effort
             logger.warning("get_service_info failed for %s: %s", name, exc)
             return
-        if info is None or not getattr(info, "properties", None):
+
+        if info is None:
+            # Retry once — same-machine mDNS resolution often races on
+            # first call, especially on macOS loopback.
+            logger.warning(
+                "_refresh: first get_service_info returned None for %s; retrying...",
+                name,
+            )
+            try:
+                try:
+                    info = zc.get_service_info(
+                        SERVICE_TYPE, name, timeout=self._GET_INFO_TIMEOUT_MS
+                    )
+                except TypeError:
+                    info = zc.get_service_info(SERVICE_TYPE, name)
+            except Exception as exc:  # pragma: no cover - best-effort
+                logger.warning(
+                    "get_service_info retry failed for %s: %s", name, exc
+                )
+                return
+
+        if info is None:
+            logger.warning(
+                "_refresh: get_service_info still None after retry for %s — "
+                "peer not resolved",
+                name,
+            )
+            return
+        if not getattr(info, "properties", None):
+            logger.warning(
+                "_refresh: %s has empty TXT record properties", name
+            )
             return
         try:
             ann = SessionAnnouncement.from_txt_record(
