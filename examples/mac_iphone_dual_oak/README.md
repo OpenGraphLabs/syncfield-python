@@ -199,7 +199,7 @@ They're **not** stable across a physical Myriad-X firmware reflash, which is rar
 | `RuntimeError: X_LINK_ALREADY_OPEN` | Device still held by a previous session | Wait ~10 s for the OAK to recycle, or replug |
 | Both previews freeze after ~1 s | Turned depth on for both OAKs on one bus | Run RGB-only (drop the `--*-depth` flags) or move one OAK to a separate bus |
 | `ImportError: depthai` | Missing OAK extra | `pip install "syncfield[oak]"` |
-| `ImportError: cv2` | Missing UVC extra | `pip install "syncfield[uvc]"` |
+| `ImportError: av` | Missing UVC extra | `pip install "syncfield[uvc]"` |
 | iPhone card stays blank | Continuity Camera dropped | Wake the iPhone, plug it into power, check System Settings → AirPlay & Handoff |
 | Health table shows `drop` events | USB bandwidth saturated | Lower resolution / FPS on one OAK, or split across USB buses |
 
