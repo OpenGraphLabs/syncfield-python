@@ -20,6 +20,12 @@ def main() -> None:
                         help="0 means OS-assigned (avoids collisions on localhost).")
     parser.add_argument("--leader-wait-timeout-sec", type=float, default=60.0)
     parser.add_argument("--keep-alive-sec", type=float, default=30.0)
+    parser.add_argument(
+        "--leader",
+        metavar="HOST_ID@ADDRESS:PORT",
+        help="Static leader address (bypasses mDNS — required on macOS "
+             "single-machine testing). Format: 'mac_a@127.0.0.1:7878'.",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
@@ -42,6 +48,19 @@ def main() -> None:
     mic = FakeStream("mic")
     mic.kind = "audio"
     session.add(mic)
+
+    if args.leader:
+        if "@" not in args.leader or ":" not in args.leader:
+            parser.error("--leader must be HOST_ID@ADDRESS:PORT, got: " + args.leader)
+        host_part, address_part = args.leader.split("@", 1)
+        address, port_str = address_part.rsplit(":", 1)
+        session.set_static_leader(
+            host_id=host_part,
+            address=address,
+            control_plane_port=int(port_str),
+        )
+        print(f"[follower {args.host_id}] static leader configured: "
+              f"{host_part}@{address}:{port_str} (mDNS bypass)")
 
     print(f"[follower {args.host_id}] waiting for leader…")
     session.start()

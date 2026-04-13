@@ -82,6 +82,12 @@ The launcher script passes `--follower mac_b:7879 --follower mac_c:7880`
 to the leader. Real multi-machine LAN deployments use mDNS as
 normal — this is a single-machine testing-only workaround.
 
+The same workaround applies in the other direction: followers cannot
+resolve the leader's mDNS TXT record on the same machine, so they
+also bypass mDNS. The launcher passes `--leader mac_a@127.0.0.1:7878`
+to each follower; the follower polls the leader's /health endpoint
+to detect state transitions instead of browsing mDNS.
+
 ## Troubleshooting
 
 - **Follower times out waiting for leader**: usually means mDNS didn't

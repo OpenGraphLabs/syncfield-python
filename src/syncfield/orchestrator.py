@@ -307,6 +307,13 @@ class SessionOrchestrator:
         # (the normal LAN path). See set_static_peers() docstring for
         # why this escape hatch exists (macOS loopback).
         self._static_peers: list = []
+        # Operator-injected leader announcement that bypasses mDNS browse.
+        # Populated via :meth:`set_static_leader`; consumed by
+        # :meth:`_maybe_wait_for_leader` and
+        # :meth:`wait_for_leader_stopped`. ``None`` means "use mDNS"
+        # (the normal LAN path). Mirrors :attr:`_static_peers` but in
+        # the follower→leader direction; same macOS loopback rationale.
+        self._static_leader: Optional[SessionAnnouncement] = None
         # Control plane (HTTP server) — populated on start() when role is set.
         self._control_plane: Optional[Any] = None
         # Cached capability snapshot — set by _start_control_plane() before
@@ -498,6 +505,37 @@ class SessionOrchestrator:
                     resolved_address=p.get("resolved_address", "127.0.0.1"),
                 ))
         self._static_peers = normalized
+
+    def set_static_leader(
+        self,
+        host_id: str,
+        address: str,
+        control_plane_port: int,
+    ) -> None:
+        """Tell this follower to bypass mDNS and poll the leader directly.
+
+        The follower's ``start()`` would normally use a SessionBrowser to
+        watch for the leader's status flip to ``"recording"``. On macOS
+        loopback that doesn't work — zeroconf can't resolve TXT records
+        for services on the same machine. Static leader mode swaps the
+        browser for HTTP polling on the leader's existing /health endpoint.
+
+        Used by ``scripts/multihost_local_cluster/follower.py`` for
+        single-machine testing. Production multi-host (separate machines
+        on a real LAN) uses mDNS as normal.
+        """
+        from syncfield.multihost.types import SessionAnnouncement
+        from importlib.metadata import version as _pkg_version
+
+        self._static_leader = SessionAnnouncement(
+            session_id=self._role.session_id if self._role else "unknown",
+            host_id=host_id,
+            status="preparing",
+            sdk_version=_pkg_version("syncfield"),
+            chirp_enabled=True,
+            control_plane_port=control_plane_port,
+            resolved_address=address,
+        )
 
     def _discover_followers_in_preparing(self) -> "list[SessionAnnouncement]":
         """Return the announcements of followers in the same session in 'preparing'.
@@ -2296,10 +2334,82 @@ class SessionOrchestrator:
         """
         if not isinstance(self._role, FollowerRole):
             return
+
+        # Static leader mode: poll /health instead of mDNS browse.
+        # Same macOS loopback rationale as :attr:`_static_peers` but
+        # in the opposite direction (follower→leader).
+        if self._static_leader is not None:
+            self._poll_static_leader_until_recording()
+            # Populate _observed_leader as if mDNS had observed it so
+            # downstream code (config POST, manifest pulls) has the
+            # leader announcement it expects.
+            self._observed_leader = self._static_leader
+            return
+
         self._browser = SessionBrowser(session_id=self._role.session_id)
         self._browser.start()
         self._observed_leader = self._browser.wait_for_recording(
             timeout=self._role.leader_wait_timeout_sec
+        )
+
+    def _poll_static_leader_until_recording(self) -> None:
+        """Poll the static leader's /health until state == 'recording'.
+
+        Honors the role's ``leader_wait_timeout_sec``. Polls every 0.3s.
+        Raises :class:`TimeoutError` if the leader never reaches
+        ``recording`` (or a terminal post-recording state) before the
+        deadline expires.
+        """
+        import httpx
+        import time as _time
+
+        assert self._static_leader is not None
+        leader = self._static_leader
+        deadline = _time.monotonic() + getattr(
+            self._role, "leader_wait_timeout_sec", 60.0
+        )
+        base = f"http://{leader.resolved_address}:{leader.control_plane_port}"
+        headers = {"Authorization": f"Bearer {self.session_id}"}
+
+        logger.info(
+            "Static leader polling: waiting for %s on %s to reach 'recording'",
+            leader.host_id,
+            base,
+        )
+        while _time.monotonic() < deadline:
+            try:
+                r = httpx.get(f"{base}/health", headers=headers, timeout=2.0)
+                if r.status_code == 200:
+                    state = r.json().get("state", "")
+                    if state == "recording":
+                        logger.info(
+                            "Static leader %s reached state=recording",
+                            leader.host_id,
+                        )
+                        return
+                    if state in ("stopped", "idle"):
+                        # Leader wrapped up before we observed recording —
+                        # this can happen on a fast/short session. Treat
+                        # as 'leader done' and return so follower can stop.
+                        logger.info(
+                            "Static leader %s reached state=%s without "
+                            "recording — proceeding",
+                            leader.host_id,
+                            state,
+                        )
+                        return
+                elif r.status_code == 503:
+                    # Pre-observation 503 — leader still attaching itself,
+                    # which shouldn't happen for a leader role, but tolerate.
+                    pass
+            except httpx.HTTPError:
+                # Leader not up yet, or transient — keep polling.
+                pass
+            _time.sleep(0.3)
+
+        raise TimeoutError(
+            f"static leader {leader.host_id} did not reach state=recording "
+            f"within {getattr(self._role, 'leader_wait_timeout_sec', 60.0):.1f}s"
         )
 
     def _stop_discovery_on_failure(self) -> None:
@@ -2353,12 +2463,59 @@ class SessionOrchestrator:
         """
         if not isinstance(self._role, FollowerRole):
             raise RuntimeError("wait_for_leader_stopped() requires FollowerRole")
+
+        # Static leader mode: poll /health instead of using the browser.
+        if self._static_leader is not None:
+            self._poll_static_leader_until_stopped(timeout)
+            return self._static_leader
+
         if self._browser is None:
             raise RuntimeError(
                 "wait_for_leader_stopped() requires an active SessionBrowser; "
                 "call start() first"
             )
         return self._browser.wait_for_stopped(timeout=timeout)
+
+    def _poll_static_leader_until_stopped(self, timeout: float) -> None:
+        """Poll the static leader's /health until it reports stopped/idle.
+
+        A connection refusal or a 404/503 response is also treated as
+        "leader is gone" — once the leader's keep-alive window expires
+        the control plane shuts down, and from a follower's perspective
+        that's indistinguishable from (and equivalent to) ``stopped``.
+        """
+        import httpx
+        import time as _time
+
+        assert self._static_leader is not None
+        leader = self._static_leader
+        deadline = _time.monotonic() + timeout
+        base = f"http://{leader.resolved_address}:{leader.control_plane_port}"
+        headers = {"Authorization": f"Bearer {self.session_id}"}
+
+        while _time.monotonic() < deadline:
+            try:
+                r = httpx.get(f"{base}/health", headers=headers, timeout=2.0)
+                if r.status_code == 200:
+                    state = r.json().get("state", "")
+                    if state in ("stopped", "idle"):
+                        return
+                else:
+                    # Non-200: leader's control plane probably already
+                    # shut down, which (in keep_alive context) also
+                    # means stopped.
+                    if r.status_code in (404, 503):
+                        return
+            except httpx.HTTPError:
+                # Connection refused -> leader's control plane is down
+                # -> stopped (graceful: no leader = no recording).
+                return
+            _time.sleep(0.5)
+
+        raise TimeoutError(
+            f"static leader {leader.host_id} did not reach state=stopped "
+            f"within {timeout:.1f}s"
+        )
 
 
 class _ControlPlaneOrchestratorAdapter:

@@ -674,3 +674,20 @@ class TestStaticPeers:
         ])
         peers = session._discover_followers_in_preparing()
         assert [p.host_id for p in peers] == ["mac_b"]
+
+
+class TestStaticLeader:
+    def test_set_static_leader_populates_attribute(self, tmp_path):
+        import syncfield as sf
+
+        session = sf.SessionOrchestrator(
+            host_id="mac_b",
+            output_dir=tmp_path,
+            role=sf.FollowerRole(session_id="sid", control_plane_port=0),
+        )
+        session.set_static_leader("mac_a", "127.0.0.1", 7878)
+
+        assert session._static_leader is not None
+        assert session._static_leader.host_id == "mac_a"
+        assert session._static_leader.resolved_address == "127.0.0.1"
+        assert session._static_leader.control_plane_port == 7878

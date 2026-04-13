@@ -25,10 +25,16 @@ fi
 tmux kill-session -t $SESSION 2>/dev/null || true
 
 tmux new-session -d -s $SESSION -n follower_b \
-    "uv run python scripts/multihost_local_cluster/follower.py --host-id mac_b --control-plane-port 7879; read -p 'Enter to close'"
+    "uv run python scripts/multihost_local_cluster/follower.py \
+        --host-id mac_b --control-plane-port 7879 \
+        --leader mac_a@127.0.0.1:7878; \
+        read -p 'Enter to close'"
 
 tmux new-window -t $SESSION -n follower_c \
-    "uv run python scripts/multihost_local_cluster/follower.py --host-id mac_c --control-plane-port 7880; read -p 'Enter to close'"
+    "uv run python scripts/multihost_local_cluster/follower.py \
+        --host-id mac_c --control-plane-port 7880 \
+        --leader mac_a@127.0.0.1:7878; \
+        read -p 'Enter to close'"
 
 # Give followers a moment to start advertising before launching the leader.
 sleep 2
