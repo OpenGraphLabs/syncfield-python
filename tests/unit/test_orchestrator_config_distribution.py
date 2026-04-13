@@ -305,6 +305,80 @@ class TestRollbackAfterDistributeFailure:
         assert session._state is SessionState.CONNECTED
 
 
+class TestFollowerBaseURL:
+    """The shared URL builder used by both distribute and fetch paths.
+
+    Phase 5 plumbs the follower's real LAN address via the
+    ``resolved_address`` field on ``SessionAnnouncement`` (populated
+    by the browser from the mDNS ``ServiceInfo``). The helper falls
+    back to loopback when the field is unset so localhost tests keep
+    working.
+    """
+
+    def test_uses_resolved_address_when_set(self) -> None:
+        ann = SessionAnnouncement(
+            session_id="amber-tiger-042", host_id="mac_b",
+            status="preparing", sdk_version="0.2.0", chirp_enabled=True,
+            control_plane_port=7878, resolved_address="192.168.1.5",
+        )
+        assert (
+            sf.SessionOrchestrator._follower_base_url(ann)
+            == "http://192.168.1.5:7878"
+        )
+
+    def test_falls_back_to_loopback(self) -> None:
+        ann = SessionAnnouncement(
+            session_id="amber-tiger-042", host_id="mac_b",
+            status="preparing", sdk_version="0.2.0", chirp_enabled=True,
+            control_plane_port=7979, resolved_address=None,
+        )
+        url = sf.SessionOrchestrator._follower_base_url(ann)
+        assert url.startswith("http://127.0.0.1:")
+        assert url == "http://127.0.0.1:7979"
+
+
+class TestDistributeUsesResolvedAddress:
+    """Distribute must build URLs from resolved_address when present."""
+
+    def test_post_url_uses_resolved_address(self, tmp_path, monkeypatch) -> None:
+        session = sf.SessionOrchestrator(
+            host_id="mac_a",
+            output_dir=tmp_path,
+            role=sf.LeaderRole(session_id="amber-tiger-042", control_plane_port=0),
+        )
+        session.add(FakeStream("cam"))
+        mic = FakeStream("mic"); mic.kind = "audio"
+        session.add(mic)
+        cfg = session._build_session_config()
+
+        session._browser = MagicMock()
+        session._browser.current_sessions.return_value = [
+            SessionAnnouncement(
+                session_id="amber-tiger-042", host_id="mac_b",
+                status="preparing", sdk_version="0.2.0", chirp_enabled=True,
+                control_plane_port=7979, resolved_address="192.168.1.42",
+            ),
+        ]
+        captured_urls: list[str] = []
+
+        def fake_post(url, json, headers, timeout):
+            captured_urls.append(url)
+            resp = MagicMock()
+            resp.status_code = 200
+            resp.json.return_value = {
+                "session_name": cfg.session_name,
+                "start_chirp": cfg.start_chirp.to_dict(),
+                "stop_chirp": cfg.stop_chirp.to_dict(),
+                "recording_mode": cfg.recording_mode,
+            }
+            return resp
+
+        monkeypatch.setattr(httpx, "post", fake_post)
+        session._distribute_config_to_followers()
+
+        assert captured_urls == ["http://192.168.1.42:7979/session/config"]
+
+
 class TestFollowerFetchConfig:
     def test_noop_without_observed_leader(self, tmp_path) -> None:
         session = sf.SessionOrchestrator(

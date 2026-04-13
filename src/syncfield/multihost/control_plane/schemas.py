@@ -96,3 +96,20 @@ class SessionStateResponse(BaseModel):
 
     state: str
     detail: Optional[str] = None
+
+
+class FileManifestEntry(BaseModel):
+    """One file in a host's post-session output tree."""
+    model_config = ConfigDict(extra="forbid")
+
+    path: str         # relative to host output dir, forward slashes
+    size: int         # bytes
+    sha256: str       # hex digest
+    mtime_ns: int     # os.stat st_mtime_ns
+
+
+class FileManifestResponse(BaseModel):
+    """Returned by GET /files/manifest."""
+    model_config = ConfigDict(extra="forbid")
+
+    files: list[FileManifestEntry]

@@ -251,6 +251,47 @@ class SessionBrowser:
             raw_port if (raw_port is not None and raw_port > 0) else None
         )
         ann = replace(ann, control_plane_port=port)
+        address = _extract_ipv4(info)
+        ann = replace(ann, resolved_address=address)
         with self._update_event:
             self._sessions[name] = ann
             self._update_event.notify_all()
+
+
+def _extract_ipv4(info: Any) -> Optional[str]:
+    """Return the first IPv4 address on *info*, or ``None``.
+
+    Prefers the modern ``info.parsed_addresses()`` API (zeroconf >= 0.39)
+    which already returns dotted-quad strings. Falls back to the legacy
+    ``info.addresses`` (list of 4-byte packed addresses) decoded with
+    :func:`socket.inet_ntoa` when the modern accessor isn't available,
+    e.g. on older zeroconf releases or minimal test doubles.
+
+    Any exception short-circuits to ``None`` rather than crashing the
+    browser — address resolution is best-effort and the caller will
+    transparently fall back to ``127.0.0.1`` downstream.
+    """
+    try:
+        parsed = info.parsed_addresses()
+    except AttributeError:
+        parsed = None
+    except Exception as exc:  # pragma: no cover - best-effort
+        logger.warning("parsed_addresses() failed: %s", exc)
+        parsed = None
+
+    if parsed:
+        for addr in parsed:
+            if isinstance(addr, str) and addr.count(".") == 3:
+                return addr
+
+    raw = getattr(info, "addresses", None)
+    if raw:
+        import socket
+
+        for packed in raw:
+            if isinstance(packed, (bytes, bytearray)) and len(packed) == 4:
+                try:
+                    return socket.inet_ntoa(bytes(packed))
+                except OSError:  # pragma: no cover - malformed packed addr
+                    continue
+    return None

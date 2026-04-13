@@ -229,6 +229,23 @@ def _rollback_stop_recording(recording: List["Stream"]) -> None:
             logger.debug("stop_recording() raised for %s: %s", stream.id, exc)
 
 
+def _sha256_of_local(path: Path) -> str:
+    """Compute the sha256 hex digest of a local file in 64 KiB chunks.
+
+    Used by :meth:`SessionOrchestrator.collect_from_followers` to verify
+    that each downloaded file matches the digest reported by the
+    follower's ``/files/manifest`` response. Streamed read so we don't
+    hold large media files entirely in memory.
+    """
+    import hashlib
+
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 class SessionOrchestrator:
     """Coordinates a multi-stream recording session for one host.
 
@@ -446,6 +463,18 @@ class SessionOrchestrator:
             and ann.control_plane_port is not None
         ]
 
+    @staticmethod
+    def _follower_base_url(ann) -> str:
+        """Return ``http://<addr>:<port>`` for a follower's control plane.
+
+        Uses the resolved LAN address from the mDNS ServiceInfo when
+        present, else falls back to loopback. The fallback is what keeps
+        localhost tests working — in production, every peer's advertisement
+        carries an IPv4 address from the same LAN.
+        """
+        address = ann.resolved_address or "127.0.0.1"
+        return f"http://{address}:{ann.control_plane_port}"
+
     def _distribute_config_to_followers(self) -> None:
         """POST this leader's SessionConfig to every preparing follower.
 
@@ -499,10 +528,12 @@ class SessionOrchestrator:
                     assert False, (
                         "discovery contract loosened: got None control_plane_port"
                     )
-                url = f"http://127.0.0.1:{ann.control_plane_port}/session/config"
-                # NOTE: 127.0.0.1 is temporary until the leader resolves the
-                # follower's actual LAN address from the mDNS ServiceInfo.
-                # Phase 4 runs on localhost; Phase 5+ will plumb the address.
+                url = f"{self._follower_base_url(ann)}/session/config"
+                # NOTE: Phase 5 plumbs the follower's real LAN address via
+                # SessionAnnouncement.resolved_address (populated by the
+                # browser from the mDNS ServiceInfo). When that field is
+                # unset (e.g. localhost tests), _follower_base_url falls
+                # back to 127.0.0.1 so the loopback path keeps working.
                 try:
                     resp = httpx.post(url, json=payload, headers=headers, timeout=5.0)
                 except httpx.HTTPError as exc:
@@ -529,6 +560,206 @@ class SessionOrchestrator:
                     logger.warning("Leader-owned browser close failed: %s", exc)
                 self._browser = None
 
+    def collect_from_followers(
+        self,
+        destination: Optional[Path] = None,
+        *,
+        timeout: float = 600.0,
+        verify_checksums: bool = True,
+    ) -> dict:
+        """Pull every follower's recorded files into a single canonical tree.
+
+        Leader-only. Must be called **after** :meth:`stop` and **inside**
+        the follower's ``keep_alive_after_stop_sec`` window — otherwise
+        the follower control planes will already have torn themselves
+        down and the GETs will fail with ``status="unreachable"``.
+
+        For each follower discovered via mDNS this method:
+
+        1. Hits ``GET /files/manifest`` with the session bearer token to
+           list every file the follower wrote during the session.
+        2. Streams each file via ``GET /files/{path}`` into
+           ``destination/<host_id>/<path>`` (parent dirs created on
+           demand).
+        3. When ``verify_checksums`` is true, hashes each downloaded
+           file with sha256 and compares to the manifest entry. On
+           mismatch it re-downloads exactly **once**; if the second
+           attempt also mismatches, the host is recorded with
+           ``status="checksum_mismatch"``.
+
+        Per-host failures (network errors, HTTP errors, checksum
+        mismatches) populate the ``status`` and ``error`` fields on
+        that host's report and the loop moves on — one bad follower
+        never aborts collection from the rest.
+
+        After every host is processed (or skipped on failure), an
+        aggregated report is written to
+        ``<destination>/aggregated_manifest.json`` and returned.
+
+        Args:
+            destination: Where to materialize the cluster tree. Defaults
+                to ``self._data_root / self.session_id`` (the cluster
+                root used by the rest of the multi-host plumbing).
+                Created if missing.
+            timeout: Per-HTTP-request timeout in seconds. Defaults to
+                600 because individual session files (multi-GB video)
+                can take a while to stream over LAN.
+            verify_checksums: Whether to sha256-verify each downloaded
+                file against the manifest entry. When false the loop
+                still records files but performs no integrity check.
+
+        Returns:
+            An :class:`AggregatedManifest`-shaped ``dict`` with a
+            per-host status entry (``"ok"`` / ``"unreachable"`` /
+            ``"checksum_mismatch"`` / ``"error"``) and the file list
+            that was successfully pulled for each host.
+
+        Raises:
+            RuntimeError: If this orchestrator is not a leader, or if
+                no ``session_id`` is set yet (called before ``start()``).
+        """
+        import json
+        import time as _time
+
+        import httpx
+
+        if self._role is None or not isinstance(self._role, LeaderRole):
+            raise RuntimeError(
+                "collect_from_followers() requires a LeaderRole"
+            )
+        if self.session_id is None:
+            raise RuntimeError(
+                "collect_from_followers() requires an active session_id"
+            )
+
+        if destination is None:
+            destination = self._data_root / self.session_id
+        destination = Path(destination)
+        destination.mkdir(parents=True, exist_ok=True)
+
+        headers = {"Authorization": f"Bearer {self.session_id}"}
+        hosts_report: list[dict] = []
+
+        # Leaders don't keep a long-lived browser around the way
+        # followers do — bootstrap a short-lived one here, mirroring
+        # _distribute_config_to_followers. Filter on our session_id so
+        # we only see this cluster's peers.
+        browser = SessionBrowser(session_id=self.session_id)
+        browser.start()
+        try:
+            # Let zeroconf converge; mDNS re-broadcasts every few
+            # seconds by default, so ~1.5s is usually enough to see
+            # every peer that's still up inside the keep-alive window.
+            _time.sleep(1.5)
+
+            peers = [
+                ann
+                for ann in browser.current_sessions()
+                if ann.host_id != self._host_id
+                and ann.control_plane_port is not None
+            ]
+
+            for ann in peers:
+                host_report: dict = {
+                    "host_id": ann.host_id,
+                    "status": "ok",
+                    "files": [],
+                    "error": None,
+                }
+                base = self._follower_base_url(ann)
+
+                # Step 1: fetch manifest. A failure here means we can't
+                # know what to download — mark unreachable and move on.
+                try:
+                    manifest_resp = httpx.get(
+                        f"{base}/files/manifest",
+                        headers=headers,
+                        timeout=timeout,
+                    )
+                    manifest_resp.raise_for_status()
+                    entries = manifest_resp.json().get("files", [])
+                except httpx.HTTPError as exc:
+                    host_report["status"] = "unreachable"
+                    host_report["error"] = f"manifest fetch: {exc}"
+                    hosts_report.append(host_report)
+                    continue
+
+                host_dest = destination / ann.host_id
+                host_dest.mkdir(parents=True, exist_ok=True)
+
+                # Step 2: stream each file. Track the first failing file
+                # so the caller can investigate; subsequent files for
+                # that host are skipped (the host is already marked as
+                # broken, so additional downloads would just muddy the
+                # report).
+                for entry in entries:
+                    rel = entry["path"]
+                    target = host_dest / rel
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    expected_sha = entry.get("sha256")
+                    # One retry on checksum mismatch when verifying;
+                    # otherwise a single attempt.
+                    attempts_left = 2 if verify_checksums else 1
+                    while attempts_left > 0:
+                        attempts_left -= 1
+                        try:
+                            with httpx.stream(
+                                "GET",
+                                f"{base}/files/{rel}",
+                                headers=headers,
+                                timeout=timeout,
+                            ) as r:
+                                r.raise_for_status()
+                                with open(target, "wb") as f:
+                                    for chunk in r.iter_bytes(
+                                        chunk_size=65536
+                                    ):
+                                        f.write(chunk)
+                        except httpx.HTTPError as exc:
+                            host_report["status"] = "error"
+                            host_report["error"] = (
+                                f"download {rel}: {exc}"
+                            )
+                            break
+
+                        if not verify_checksums:
+                            break
+                        actual = _sha256_of_local(target)
+                        if actual == expected_sha:
+                            break
+                        if attempts_left == 0:
+                            host_report["status"] = "checksum_mismatch"
+                            host_report["error"] = (
+                                f"sha256 mismatch on {rel}"
+                            )
+                            break
+                        # else: loop and retry once more.
+
+                    if host_report["status"] != "ok":
+                        # First failure for this host wins the report;
+                        # don't attempt the rest of its files.
+                        break
+                    host_report["files"].append(entry)
+
+                hosts_report.append(host_report)
+        finally:
+            try:
+                browser.close()
+            except Exception as exc:  # pragma: no cover - best-effort
+                logger.warning(
+                    "collect_from_followers browser close failed: %s",
+                    exc,
+                )
+
+        aggregate = {
+            "session_id": self.session_id,
+            "leader_host_id": self._host_id,
+            "hosts": hosts_report,
+        }
+        with open(destination / "aggregated_manifest.json", "w") as f:
+            json.dump(aggregate, f, indent=2)
+        return aggregate
+
     def _fetch_config_from_leader(self) -> None:
         """Follower-side: GET the leader's applied SessionConfig and apply locally.
 
@@ -550,7 +781,7 @@ class SessionOrchestrator:
         if port is None:
             return
 
-        url = f"http://127.0.0.1:{port}/session/config"
+        url = f"{self._follower_base_url(self._observed_leader)}/session/config"
         headers = {"Authorization": f"Bearer {self.session_id}"}
         try:
             resp = httpx.get(url, headers=headers, timeout=5.0)
@@ -2152,6 +2383,20 @@ class _ControlPlaneOrchestratorAdapter:
         push.
         """
         self._orch._applied_session_config = config
+
+    def host_output_dir(self) -> Optional[Path]:
+        """Return the directory holding this host's recorded files.
+
+        For multi-host sessions this is ``<data_root>/<session_id>/<host_id>/``
+        (the directory containing the ep_* episode dirs). Returns None if
+        no episode has been recorded yet (orchestrator still IDLE or the
+        episode dir was never created).
+        """
+        if not self._orch._episode_dir_created:
+            return None
+        # self._orch._output_dir is <data_root>/<session_id>/<host_id>/ep_*
+        # — walk one level up to get the host directory.
+        return self._orch._output_dir.parent
 
 
 class _StreamMetricsSnapshot:

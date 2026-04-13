@@ -153,3 +153,45 @@ class TestControlPlanePort:
             control_plane_port=55123,
         )
         assert a.control_plane_port == 55123
+
+
+class TestResolvedAddress:
+    """Same treatment as ``control_plane_port``: browser-populated, not TXT-carried."""
+
+    def test_default_is_none(self) -> None:
+        a = SessionAnnouncement(
+            session_id="sid",
+            host_id="h",
+            status="preparing",
+            sdk_version="0.2.0",
+            chirp_enabled=True,
+        )
+        assert a.resolved_address is None
+
+    def test_explicit_field_survives_construction(self) -> None:
+        a = SessionAnnouncement(
+            session_id="sid",
+            host_id="h",
+            status="recording",
+            sdk_version="0.2.0",
+            chirp_enabled=True,
+            control_plane_port=7878,
+            resolved_address="192.168.1.42",
+        )
+        assert a.resolved_address == "192.168.1.42"
+
+    def test_txt_round_trip_does_not_carry_address(self) -> None:
+        """Like ``control_plane_port``, the address lives on ServiceInfo."""
+        a = SessionAnnouncement(
+            session_id="sid",
+            host_id="h",
+            status="recording",
+            sdk_version="0.2.0",
+            chirp_enabled=True,
+            resolved_address="192.168.1.42",
+        )
+        record = a.to_txt_record()
+        assert b"resolved_address" not in record
+
+        parsed = SessionAnnouncement.from_txt_record(record)
+        assert parsed.resolved_address is None

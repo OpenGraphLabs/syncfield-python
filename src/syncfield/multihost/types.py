@@ -67,6 +67,14 @@ class SessionAnnouncement:
             record), so ``to_txt_record`` / ``from_txt_record`` deliberately
             ignore it. The browser populates this field on announcements
             reconstructed from a live ``ServiceInfo``.
+        resolved_address: LAN IPv4 address (as a dotted-quad string) at
+            which the advertiser's host can be reached. Like
+            ``control_plane_port``, this is populated by the browser
+            from the live ``ServiceInfo`` (``info.parsed_addresses()``)
+            and is **not** carried in the TXT record — so
+            ``to_txt_record`` / ``from_txt_record`` deliberately ignore
+            it. Used by the leader to build HTTP URLs for peer control
+            planes without hardcoding ``127.0.0.1``.
     """
 
     session_id: str
@@ -77,6 +85,7 @@ class SessionAnnouncement:
     started_at_ns: Optional[int] = None
     last_seen_ns: Optional[int] = None
     control_plane_port: Optional[int] = None
+    resolved_address: Optional[str] = None
 
     def __post_init__(self) -> None:
         if self.status not in _VALID_STATUSES:

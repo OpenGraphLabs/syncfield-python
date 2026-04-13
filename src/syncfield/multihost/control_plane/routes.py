@@ -20,6 +20,7 @@ HTTP 400 with the validation error message verbatim). GET returns
 from __future__ import annotations
 
 import time
+from pathlib import Path
 from typing import Protocol, runtime_checkable
 
 from fastapi import Depends, FastAPI, HTTPException, Request, status
@@ -27,6 +28,8 @@ from fastapi import Depends, FastAPI, HTTPException, Request, status
 from syncfield.multihost.control_plane.auth import verify_session_token
 from syncfield.multihost.control_plane.schemas import (
     ChirpSpecModel,
+    FileManifestEntry,
+    FileManifestResponse,
     HealthResponse,
     SessionConfigRequest,
     SessionConfigResponse,
@@ -62,6 +65,16 @@ class _OrchestratorLike(Protocol):
     def trigger_stop(self) -> str: ...
     def trigger_control_plane_shutdown(self) -> None: ...
     def apply_distributed_config(self, config) -> None: ...
+    def host_output_dir(self) -> "Path | None": ...
+
+
+def _sha256_file(path: Path) -> str:
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 def _chirp_from_model(m: ChirpSpecModel) -> "ChirpSpec":
@@ -253,3 +266,72 @@ def _register_routes(app: FastAPI) -> None:
             state="shutting_down",
             detail="control plane teardown requested",
         )
+
+    @app.get(
+        "/files/manifest",
+        response_model=FileManifestResponse,
+        dependencies=[Depends(verify_session_token)],
+    )
+    def files_manifest(request: Request) -> FileManifestResponse:
+        """List every file in this host's session output tree.
+
+        Streams the file contents through sha256 once per request — not
+        cached. For typical research-lab sessions (tens of GB total) this
+        is fast enough; Phase 6+ can add caching if needed.
+        """
+        orch = request.app.state.orchestrator
+        root = orch.host_output_dir()
+        if root is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="no episode directory exists for this host",
+            )
+        entries: list[FileManifestEntry] = []
+        for file_path in sorted(root.rglob("*")):
+            if not file_path.is_file():
+                continue
+            rel = file_path.relative_to(root).as_posix()
+            st = file_path.stat()
+            entries.append(FileManifestEntry(
+                path=rel,
+                size=st.st_size,
+                sha256=_sha256_file(file_path),
+                mtime_ns=st.st_mtime_ns,
+            ))
+        return FileManifestResponse(files=entries)
+
+    @app.get(
+        "/files/{path:path}",
+        dependencies=[Depends(verify_session_token)],
+    )
+    def files_download(request: Request, path: str):
+        """Stream a single file from this host's session output tree.
+
+        Security: resolves `path` against the allowed host directory with
+        `Path.resolve()` and rejects anything that escapes it. `..` and
+        absolute paths therefore become 403.
+        """
+        from fastapi.responses import FileResponse
+
+        orch = request.app.state.orchestrator
+        root = orch.host_output_dir()
+        if root is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="no episode directory exists for this host",
+            )
+        candidate = (root / path).resolve()
+        allowed_root = root.resolve()
+        try:
+            candidate.relative_to(allowed_root)
+        except ValueError:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="path escapes the host output directory",
+            )
+        if not candidate.is_file():
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"file not found: {path}",
+            )
+        return FileResponse(path=str(candidate))

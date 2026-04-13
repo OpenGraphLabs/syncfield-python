@@ -1,7 +1,9 @@
 """Endpoint tests using FastAPI TestClient + a fake orchestrator."""
 
+import hashlib
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from fastapi.testclient import TestClient
@@ -38,6 +40,7 @@ class _FakeOrchestrator:
     stop_called: int = 0
     delete_called: int = 0
     applied_config_on_orch: Optional[Any] = None
+    host_output_dir_path: Optional[Path] = None
 
     def snapshot_stream_metrics(self) -> List[_FakeStreamMetrics]:
         return list(self.streams_metrics)
@@ -57,6 +60,9 @@ class _FakeOrchestrator:
 
     def apply_distributed_config(self, config) -> None:
         self.applied_config_on_orch = config
+
+    def host_output_dir(self) -> Optional[Path]:
+        return self.host_output_dir_path
 
 
 def _client_for(orch: _FakeOrchestrator, started_at_monotonic_s: float = 0.0) -> TestClient:
@@ -233,3 +239,71 @@ class TestSessionDelete:
         assert resp.status_code == 200
         assert resp.json()["state"] == "shutting_down"
         assert orch.delete_called == 1
+
+
+class TestFileEndpoints:
+    def test_manifest_when_no_episode_returns_404(self) -> None:
+        orch = _FakeOrchestrator(host_output_dir_path=None)
+        client = _client_for(orch)
+        resp = client.get("/files/manifest", headers=AUTH)
+        assert resp.status_code == 404
+        assert "episode" in resp.json()["detail"].lower()
+
+    def test_manifest_lists_files_with_sha256(self, tmp_path: Path) -> None:
+        # Create a small on-disk tree simulating a host output dir.
+        (tmp_path / "ep_001").mkdir()
+        file_a = tmp_path / "ep_001" / "cam_main.mp4"
+        file_a.write_bytes(b"hello world")
+        file_b = tmp_path / "ep_001" / "mic.wav"
+        file_b.write_bytes(b"\x00\x01\x02\x03")
+        # Non-file entry should be ignored.
+        (tmp_path / "ep_001" / "subdir").mkdir()
+
+        orch = _FakeOrchestrator(host_output_dir_path=tmp_path)
+        client = _client_for(orch)
+        resp = client.get("/files/manifest", headers=AUTH)
+        assert resp.status_code == 200
+        files = resp.json()["files"]
+
+        by_path = {e["path"]: e for e in files}
+        assert set(by_path.keys()) == {"ep_001/cam_main.mp4", "ep_001/mic.wav"}
+
+        entry_a = by_path["ep_001/cam_main.mp4"]
+        assert entry_a["size"] == len(b"hello world")
+        assert entry_a["sha256"] == hashlib.sha256(b"hello world").hexdigest()
+        assert isinstance(entry_a["mtime_ns"], int)
+
+        entry_b = by_path["ep_001/mic.wav"]
+        assert entry_b["size"] == 4
+        assert entry_b["sha256"] == hashlib.sha256(b"\x00\x01\x02\x03").hexdigest()
+
+    def test_download_streams_file(self, tmp_path: Path) -> None:
+        target = tmp_path / "foo.txt"
+        target.write_bytes(b"streamed payload")
+        orch = _FakeOrchestrator(host_output_dir_path=tmp_path)
+        client = _client_for(orch)
+        resp = client.get("/files/foo.txt", headers=AUTH)
+        assert resp.status_code == 200
+        assert resp.content == b"streamed payload"
+
+    def test_download_rejects_parent_escape(self, tmp_path: Path) -> None:
+        # Put a sibling file outside the allowed root.
+        allowed = tmp_path / "host_dir"
+        allowed.mkdir()
+        evil = tmp_path / "evil.txt"
+        evil.write_bytes(b"secret")
+
+        orch = _FakeOrchestrator(host_output_dir_path=allowed)
+        client = _client_for(orch)
+        # URL-encode ``../`` so httpx does not normalize it client-side
+        # — this is the realistic attacker vector we need to reject.
+        resp = client.get("/files/..%2Fevil.txt", headers=AUTH)
+        assert resp.status_code == 403
+        assert "escapes" in resp.json()["detail"].lower()
+
+    def test_download_returns_404_for_missing_file(self, tmp_path: Path) -> None:
+        orch = _FakeOrchestrator(host_output_dir_path=tmp_path)
+        client = _client_for(orch)
+        resp = client.get("/files/does_not_exist.bin", headers=AUTH)
+        assert resp.status_code == 404
+        assert "not found" in resp.json()["detail"].lower()

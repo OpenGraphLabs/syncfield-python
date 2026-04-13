@@ -17,9 +17,14 @@ class _FakeServiceInfo:
         self,
         properties: Dict[bytes, bytes],
         port: Optional[int] = None,
+        parsed_addresses: Optional[List[str]] = None,
     ) -> None:
         self.properties = properties
         self.port = port
+        self._parsed_addresses = parsed_addresses
+
+    def parsed_addresses(self) -> List[str]:
+        return list(self._parsed_addresses or [])
 
 
 class _FakeZeroconf:
@@ -100,9 +105,17 @@ def _register(
     zc: _FakeZeroconf,
     ann: SessionAnnouncement,
     port: Optional[int] = None,
+    parsed_addresses: Optional[List[str]] = None,
 ) -> str:
     name = f"{ann.session_id}._syncfield._tcp.local."
-    zc.register(name, _FakeServiceInfo(ann.to_txt_record(), port=port))
+    zc.register(
+        name,
+        _FakeServiceInfo(
+            ann.to_txt_record(),
+            port=port,
+            parsed_addresses=parsed_addresses,
+        ),
+    )
     return name
 
 
@@ -286,5 +299,77 @@ class TestControlPlanePortParsing:
             snapshot = browser.current_sessions()
             assert len(snapshot) == 1
             assert snapshot[0].control_plane_port is None
+        finally:
+            browser.close()
+
+
+class TestResolvedAddressParsing:
+    """Browser surfaces the first IPv4 address from ServiceInfo.
+
+    Like ``control_plane_port``, the address isn't in the TXT record —
+    it lives on the ``ServiceInfo`` (``parsed_addresses()`` in modern
+    zeroconf, ``addresses`` as packed bytes in legacy releases). The
+    browser must attach whichever surfaces so downstream HTTP calls
+    can skip the ``127.0.0.1`` hardcoding.
+    """
+
+    def test_parses_ipv4_address_into_announcement(self, fake_backend):
+        zc, browsers = fake_backend
+        browser = SessionBrowser()
+        browser.start()
+        try:
+            ann = _announcement("sid", "recording", started_at_ns=1)
+            name = _register(
+                zc, ann, port=7878, parsed_addresses=["192.168.1.42"]
+            )
+            browsers[0].fire_add(name)
+
+            snapshot = browser.current_sessions()
+            assert len(snapshot) == 1
+            assert snapshot[0].resolved_address == "192.168.1.42"
+        finally:
+            browser.close()
+
+    def test_empty_addresses_is_none(self, fake_backend):
+        zc, browsers = fake_backend
+        browser = SessionBrowser()
+        browser.start()
+        try:
+            ann = _announcement("sid", "preparing")
+            name = _register(zc, ann, port=7878, parsed_addresses=[])
+            browsers[0].fire_add(name)
+
+            snapshot = browser.current_sessions()
+            assert len(snapshot) == 1
+            assert snapshot[0].resolved_address is None
+        finally:
+            browser.close()
+
+    def test_legacy_addresses_bytes_fallback(self, fake_backend):
+        """Old zeroconf versions lack ``parsed_addresses()``; fall back to raw bytes."""
+        import socket
+
+        zc, browsers = fake_backend
+        browser = SessionBrowser()
+        browser.start()
+        try:
+            ann = _announcement("sid", "recording", started_at_ns=1)
+            name = f"{ann.session_id}._syncfield._tcp.local."
+
+            # Build a fake info that only exposes ``addresses`` (raw bytes),
+            # simulating a zeroconf < 0.39 release or a minimal test double
+            # whose ``parsed_addresses`` is absent.
+            class _LegacyInfo:
+                def __init__(self) -> None:
+                    self.properties = ann.to_txt_record()
+                    self.port = 7878
+                    self.addresses = [socket.inet_aton("10.0.0.7")]
+
+            zc.register(name, _LegacyInfo())  # type: ignore[arg-type]
+            browsers[0].fire_add(name)
+
+            snapshot = browser.current_sessions()
+            assert len(snapshot) == 1
+            assert snapshot[0].resolved_address == "10.0.0.7"
         finally:
             browser.close()
