@@ -62,13 +62,41 @@ def _fast_chirp_config() -> SyncToneConfig:
 
 
 def _session(tmp_path, **kwargs) -> SessionOrchestrator:
-    """Construct a silent-chirp session for concise test setup."""
-    return SessionOrchestrator(
+    """Construct a silent-chirp session with countdown stripped.
+
+    The 3-second default countdown is real-world ergonomics; it has zero
+    behavioural value in tests and used to add ~3s per ``start()`` call.
+    We keep the production default untouched and instead wrap ``start``
+    on the returned instance so every call defaults to ``countdown_s=0``
+    unless a test passes an explicit value (e.g. countdown-tick tests).
+    """
+    session = SessionOrchestrator(
         host_id=kwargs.pop("host_id", "rig_01"),
         output_dir=tmp_path,
         sync_tone=kwargs.pop("sync_tone", SyncToneConfig.silent()),
         **kwargs,
     )
+    _real_start = session.start
+
+    def _fast_start(*args, **start_kwargs):
+        start_kwargs.setdefault("countdown_s", 0)
+        return _real_start(*args, **start_kwargs)
+
+    session.start = _fast_start  # type: ignore[method-assign]
+    return session
+
+
+@pytest.fixture(autouse=True)
+def _no_countdown_sleep(monkeypatch):
+    """Neutralize ``time.sleep`` inside the orchestrator's countdown.
+
+    Two tests intentionally exercise ``countdown_s=3`` to verify the
+    tick callback / beep cadence, but neither asserts on wall-clock
+    elapsed time — they only care that the right number of ticks fire.
+    Replacing the orchestrator's ``time.sleep`` with a no-op keeps that
+    behaviour intact while shaving 3-6s off those tests.
+    """
+    monkeypatch.setattr("syncfield.orchestrator.time.sleep", lambda _s: None)
 
 
 class TestConstruction:

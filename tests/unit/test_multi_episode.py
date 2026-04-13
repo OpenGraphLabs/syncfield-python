@@ -18,11 +18,31 @@ from syncfield.tone import SyncToneConfig
 
 
 def _session(tmp_path: Path) -> SessionOrchestrator:
-    return SessionOrchestrator(
+    """Build an orchestrator with all wall-clock waits stripped.
+
+    The default countdown (3s) and chirp stabilization margins exist for
+    real research-lab ergonomics — they have zero behavioural value in
+    unit tests. We keep production defaults untouched and override only
+    here:
+
+    * ``SyncToneConfig.silent()`` — no chirp playback or stabilization
+      margins (these tests don't assert on chirp output).
+    * ``countdown_s=0`` defaulted on every ``start()`` via a thin wrapper
+      so existing call sites stay un-touched.
+    """
+    session = SessionOrchestrator(
         host_id="rig_01",
         output_dir=tmp_path,
         sync_tone=SyncToneConfig.silent(),
     )
+    _real_start = session.start
+
+    def _fast_start(*args, **kwargs):
+        kwargs.setdefault("countdown_s", 0)
+        return _real_start(*args, **kwargs)
+
+    session.start = _fast_start  # type: ignore[method-assign]
+    return session
 
 
 class TestMultiEpisodeRecording:
