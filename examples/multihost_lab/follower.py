@@ -1,7 +1,8 @@
 """Multi-host lab follower.
 
 Run on every machine other than the leader. Blocks until the leader's
-session is recording, then mirrors its lifecycle.
+session is recording, then mirrors its lifecycle. No UI — the operator
+sits at the leader's MacBook; followers are headless.
 
     pip install "syncfield[multihost,uvc,audio]"
     python follower.py
