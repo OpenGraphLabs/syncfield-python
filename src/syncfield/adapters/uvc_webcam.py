@@ -43,6 +43,8 @@ from syncfield.clock import SessionClock
 from syncfield.stream import DeviceKey, StreamBase
 from syncfield.types import (
     FinalizationReport,
+    HealthEvent,
+    HealthEventKind,
     SampleEvent,
     StreamCapabilities,
 )
@@ -153,6 +155,11 @@ class UVCWebcamStream(StreamBase):
         if self._thread is None or not self._thread.is_alive():
             self.connect()
         self._output_dir.mkdir(parents=True, exist_ok=True)
+        # Reset per-recording counters so a second recording in the
+        # same session starts clean.
+        self._frame_count = 0
+        self._first_at = None
+        self._last_at = None
         self._encoder = VideoEncoder.open(
             self._file_path,
             width=self._width,
@@ -195,6 +202,9 @@ class UVCWebcamStream(StreamBase):
         if self._input is None:
             self.prepare()
         self._output_dir.mkdir(parents=True, exist_ok=True)
+        self._frame_count = 0
+        self._first_at = None
+        self._last_at = None
         self._encoder = VideoEncoder.open(
             self._file_path,
             width=self._width,
@@ -255,9 +265,17 @@ class UVCWebcamStream(StreamBase):
                             capture_ns=capture_ns,
                         )
                     )
-        except Exception:
-            # Device disconnect or decode error — exit the loop; the
-            # orchestrator observes the thread dying via disconnect().
+        except Exception as exc:  # noqa: BLE001 - PyAV surfaces diverse errors here
+            # Device disconnect or decode error — emit a health event so the
+            # orchestrator sees a first-class signal, then exit the thread.
+            self._emit_health(
+                HealthEvent(
+                    stream_id=self.id,
+                    kind=HealthEventKind.ERROR,
+                    at_ns=time.monotonic_ns(),
+                    detail=f"capture loop ended: {exc!r}",
+                )
+            )
             return
 
     # ------------------------------------------------------------------
