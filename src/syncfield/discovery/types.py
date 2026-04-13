@@ -49,7 +49,7 @@ class DiscoveredDevice:
             speed, BLE address tail). Rendered in a muted color below the
             name in UIs.
         device_id: Stable identifier for this specific device —
-            ``cv2`` index, OAK serial, BLE MAC. Used for cache keys and
+            UVC device index, OAK serial, BLE MAC. Used for cache keys and
             user-facing copy like "already added".
         construct_kwargs: Keyword arguments for
             ``adapter_cls(**construct_kwargs, **caller_kwargs)``. Contains

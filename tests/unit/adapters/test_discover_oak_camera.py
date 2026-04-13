@@ -23,10 +23,6 @@ def mock_depthai(monkeypatch):
     fake.Device.getAllAvailableDevices.return_value = []
     monkeypatch.setitem(sys.modules, "depthai", fake)
 
-    fake_cv2 = MagicMock()
-    fake_cv2.VideoWriter_fourcc = lambda *a: 0
-    monkeypatch.setitem(sys.modules, "cv2", fake_cv2)
-
     sys.modules.pop("syncfield.adapters.oak_camera", None)
     importlib.import_module("syncfield.adapters.oak_camera")
     yield fake

@@ -9,10 +9,10 @@ succeeds but that specific class is simply absent from the module.
 Adapter                    Requires                               Install
 =========================  =====================================  =============================
 ``JSONLFileStream``        —                                      ``syncfield``
-``UVCWebcamStream``        ``opencv-python``                      ``syncfield[uvc]``
+``UVCWebcamStream``        ``av``                                 ``syncfield[uvc]``
 ``BLEImuGenericStream``    ``bleak``                              ``syncfield[ble]``
 ``OgloTactileStream``      ``bleak``                              ``syncfield[ble]``
-``OakCameraStream``        ``depthai`` + ``opencv-python``        ``syncfield[oak,uvc]``
+``OakCameraStream``        ``depthai`` + ``av``                   ``syncfield[oak]``
 =========================  =====================================  =============================
 
 Users who need a specific optional adapter can always import it directly
