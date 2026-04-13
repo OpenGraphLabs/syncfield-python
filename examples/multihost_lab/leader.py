@@ -37,4 +37,9 @@ session = sf.SessionOrchestrator(
 session.add(UVCWebcamStream("mac_webcam", device_index=0, output_dir=session.output_dir))
 session.add(UVCWebcamStream("iphone",     device_index=1, output_dir=session.output_dir))
 
+# Bring the cluster online BEFORE the viewer opens so the leader is
+# discoverable on mDNS immediately. Followers attach as soon as their
+# background browser sees this leader's advert (no Record click needed).
+session.connect()
+
 syncfield.viewer.launch(session)
