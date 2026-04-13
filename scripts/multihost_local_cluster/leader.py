@@ -26,6 +26,15 @@ def main() -> None:
                         help="How long to record before stopping. 0 = wait for Ctrl-C.")
     parser.add_argument("--keep-alive-sec", type=float, default=30.0,
                         help="How long the control plane stays up post-stop so followers can be pulled from.")
+    parser.add_argument(
+        "--follower",
+        action="append",
+        default=[],
+        metavar="HOST_ID:PORT",
+        help="Static follower (repeatable). Bypasses mDNS — required on macOS "
+             "single-machine testing where zeroconf can't resolve loopback TXT "
+             "records. Format: 'mac_b:7879'. Specify once per follower.",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
@@ -47,6 +56,22 @@ def main() -> None:
     mic = FakeStream("mic_builtin")
     mic.kind = "audio"
     session.add(mic)
+
+    if args.follower:
+        static_peers = []
+        for spec in args.follower:
+            if ":" not in spec:
+                parser.error(f"--follower must be HOST_ID:PORT, got {spec!r}")
+            host_id, port_str = spec.rsplit(":", 1)
+            static_peers.append({
+                "host_id": host_id,
+                "control_plane_port": int(port_str),
+                "resolved_address": "127.0.0.1",
+                "status": "preparing",
+            })
+        session.set_static_peers(static_peers)
+        print(f"[leader {args.host_id}] static peers configured: "
+              f"{[p['host_id'] for p in static_peers]} (mDNS bypass)")
 
     print(f"[leader {args.host_id}] starting session {session.session_id}")
     session.start()

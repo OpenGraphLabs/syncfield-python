@@ -34,7 +34,11 @@ tmux new-window -t $SESSION -n follower_c \
 sleep 2
 
 tmux new-window -t $SESSION -n leader \
-    "uv run python scripts/multihost_local_cluster/leader.py --host-id mac_a --control-plane-port 7878 --recording-seconds 5; read -p 'Enter to close'"
+    "uv run python scripts/multihost_local_cluster/leader.py \
+        --host-id mac_a --control-plane-port 7878 --recording-seconds 5 \
+        --follower mac_b:7879 \
+        --follower mac_c:7880; \
+        read -p 'Enter to close'"
 
 echo "Launched local cluster in tmux session '$SESSION'."
 echo "Attach with:  tmux attach -t $SESSION"

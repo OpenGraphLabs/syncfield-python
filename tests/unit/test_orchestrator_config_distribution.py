@@ -625,3 +625,52 @@ class TestFollowerAdvertising:
             assert _FakeAdvertiser.created == 0
         finally:
             follower._stop_control_plane_only_for_tests()
+
+
+class TestStaticPeers:
+    def test_set_static_peers_short_circuits_mdns_in_discovery(self, tmp_path):
+        """Static peers bypass the mDNS browser entirely."""
+        import syncfield as sf
+        from tests.unit.conftest import FakeStream
+
+        session = sf.SessionOrchestrator(
+            host_id="mac_a",
+            output_dir=tmp_path,
+            role=sf.LeaderRole(session_id="sid", control_plane_port=0),
+        )
+        session.add(FakeStream("cam"))
+        mic = FakeStream("mic"); mic.kind = "audio"
+        session.add(mic)
+
+        # Inject static peers.
+        session.set_static_peers([
+            {"host_id": "mac_b", "control_plane_port": 7879,
+             "resolved_address": "127.0.0.1", "status": "preparing"},
+        ])
+
+        # No browser attached — would fail without the short-circuit.
+        assert session._browser is None
+
+        peers = session._discover_followers_in_preparing()
+        assert len(peers) == 1
+        assert peers[0].host_id == "mac_b"
+        assert peers[0].control_plane_port == 7879
+        assert peers[0].resolved_address == "127.0.0.1"
+
+    def test_static_peers_excludes_self(self, tmp_path):
+        """Self should be filtered out even from static peers."""
+        import syncfield as sf
+
+        session = sf.SessionOrchestrator(
+            host_id="mac_a",
+            output_dir=tmp_path,
+            role=sf.LeaderRole(session_id="sid", control_plane_port=0),
+        )
+        session.set_static_peers([
+            {"host_id": "mac_a", "control_plane_port": 7878,
+             "resolved_address": "127.0.0.1", "status": "preparing"},
+            {"host_id": "mac_b", "control_plane_port": 7879,
+             "resolved_address": "127.0.0.1", "status": "preparing"},
+        ])
+        peers = session._discover_followers_in_preparing()
+        assert [p.host_id for p in peers] == ["mac_b"]

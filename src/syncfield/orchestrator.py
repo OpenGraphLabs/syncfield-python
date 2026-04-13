@@ -300,6 +300,13 @@ class SessionOrchestrator:
         self._advertiser: Optional[SessionAdvertiser] = None
         self._browser: Optional[SessionBrowser] = None
         self._observed_leader: Optional[SessionAnnouncement] = None
+        # Operator-injected peer list that bypasses mDNS discovery.
+        # Populated via :meth:`set_static_peers`; consumed by
+        # :meth:`_discover_followers_in_preparing` and
+        # :meth:`collect_from_followers`. Empty list means "use mDNS"
+        # (the normal LAN path). See set_static_peers() docstring for
+        # why this escape hatch exists (macOS loopback).
+        self._static_peers: list = []
         # Control plane (HTTP server) — populated on start() when role is set.
         self._control_plane: Optional[Any] = None
         # Cached capability snapshot — set by _start_control_plane() before
@@ -444,6 +451,54 @@ class SessionOrchestrator:
             recording_mode="standard",
         )
 
+    def set_static_peers(
+        self,
+        peers: list,
+    ) -> None:
+        """Inject explicit peer addresses, bypassing mDNS discovery.
+
+        Each peer is a ``SessionAnnouncement``-shaped dict or instance:
+
+            session.set_static_peers([
+                {"host_id": "mac_b", "control_plane_port": 7879,
+                 "resolved_address": "127.0.0.1", "status": "preparing"},
+                {"host_id": "mac_c", "control_plane_port": 7880,
+                 "resolved_address": "127.0.0.1", "status": "preparing"},
+            ])
+
+        Used by the local single-machine test cluster
+        (``scripts/multihost_local_cluster/leader.py``) to work around
+        macOS's loopback mDNS resolution limitation, where
+        ``zeroconf.get_service_info`` cannot retrieve TXT records for
+        services on the same machine. Real LAN deployments with
+        separate hosts use mDNS as normal.
+
+        When set, ``_discover_followers_in_preparing`` and
+        ``collect_from_followers`` use these peers IN ADDITION to any
+        mDNS-discovered peers (deduped by host_id, static wins).
+
+        Pass ``[]`` to clear.
+        """
+        from syncfield.multihost.types import SessionAnnouncement
+        from importlib.metadata import version as _pkg_version
+
+        normalized = []
+        for p in peers:
+            if isinstance(p, SessionAnnouncement):
+                normalized.append(p)
+            else:
+                # Build SessionAnnouncement from dict, with sensible defaults.
+                normalized.append(SessionAnnouncement(
+                    session_id=self.session_id or p.get("session_id", "unknown"),
+                    host_id=p["host_id"],
+                    status=p.get("status", "preparing"),
+                    sdk_version=p.get("sdk_version", _pkg_version("syncfield")),
+                    chirp_enabled=p.get("chirp_enabled", True),
+                    control_plane_port=p["control_plane_port"],
+                    resolved_address=p.get("resolved_address", "127.0.0.1"),
+                ))
+        self._static_peers = normalized
+
     def _discover_followers_in_preparing(self) -> "list[SessionAnnouncement]":
         """Return the announcements of followers in the same session in 'preparing'.
 
@@ -456,7 +511,14 @@ class SessionOrchestrator:
         browser for discovery;
         :meth:`_distribute_config_to_followers` takes care of that
         bootstrap).
+
+        Static peers (set via :meth:`set_static_peers`) take precedence
+        over mDNS discovery. When static peers are provided, mDNS is
+        not consulted at all.
         """
+        if self._static_peers:
+            # Static peers bypass the macOS loopback mDNS limitation.
+            return [p for p in self._static_peers if p.host_id != self._host_id]
         if self._browser is None:
             return []
         sid = self.session_id
@@ -504,8 +566,13 @@ class SessionOrchestrator:
         # Bootstrap a short-lived browser here so we can discover followers
         # that are currently in the 'preparing' phase. Filter on our own
         # session_id so we only see our cluster.
+        #
+        # Skip the mDNS bootstrap entirely when static peers are set —
+        # :meth:`_discover_followers_in_preparing` short-circuits to the
+        # static list and never touches the browser. This is the macOS
+        # loopback escape hatch; see :meth:`set_static_peers`.
         leader_owned_browser = False
-        if self._browser is None:
+        if self._browser is None and not self._static_peers:
             self._browser = SessionBrowser(session_id=self.session_id)
             self._browser.start()
             leader_owned_browser = True
@@ -650,20 +717,31 @@ class SessionOrchestrator:
         # followers do — bootstrap a short-lived one here, mirroring
         # _distribute_config_to_followers. Filter on our session_id so
         # we only see this cluster's peers.
-        browser = SessionBrowser(session_id=self.session_id)
-        browser.start()
-        try:
-            # Let zeroconf converge; mDNS re-broadcasts every few
-            # seconds by default, so ~1.5s is usually enough to see
-            # every peer that's still up inside the keep-alive window.
-            _time.sleep(1.5)
-
+        #
+        # Static peers (set via :meth:`set_static_peers`) bypass mDNS
+        # entirely — used by the local single-machine test cluster to
+        # work around the macOS loopback get_service_info limitation.
+        if self._static_peers:
+            browser = None
             peers = [
-                ann
-                for ann in browser.current_sessions()
-                if ann.host_id != self._host_id
-                and ann.control_plane_port is not None
+                p for p in self._static_peers if p.host_id != self._host_id
             ]
+        else:
+            browser = SessionBrowser(session_id=self.session_id)
+            browser.start()
+        try:
+            if browser is not None:
+                # Let zeroconf converge; mDNS re-broadcasts every few
+                # seconds by default, so ~1.5s is usually enough to see
+                # every peer that's still up inside the keep-alive window.
+                _time.sleep(1.5)
+
+                peers = [
+                    ann
+                    for ann in browser.current_sessions()
+                    if ann.host_id != self._host_id
+                    and ann.control_plane_port is not None
+                ]
 
             for ann in peers:
                 host_report: dict = {
@@ -749,13 +827,14 @@ class SessionOrchestrator:
 
                 hosts_report.append(host_report)
         finally:
-            try:
-                browser.close()
-            except Exception as exc:  # pragma: no cover - best-effort
-                logger.warning(
-                    "collect_from_followers browser close failed: %s",
-                    exc,
-                )
+            if browser is not None:
+                try:
+                    browser.close()
+                except Exception as exc:  # pragma: no cover - best-effort
+                    logger.warning(
+                        "collect_from_followers browser close failed: %s",
+                        exc,
+                    )
 
         aggregate = {
             "session_id": self.session_id,
