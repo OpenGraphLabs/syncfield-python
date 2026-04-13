@@ -164,6 +164,29 @@ Output directory:
   manifest.json
 ```
 
+## Multi-host research lab
+
+Run a coordinated capture session across 2–N MacBooks with zero manual
+coordination. See [`examples/multihost_lab/`](examples/multihost_lab/)
+for the full recipe.
+
+Short version (every host, same LAN, `pip install "syncfield[multihost,uvc,audio]"`):
+
+```bash
+# Leader MacBook
+python examples/multihost_lab/leader.py
+
+# Every other MacBook
+python examples/multihost_lab/follower.py
+```
+
+The leader plays a rising audio chirp at start and a falling chirp at
+stop; every host's microphone captures both, and the sync service
+cross-correlates them post-hoc for sub-5ms inter-host alignment. The
+leader auto-pushes session config to each follower over a local HTTP
+control plane, and after `stop()` pulls every follower's files into
+one canonical tree via `session.collect_from_followers()`.
+
 ## Best Practices
 
 ### Call `stamp()`/`record()` immediately after I/O read
