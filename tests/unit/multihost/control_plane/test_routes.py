@@ -29,12 +29,15 @@ class _FakeOrchestrator:
     role_kind: Optional[str] = "leader"
     state_name: str = "recording"
     sdk_version: str = "0.2.0"
+    has_audio_stream: bool = True
+    supported_audio_range_hz: tuple = (20.0, 20_000.0)
     streams_metrics: List[_FakeStreamMetrics] = field(default_factory=list)
     stored_config: Optional[Dict[str, Any]] = None
 
     start_called: int = 0
     stop_called: int = 0
     delete_called: int = 0
+    applied_config_on_orch: Optional[Any] = None
 
     def snapshot_stream_metrics(self) -> List[_FakeStreamMetrics]:
         return list(self.streams_metrics)
@@ -51,6 +54,9 @@ class _FakeOrchestrator:
 
     def trigger_control_plane_shutdown(self) -> None:
         self.delete_called += 1
+
+    def apply_distributed_config(self, config) -> None:
+        self.applied_config_on_orch = config
 
 
 def _client_for(orch: _FakeOrchestrator, started_at_monotonic_s: float = 0.0) -> TestClient:
@@ -136,8 +142,11 @@ class TestSessionConfig:
 
         config_payload = {
             "session_name": "lab_run_01",
-            "chirp_spec": {"from_hz": 400, "to_hz": 2500, "duration_ms": 1500},
-            "recording_mode": "high_quality_video",
+            "start_chirp": {"from_hz": 400.0, "to_hz": 2500.0, "duration_ms": 500,
+                            "amplitude": 0.8, "envelope_ms": 15},
+            "stop_chirp": {"from_hz": 2500.0, "to_hz": 400.0, "duration_ms": 500,
+                           "amplitude": 0.8, "envelope_ms": 15},
+            "recording_mode": "standard",
         }
         post = client.post("/session/config", json=config_payload, headers=AUTH)
         assert post.status_code == 200
@@ -147,13 +156,73 @@ class TestSessionConfig:
         assert get.status_code == 200
         assert get.json() == post.json()
 
-    def test_get_before_post_returns_empty_config(self) -> None:
+    def test_get_before_post_returns_404(self) -> None:
         orch = _FakeOrchestrator()
         client = _client_for(orch)
         resp = client.get("/session/config", headers=AUTH)
-        assert resp.status_code == 200
-        body = resp.json()
-        assert body.get("session_name") is None
+        assert resp.status_code == 404
+
+
+class TestConfigValidation:
+    def test_valid_config_is_applied(self) -> None:
+        orch = _FakeOrchestrator(has_audio_stream=True)
+        client = _client_for(orch)
+
+        payload = {
+            "session_name": "lab_01",
+            "start_chirp": {"from_hz": 400.0, "to_hz": 2500.0, "duration_ms": 500,
+                            "amplitude": 0.8, "envelope_ms": 15},
+            "stop_chirp": {"from_hz": 2500.0, "to_hz": 400.0, "duration_ms": 500,
+                           "amplitude": 0.8, "envelope_ms": 15},
+            "recording_mode": "standard",
+        }
+        r = client.post("/session/config", json=payload, headers=AUTH)
+        assert r.status_code == 200
+        body = r.json()
+        assert body["session_name"] == "lab_01"
+        assert body["start_chirp"]["from_hz"] == 400.0
+
+        # GET returns same applied state.
+        r2 = client.get("/session/config", headers=AUTH)
+        assert r2.status_code == 200
+        assert r2.json() == body
+
+    def test_follower_without_audio_rejects_with_400(self) -> None:
+        orch = _FakeOrchestrator(has_audio_stream=False)
+        client = _client_for(orch)
+        payload = {
+            "session_name": "lab_01",
+            "start_chirp": {"from_hz": 400.0, "to_hz": 2500.0, "duration_ms": 500,
+                            "amplitude": 0.8, "envelope_ms": 15},
+            "stop_chirp": {"from_hz": 2500.0, "to_hz": 400.0, "duration_ms": 500,
+                           "amplitude": 0.8, "envelope_ms": 15},
+        }
+        r = client.post("/session/config", json=payload, headers=AUTH)
+        assert r.status_code == 400
+        assert "audio" in r.json()["detail"].lower()
+
+    def test_chirp_out_of_audio_range_rejects_with_400(self) -> None:
+        orch = _FakeOrchestrator(
+            has_audio_stream=True,
+            supported_audio_range_hz=(20.0, 20_000.0),
+        )
+        client = _client_for(orch)
+        payload = {
+            "session_name": "lab_01",
+            "start_chirp": {"from_hz": 400.0, "to_hz": 30_000.0, "duration_ms": 500,
+                            "amplitude": 0.8, "envelope_ms": 15},
+            "stop_chirp": {"from_hz": 30_000.0, "to_hz": 400.0, "duration_ms": 500,
+                           "amplitude": 0.8, "envelope_ms": 15},
+        }
+        r = client.post("/session/config", json=payload, headers=AUTH)
+        assert r.status_code == 400
+        assert "out of this host's audio range" in r.json()["detail"]
+
+    def test_get_before_post_returns_404(self) -> None:
+        orch = _FakeOrchestrator()
+        client = _client_for(orch)
+        r = client.get("/session/config", headers=AUTH)
+        assert r.status_code == 404
 
 
 class TestSessionDelete:

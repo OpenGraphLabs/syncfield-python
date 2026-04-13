@@ -80,8 +80,15 @@ class TestControlPlaneE2E:
             # POST config.
             payload = {
                 "session_name": "lab_run_01",
-                "chirp_spec": {"from_hz": 400, "to_hz": 2500},
-                "recording_mode": "high_quality_video",
+                "start_chirp": {
+                    "from_hz": 400.0, "to_hz": 2500.0, "duration_ms": 500,
+                    "amplitude": 0.8, "envelope_ms": 15,
+                },
+                "stop_chirp": {
+                    "from_hz": 2500.0, "to_hz": 400.0, "duration_ms": 500,
+                    "amplitude": 0.8, "envelope_ms": 15,
+                },
+                "recording_mode": "standard",
             }
             r = httpx.post(
                 f"http://127.0.0.1:{port}/session/config",
@@ -91,6 +98,9 @@ class TestControlPlaneE2E:
             )
             assert r.status_code == 200
             assert r.json()["session_name"] == "lab_run_01"
+            assert r.json()["start_chirp"]["from_hz"] == 400.0
+            assert r.json()["stop_chirp"]["to_hz"] == 400.0
+            assert r.json()["recording_mode"] == "standard"
 
             # GET echoes it back.
             r2 = httpx.get(
@@ -100,6 +110,7 @@ class TestControlPlaneE2E:
             )
             assert r2.status_code == 200
             assert r2.json()["session_name"] == "lab_run_01"
+            assert r2.json()["start_chirp"]["from_hz"] == 400.0
         finally:
             leader._stop_control_plane_only_for_tests()
 

@@ -237,3 +237,36 @@ class TestSessionLogWriter:
     def test_path_property_points_at_session_log_jsonl(self, tmp_path: Path):
         writer = SessionLogWriter(tmp_path)
         assert writer.path == tmp_path / "session_log.jsonl"
+
+
+class TestManifestSessionConfig:
+    def test_manifest_includes_session_config_when_supplied(self, tmp_path):
+        from syncfield.writer import write_manifest
+        from syncfield.multihost.session_config import SessionConfig
+        from syncfield.types import ChirpSpec
+
+        cfg = SessionConfig(
+            session_name="lab_01",
+            start_chirp=ChirpSpec(from_hz=400, to_hz=2500, duration_ms=500,
+                                  amplitude=0.8, envelope_ms=15),
+            stop_chirp=ChirpSpec(from_hz=2500, to_hz=400, duration_ms=500,
+                                 amplitude=0.8, envelope_ms=15),
+        )
+        path = write_manifest(
+            host_id="mac_a",
+            streams={"cam": {}},
+            output_dir=tmp_path,
+            session_config=cfg.to_dict(),
+        )
+        import json
+        manifest = json.loads(path.read_text())
+        assert manifest["session_config"]["session_name"] == "lab_01"
+
+    def test_manifest_omits_session_config_when_none(self, tmp_path):
+        from syncfield.writer import write_manifest
+        path = write_manifest(
+            host_id="mac_a", streams={"cam": {}}, output_dir=tmp_path,
+        )
+        import json
+        manifest = json.loads(path.read_text())
+        assert "session_config" not in manifest

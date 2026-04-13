@@ -285,6 +285,8 @@ class SessionOrchestrator:
         self._observed_leader: Optional[SessionAnnouncement] = None
         # Control plane (HTTP server) — populated on start() when role is set.
         self._control_plane: Optional[Any] = None
+        # Session-global config this leader distributed (Phase 4).
+        self._applied_session_config = None
 
         self._output_dir = self._compute_initial_output_dir()
         self._sync_tone = sync_tone or SyncToneConfig.default()
@@ -400,6 +402,192 @@ class SessionOrchestrator:
         )
         self._rebind_stream_output_dirs()
 
+    def _build_session_config(self):
+        """Build the SessionConfig this leader will distribute to followers.
+
+        Returns ``None`` for single-host sessions and for followers —
+        only the leader constructs cluster-wide config. The config draws
+        from ``self._sync_tone`` (chirp specs), ``self.session_id``
+        (session name), and Phase-4's fixed ``recording_mode='standard'``.
+        """
+        from syncfield.multihost.session_config import SessionConfig
+
+        if not isinstance(self._role, LeaderRole):
+            return None
+        return SessionConfig(
+            session_name=self.session_id,
+            start_chirp=self._sync_tone.start_chirp,
+            stop_chirp=self._sync_tone.stop_chirp,
+            recording_mode="standard",
+        )
+
+    def _discover_followers_in_preparing(self) -> "list[SessionAnnouncement]":
+        """Return the announcements of followers in the same session in 'preparing'.
+
+        Skips self (matches on ``host_id``), ignores announcements from
+        other sessions, and excludes any follower that did not advertise
+        a control-plane port (those are structurally un-POSTable and
+        would just become rejections downstream). Returns an empty list
+        if no browser is attached (leader path uses an advertiser, not
+        a browser — so the leader must separately start a short-lived
+        browser for discovery;
+        :meth:`_distribute_config_to_followers` takes care of that
+        bootstrap).
+        """
+        if self._browser is None:
+            return []
+        sid = self.session_id
+        return [
+            ann
+            for ann in self._browser.current_sessions()
+            if ann.session_id == sid
+            and ann.host_id != self._host_id
+            and ann.status == "preparing"
+            and ann.control_plane_port is not None
+        ]
+
+    def _distribute_config_to_followers(self) -> None:
+        """POST this leader's SessionConfig to every preparing follower.
+
+        No-op if no followers are currently visible. Follower 400 errors
+        aggregate into a :class:`~syncfield.multihost.errors.ClusterConfigMismatch`,
+        which the caller (``start()``) treats as a fatal start failure.
+        Non-400 HTTP errors (timeouts, 5xx, connection refused) are
+        also aggregated into the same exception with a synthesized
+        reason so a single unreachable follower can't silently proceed.
+        """
+        import httpx
+        import time as _time
+        from syncfield.multihost.browser import SessionBrowser
+        from syncfield.multihost.errors import ClusterConfigMismatch
+
+        config = self._build_session_config()
+        if config is None:
+            return  # single-host or follower — nothing to distribute
+
+        # Leaders don't hold a browser during the session — advertiser only.
+        # Bootstrap a short-lived browser here so we can discover followers
+        # that are currently in the 'preparing' phase. Filter on our own
+        # session_id so we only see our cluster.
+        leader_owned_browser = False
+        if self._browser is None:
+            self._browser = SessionBrowser(session_id=self.session_id)
+            self._browser.start()
+            leader_owned_browser = True
+            # Let zeroconf converge; mDNS advertisements re-broadcast
+            # every few seconds by default, so ~1.5s is usually enough
+            # to see every follower that's already up and advertising.
+            _time.sleep(1.5)
+
+        try:
+            followers = self._discover_followers_in_preparing()
+            if not followers:
+                # No followers means the leader's config is still
+                # ground truth for its own recording — persist it.
+                self._applied_session_config = config
+                return
+
+            payload = config.to_dict()
+            headers = {"Authorization": f"Bearer {self.session_id}"}
+            rejections: dict = {}
+
+            for ann in followers:
+                if ann.control_plane_port is None:
+                    # Filtered upstream by _discover_followers_in_preparing;
+                    # defense-in-depth — turn into an assertion so a
+                    # contract regression fails loudly.
+                    assert False, (
+                        "discovery contract loosened: got None control_plane_port"
+                    )
+                url = f"http://127.0.0.1:{ann.control_plane_port}/session/config"
+                # NOTE: 127.0.0.1 is temporary until the leader resolves the
+                # follower's actual LAN address from the mDNS ServiceInfo.
+                # Phase 4 runs on localhost; Phase 5+ will plumb the address.
+                try:
+                    resp = httpx.post(url, json=payload, headers=headers, timeout=5.0)
+                except httpx.HTTPError as exc:
+                    rejections[ann.host_id] = f"network error: {exc}"
+                    continue
+                if resp.status_code != 200:
+                    try:
+                        detail = resp.json().get("detail", f"HTTP {resp.status_code}")
+                    except Exception:
+                        detail = f"HTTP {resp.status_code}"
+                    rejections[ann.host_id] = str(detail)
+
+            if rejections:
+                raise ClusterConfigMismatch(rejections)
+
+            # Remember what we successfully distributed so stop() can embed
+            # it in the leader's own manifest.
+            self._applied_session_config = config
+        finally:
+            if leader_owned_browser and self._browser is not None:
+                try:
+                    self._browser.close()
+                except Exception as exc:  # pragma: no cover
+                    logger.warning("Leader-owned browser close failed: %s", exc)
+                self._browser = None
+
+    def _fetch_config_from_leader(self) -> None:
+        """Follower-side: GET the leader's applied SessionConfig and apply locally.
+
+        Called after :meth:`_rewrite_output_dir_for_observed_session`
+        so ``self._observed_leader`` is populated. No-op if the
+        observed leader didn't advertise a control_plane_port (older
+        SDK, or control plane failed to bind), or if there's no
+        observed leader at all (single-host path / pre-attach state).
+        """
+        import httpx
+        from syncfield.multihost.session_config import (
+            SessionConfig,
+            validate_config_against_local_capabilities,
+        )
+
+        if self._observed_leader is None:
+            return
+        port = self._observed_leader.control_plane_port
+        if port is None:
+            return
+
+        url = f"http://127.0.0.1:{port}/session/config"
+        headers = {"Authorization": f"Bearer {self.session_id}"}
+        try:
+            resp = httpx.get(url, headers=headers, timeout=5.0)
+        except httpx.HTTPError as exc:
+            logger.warning("Follower fetch of leader config failed: %s", exc)
+            return
+
+        if resp.status_code == 404:
+            # Leader hasn't posted its config yet — happens when a
+            # follower observes the leader BEFORE the leader's own
+            # distribute loop runs. That distribute call will reach
+            # us via POST shortly.
+            return
+        if resp.status_code != 200:
+            logger.warning(
+                "Follower got HTTP %d fetching leader config", resp.status_code
+            )
+            return
+
+        cfg = SessionConfig.from_dict(resp.json())
+        try:
+            validate_config_against_local_capabilities(
+                cfg,
+                has_audio_stream=any(
+                    getattr(s, "kind", "custom") == "audio"
+                    for s in self._streams.values()
+                ),
+                supported_audio_range_hz=(20.0, 20_000.0),
+            )
+        except ValueError as exc:
+            # Local validation fails — this is a real disagreement,
+            # not a race. Surface it so the caller can abort.
+            from syncfield.multihost.errors import ClusterConfigMismatch
+            raise ClusterConfigMismatch({self._host_id: str(exc)})
+
+        self._applied_session_config = cfg
+
     def _rebind_stream_output_dirs(self) -> None:
         """Propagate ``self._output_dir`` into streams that cached it at ``add()`` time.
 
@@ -507,6 +695,63 @@ class SessionOrchestrator:
             except Exception as exc:  # pragma: no cover - best-effort
                 logger.warning("ControlPlaneServer.stop() failed: %s", exc)
             self._control_plane = None
+
+    def _rollback_after_distribute_failure(self) -> None:
+        """Roll back the session state after config distribution fails.
+
+        Called from :meth:`start` when
+        :meth:`_distribute_config_to_followers` raises
+        :class:`~syncfield.multihost.errors.ClusterConfigMismatch` (or
+        any other exception). The session is currently in ``RECORDING``
+        with streams actively writing; we unwind it to ``CONNECTED``
+        so the caller can retry ``start()`` without re-opening
+        hardware. The advertiser never flipped to ``recording``
+        (distribute runs before that flip), so we only need to tear
+        down the post-chirp / post-stream-start state.
+        """
+        # 1. Stop each stream that's currently recording. Must happen
+        #    BEFORE closing writers so any in-flight samples are
+        #    flushed before the file handles go away.
+        recording_streams = list(self._streams.values())
+        _rollback_stop_recording(recording_streams)
+
+        # 2. Close sample writers — matches the happy stop() flow so
+        #    trailing samples from rolled-back streams don't race a
+        #    closed file.
+        self._close_sample_writers()
+
+        # 3. Tear down control plane + discovery.
+        self._force_stop_control_plane()
+        self._stop_discovery_on_failure()
+
+        # 4. Reset sync_point / chirp state so a later retry doesn't
+        #    reuse stale anchors.
+        self._sync_point = None
+        self._session_clock = None
+        self._chirp_start = None
+        self._chirp_stop = None
+
+        # 5. Close the session log. The episode dir is left on disk —
+        #    the operator may want to inspect what got written before
+        #    the abort, and a subsequent start_new_episode will create
+        #    a fresh one.
+        if self._log_writer is not None:
+            self._log_writer.close()
+            self._log_writer = None
+        self._episode_dir_created = False
+
+        # 6. Transition: if start() auto-connected from IDLE, tear all
+        #    the way back to IDLE with devices closed so the caller sees
+        #    the same state they started with. Otherwise land in CONNECTED
+        #    for an explicit-connect caller who can retry without
+        #    re-opening hardware.
+        if self._auto_connected:
+            _rollback_disconnect_streams(self._connected_streams)
+            self._connected_streams = []
+            self._auto_connected = False
+            self._transition(SessionState.IDLE)
+        else:
+            self._transition(SessionState.CONNECTED)
 
     # -- test integration helpers (invoked only by dedicated tests) -----
 
@@ -822,6 +1067,7 @@ class SessionOrchestrator:
                 self._maybe_start_advertising()
                 self._maybe_wait_for_leader()
                 self._rewrite_output_dir_for_observed_session()
+                self._fetch_config_from_leader()
             except Exception:
                 self._stop_discovery_on_failure()
                 self._force_stop_control_plane()
@@ -922,6 +1168,19 @@ class SessionOrchestrator:
             # has enabled file writing before playing it.
             self._maybe_play_start_chirp()
             self._transition(SessionState.RECORDING)
+
+            # Distribute the leader's SessionConfig to every preparing
+            # follower before announcing 'recording'. A rejection from
+            # any follower raises ClusterConfigMismatch; we locally
+            # roll back streams + writers + control plane + discovery
+            # (the advertiser stays at 'preparing' which is correct —
+            # it never flipped) before re-raising so the operator
+            # sees a clean abort.
+            try:
+                self._distribute_config_to_followers()
+            except Exception:
+                self._rollback_after_distribute_failure()
+                raise
 
             # Leader only: flip the advertised status to `recording`
             # now that we actually are — the start chirp has played
@@ -1345,6 +1604,11 @@ class SessionOrchestrator:
             role=role_str,
             leader_host_id=leader_host_id,
             task=self._task,
+            session_config=(
+                self._applied_session_config.to_dict()
+                if self._applied_session_config is not None
+                else None
+            ),
         )
 
     # ------------------------------------------------------------------
@@ -1771,6 +2035,27 @@ class _ControlPlaneOrchestratorAdapter:
 
         return version("syncfield")
 
+    @property
+    def has_audio_stream(self) -> bool:
+        """Whether this host has at least one audio-capable stream registered."""
+        with self._orch._lock:
+            return any(
+                getattr(stream, "kind", "custom") == "audio"
+                for stream in self._orch._streams.values()
+            )
+
+    @property
+    def supported_audio_range_hz(self):
+        """Best-effort audio-frequency range supported by this host's audio streams.
+
+        Phase 4 uses a conservative default (20 Hz - 20 kHz — the
+        standard human-hearing range, which every consumer mic covers)
+        since the adapter SPI does not yet expose per-stream frequency
+        ranges. A future phase may tighten this once individual adapters
+        publish their true capability ranges.
+        """
+        return (20.0, 20_000.0)
+
     # -- metrics snapshot --
 
     def snapshot_stream_metrics(self):
@@ -1856,6 +2141,17 @@ class _ControlPlaneOrchestratorAdapter:
         timer = threading.Timer(0.05, self._orch._force_stop_control_plane)
         timer.daemon = True
         timer.start()
+
+    def apply_distributed_config(self, config) -> None:
+        """Propagate a POSTed SessionConfig to the orchestrator.
+
+        Called from the POST /session/config handler after successful
+        local validation so the follower's manifest.json embeds the
+        same config the leader distributed. Mirrors what the leader
+        does in _distribute_config_to_followers after a successful
+        push.
+        """
+        self._orch._applied_session_config = config
 
 
 class _StreamMetricsSnapshot:
