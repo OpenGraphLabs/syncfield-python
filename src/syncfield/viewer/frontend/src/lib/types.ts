@@ -131,3 +131,115 @@ export function isCountdown(msg: ServerMessage): msg is CountdownEvent {
 export function isStopResult(msg: ServerMessage): msg is StopResultEvent {
   return msg.type === "stop_result";
 }
+
+// ---------------------------------------------------------------------------
+// Multi-host cluster types
+// ---------------------------------------------------------------------------
+
+export interface ClusterPeer {
+  host_id: string;
+  role: string;          // "leader" | "follower"
+  status: string;        // mDNS advert status: "preparing" | "recording" | "stopped"
+  sdk_version: string;
+  chirp_enabled: boolean;
+  control_plane_port: number | null;
+  resolved_address: string | null;
+  is_self: boolean;
+  reachable: boolean | null;
+}
+
+export interface ClusterPeersResponse {
+  session_id: string;
+  self_host_id: string;
+  self_role: string;
+  peers: ClusterPeer[];
+}
+
+export interface ClusterStreamHealth {
+  id: string;
+  kind: string;
+  fps: number;
+  frames: number;
+  dropped: number;
+  last_frame_ns: number | null;
+  bytes_written: number;
+}
+
+export interface ClusterHostHealth {
+  host_id: string;
+  is_self: boolean;
+  status: "ok" | "unreachable" | "error";
+  rtt_ms: number | null;
+  error?: string;
+  health?: {
+    host_id: string;
+    role: string;
+    state: string;
+    sdk_version: string;
+    uptime_s: number;
+  };
+  streams?: ClusterStreamHealth[];
+}
+
+export interface ClusterHealthResponse {
+  session_id: string;
+  hosts: ClusterHostHealth[];
+}
+
+export interface ClusterDevice {
+  adapter_type: string;
+  kind: string;
+  display_name: string;
+  description: string;
+  device_id: string;
+  in_use: boolean;
+  warnings: string[];
+  accepts_output_dir: boolean;
+}
+
+export interface ClusterHostDevices {
+  host_id: string;
+  is_self: boolean;
+  status: "ok" | "error";
+  devices: ClusterDevice[];
+  errors: Record<string, string>;
+  timed_out: string[];
+  duration_s: number;
+  error?: string;
+}
+
+export interface ClusterDevicesResponse {
+  hosts: ClusterHostDevices[];
+}
+
+export interface ClusterActionResult {
+  host_id: string;
+  status: "ok" | "error";
+  state?: string;
+  error?: string;
+}
+
+export interface ClusterActionResponse {
+  hosts: ClusterActionResult[];
+}
+
+export interface ClusterCollectResponse {
+  session_id: string;
+  leader_host_id: string;
+  hosts: {
+    host_id: string;
+    status: string;
+    files: Array<{ path: string; size: number; sha256: string; mtime_ns: number }>;
+    error: string | null;
+  }[];
+}
+
+export interface ClusterConfigResponse {
+  session_id: string;
+  applied_config: {
+    session_name: string;
+    start_chirp: { from_hz: number; to_hz: number; duration_ms: number; amplitude: number; envelope_ms: number };
+    stop_chirp: { from_hz: number; to_hz: number; duration_ms: number; amplitude: number; envelope_ms: number };
+    recording_mode: string;
+  } | null;
+}

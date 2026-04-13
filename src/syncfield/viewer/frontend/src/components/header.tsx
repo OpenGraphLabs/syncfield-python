@@ -11,6 +11,8 @@ interface HeaderProps {
   onModeChange: (mode: ViewMode) => void;
   /** Hide recording-specific controls in review mode. */
   showRecordingControls?: boolean;
+  /** When truthy, render a compact "· N peers" chip next to host_id. */
+  clusterPeerCount?: number | null;
 }
 
 /** Dot color by session state. */
@@ -52,6 +54,7 @@ export function Header({
   mode,
   onModeChange,
   showRecordingControls = true,
+  clusterPeerCount = null,
 }: HeaderProps) {
   const state = snapshot?.state ?? "idle";
   const hostId = snapshot?.host_id ?? "—";
@@ -77,6 +80,11 @@ export function Header({
           <div className="mx-1 h-4 w-px bg-border" />
 
           <span className="font-mono text-xs text-muted">{hostId}</span>
+          {clusterPeerCount != null && clusterPeerCount > 0 && (
+            <span className="text-xs text-muted">
+              · {clusterPeerCount} {clusterPeerCount === 1 ? "peer" : "peers"}
+            </span>
+          )}
 
           <div className="mx-1 h-4 w-px bg-border" />
 

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { useSession } from "@/hooks/use-session";
 import { useDiscovery } from "@/hooks/use-discovery";
+import { useCluster } from "@/hooks/use-cluster";
 import { cn } from "@/lib/utils";
 import { Header } from "@/components/header";
 import { ControlPanel } from "@/components/control-panel";
@@ -9,6 +10,8 @@ import { StreamCard } from "@/components/stream-card";
 import { HealthTable } from "@/components/health-table";
 import { CountdownOverlay } from "@/components/countdown-overlay";
 import { DiscoveryModal } from "@/components/discovery-modal";
+import { ClusterPanel } from "@/components/cluster-panel";
+import { ClusterDiscoveryModal } from "@/components/cluster-discovery-modal";
 import { Footer } from "@/components/footer";
 import { StopResultBanner } from "@/components/stop-result-banner";
 import { TaskSelector } from "@/components/task-selector";
@@ -73,7 +76,9 @@ function RecordView({
     useSession();
   const taskState = useTasks();
   const discovery = useDiscovery();
+  const cluster = useCluster();
   const [discoveryOpen, setDiscoveryOpen] = useState(false);
+  const [clusterDiscoveryOpen, setClusterDiscoveryOpen] = useState(false);
 
   useEffect(() => {
     const state = snapshot?.state ?? "idle";
@@ -106,6 +111,9 @@ function RecordView({
         onDiscoverClick={() => setDiscoveryOpen(true)}
         mode={mode}
         onModeChange={onModeChange}
+        clusterPeerCount={
+          cluster.available ? (cluster.peers?.peers.length ?? null) : null
+        }
       />
 
       <ControlPanel state={state} hasTask={taskState.currentTask !== null} onCommand={sendCommand} />
@@ -149,14 +157,22 @@ function RecordView({
           )}
         </div>
 
-        {streamList.length > 0 && (
-          <div className="hidden w-72 shrink-0 border-l lg:block">
-            <div className="px-3 py-2.5">
-              <h3 className="text-xs font-medium text-muted">Health Events</h3>
-            </div>
-            <div className="overflow-y-auto">
-              <HealthTable entries={snapshot?.health_log ?? []} />
-            </div>
+        {(streamList.length > 0 || cluster.available) && (
+          <div className="hidden w-72 shrink-0 overflow-y-auto border-l lg:block">
+            {cluster.available && (
+              <ClusterPanel
+                cluster={cluster}
+                onDiscoverAcrossCluster={() => setClusterDiscoveryOpen(true)}
+              />
+            )}
+            {streamList.length > 0 && (
+              <>
+                <div className="px-3 py-2.5">
+                  <h3 className="text-xs font-medium text-muted">Health Events</h3>
+                </div>
+                <HealthTable entries={snapshot?.health_log ?? []} />
+              </>
+            )}
           </div>
         )}
       </div>
@@ -173,6 +189,12 @@ function RecordView({
         error={discovery.error}
         onScan={discovery.scan}
         onAdd={discovery.addDevice}
+      />
+
+      <ClusterDiscoveryModal
+        isOpen={clusterDiscoveryOpen}
+        onClose={() => setClusterDiscoveryOpen(false)}
+        cluster={cluster}
       />
     </div>
   );

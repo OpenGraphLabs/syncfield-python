@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
 import cv2
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -182,6 +182,31 @@ def _scan_episodes(data_dir: Path) -> List[Dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
+# Multi-host helpers
+# ---------------------------------------------------------------------------
+
+
+def _require_multihost(orch) -> None:
+    """Raise HTTP 409 unless the orchestrator has an attached multi-host role."""
+    if orch._role is None:
+        raise HTTPException(
+            status_code=409, detail="multi-host role not configured"
+        )
+
+
+def _require_leader(orch) -> None:
+    """Raise HTTP 409 unless the orchestrator is running as a LeaderRole."""
+    from syncfield.roles import LeaderRole
+
+    _require_multihost(orch)
+    if not isinstance(orch._role, LeaderRole):
+        raise HTTPException(
+            status_code=409,
+            detail="this operation requires a LeaderRole",
+        )
+
+
+# ---------------------------------------------------------------------------
 # Server class
 # ---------------------------------------------------------------------------
 
@@ -210,6 +235,7 @@ class ViewerServer:
         self.app = FastAPI(title=title, docs_url=None, redoc_url=None)
         self._setup_middleware()
         self._setup_routes()
+        self._setup_cluster_routes()
         self._setup_task_routes()
         self._setup_episode_routes()
         self._setup_static()
@@ -364,6 +390,606 @@ class ViewerServer:
                 return JSONResponse({"status": "removed", "id": stream_id})
             except Exception as exc:
                 return JSONResponse({"error": str(exc)}, status_code=400)
+
+    # ------------------------------------------------------------------
+    # Multi-host cluster routes
+    # ------------------------------------------------------------------
+
+    def _setup_cluster_routes(self) -> None:
+        """Register cluster-aware REST endpoints.
+
+        Every endpoint short-circuits with HTTP 409 when the
+        orchestrator has no multi-host role — single-host sessions
+        see no cluster features. Leader-only endpoints
+        (``start``/``stop``/``collect``) gate on :class:`LeaderRole`.
+
+        Peer fan-out uses ``httpx.AsyncClient`` with a short per-peer
+        timeout; per-peer failures become ``status="unreachable"``
+        entries in the response without aborting the aggregation.
+        """
+        app = self.app
+
+        @app.get("/api/cluster/peers")
+        async def api_cluster_peers() -> JSONResponse:
+            orch = self._session
+            _require_multihost(orch)
+
+            announcements = await asyncio.to_thread(
+                self._snapshot_peer_announcements
+            )
+            peers = self._build_peer_list(announcements)
+            return JSONResponse({
+                "session_id": orch.session_id,
+                "self_host_id": orch.host_id,
+                "self_role": orch._role.kind,
+                "peers": peers,
+            })
+
+        @app.get("/api/cluster/health")
+        async def api_cluster_health() -> JSONResponse:
+            orch = self._session
+            _require_multihost(orch)
+
+            announcements = await asyncio.to_thread(
+                self._snapshot_peer_announcements
+            )
+            hosts = await self._fan_out_health(announcements)
+            return JSONResponse({
+                "session_id": orch.session_id,
+                "hosts": hosts,
+            })
+
+        @app.post("/api/cluster/devices/discover")
+        async def api_cluster_devices_discover(
+            request: Request,
+        ) -> JSONResponse:
+            orch = self._session
+            _require_multihost(orch)
+
+            try:
+                body = await request.json()
+            except Exception:
+                body = {}
+            kinds = body.get("kinds") if isinstance(body, dict) else None
+            timeout = (
+                body.get("timeout", 10.0)
+                if isinstance(body, dict)
+                else 10.0
+            )
+
+            announcements = await asyncio.to_thread(
+                self._snapshot_peer_announcements
+            )
+            hosts = await self._fan_out_device_discovery(
+                announcements, kinds=kinds, timeout=float(timeout),
+            )
+            return JSONResponse({"hosts": hosts})
+
+        @app.post("/api/cluster/start")
+        async def api_cluster_start() -> JSONResponse:
+            orch = self._session
+            _require_leader(orch)
+
+            announcements = await asyncio.to_thread(
+                self._snapshot_peer_announcements
+            )
+            hosts = await self._fan_out_session_command(
+                announcements, path="/session/start",
+            )
+            return JSONResponse({"hosts": hosts})
+
+        @app.post("/api/cluster/stop")
+        async def api_cluster_stop() -> JSONResponse:
+            orch = self._session
+            _require_leader(orch)
+
+            announcements = await asyncio.to_thread(
+                self._snapshot_peer_announcements
+            )
+            hosts = await self._fan_out_session_command(
+                announcements, path="/session/stop",
+            )
+            return JSONResponse({"hosts": hosts})
+
+        @app.post("/api/cluster/collect")
+        async def api_cluster_collect() -> JSONResponse:
+            orch = self._session
+            _require_leader(orch)
+
+            # Guard: collecting while still recording would race the
+            # followers' file writers. The follower control planes
+            # remain alive for `keep_alive_after_stop_sec` specifically
+            # to give the leader time to pull files AFTER stop().
+            from syncfield.types import SessionState
+
+            if orch.state is SessionState.RECORDING:
+                raise HTTPException(
+                    status_code=409,
+                    detail="session must be stopped before collecting",
+                )
+
+            try:
+                manifest = await asyncio.wait_for(
+                    asyncio.to_thread(orch.collect_from_followers),
+                    timeout=300.0,
+                )
+            except asyncio.TimeoutError:
+                raise HTTPException(
+                    status_code=504,
+                    detail="collect_from_followers timed out after 300s",
+                )
+            except Exception as exc:
+                logger.exception("collect_from_followers failed")
+                raise HTTPException(status_code=500, detail=str(exc))
+            return JSONResponse(manifest)
+
+        @app.get("/api/cluster/config")
+        async def api_cluster_config() -> JSONResponse:
+            orch = self._session
+            _require_multihost(orch)
+
+            applied = orch._applied_session_config
+            return JSONResponse({
+                "session_id": orch.session_id,
+                "applied_config": applied.to_dict() if applied is not None else None,
+            })
+
+    # ------------------------------------------------------------------
+    # Cluster helpers
+    # ------------------------------------------------------------------
+
+    def _snapshot_peer_announcements(self) -> List[Any]:
+        """Return a snapshot of every peer announcement we can observe.
+
+        Prefers the orchestrator's long-lived browser when one exists
+        (followers hold a browser for the whole session). Otherwise
+        bootstraps a short-lived :class:`SessionBrowser` scoped to this
+        session and sleeps ~1.2s to let mDNS converge, then closes it.
+
+        Runs synchronously — callers should wrap in ``asyncio.to_thread``
+        to avoid blocking the event loop.
+        """
+        orch = self._session
+        session_id = orch.session_id
+        browser = getattr(orch, "_browser", None)
+        if browser is not None:
+            try:
+                return [
+                    ann for ann in browser.current_sessions()
+                    if session_id is None or ann.session_id == session_id
+                ]
+            except Exception:
+                logger.exception(
+                    "orchestrator browser current_sessions() failed; "
+                    "falling back to a short-lived browser",
+                )
+
+        # Bootstrap a short-lived browser filtered to this session.
+        try:
+            from syncfield.multihost.browser import SessionBrowser
+        except Exception:
+            logger.exception("SessionBrowser import failed")
+            return []
+        try:
+            b = SessionBrowser(session_id=session_id)
+            b.start()
+        except Exception:
+            logger.exception("SessionBrowser failed to start")
+            return []
+        try:
+            # mDNS typically converges within ~1s on a quiet LAN.
+            time.sleep(1.2)
+            return list(b.current_sessions())
+        finally:
+            try:
+                b.close()
+            except Exception:
+                logger.debug("SessionBrowser close raised", exc_info=True)
+
+    def _build_peer_list(self, announcements: List[Any]) -> List[Dict[str, Any]]:
+        """Assemble the peer list response (self + other announcements).
+
+        Per the endpoint contract, role derivation is pragmatic:
+
+        - For self, use the local orchestrator's role kind.
+        - For a follower viewer, the observed leader gets ``"leader"``
+          and all other hosts default to ``"follower"``.
+        - For a leader viewer, every non-self announcement defaults to
+          ``"follower"`` (leaders do not advertise other leaders).
+        """
+        orch = self._session
+        self_host_id = orch.host_id
+        self_role_kind = orch._role.kind if orch._role is not None else "follower"
+
+        leader_host_id: Optional[str] = None
+        if self_role_kind == "leader":
+            leader_host_id = self_host_id
+        else:
+            observed = getattr(orch, "_observed_leader", None)
+            if observed is not None:
+                leader_host_id = observed.host_id
+
+        peers: List[Dict[str, Any]] = []
+        seen_host_ids: Set[str] = set()
+
+        # Self entry first — the UI uses the ordering as a hint.
+        # Pull our own chirp_enabled / sdk_version / control_plane_port
+        # from the advertiser if one is running, else synthesize.
+        self_info = self._self_peer_entry(self_role_kind)
+        peers.append(self_info)
+        seen_host_ids.add(self_host_id)
+
+        for ann in announcements:
+            if ann.host_id in seen_host_ids:
+                continue
+            seen_host_ids.add(ann.host_id)
+            if ann.host_id == leader_host_id:
+                role = "leader"
+            else:
+                role = "follower"
+            peers.append({
+                "host_id": ann.host_id,
+                "role": role,
+                "status": ann.status,
+                "sdk_version": ann.sdk_version,
+                "chirp_enabled": ann.chirp_enabled,
+                "control_plane_port": ann.control_plane_port,
+                "resolved_address": ann.resolved_address,
+                "is_self": False,
+                "reachable": None,
+            })
+        return peers
+
+    def _self_peer_entry(self, role: str) -> Dict[str, Any]:
+        """Synthesize the peer-list entry for this host."""
+        orch = self._session
+        try:
+            from importlib.metadata import version
+
+            sdk_version = version("syncfield")
+        except Exception:
+            sdk_version = "unknown"
+
+        chirp_enabled = True
+        control_plane_port: Optional[int] = None
+        resolved_address: Optional[str] = None
+
+        cp = getattr(orch, "_control_plane", None)
+        if cp is not None:
+            control_plane_port = getattr(cp, "actual_port", None)
+
+        # Look up our own advertisement in the browser when available
+        # to recover chirp_enabled and resolved_address.
+        browser = getattr(orch, "_browser", None)
+        if browser is not None:
+            try:
+                for ann in browser.current_sessions():
+                    if ann.host_id == orch.host_id:
+                        chirp_enabled = ann.chirp_enabled
+                        if control_plane_port is None:
+                            control_plane_port = ann.control_plane_port
+                        resolved_address = ann.resolved_address
+                        break
+            except Exception:
+                logger.debug(
+                    "self-lookup via browser failed", exc_info=True
+                )
+
+        return {
+            "host_id": orch.host_id,
+            "role": role,
+            "status": orch.state.value,
+            "sdk_version": sdk_version,
+            "chirp_enabled": chirp_enabled,
+            "control_plane_port": control_plane_port,
+            "resolved_address": resolved_address,
+            "is_self": True,
+            "reachable": True,
+        }
+
+    def _self_health_entry(self) -> Dict[str, Any]:
+        """Return a synthetic health+streams block for this host.
+
+        Mirrors the shape of ``ControlPlaneServer``'s ``/health`` and
+        ``/streams`` endpoints by constructing an adapter around the
+        orchestrator and reading the same attributes those handlers use.
+        """
+        orch = self._session
+        try:
+            from syncfield.orchestrator import _ControlPlaneOrchestratorAdapter
+
+            adapter = _ControlPlaneOrchestratorAdapter(orch)
+            health = {
+                "host_id": adapter.host_id,
+                "role": adapter.role_kind,
+                "state": adapter.state_name,
+                "sdk_version": adapter.sdk_version,
+                "uptime_s": None,
+            }
+            streams_snapshot = adapter.snapshot_stream_metrics()
+        except Exception:
+            logger.exception("self health synthesis failed")
+            health = {
+                "host_id": orch.host_id,
+                "role": orch._role.kind if orch._role else None,
+                "state": orch.state.value,
+                "sdk_version": "unknown",
+                "uptime_s": None,
+            }
+            streams_snapshot = []
+
+        streams = [
+            {
+                "id": m.id,
+                "kind": m.kind,
+                "fps": m.fps,
+                "frames": m.frames,
+                "dropped": m.dropped,
+                "last_frame_ns": m.last_frame_ns,
+                "bytes_written": m.bytes_written,
+            }
+            for m in streams_snapshot
+        ]
+        return {
+            "host_id": orch.host_id,
+            "is_self": True,
+            "status": "ok",
+            "rtt_ms": None,
+            "health": health,
+            "streams": streams,
+        }
+
+    async def _fan_out_health(
+        self, announcements: List[Any]
+    ) -> List[Dict[str, Any]]:
+        """Fetch ``/health`` + ``/streams`` from every non-self peer."""
+        import httpx
+
+        orch = self._session
+        self_host_id = orch.host_id
+        results: List[Dict[str, Any]] = [self._self_health_entry()]
+
+        # Track host_ids we've already included to suppress any self
+        # announcement the browser might have picked up.
+        included: Set[str] = {self_host_id}
+        peers = [
+            ann for ann in announcements
+            if ann.host_id != self_host_id
+            and ann.host_id not in included
+            and ann.control_plane_port is not None
+        ]
+        for ann in peers:
+            included.add(ann.host_id)
+
+        if not peers:
+            return results
+
+        headers = {"Authorization": f"Bearer {orch.session_id}"}
+
+        async def _probe(ann) -> Dict[str, Any]:
+            base = orch._follower_base_url(ann)
+            started = time.monotonic()
+            try:
+                async with httpx.AsyncClient(timeout=2.0) as client:
+                    health_resp = await client.get(
+                        f"{base}/health", headers=headers,
+                    )
+                    rtt_ms = round((time.monotonic() - started) * 1000.0, 1)
+                    if health_resp.status_code != 200:
+                        return {
+                            "host_id": ann.host_id,
+                            "is_self": False,
+                            "status": "unreachable",
+                            "error": f"health HTTP {health_resp.status_code}",
+                        }
+                    streams_resp = await client.get(
+                        f"{base}/streams", headers=headers,
+                    )
+                    if streams_resp.status_code != 200:
+                        streams_data: List[Dict[str, Any]] = []
+                    else:
+                        streams_data = (
+                            streams_resp.json().get("streams", [])
+                        )
+                return {
+                    "host_id": ann.host_id,
+                    "is_self": False,
+                    "status": "ok",
+                    "rtt_ms": rtt_ms,
+                    "health": health_resp.json(),
+                    "streams": streams_data,
+                }
+            except Exception as exc:
+                return {
+                    "host_id": ann.host_id,
+                    "is_self": False,
+                    "status": "unreachable",
+                    "error": str(exc),
+                }
+
+        peer_results = await asyncio.gather(
+            *(_probe(a) for a in peers), return_exceptions=False,
+        )
+        results.extend(peer_results)
+        return results
+
+    async def _fan_out_device_discovery(
+        self,
+        announcements: List[Any],
+        *,
+        kinds: Optional[List[str]],
+        timeout: float,
+    ) -> List[Dict[str, Any]]:
+        """Run ``/devices/discover`` on every peer; self runs locally."""
+        import httpx
+
+        orch = self._session
+        self_host_id = orch.host_id
+
+        # Self: run discovery in-process so we don't need a loopback
+        # HTTP hop and so we remain callable even if our own control
+        # plane hasn't finished booting.
+        async def _self_discover() -> Dict[str, Any]:
+            try:
+                import syncfield.adapters  # noqa: F401 — register discoverers
+                from syncfield.discovery import scan
+            except ImportError as exc:
+                return {
+                    "host_id": self_host_id,
+                    "is_self": True,
+                    "status": "error",
+                    "error": f"discovery unavailable: {exc}",
+                    "devices": [],
+                }
+            try:
+                report = await asyncio.to_thread(
+                    scan, kinds=kinds, timeout=timeout, use_cache=False,
+                )
+            except Exception as exc:
+                logger.exception("self device discovery failed")
+                return {
+                    "host_id": self_host_id,
+                    "is_self": True,
+                    "status": "error",
+                    "error": str(exc),
+                    "devices": [],
+                }
+            return {
+                "host_id": self_host_id,
+                "is_self": True,
+                "status": "ok",
+                "devices": [
+                    {
+                        "adapter_type": d.adapter_type,
+                        "kind": d.kind,
+                        "display_name": d.display_name,
+                        "device_id": d.device_id,
+                        "in_use": d.in_use,
+                        "warnings": list(d.warnings),
+                        "accepts_output_dir": d.accepts_output_dir,
+                        "description": d.description,
+                    }
+                    for d in report.devices
+                ],
+                "errors": dict(report.errors),
+                "timed_out": list(report.timed_out),
+                "duration_s": report.duration_s,
+            }
+
+        headers = {"Authorization": f"Bearer {orch.session_id}"}
+        kinds_qs = ",".join(kinds) if kinds else ""
+        # httpx's client-level timeout should comfortably exceed the
+        # per-discoverer timeout so a cooperating peer has time to
+        # respond.
+        client_timeout = max(timeout + 5.0, 15.0)
+
+        async def _peer_discover(ann) -> Dict[str, Any]:
+            base = orch._follower_base_url(ann)
+            params: Dict[str, Any] = {"timeout": timeout}
+            if kinds_qs:
+                params["kinds"] = kinds_qs
+            try:
+                async with httpx.AsyncClient(timeout=client_timeout) as client:
+                    resp = await client.get(
+                        f"{base}/devices/discover",
+                        params=params,
+                        headers=headers,
+                    )
+                    if resp.status_code != 200:
+                        return {
+                            "host_id": ann.host_id,
+                            "is_self": False,
+                            "status": "error",
+                            "error": f"HTTP {resp.status_code}",
+                            "devices": [],
+                        }
+                    data = resp.json()
+                return {
+                    "host_id": ann.host_id,
+                    "is_self": False,
+                    "status": "ok",
+                    "devices": data.get("devices", []),
+                    "errors": data.get("errors", {}),
+                    "timed_out": data.get("timed_out", []),
+                    "duration_s": data.get("duration_s"),
+                }
+            except Exception as exc:
+                return {
+                    "host_id": ann.host_id,
+                    "is_self": False,
+                    "status": "unreachable",
+                    "error": str(exc),
+                    "devices": [],
+                }
+
+        peers = [
+            ann for ann in announcements
+            if ann.host_id != self_host_id and ann.control_plane_port is not None
+        ]
+
+        tasks = [_self_discover()] + [_peer_discover(a) for a in peers]
+        return list(await asyncio.gather(*tasks))
+
+    async def _fan_out_session_command(
+        self, announcements: List[Any], *, path: str,
+    ) -> List[Dict[str, Any]]:
+        """POST *path* (``/session/start`` or ``/session/stop``) to every follower.
+
+        Leader's own start/stop is intentionally NOT triggered here —
+        that flow continues to go through the viewer's WebSocket.
+        """
+        import httpx
+
+        orch = self._session
+        self_host_id = orch.host_id
+        headers = {"Authorization": f"Bearer {orch.session_id}"}
+
+        peers = [
+            ann for ann in announcements
+            if ann.host_id != self_host_id and ann.control_plane_port is not None
+        ]
+        if not peers:
+            return []
+
+        async def _send(ann) -> Dict[str, Any]:
+            base = orch._follower_base_url(ann)
+            try:
+                # Followers block inside trigger_start/trigger_stop for
+                # the full countdown + chirp duration; give them room.
+                async with httpx.AsyncClient(timeout=30.0) as client:
+                    resp = await client.post(
+                        f"{base}{path}", headers=headers,
+                    )
+                    if resp.status_code != 200:
+                        try:
+                            detail = resp.json().get(
+                                "detail", f"HTTP {resp.status_code}",
+                            )
+                        except Exception:
+                            detail = f"HTTP {resp.status_code}"
+                        return {
+                            "host_id": ann.host_id,
+                            "status": "error",
+                            "error": str(detail),
+                        }
+                    try:
+                        data = resp.json()
+                        state = data.get("state")
+                    except Exception:
+                        state = None
+                    return {
+                        "host_id": ann.host_id,
+                        "status": "ok",
+                        "state": state,
+                    }
+            except Exception as exc:
+                return {
+                    "host_id": ann.host_id,
+                    "status": "error",
+                    "error": str(exc),
+                }
+
+        return list(await asyncio.gather(*(_send(a) for a in peers)))
 
     # ------------------------------------------------------------------
     # Task management routes
