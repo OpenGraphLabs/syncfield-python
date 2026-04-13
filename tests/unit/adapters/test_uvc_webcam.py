@@ -160,3 +160,28 @@ class TestFourPhaseLifecycle:
             assert stream._thread is first_thread  # noqa: SLF001
         finally:
             stream.disconnect()
+
+    def test_jitter_reported_when_enough_frames(
+        self, mock_av_generous, tmp_path
+    ):
+        """After recording 20+ frames, jitter p95/p99 are populated."""
+        from syncfield.adapters.uvc_webcam import UVCWebcamStream
+
+        stream = UVCWebcamStream(
+            "cam", device_index=0, output_dir=tmp_path, fps=30.0
+        )
+        stream.prepare()
+        stream.connect()
+        stream.start_recording(_clock())
+        # Need enough recorded frames for the >=20 sample threshold.
+        # mock_av_generous paces at 1ms/frame, so 100ms should yield ~90.
+        time.sleep(0.15)
+        report = stream.stop_recording()
+        stream.disconnect()
+
+        assert report.jitter_p95_ns is not None
+        assert report.jitter_p99_ns is not None
+        assert report.jitter_p99_ns >= report.jitter_p95_ns
+        # Sanity: jitter should be on the order of pace_seconds (1ms = 1_000_000 ns)
+        # — allow generous bounds for CI load.
+        assert 0 < report.jitter_p95_ns < 100_000_000  # < 100ms

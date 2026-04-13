@@ -297,6 +297,8 @@ class FinalizationReport:
     last_sample_at_ns: int | None
     health_events: list[HealthEvent]
     error: str | None
+    jitter_p95_ns: int | None = None
+    jitter_p99_ns: int | None = None
 
 
 @dataclass(frozen=True)

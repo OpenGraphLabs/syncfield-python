@@ -60,7 +60,7 @@ except ImportError as exc:  # pragma: no cover - exercised via sys.modules patch
         "Install with `pip install syncfield[oak]`."
     ) from exc
 
-from syncfield.adapters._video_encoder import VideoEncoder
+from syncfield.adapters._video_encoder import VideoEncoder, compute_jitter_percentiles
 
 from syncfield.clock import SessionClock
 from syncfield.stream import StreamBase
@@ -148,6 +148,11 @@ class OakCameraStream(StreamBase):
         self._depth_frame_count = 0
         self._first_at: Optional[int] = None
         self._last_at: Optional[int] = None
+
+        # Jitter collection: inter-frame intervals (ns) over the current
+        # recording window. Reset in start_recording().
+        self._prev_capture_ns: Optional[int] = None
+        self._intervals_ns: list[int] = []
 
         # True while the capture loop should write frames to disk and
         # emit ``SampleEvent``. ``connect()`` leaves this False so the
@@ -306,6 +311,8 @@ class OakCameraStream(StreamBase):
         self._depth_frame_count = 0
         self._first_at = None
         self._last_at = None
+        self._prev_capture_ns = None
+        self._intervals_ns = []
 
         width, height = self._rgb_resolution
         self._video_writer = VideoEncoder.open(
@@ -331,6 +338,7 @@ class OakCameraStream(StreamBase):
         self._recording = False
         self._release_writers()
 
+        jitter_p95, jitter_p99 = compute_jitter_percentiles(self._intervals_ns)
         return FinalizationReport(
             stream_id=self.id,
             status="completed",
@@ -340,6 +348,8 @@ class OakCameraStream(StreamBase):
             last_sample_at_ns=self._last_at,
             health_events=list(self._collected_health),
             error=None,
+            jitter_p95_ns=jitter_p95,
+            jitter_p99_ns=jitter_p99,
         )
 
     def disconnect(self) -> None:
@@ -443,6 +453,9 @@ class OakCameraStream(StreamBase):
             capture_ns = time.monotonic_ns()
             if rgb_msg is None:
                 continue
+            if self._prev_capture_ns is not None:
+                self._intervals_ns.append(capture_ns - self._prev_capture_ns)
+            self._prev_capture_ns = capture_ns
 
             frame = rgb_msg.getCvFrame()
 

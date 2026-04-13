@@ -158,3 +158,20 @@ def open_uvc_input(
         raise RuntimeError(f"Unsupported platform for UVC input: {sys.platform}")
 
     return av.open(url, format=fmt, options=options)
+
+
+def compute_jitter_percentiles(
+    intervals_ns: list[int],
+) -> tuple[Optional[int], Optional[int]]:
+    """Return (p95, p99) of inter-frame intervals, or (None, None) if <20 samples.
+
+    At very small sample sizes percentile estimates are noisy and not
+    usefully actionable — better to leave them null than to emit a
+    misleading number.
+    """
+    if len(intervals_ns) < 20:
+        return None, None
+    sorted_iv = sorted(intervals_ns)
+    p95_idx = min(len(sorted_iv) - 1, int(len(sorted_iv) * 0.95))
+    p99_idx = min(len(sorted_iv) - 1, int(len(sorted_iv) * 0.99))
+    return sorted_iv[p95_idx], sorted_iv[p99_idx]

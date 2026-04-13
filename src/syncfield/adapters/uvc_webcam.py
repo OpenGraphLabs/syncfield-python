@@ -38,7 +38,11 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
-from syncfield.adapters._video_encoder import VideoEncoder, open_uvc_input
+from syncfield.adapters._video_encoder import (
+    VideoEncoder,
+    compute_jitter_percentiles,
+    open_uvc_input,
+)
 from syncfield.clock import SessionClock
 from syncfield.stream import DeviceKey, StreamBase
 from syncfield.types import (
@@ -106,6 +110,11 @@ class UVCWebcamStream(StreamBase):
         self._first_at: Optional[int] = None
         self._last_at: Optional[int] = None
 
+        # Jitter collection: inter-frame intervals (ns) over the current
+        # recording window. Reset in start_recording() / start().
+        self._prev_capture_ns: Optional[int] = None
+        self._intervals_ns: list[int] = []
+
         # True while the capture loop is writing frames and emitting
         # SampleEvents. ``connect()`` leaves this False so the preview
         # phase stays write-free; ``start_recording()`` flips it True.
@@ -160,6 +169,8 @@ class UVCWebcamStream(StreamBase):
         self._frame_count = 0
         self._first_at = None
         self._last_at = None
+        self._prev_capture_ns = None
+        self._intervals_ns = []
         self._encoder = VideoEncoder.open(
             self._file_path,
             width=self._width,
@@ -174,6 +185,7 @@ class UVCWebcamStream(StreamBase):
         if self._encoder is not None:
             self._encoder.close()
             self._encoder = None
+        jitter_p95, jitter_p99 = compute_jitter_percentiles(self._intervals_ns)
         return FinalizationReport(
             stream_id=self.id,
             status="completed",
@@ -183,6 +195,8 @@ class UVCWebcamStream(StreamBase):
             last_sample_at_ns=self._last_at,
             health_events=list(self._collected_health),
             error=None,
+            jitter_p95_ns=jitter_p95,
+            jitter_p99_ns=jitter_p99,
         )
 
     def disconnect(self) -> None:
@@ -205,6 +219,8 @@ class UVCWebcamStream(StreamBase):
         self._frame_count = 0
         self._first_at = None
         self._last_at = None
+        self._prev_capture_ns = None
+        self._intervals_ns = []
         self._encoder = VideoEncoder.open(
             self._file_path,
             width=self._width,
@@ -243,6 +259,9 @@ class UVCWebcamStream(StreamBase):
         try:
             for frame in self._input.decode(video=0):
                 capture_ns = time.monotonic_ns()
+                if self._prev_capture_ns is not None:
+                    self._intervals_ns.append(capture_ns - self._prev_capture_ns)
+                self._prev_capture_ns = capture_ns
                 if self._stop_event.is_set():
                     break
 
