@@ -63,7 +63,6 @@ class VideoEncoder:
         height: int,
         fps: float,
         codec: Optional[str] = None,
-        pixel_format: str = "yuv420p",
     ) -> "VideoEncoder":
         """Open ``path`` for writing and configure the H.264 stream."""
         chosen_codec = codec or _pick_h264_encoder()
@@ -71,7 +70,7 @@ class VideoEncoder:
         stream = container.add_stream(chosen_codec, rate=int(round(fps)))
         stream.width = int(width)
         stream.height = int(height)
-        stream.pix_fmt = pixel_format
+        stream.pix_fmt = "yuv420p"
         return cls(container, stream)
 
     def write(self, frame_bgr: np.ndarray) -> None:
@@ -88,12 +87,25 @@ class VideoEncoder:
             self._container.mux(packet)
 
     def close(self) -> None:
-        """Flush the encoder and close the container. Idempotent."""
+        """Flush the encoder and close the container. Idempotent.
+
+        May raise if the final flush fails. A second ``close()`` is always
+        a no-op. The underlying container is closed even if the flush
+        raises, so resources are not leaked.
+        """
         if self._closed:
             return
         self._closed = True
+        flush_error: Optional[BaseException] = None
         try:
             for packet in self._stream.encode(None):
                 self._container.mux(packet)
-        finally:
+        except BaseException as exc:  # noqa: BLE001 - propagate after cleanup
+            flush_error = exc
+        # Always close the container, even if flush raised.
+        try:
             self._container.close()
+        except Exception:  # noqa: BLE001 - trailer write failure is unrecoverable
+            pass
+        if flush_error is not None:
+            raise flush_error

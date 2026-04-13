@@ -33,7 +33,9 @@ def fake_av(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     container.add_stream.return_value = stream
 
     packet = MagicMock(name="Packet")
-    stream.encode.return_value = [packet]
+    stream.encode = MagicMock(
+        side_effect=lambda frame: [packet] if frame is not None else []
+    )
 
     av = SimpleNamespace()
     av.open = MagicMock(name="av.open", return_value=container)
@@ -92,7 +94,7 @@ def test_write_encodes_and_muxes_one_frame(tmp_path: Path, fake_av: SimpleNamesp
 
     fake_av.av.VideoFrame.from_ndarray.assert_called_once()
     fake_av.stream.encode.assert_called()
-    fake_av.container.mux.assert_called_with(fake_av.packet)
+    fake_av.container.mux.assert_called_once_with(fake_av.packet)
 
     enc.close()
 
@@ -115,3 +117,28 @@ def test_write_after_close_raises(tmp_path: Path, fake_av: SimpleNamespace) -> N
     frame = np.zeros((48, 64, 3), dtype=np.uint8)
     with pytest.raises(RuntimeError):
         enc.write(frame)
+
+
+def test_close_propagates_flush_error_but_closes_container(
+    tmp_path: Path, fake_av: SimpleNamespace
+) -> None:
+    """If the flush raises, close() still closes the container and re-raises."""
+    from syncfield.adapters._video_encoder import VideoEncoder
+
+    enc = VideoEncoder.open(tmp_path / "clip.mp4", width=64, height=48, fps=30.0)
+
+    # Make the flush (encode(None)) raise.
+    fake_av.stream.encode = MagicMock(
+        side_effect=lambda frame: (_ for _ in ()).throw(RuntimeError("flush failed"))
+        if frame is None
+        else [fake_av.packet]
+    )
+
+    with pytest.raises(RuntimeError, match="flush failed"):
+        enc.close()
+
+    # Container was still closed even though flush raised.
+    fake_av.container.close.assert_called_once()
+    # Second close() is a no-op.
+    enc.close()
+    fake_av.container.close.assert_called_once()
