@@ -46,10 +46,16 @@ def _get_zeroconf_cls() -> Callable[[], Any]:
     Isolated as a helper so unit tests can monkey-patch it with a fake
     backend without needing the real library installed in the test
     environment.
-    """
-    from zeroconf import Zeroconf  # type: ignore[import-not-found]
 
-    return Zeroconf
+    The returned factory binds ``interfaces=InterfaceChoice.All`` so the
+    Zeroconf instance listens on every interface — including loopback,
+    which the default ``InterfaceChoice.Default`` often excludes on
+    macOS. Without this, two SyncField processes on the same MacBook
+    cannot discover each other via mDNS.
+    """
+    from zeroconf import InterfaceChoice, Zeroconf  # type: ignore[import-not-found]
+
+    return lambda: Zeroconf(interfaces=InterfaceChoice.All)
 
 
 def _get_service_info_cls() -> Callable[..., Any]:

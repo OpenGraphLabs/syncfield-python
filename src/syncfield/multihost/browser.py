@@ -31,10 +31,17 @@ logger = logging.getLogger(__name__)
 
 
 def _get_zeroconf_cls() -> Callable[[], Any]:
-    """Return a zero-argument factory for a ``Zeroconf`` instance."""
-    from zeroconf import Zeroconf  # type: ignore[import-not-found]
+    """Return a zero-argument factory for a ``Zeroconf`` instance.
 
-    return Zeroconf
+    The returned factory binds ``interfaces=InterfaceChoice.All`` so the
+    Zeroconf instance listens on every interface — including loopback,
+    which the default ``InterfaceChoice.Default`` often excludes on
+    macOS. Without this, two SyncField processes on the same MacBook
+    cannot discover each other via mDNS.
+    """
+    from zeroconf import InterfaceChoice, Zeroconf  # type: ignore[import-not-found]
+
+    return lambda: Zeroconf(interfaces=InterfaceChoice.All)
 
 
 def _get_service_browser_cls() -> Callable[..., Any]:
@@ -197,6 +204,7 @@ class SessionBrowser:
         with self._update_event:
             self._sessions.pop(name, None)
             self._update_event.notify_all()
+        logger.info("SessionBrowser lost peer: %s", name)
 
     #: Default ``get_service_info`` timeout, in milliseconds.
     #: zeroconf's listener callbacks fire as soon as the service name
@@ -254,8 +262,24 @@ class SessionBrowser:
         address = _extract_ipv4(info)
         ann = replace(ann, resolved_address=address)
         with self._update_event:
+            previous = self._sessions.get(name)
             self._sessions[name] = ann
             self._update_event.notify_all()
+        if previous is None:
+            logger.info(
+                "SessionBrowser observed peer: host_id=%s status=%s "
+                "control_plane_port=%s",
+                ann.host_id,
+                ann.status,
+                ann.control_plane_port,
+            )
+        elif previous.status != ann.status:
+            logger.info(
+                "SessionBrowser peer status change: host_id=%s %s -> %s",
+                ann.host_id,
+                previous.status,
+                ann.status,
+            )
 
 
 def _extract_ipv4(info: Any) -> Optional[str]:
