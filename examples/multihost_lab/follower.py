@@ -28,10 +28,10 @@ session.add(UVCWebcamStream("iphone",     device_index=1, output_dir=session.out
 
 
 if __name__ == "__main__":
-    # Bring up devices + control plane + browser so this follower is
-    # immediately on mDNS and visible to the leader's cluster panel,
-    # even before the leader clicks Record. session.start() below will
-    # then block only on the leader's recording transition.
+    # Control plane + browser are already running — brought up at
+    # SessionOrchestrator construction time, so this follower is on
+    # mDNS immediately. connect() below opens devices so local capture
+    # is ready the moment the leader flips to recording.
     session.connect()
     print("Follower connected, waiting for leader…")
 

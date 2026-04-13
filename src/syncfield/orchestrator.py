@@ -377,6 +377,82 @@ class SessionOrchestrator:
         self._sample_writers: Dict[str, SampleWriter] = {}
         self._sample_handler_active: Dict[str, List[bool]] = {}
 
+        # Multi-host: start control plane + advertiser (or follower browser)
+        # at construction time so cluster discovery is independent of device
+        # lifecycle. Failures here raise out of __init__ (the constructor is
+        # the right place to fail loudly on port-binding or role-config errors).
+        if self._role is not None:
+            self._bring_multihost_online()
+            import atexit
+            atexit.register(self._safe_shutdown)
+
+    def _bring_multihost_online(self) -> None:
+        """Spin up control plane + advertiser (or follower browser) at construction time.
+
+        Audio-stream validation is deliberately NOT done here — streams are
+        added AFTER __init__. The check stays in start().
+
+        Failures partway through tear down anything that came up so the
+        constructor doesn't leak threads/sockets.
+        """
+        started_control_plane = False
+        try:
+            self._start_control_plane()
+            started_control_plane = True
+            self._maybe_start_advertising()
+            self._maybe_start_follower_browser_in_background()
+        except Exception:
+            if self._advertiser is not None:
+                try:
+                    self._advertiser.close()
+                except Exception:
+                    pass
+                self._advertiser = None
+            if self._browser is not None:
+                try:
+                    self._browser.close()
+                except Exception:
+                    pass
+                self._browser = None
+            if started_control_plane:
+                self._force_stop_control_plane()
+            raise
+
+    def _safe_shutdown(self) -> None:
+        """atexit-callable wrapper around shutdown() that swallows errors."""
+        try:
+            self.shutdown()
+        except Exception:
+            pass
+
+    def shutdown(self) -> None:
+        """Tear down ALL multi-host machinery (control plane + advertiser + browser).
+
+        Safe to call multiple times. Single-host sessions (role=None) are
+        no-ops. Devices are NOT touched here — call disconnect() for that.
+
+        Automatically called via atexit when the orchestrator is constructed
+        with a role; you usually don't need to call it explicitly unless
+        you want deterministic teardown before process exit.
+        """
+        if self._role is None:
+            return
+        if self._browser is not None:
+            try:
+                self._browser.close()
+            except Exception as exc:
+                logger.warning("browser.close failed: %s", exc)
+            self._browser = None
+        if self._advertiser is not None:
+            try:
+                self._advertiser.close()
+            except Exception as exc:
+                logger.warning("advertiser.close failed: %s", exc)
+            self._advertiser = None
+        self._force_stop_control_plane()
+        self._observed_leader = None
+        self._follower_observer_thread = None
+
     def _compute_initial_output_dir(self) -> Path:
         """Return the episode directory path for this session.
 
@@ -1497,70 +1573,6 @@ class SessionOrchestrator:
             # user having to add an audio stream manually.
             self._maybe_inject_host_audio()
 
-            # Multi-host: bring the cluster-formation machinery up NOW
-            # so the operator can see who's connected in the viewer
-            # cluster panel BEFORE clicking Record. Previously this
-            # work happened inside start(), which meant the leader only
-            # appeared on mDNS after a recording began — late discovery
-            # that confused operators running multi-rig research labs.
-            #
-            # Order matters here:
-            # 1. Validate audio — cheapest, catches mis-configured host
-            #    before we allocate any network resources.
-            # 2. Control plane — must be up before the advertiser so the
-            #    advertiser can publish the real (possibly OS-assigned)
-            #    control-plane port in its TXT record.
-            # 3. Advertiser — leaders always advertise at connect;
-            #    pre-shared followers also advertise; auto-discover
-            #    followers defer to post-observation.
-            # 4. Follower's background browser — starts a daemon thread
-            #    that blocks on wait_for_observation(inf). This thread
-            #    sets _observed_leader and kicks off the follower's
-            #    own advertiser as soon as any leader appears on mDNS,
-            #    with no impact on connect() latency.
-            #
-            # On any failure during the multi-host bringup, tear down
-            # whatever did come up and roll all the way back to IDLE
-            # with devices closed (so the caller sees the same state
-            # they had before connect()).
-            if self._role is not None:
-                try:
-                    self._validate_multihost_audio_requirement()
-                    self._start_control_plane()
-                    self._maybe_start_advertising()
-                    self._maybe_start_follower_browser_in_background()
-                except Exception as exc:
-                    self._log_rollback(exc, len(connected))
-                    # Tear down any multi-host infrastructure that did
-                    # come up before the failure.
-                    if self._advertiser is not None:
-                        try:
-                            self._advertiser.close()
-                        except Exception as adv_exc:  # pragma: no cover
-                            logger.warning(
-                                "advertiser.close failed during connect rollback: %s",
-                                adv_exc,
-                            )
-                        self._advertiser = None
-                    if self._browser is not None:
-                        try:
-                            self._browser.close()
-                        except Exception as br_exc:  # pragma: no cover
-                            logger.warning(
-                                "browser.close failed during connect rollback: %s",
-                                br_exc,
-                            )
-                        self._browser = None
-                    self._force_stop_control_plane()
-                    # Close the streams we just opened.
-                    _rollback_disconnect_streams(connected)
-                    self._connected_streams = []
-                    self._transition(SessionState.IDLE)
-                    if self._log_writer is not None:
-                        self._log_writer.close()
-                        self._log_writer = None
-                    raise
-
             self._transition(SessionState.CONNECTED)
 
     # ------------------------------------------------------------------
@@ -1623,11 +1635,28 @@ class SessionOrchestrator:
             else:
                 self._auto_connected = False
 
-            # NOTE: multi-host machinery (audio validation, control
-            # plane, advertiser, follower browser) was already brought
-            # up in connect(). start() now focuses exclusively on the
-            # recording transition so the cluster can form well before
-            # the operator clicks Record.
+            # Validate audio requirement before we touch any cluster
+            # state. Streams are added between __init__ and start(),
+            # so this can't live in __init__ — it stays at recording
+            # time where the stream set is final.
+            self._validate_multihost_audio_requirement()
+
+            # Refresh the capability snapshot read by control-plane route
+            # handlers (POST /session/config). The cache was initialized
+            # to False when the control plane came up at __init__ (no
+            # streams yet); the final stream set is known now, so update
+            # it before any distribute POST can race a route handler.
+            if self._role is not None:
+                self._has_audio_stream_at_start = any(
+                    getattr(s, "kind", "custom") == "audio"
+                    for s in self._streams.values()
+                )
+
+            # NOTE: multi-host machinery (control plane, advertiser,
+            # follower browser) was already brought up at __init__.
+            # start() now focuses exclusively on the recording
+            # transition so the cluster can form well before the
+            # operator clicks Record.
 
             # Multi-host: wait for leader BEFORE touching the
             # filesystem, so an auto-discover follower never mkdirs
@@ -1970,30 +1999,9 @@ class SessionOrchestrator:
             # Keep auto-injected audio stream registered (visible in viewer)
             # but disconnected. It will be reconnected on next connect().
 
-            # Tear down multi-host infrastructure that connect() brought
-            # up. We do this AFTER disconnecting streams but BEFORE
-            # transitioning to IDLE so observers of the state change
-            # see a fully torn-down session. Each step is best-effort;
-            # a single failing close must not leave another subsystem
-            # running.
-            if self._role is not None:
-                if self._browser is not None:
-                    try:
-                        self._browser.close()
-                    except Exception as exc:  # pragma: no cover
-                        logger.warning("browser.close failed: %s", exc)
-                    self._browser = None
-                if self._advertiser is not None:
-                    try:
-                        self._advertiser.close()
-                    except Exception as exc:  # pragma: no cover
-                        logger.warning("advertiser.close failed: %s", exc)
-                    self._advertiser = None
-                self._force_stop_control_plane()
-                # Clear observation state so a subsequent connect()
-                # starts fresh rather than re-using a stale leader.
-                self._observed_leader = None
-                self._follower_observer_thread = None
+            # Multi-host infrastructure (advertiser, browser, control plane)
+            # stays up across disconnect(). It was brought up at __init__
+            # and is only torn down by shutdown() or the atexit handler.
 
             self._transition(SessionState.IDLE)
             if self._log_writer is not None:

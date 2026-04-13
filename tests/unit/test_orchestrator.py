@@ -1104,25 +1104,26 @@ class TestFollowerRoleIntegration:
             session.wait_for_leader_stopped()
 
 
-class TestLeaderOnMdnsAfterConnect:
-    """Regression: connect() must bring the leader onto mDNS before
-    start() is called, so the viewer cluster panel can show every
-    attached host as soon as they're connected.
+class TestMdnsOnlineAtConstruction:
+    """Regression: constructing a SessionOrchestrator with a multi-host
+    role must bring mDNS + control plane online immediately, independent
+    of any device/connect() lifecycle. disconnect() touches devices
+    only; shutdown() is the lone teardown surface for cluster state.
     """
 
-    def test_leader_advertises_at_connect_not_start(
+    def test_leader_advertiser_running_immediately_after_init(
         self, tmp_path, monkeypatch
     ) -> None:
-        """Leader's advertiser must be live after connect(), BEFORE
-        start(). Previously it only started inside start()."""
+        """Leader's advertiser must be live as soon as the orchestrator
+        is constructed — no connect() / start() needed."""
         import syncfield as sf
         import syncfield.orchestrator as orch_mod
 
-        started_advertisers: list = []
+        started: list = []
 
         class _FakeAdvertiser:
             def __init__(self, **kwargs):
-                started_advertisers.append(kwargs)
+                started.append(kwargs)
             def start(self): pass
             def update_status(self, *a, **kw): pass
             def close(self): pass
@@ -1134,32 +1135,56 @@ class TestLeaderOnMdnsAfterConnect:
         session = sf.SessionOrchestrator(
             host_id="mac_a",
             output_dir=tmp_path,
-            role=sf.LeaderRole(
-                session_id="sid", control_plane_port=0
-            ),
+            role=sf.LeaderRole(session_id="sid", control_plane_port=0),
         )
-        session.add(FakeStream("cam"))
-        mic = FakeStream("mic")
-        mic.kind = "audio"
-        session.add(mic)
 
-        # No advertiser constructed yet — connect() is what brings it up.
-        assert len(started_advertisers) == 0
-
-        session.connect()
         try:
-            # After connect: advertiser MUST be live.
-            assert len(started_advertisers) == 1
-            assert started_advertisers[0]["session_id"] == "sid"
-            assert started_advertisers[0]["host_id"] == "mac_a"
-            # Control plane is also up (so the advertiser could embed
-            # its actual port in the TXT record).
-            assert session._control_plane is not None
+            assert len(started) == 1
+            assert started[0]["session_id"] == "sid"
+            assert started[0]["host_id"] == "mac_a"
         finally:
-            session.disconnect()
+            session.shutdown()
 
-        # After disconnect: advertiser + control plane torn down so the
-        # next connect() can bring fresh instances online.
+    def test_disconnect_preserves_cluster_state(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """disconnect() is device-only; advertiser + control plane stay up."""
+        import syncfield as sf
+        import syncfield.orchestrator as orch_mod
+
+        class _FakeAdvertiser:
+            def __init__(self, **kwargs): pass
+            def start(self): pass
+            def update_status(self, *a, **kw): pass
+            def close(self): pass
+
+        monkeypatch.setattr(
+            orch_mod, "SessionAdvertiser", _FakeAdvertiser, raising=False
+        )
+
+        session = sf.SessionOrchestrator(
+            host_id="mac_a",
+            output_dir=tmp_path,
+            role=sf.LeaderRole(session_id="sid", control_plane_port=0),
+        )
+        try:
+            session.add(FakeStream("cam"))
+            mic = FakeStream("mic")
+            mic.kind = "audio"
+            session.add(mic)
+
+            session.connect()
+            assert session._control_plane is not None
+            assert session._advertiser is not None
+
+            session.disconnect()
+            # Cluster state survives disconnect.
+            assert session._control_plane is not None
+            assert session._advertiser is not None
+        finally:
+            session.shutdown()
+
+        # shutdown() is the teardown surface.
         assert session._advertiser is None
         assert session._control_plane is None
 
