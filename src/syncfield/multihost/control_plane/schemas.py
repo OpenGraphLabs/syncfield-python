@@ -113,3 +113,27 @@ class FileManifestResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     files: list[FileManifestEntry]
+
+
+class DiscoveredDeviceResponse(BaseModel):
+    """One device found by syncfield.discovery.scan() on a host."""
+    model_config = ConfigDict(extra="forbid")
+
+    adapter_type: str
+    kind: str
+    display_name: str
+    description: str
+    device_id: str
+    accepts_output_dir: bool
+    in_use: bool
+    warnings: list[str]
+
+
+class DiscoveryReportResponse(BaseModel):
+    """Returned by GET /devices/discover — mirrors syncfield.discovery.DiscoveryReport."""
+    model_config = ConfigDict(extra="forbid")
+
+    devices: list[DiscoveredDeviceResponse]
+    errors: dict[str, str]       # adapter_type -> error message
+    timed_out: list[str]         # adapter_type values
+    duration_s: float

@@ -21,13 +21,15 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import Optional, Protocol, runtime_checkable
 
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 
 from syncfield.multihost.control_plane.auth import verify_session_token
 from syncfield.multihost.control_plane.schemas import (
     ChirpSpecModel,
+    DiscoveredDeviceResponse,
+    DiscoveryReportResponse,
     FileManifestEntry,
     FileManifestResponse,
     HealthResponse,
@@ -335,3 +337,46 @@ def _register_routes(app: FastAPI) -> None:
                 detail=f"file not found: {path}",
             )
         return FileResponse(path=str(candidate))
+
+    @app.get(
+        "/devices/discover",
+        response_model=DiscoveryReportResponse,
+        dependencies=[Depends(verify_session_token)],
+    )
+    def devices_discover(
+        request: Request,
+        kinds: Optional[str] = None,
+        timeout: float = 10.0,
+    ) -> DiscoveryReportResponse:
+        """Run device discovery on this host and return the report.
+
+        Calls :func:`syncfield.discovery.scan` with the given kinds filter
+        (comma-separated) and timeout. Discoverers that raise are captured
+        in the ``errors`` field; those that exceed the timeout land in
+        ``timed_out``. The viewer's "Discover Devices" button hits this
+        endpoint once per host and aggregates the responses client-side.
+        """
+        import syncfield.discovery as discovery
+        import syncfield.adapters  # noqa: F401  - registers shipped discoverers
+
+        kinds_list = kinds.split(",") if kinds else None
+        report = discovery.scan(kinds=kinds_list, timeout=timeout, use_cache=False)
+
+        return DiscoveryReportResponse(
+            devices=[
+                DiscoveredDeviceResponse(
+                    adapter_type=d.adapter_type,
+                    kind=d.kind,
+                    display_name=d.display_name,
+                    description=d.description,
+                    device_id=d.device_id,
+                    accepts_output_dir=d.accepts_output_dir,
+                    in_use=d.in_use,
+                    warnings=list(d.warnings),
+                )
+                for d in report.devices
+            ],
+            errors=dict(report.errors),
+            timed_out=list(report.timed_out),
+            duration_s=report.duration_s,
+        )

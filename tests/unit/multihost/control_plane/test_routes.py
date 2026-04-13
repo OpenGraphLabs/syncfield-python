@@ -307,3 +307,52 @@ class TestFileEndpoints:
         resp = client.get("/files/does_not_exist.bin", headers=AUTH)
         assert resp.status_code == 404
         assert "not found" in resp.json()["detail"].lower()
+
+
+class TestDevicesDiscover:
+    def test_returns_discovery_report(self, monkeypatch) -> None:
+        # Monkeypatch syncfield.discovery.scan to return a predictable
+        # fake report — we don't want the test to actually enumerate
+        # USB/BLE hardware on the dev machine.
+        from syncfield.discovery.types import (
+            DiscoveredDevice,
+            DiscoveryReport,
+        )
+
+        fake_report = DiscoveryReport(
+            devices=(
+                DiscoveredDevice(
+                    adapter_type="uvc_webcam",
+                    adapter_cls=object,  # placeholder; schema doesn't need this
+                    kind="video",
+                    display_name="Fake Camera",
+                    description="uvc · index 0",
+                    device_id="0",
+                    construct_kwargs={},
+                    accepts_output_dir=True,
+                    in_use=False,
+                    warnings=(),
+                ),
+            ),
+            errors={},
+            timed_out=(),
+            duration_s=0.05,
+        )
+        monkeypatch.setattr(
+            "syncfield.discovery.scan",
+            lambda **kwargs: fake_report,
+        )
+
+        orch = _FakeOrchestrator()
+        client = _client_for(orch)
+        resp = client.get("/devices/discover", headers=AUTH)
+        assert resp.status_code == 200
+        body = resp.json()
+        assert len(body["devices"]) == 1
+        assert body["devices"][0]["adapter_type"] == "uvc_webcam"
+        assert body["duration_s"] == 0.05
+
+    def test_requires_bearer(self) -> None:
+        orch = _FakeOrchestrator()
+        client = _client_for(orch)
+        assert client.get("/devices/discover").status_code == 401
