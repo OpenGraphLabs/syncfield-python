@@ -723,6 +723,7 @@ class _FakeBrowser:
         self.started = False
         self.closed = False
         self.wait_recording_calls: list[float] = []
+        self.wait_observation_calls: list[float] = []
         self.wait_stopped_calls: list[float] = []
         _FakeBrowser.instances.append(self)
 
@@ -731,6 +732,16 @@ class _FakeBrowser:
 
     def wait_for_recording(self, timeout: float):
         self.wait_recording_calls.append(timeout)
+        result = type(self).wait_recording_result
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    def wait_for_observation(self, timeout: float):
+        # A configured "recording available" result implies "observation
+        # available" — real wait_for_observation is strictly weaker than
+        # wait_for_recording. TimeoutError scripts propagate identically.
+        self.wait_observation_calls.append(timeout)
         result = type(self).wait_recording_result
         if isinstance(result, Exception):
             raise result
@@ -935,7 +946,12 @@ class TestFollowerRoleIntegration:
         browser = _FakeBrowser.instances[0]
         assert browser.session_id == "amber-tiger-042"
         assert browser.started is True
-        assert browser.wait_recording_calls == [60.0]  # default timeout
+        # Observation wait gets the full timeout; recording wait gets
+        # whatever is left of the 60s deadline after observation returned
+        # (slightly less than 60 due to monotonic clock tick).
+        assert browser.wait_observation_calls == [60.0]
+        assert len(browser.wait_recording_calls) == 1
+        assert 0.0 < browser.wait_recording_calls[0] <= 60.0
 
         assert session.observed_leader is not None
         assert session.observed_leader.host_id == "leader_host"

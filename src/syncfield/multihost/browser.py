@@ -143,6 +143,42 @@ class SessionBrowser:
         """
         return self._wait_for_status("recording", timeout)
 
+    def wait_for_observation(self, timeout: float = 30.0) -> SessionAnnouncement:
+        """Block until a matching leader is observed in ANY status.
+
+        Faster than :meth:`wait_for_recording` — returns as soon as the
+        browser has ANY matching announcement (preparing, recording, or
+        stopped). Callers use this to detect a leader's presence without
+        waiting for its session to actually start recording.
+        """
+        deadline = time.monotonic() + timeout
+        with self._update_event:
+            while True:
+                match = self._find_any_match()
+                if match is not None:
+                    return match
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        f"no matching leader observed within {timeout:.1f}s "
+                        f"(filter session_id={self._session_id_filter!r})"
+                    )
+                self._update_event.wait(timeout=remaining)
+
+    def _find_any_match(self) -> Optional[SessionAnnouncement]:
+        """Return any announcement matching the session_id filter, regardless of status.
+
+        Caller must hold the condition lock.
+        """
+        for ann in self._sessions.values():
+            if (
+                self._session_id_filter is not None
+                and ann.session_id != self._session_id_filter
+            ):
+                continue
+            return ann
+        return None
+
     def wait_for_stopped(self, timeout: float = 3600.0) -> SessionAnnouncement:
         """Block until a matching leader advertises ``status="stopped"``.
 

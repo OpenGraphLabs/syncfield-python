@@ -2476,9 +2476,22 @@ class SessionOrchestrator:
 
         self._browser = SessionBrowser(session_id=self._role.session_id)
         self._browser.start()
-        self._observed_leader = self._browser.wait_for_recording(
-            timeout=self._role.leader_wait_timeout_sec
-        )
+        timeout = self._role.leader_wait_timeout_sec
+        deadline = time.monotonic() + timeout
+
+        # Phase 1: observe leader ASAP (any status).
+        # Sets self._observed_leader so the follower can now advertise
+        # itself, which makes it discoverable by the leader's distribute
+        # and by the operator's viewer cluster panel.
+        first = self._browser.wait_for_observation(timeout=timeout)
+        self._observed_leader = first
+        self._maybe_start_follower_advertising_post_observation()
+
+        # Phase 2: wait for leader to actually reach recording status.
+        remaining = max(0.1, deadline - time.monotonic())
+        recording_ann = self._browser.wait_for_recording(timeout=remaining)
+        # Refresh to latest (status changed).
+        self._observed_leader = recording_ann
 
     def _poll_static_leader_until_recording(self) -> None:
         """Poll the static leader's /health until state == 'recording'.

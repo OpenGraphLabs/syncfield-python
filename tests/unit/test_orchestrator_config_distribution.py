@@ -691,3 +691,79 @@ class TestStaticLeader:
         assert session._static_leader.host_id == "mac_a"
         assert session._static_leader.resolved_address == "127.0.0.1"
         assert session._static_leader.control_plane_port == 7878
+
+
+class TestAutoDiscoverFollowerAdvertisesOnPreparing:
+    def test_follower_advertises_after_observing_preparing_leader(
+        self, tmp_path, monkeypatch
+    ):
+        """Regression: auto-discover follower must start advertising as
+        soon as it sees a leader in PREPARING, not wait for RECORDING.
+        Otherwise leader's distribute runs against an empty peer list.
+        """
+        import syncfield as sf
+        from tests.unit.conftest import FakeStream
+        from syncfield.multihost.types import SessionAnnouncement
+        import syncfield.orchestrator as orch_mod
+
+        created_advertisers: list = []
+
+        class _FakeAdvertiser:
+            def __init__(self, **kwargs):
+                created_advertisers.append(kwargs)
+            def start(self): pass
+            def update_status(self, *a, **kw): pass
+            def close(self): pass
+
+        class _FakeBrowser:
+            def __init__(self, session_id=None):
+                self.session_id_filter = session_id
+                self._observed: SessionAnnouncement | None = None
+            def start(self): pass
+            def close(self): pass
+            def wait_for_observation(self, timeout=30.0):
+                # Simulate: leader in preparing state observed immediately.
+                return SessionAnnouncement(
+                    session_id="auto-generated-session",
+                    host_id="mac_a",
+                    status="preparing",
+                    sdk_version="0.2.0",
+                    chirp_enabled=True,
+                    control_plane_port=7878,
+                )
+            def wait_for_recording(self, timeout=30.0):
+                return SessionAnnouncement(
+                    session_id="auto-generated-session",
+                    host_id="mac_a",
+                    status="recording",
+                    sdk_version="0.2.0",
+                    chirp_enabled=True,
+                    control_plane_port=7878,
+                )
+            def current_sessions(self): return []
+
+        monkeypatch.setattr(orch_mod, "SessionAdvertiser", _FakeAdvertiser, raising=False)
+        monkeypatch.setattr(orch_mod, "SessionBrowser", _FakeBrowser, raising=False)
+
+        follower = sf.SessionOrchestrator(
+            host_id="mac_b",
+            output_dir=tmp_path,
+            role=sf.FollowerRole(control_plane_port=0),  # auto-discover
+        )
+        follower.add(FakeStream("cam"))
+        mic = FakeStream("mic"); mic.kind = "audio"
+        follower.add(mic)
+
+        # Drive _maybe_wait_for_leader directly.
+        follower._start_control_plane_only_for_tests()
+        try:
+            follower._maybe_wait_for_leader()
+
+            # Advertiser MUST have started after the first observation,
+            # even though the leader was only in 'preparing' at that
+            # point (not recording).
+            assert len(created_advertisers) == 1
+            assert created_advertisers[0]["session_id"] == "auto-generated-session"
+            assert created_advertisers[0]["host_id"] == "mac_b"
+        finally:
+            follower._stop_control_plane_only_for_tests()
