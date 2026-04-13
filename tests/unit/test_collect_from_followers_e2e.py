@@ -145,16 +145,20 @@ class TestCollectFromFollowersE2E:
             _patch_browser_with_announcement(monkeypatch, ann)
 
             leader = _build_leader(tmp_path)
+            leader_ep = leader._output_dir.name
 
             dest = tmp_path / "aggregated"
             result = leader.collect_from_followers(destination=dest)
         finally:
             follower._stop_control_plane_only_for_tests()
 
-        # Files arrived with correct bytes.
-        assert (dest / "mac_b" / "test1.txt").read_text() == "hello"
+        # Files arrived with correct bytes in the flat layout:
+        # <dest>/<leader_ep>/<host_id>.<flat_path>
         assert (
-            dest / "mac_b" / "nested" / "test2.bin"
+            dest / leader_ep / "mac_b.test1.txt"
+        ).read_text() == "hello"
+        assert (
+            dest / leader_ep / "mac_b.nested.test2.bin"
         ).read_bytes() == b"\x00\x01\x02\x03\x04"
 
         # Aggregated manifest written, matches return value, reports ok.
@@ -164,14 +168,19 @@ class TestCollectFromFollowersE2E:
         assert on_disk == result
         assert result["session_id"] == "amber-tiger-042"
         assert result["leader_host_id"] == "mac_a"
-        assert len(result["hosts"]) == 1
-        host = result["hosts"][0]
+        assert result["leader_episode"] == leader_ep
+
+        # [0] leader self-entry (missing — leader didn't record).
+        # [1] follower self-entry.
+        assert len(result["hosts"]) == 2
+        assert result["hosts"][0]["host_id"] == "mac_a"
+        host = result["hosts"][1]
         assert host["host_id"] == "mac_b"
         assert host["status"] == "ok"
         assert host["error"] is None
-        # Both files are reported in the host's manifest.
+        # Both files are reported in the host's manifest with flat paths.
         rels = {entry["path"] for entry in host["files"]}
-        assert rels == {"test1.txt", "nested/test2.bin"}
+        assert rels == {"mac_b.test1.txt", "mac_b.nested.test2.bin"}
 
     def test_unreachable_follower_marks_host_without_raising(
         self, tmp_path, monkeypatch
@@ -199,8 +208,10 @@ class TestCollectFromFollowersE2E:
         )
 
         assert (dest / "aggregated_manifest.json").exists()
-        assert len(result["hosts"]) == 1
-        host = result["hosts"][0]
+        # [0] leader self-entry, [1] unreachable follower.
+        assert len(result["hosts"]) == 2
+        assert result["hosts"][0]["host_id"] == "mac_a"
+        host = result["hosts"][1]
         assert host["host_id"] == "mac_b"
         assert host["status"] == "unreachable"
         assert host["error"] is not None

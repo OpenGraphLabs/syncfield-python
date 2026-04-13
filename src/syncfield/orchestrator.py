@@ -677,53 +677,56 @@ class SessionOrchestrator:
         *,
         timeout: float = 600.0,
         verify_checksums: bool = True,
+        keep_leader_originals: bool = False,
     ) -> dict:
-        """Pull every follower's recorded files into a single canonical tree.
+        """Aggregate every host's recorded files into one flat episode directory.
 
         Leader-only. Must be called **after** :meth:`stop` and **inside**
         the follower's ``keep_alive_after_stop_sec`` window — otherwise
         the follower control planes will already have torn themselves
         down and the GETs will fail with ``status="unreachable"``.
 
-        For each follower discovered via mDNS this method:
+        Layout produced::
 
-        1. Hits ``GET /files/manifest`` with the session bearer token to
-           list every file the follower wrote during the session.
-        2. Streams each file via ``GET /files/{path}`` into
-           ``destination/<host_id>/<path>`` (parent dirs created on
-           demand).
-        3. When ``verify_checksums`` is true, hashes each downloaded
-           file with sha256 and compares to the manifest entry. On
-           mismatch it re-downloads exactly **once**; if the second
-           attempt also mismatches, the host is recorded with
-           ``status="checksum_mismatch"``.
+            <destination_root>/
+                aggregated_manifest.json
+                <leader_episode_name>/
+                    <host_id>.<flat_filename>      (one entry per file per host)
 
-        Per-host failures (network errors, HTTP errors, checksum
-        mismatches) populate the ``status`` and ``error`` fields on
-        that host's report and the loop moves on — one bad follower
+        Each host's files are flattened into the leader's episode
+        directory with a ``<host_id>.`` prefix; subdirectories within
+        a host's episode become dotted segments (e.g. ``subdir/file.bin``
+        → ``mac_b.subdir.file.bin``). The episode directory name itself
+        is stripped from each host's path (it differs per host because
+        each host generates its own timestamp) — the leader's episode
+        name is the canonical one for the aggregated tree, matching what
+        the downstream sync pipeline expects.
+
+        The leader's own recordings (written during recording at
+        ``<data_root>/<session>/<leader_host>/<ep>/``) are copied in
+        first; followers are then pulled over HTTP. One bad follower
         never aborts collection from the rest.
 
-        After every host is processed (or skipped on failure), an
-        aggregated report is written to
-        ``<destination>/aggregated_manifest.json`` and returned.
-
         Args:
-            destination: Where to materialize the cluster tree. Defaults
-                to ``self._data_root / self.session_id`` (the cluster
-                root used by the rest of the multi-host plumbing).
-                Created if missing.
-            timeout: Per-HTTP-request timeout in seconds. Defaults to
-                600 because individual session files (multi-GB video)
-                can take a while to stream over LAN.
-            verify_checksums: Whether to sha256-verify each downloaded
-                file against the manifest entry. When false the loop
-                still records files but performs no integrity check.
+            destination: Directory to write into. Defaults to
+                ``<data_root>/<session_id>/``. The leader's episode
+                name is ALWAYS appended as the inner directory; the
+                destination argument names the root that contains it.
+            timeout: Per-host HTTP timeout in seconds. Defaults to 600
+                because individual session files (multi-GB video) can
+                take a while to stream over LAN.
+            verify_checksums: sha256-verify each downloaded file
+                against the manifest entry, with one retry on mismatch.
+                Self-copied files are not re-hashed (trusted local).
+            keep_leader_originals: When False (default), the leader's
+                per-host subdir (``<root>/<session>/<leader_host>/``) is
+                removed after a successful copy so the canonical layout
+                is single-rooted. Set True to keep the originals for
+                debugging.
 
         Returns:
-            An :class:`AggregatedManifest`-shaped ``dict`` with a
-            per-host status entry (``"ok"`` / ``"unreachable"`` /
-            ``"checksum_mismatch"`` / ``"error"``) and the file list
-            that was successfully pulled for each host.
+            The aggregated manifest dict (same shape that gets written
+            to ``<destination>/aggregated_manifest.json``).
 
         Raises:
             RuntimeError: If this orchestrator is not a leader, or if
@@ -731,8 +734,6 @@ class SessionOrchestrator:
         """
         import json
         import time as _time
-
-        import httpx
 
         if self._role is None or not isinstance(self._role, LeaderRole):
             raise RuntimeError(
@@ -743,145 +744,272 @@ class SessionOrchestrator:
                 "collect_from_followers() requires an active session_id"
             )
 
+        # Default destination root = <data_root>/<session_id>/. The
+        # leader's episode name is always appended below.
         if destination is None:
-            destination = self._data_root / self.session_id
-        destination = Path(destination)
-        destination.mkdir(parents=True, exist_ok=True)
+            destination_root = self._data_root / self.session_id
+        else:
+            destination_root = Path(destination)
+        destination_root.mkdir(parents=True, exist_ok=True)
 
-        headers = {"Authorization": f"Bearer {self.session_id}"}
-        hosts_report: list[dict] = []
+        # Canonical episode dir name from the leader's own _output_dir.
+        # This is the directory recording wrote into during Phase 1,
+        # e.g. ``ep_20260413_013803_fe7d89``. Every host's files land
+        # flat inside it.
+        leader_episode_name = self._output_dir.name
+        episode_dir = destination_root / leader_episode_name
+        episode_dir.mkdir(parents=True, exist_ok=True)
 
-        # Leaders don't keep a long-lived browser around the way
-        # followers do — bootstrap a short-lived one here, mirroring
-        # _distribute_config_to_followers. Filter on our session_id so
-        # we only see this cluster's peers.
-        #
-        # Static peers (set via :meth:`set_static_peers`) bypass mDNS
-        # entirely — used by the local single-machine test cluster to
-        # work around the macOS loopback get_service_info limitation.
+        aggregate: dict = {
+            "session_id": self.session_id,
+            "leader_host_id": self._host_id,
+            "leader_episode": leader_episode_name,
+            "hosts": [],
+        }
+
+        # Step 1: copy the leader's own files in first so aggregate
+        # ordering is leader → followers.
+        aggregate["hosts"].append(
+            self._copy_leader_files_to_episode_dir(
+                episode_dir, keep_leader_originals
+            )
+        )
+
+        # Step 2: discover followers via static peers (loopback escape
+        # hatch) or a short-lived mDNS browser, mirroring the discovery
+        # path used by :meth:`_distribute_config_to_followers`.
+        browser_bootstrap: Optional["SessionBrowser"] = None
         if self._static_peers:
-            browser = None
             peers = [
                 p for p in self._static_peers if p.host_id != self._host_id
             ]
         else:
-            browser = SessionBrowser(session_id=self.session_id)
-            browser.start()
+            browser_bootstrap = SessionBrowser(session_id=self.session_id)
+            browser_bootstrap.start()
+            # Let zeroconf converge; mDNS re-broadcasts every few
+            # seconds by default, so ~1.5s is usually enough to see
+            # every peer that's still up inside the keep-alive window.
+            _time.sleep(1.5)
+            peers = [
+                ann
+                for ann in browser_bootstrap.current_sessions()
+                if ann.host_id != self._host_id
+                and ann.control_plane_port is not None
+            ]
+
+        # Step 3: pull files from each follower into the flat dir.
         try:
-            if browser is not None:
-                # Let zeroconf converge; mDNS re-broadcasts every few
-                # seconds by default, so ~1.5s is usually enough to see
-                # every peer that's still up inside the keep-alive window.
-                _time.sleep(1.5)
-
-                peers = [
-                    ann
-                    for ann in browser.current_sessions()
-                    if ann.host_id != self._host_id
-                    and ann.control_plane_port is not None
-                ]
-
             for ann in peers:
-                host_report: dict = {
-                    "host_id": ann.host_id,
-                    "status": "ok",
-                    "files": [],
-                    "error": None,
-                }
-                base = self._follower_base_url(ann)
-
-                # Step 1: fetch manifest. A failure here means we can't
-                # know what to download — mark unreachable and move on.
-                try:
-                    manifest_resp = httpx.get(
-                        f"{base}/files/manifest",
-                        headers=headers,
+                aggregate["hosts"].append(
+                    self._pull_follower_into_episode_dir(
+                        ann,
+                        episode_dir,
                         timeout=timeout,
+                        verify_checksums=verify_checksums,
                     )
-                    manifest_resp.raise_for_status()
-                    entries = manifest_resp.json().get("files", [])
-                except httpx.HTTPError as exc:
-                    host_report["status"] = "unreachable"
-                    host_report["error"] = f"manifest fetch: {exc}"
-                    hosts_report.append(host_report)
-                    continue
-
-                host_dest = destination / ann.host_id
-                host_dest.mkdir(parents=True, exist_ok=True)
-
-                # Step 2: stream each file. Track the first failing file
-                # so the caller can investigate; subsequent files for
-                # that host are skipped (the host is already marked as
-                # broken, so additional downloads would just muddy the
-                # report).
-                for entry in entries:
-                    rel = entry["path"]
-                    target = host_dest / rel
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    expected_sha = entry.get("sha256")
-                    # One retry on checksum mismatch when verifying;
-                    # otherwise a single attempt.
-                    attempts_left = 2 if verify_checksums else 1
-                    while attempts_left > 0:
-                        attempts_left -= 1
-                        try:
-                            with httpx.stream(
-                                "GET",
-                                f"{base}/files/{rel}",
-                                headers=headers,
-                                timeout=timeout,
-                            ) as r:
-                                r.raise_for_status()
-                                with open(target, "wb") as f:
-                                    for chunk in r.iter_bytes(
-                                        chunk_size=65536
-                                    ):
-                                        f.write(chunk)
-                        except httpx.HTTPError as exc:
-                            host_report["status"] = "error"
-                            host_report["error"] = (
-                                f"download {rel}: {exc}"
-                            )
-                            break
-
-                        if not verify_checksums:
-                            break
-                        actual = _sha256_of_local(target)
-                        if actual == expected_sha:
-                            break
-                        if attempts_left == 0:
-                            host_report["status"] = "checksum_mismatch"
-                            host_report["error"] = (
-                                f"sha256 mismatch on {rel}"
-                            )
-                            break
-                        # else: loop and retry once more.
-
-                    if host_report["status"] != "ok":
-                        # First failure for this host wins the report;
-                        # don't attempt the rest of its files.
-                        break
-                    host_report["files"].append(entry)
-
-                hosts_report.append(host_report)
+                )
         finally:
-            if browser is not None:
+            if browser_bootstrap is not None:
                 try:
-                    browser.close()
+                    browser_bootstrap.close()
                 except Exception as exc:  # pragma: no cover - best-effort
                     logger.warning(
                         "collect_from_followers browser close failed: %s",
                         exc,
                     )
 
-        aggregate = {
-            "session_id": self.session_id,
-            "leader_host_id": self._host_id,
-            "hosts": hosts_report,
-        }
-        with open(destination / "aggregated_manifest.json", "w") as f:
+        # Step 4: write aggregated_manifest.json at the destination root.
+        manifest_path = destination_root / "aggregated_manifest.json"
+        with open(manifest_path, "w") as f:
             json.dump(aggregate, f, indent=2)
         return aggregate
+
+    def _copy_leader_files_to_episode_dir(
+        self, episode_dir: Path, keep_originals: bool
+    ) -> dict:
+        """Copy the leader's own recorded files into the canonical episode dir.
+
+        Source: ``self._output_dir`` (the leader's own recording path,
+        layout set by Phase 1: ``<data_root>/<session_id>/<host_id>/ep_<ts>_<hex>/``).
+        Target: ``episode_dir / <host_id>.<flat_path>``.
+
+        Subdirectories within the source are flattened with ``.``
+        separators. Self-copied files are trusted; no sha256 is computed
+        for verification, though the digest is recorded in the report
+        for downstream consumers.
+        """
+        import shutil
+
+        if not self._output_dir.exists():
+            return {
+                "host_id": self._host_id,
+                "status": "missing",
+                "files": [],
+                "error": "leader output dir does not exist",
+            }
+
+        copied: list = []
+        for src in sorted(self._output_dir.rglob("*")):
+            if not src.is_file():
+                continue
+            rel = src.relative_to(self._output_dir).as_posix()
+            flat = f"{self._host_id}.{rel.replace('/', '.')}"
+            dst = episode_dir / flat
+            shutil.copy2(src, dst)
+            st = dst.stat()
+            copied.append(
+                {
+                    "path": flat,
+                    "size": st.st_size,
+                    "sha256": _sha256_of_local(dst),
+                    "mtime_ns": st.st_mtime_ns,
+                }
+            )
+
+        if not keep_originals:
+            # Remove the leader's ``<data_root>/<session_id>/<leader_host>/``
+            # tree — the directory immediately above _output_dir's
+            # episode dir — so the canonical layout is single-rooted.
+            leader_host_dir = self._output_dir.parent
+            if leader_host_dir.exists():
+                try:
+                    shutil.rmtree(leader_host_dir)
+                except OSError as exc:
+                    logger.warning(
+                        "Failed to remove leader's host dir %s: %s",
+                        leader_host_dir,
+                        exc,
+                    )
+
+        return {
+            "host_id": self._host_id,
+            "status": "ok",
+            "files": copied,
+            "error": None,
+        }
+
+    def _pull_follower_into_episode_dir(
+        self,
+        ann,
+        episode_dir: Path,
+        *,
+        timeout: float,
+        verify_checksums: bool,
+    ) -> dict:
+        """Pull every file from a single follower into the flat episode dir.
+
+        The follower's manifest paths are relative to its
+        ``host_output_dir``, typically beginning with ``ep_<ts>_<hex>/``.
+        We strip that leading episode segment and use only the
+        stream-level remainder, then flatten any further subdirs with
+        ``.`` so each file lives at
+        ``episode_dir / <host_id>.<flat_path>``.
+
+        Per-host failures (network errors, HTTP errors, checksum
+        mismatches) populate ``status`` and ``error`` on the returned
+        report; the outer loop moves on to the next host.
+        """
+        import httpx
+
+        host_report: dict = {
+            "host_id": ann.host_id,
+            "status": "ok",
+            "files": [],
+            "error": None,
+        }
+        base = self._follower_base_url(ann)
+        headers = {"Authorization": f"Bearer {self.session_id}"}
+
+        # Step 1: fetch manifest. A failure here means we can't know
+        # what to download — mark unreachable and return.
+        try:
+            manifest_resp = httpx.get(
+                f"{base}/files/manifest",
+                headers=headers,
+                timeout=timeout,
+            )
+            manifest_resp.raise_for_status()
+            entries = manifest_resp.json().get("files", [])
+        except httpx.HTTPError as exc:
+            host_report["status"] = "unreachable"
+            host_report["error"] = f"manifest fetch: {exc}"
+            return host_report
+
+        # Step 2: stream each file. Use raw_rel against the follower's
+        # /files/ endpoint (that's what the follower expects — relative
+        # to its host_output_dir, including the ``ep_*/`` prefix); use
+        # flat_name for the on-disk destination in the aggregated tree.
+        for entry in entries:
+            raw_rel = entry["path"]
+            flat_name = self._flatten_follower_path(ann.host_id, raw_rel)
+            target = episode_dir / flat_name
+            expected_sha = entry.get("sha256")
+
+            attempts_left = 2 if verify_checksums else 1
+            last_error: Optional[str] = None
+            while attempts_left > 0:
+                attempts_left -= 1
+                try:
+                    with httpx.stream(
+                        "GET",
+                        f"{base}/files/{raw_rel}",
+                        headers=headers,
+                        timeout=timeout,
+                    ) as r:
+                        r.raise_for_status()
+                        with open(target, "wb") as fout:
+                            for chunk in r.iter_bytes(chunk_size=65536):
+                                fout.write(chunk)
+                except httpx.HTTPError as exc:
+                    host_report["status"] = "error"
+                    host_report["error"] = f"download {raw_rel}: {exc}"
+                    last_error = host_report["error"]
+                    break
+
+                if not verify_checksums or expected_sha is None:
+                    break
+                actual = _sha256_of_local(target)
+                if actual == expected_sha:
+                    break
+                if attempts_left == 0:
+                    host_report["status"] = "checksum_mismatch"
+                    host_report["error"] = f"sha256 mismatch on {raw_rel}"
+                    last_error = host_report["error"]
+                    break
+                # else: loop and retry once more.
+
+            if host_report["status"] != "ok":
+                # First failure for this host wins the report;
+                # don't attempt the rest of its files.
+                break
+
+            st = target.stat()
+            host_report["files"].append(
+                {
+                    "path": flat_name,
+                    "size": st.st_size,
+                    "sha256": entry.get("sha256"),
+                    "mtime_ns": st.st_mtime_ns,
+                }
+            )
+
+        return host_report
+
+    @staticmethod
+    def _flatten_follower_path(host_id: str, raw_rel: str) -> str:
+        """Convert a follower-side relative path to the flat episode-dir name.
+
+        Strips a leading ``ep_*/`` segment and replaces remaining ``/``
+        with ``.`` so subdirectories become dotted name components.
+        The resulting name is prefixed with ``<host_id>.`` so every
+        host's files share a single flat directory without colliding.
+        """
+        parts = raw_rel.split("/", 1)
+        if parts[0].startswith("ep_") and len(parts) > 1:
+            stream_path = parts[1]
+        else:
+            stream_path = raw_rel
+        return f"{host_id}.{stream_path.replace('/', '.')}"
 
     def _fetch_config_from_leader(self) -> None:
         """Follower-side: GET the leader's applied SessionConfig and apply locally.

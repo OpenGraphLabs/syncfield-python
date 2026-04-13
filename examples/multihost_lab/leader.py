@@ -1,31 +1,35 @@
 """Multi-host lab leader.
 
-Run this on the machine with the primary camera + speaker. Every
+Run this on the machine with the primary camera(s) + speaker. Every
 other machine on the same LAN runs `follower.py`.
+
+    pip install "syncfield[multihost,uvc,audio]"
+    python leader.py
+
+The SDK auto-injects a host audio stream (your built-in mic) on every
+multi-host host so the leader's chirp gets captured for post-hoc
+cross-correlation alignment. You only need to declare your own
+data-bearing streams (cameras, sensors) — audio is automatic.
 """
 
-from __future__ import annotations
-
-import time
 from pathlib import Path
 
 import syncfield as sf
-from syncfield.adapters.host_audio import HostAudioStream
-from syncfield.adapters.uvc_webcam import UVCWebcamStream
+from syncfield.adapters import UVCWebcamStream
 
 
-def main() -> None:
-    session = sf.SessionOrchestrator(
-        host_id="mac_a",
-        output_dir=Path("./data"),
-        role=sf.LeaderRole(session_id="lab_session"),
-    )
+session = sf.SessionOrchestrator(
+    host_id="mac_a",
+    output_dir=Path(__file__).parent / "output",
+    role=sf.LeaderRole(session_id="lab_session"),
+)
 
-    # Every multi-host host needs at least one audio-capable stream —
-    # the leader records its own chirp, followers record it arriving
-    # through the air.
-    session.add(UVCWebcamStream("cam_main", device_index=0, output_dir=Path("./data")))
-    session.add(HostAudioStream("mic_builtin", output_dir=Path("./data")))
+session.add(UVCWebcamStream("mac_webcam", device_index=0, output_dir=session.output_dir))
+session.add(UVCWebcamStream("iphone",     device_index=1, output_dir=session.output_dir))
+
+
+if __name__ == "__main__":
+    import time
 
     print(f"Leader starting session {session.session_id}…")
     session.start()
@@ -38,10 +42,7 @@ def main() -> None:
         session.stop()
         print("Collecting files from followers…")
         report = session.collect_from_followers()
-        print(f"Collected from {len(report['hosts'])} follower(s):")
+        print(f"Collected from {len(report['hosts'])} host(s):")
         for host in report["hosts"]:
-            print(f"  - {host['host_id']}: {host['status']}")
-
-
-if __name__ == "__main__":
-    main()
+            print(f"  - {host['host_id']}: {host['status']} "
+                  f"({len(host.get('files', []))} files)")

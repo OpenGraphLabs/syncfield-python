@@ -1,7 +1,10 @@
 """Leader-side post-stop file aggregation: ``collect_from_followers()``.
 
-Phase 5 Task 4. The leader, after ``stop()``, pulls every follower's
-recorded files into a canonical tree and writes an aggregated manifest.
+Phase 5 Task 4 (refactored to flat layout). The leader, after ``stop()``,
+pulls every host's files — its own plus every follower's — into a single
+flat episode directory rooted at the leader's episode name, and writes
+an aggregated manifest alongside it.
+
 These tests stub out ``SessionBrowser`` and ``httpx`` so the logic is
 exercised without any real network or zeroconf I/O.
 """
@@ -91,6 +94,11 @@ def _leader(tmp_path: Path) -> sf.SessionOrchestrator:
     )
 
 
+def _leader_episode_name(leader: sf.SessionOrchestrator) -> str:
+    """The canonical episode dir name the leader records into."""
+    return leader._output_dir.name
+
+
 # ---------------------------------------------------------------------------
 # Validation: role + session_id preconditions
 # ---------------------------------------------------------------------------
@@ -131,22 +139,58 @@ class TestPreconditions:
 
 
 # ---------------------------------------------------------------------------
-# Happy path: one follower, files land in <dest>/<host_id>/<path>
+# Flatten helper
+# ---------------------------------------------------------------------------
+
+
+class TestFlattenFollowerPath:
+    def test_strips_episode_prefix(self):
+        assert (
+            sf.SessionOrchestrator._flatten_follower_path(
+                "mac_b", "ep_20260413_xxx/host_audio.wav"
+            )
+            == "mac_b.host_audio.wav"
+        )
+
+    def test_flattens_subdirs(self):
+        assert (
+            sf.SessionOrchestrator._flatten_follower_path(
+                "mac_b", "ep_xxx/subdir/file.bin"
+            )
+            == "mac_b.subdir.file.bin"
+        )
+
+    def test_no_episode_prefix(self):
+        assert (
+            sf.SessionOrchestrator._flatten_follower_path(
+                "mac_b", "loose_file.txt"
+            )
+            == "mac_b.loose_file.txt"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Happy path: one follower, files land flat under <dest>/<leader_ep>/
 # ---------------------------------------------------------------------------
 
 
 class TestHappyPath:
     def test_collects_from_one_follower(self, tmp_path, monkeypatch):
         session = _leader(tmp_path)
+        leader_ep = _leader_episode_name(session)
         ann = _make_announcement(host_id="mac_b", port=7979)
         _patch_browser(monkeypatch, [ann])
 
-        # Two files reported by the follower's manifest endpoint.
+        # Two files reported by the follower's manifest endpoint. The
+        # follower's manifest paths are relative to its host_output_dir
+        # and begin with an ``ep_*/`` segment (a different episode name
+        # than the leader's — that's the whole point of the flattening).
+        follower_ep = "ep_20260413_014200_beef01"
         payload_a = b"hello world"
         payload_b = b"frame data" * 1000  # ~10 KiB
         files = {
-            "video.mp4": payload_a,
-            "audio/mic.wav": payload_b,
+            f"{follower_ep}/video.mp4": payload_a,
+            f"{follower_ep}/audio/mic.wav": payload_b,
         }
         manifest_entries = [
             {
@@ -171,7 +215,7 @@ class TestHappyPath:
         def fake_stream(method, url, headers, timeout):
             assert method == "GET"
             assert headers["Authorization"] == "Bearer amber-tiger-042"
-            # url shape: http://127.0.0.1:7979/files/<rel>
+            # url shape: http://127.0.0.1:7979/files/<raw_rel>
             prefix = "http://127.0.0.1:7979/files/"
             assert url.startswith(prefix)
             rel = url[len(prefix):]
@@ -192,38 +236,127 @@ class TestHappyPath:
         dest = tmp_path / "collected"
         result = session.collect_from_followers(destination=dest)
 
-        # Files materialised under <dest>/<host_id>/<rel>
-        assert (dest / "mac_b" / "video.mp4").read_bytes() == payload_a
-        assert (dest / "mac_b" / "audio" / "mic.wav").read_bytes() == payload_b
+        # Files materialised at <dest>/<leader_ep>/<host>.<flat_path>.
+        assert (
+            dest / leader_ep / "mac_b.video.mp4"
+        ).read_bytes() == payload_a
+        assert (
+            dest / leader_ep / "mac_b.audio.mic.wav"
+        ).read_bytes() == payload_b
 
-        # Aggregated manifest written + matches return value.
+        # Aggregated manifest written at <dest>/aggregated_manifest.json
+        # and matches the return value.
         on_disk = json.loads(
             (dest / "aggregated_manifest.json").read_text()
         )
         assert on_disk == result
         assert result["session_id"] == "amber-tiger-042"
         assert result["leader_host_id"] == "mac_a"
-        assert len(result["hosts"]) == 1
-        host = result["hosts"][0]
+        assert result["leader_episode"] == leader_ep
+
+        # Leader's self-entry is the first host in the report. Its
+        # _output_dir doesn't exist (no recording happened), so it's
+        # reported as "missing" — that's the expected contract for the
+        # no-recording test setup.
+        assert len(result["hosts"]) == 2
+        leader_entry = result["hosts"][0]
+        assert leader_entry["host_id"] == "mac_a"
+        assert leader_entry["status"] == "missing"
+
+        # Follower entry.
+        host = result["hosts"][1]
         assert host["host_id"] == "mac_b"
         assert host["status"] == "ok"
         assert host["error"] is None
-        assert {f["path"] for f in host["files"]} == set(files.keys())
+        assert {f["path"] for f in host["files"]} == {
+            "mac_b.video.mp4",
+            "mac_b.audio.mic.wav",
+        }
+
+    def test_copies_leader_files_into_flat_episode_dir(
+        self, tmp_path, monkeypatch
+    ):
+        """Leader's own recordings are copied + flattened into the episode dir."""
+        session = _leader(tmp_path)
+        leader_ep = _leader_episode_name(session)
+        # Simulate that recording happened: seed the leader's episode
+        # dir with a couple of files. _output_dir points to
+        # <tmp_path>/amber-tiger-042/mac_a/<leader_ep>/.
+        session._output_dir.mkdir(parents=True, exist_ok=True)
+        (session._output_dir / "host_audio.wav").write_bytes(b"leader-audio")
+        (session._output_dir / "manifest.json").write_text("{}")
+        (session._output_dir / "subdir").mkdir()
+        (session._output_dir / "subdir" / "file.bin").write_bytes(b"xx")
+
+        _patch_browser(monkeypatch, [])  # no followers
+
+        dest = tmp_path / "collected"
+        result = session.collect_from_followers(destination=dest)
+
+        # Flat files with mac_a. prefix under the leader's episode dir.
+        assert (
+            dest / leader_ep / "mac_a.host_audio.wav"
+        ).read_bytes() == b"leader-audio"
+        assert (
+            dest / leader_ep / "mac_a.manifest.json"
+        ).read_text() == "{}"
+        assert (
+            dest / leader_ep / "mac_a.subdir.file.bin"
+        ).read_bytes() == b"xx"
+
+        # Leader's Phase-1 host dir was removed (default keep_leader_originals=False).
+        leader_host_dir = tmp_path / "amber-tiger-042" / "mac_a"
+        assert not leader_host_dir.exists()
+
+        # Leader entry in the aggregate is "ok" with the flat paths.
+        assert len(result["hosts"]) == 1
+        leader_entry = result["hosts"][0]
+        assert leader_entry["host_id"] == "mac_a"
+        assert leader_entry["status"] == "ok"
+        assert {f["path"] for f in leader_entry["files"]} == {
+            "mac_a.host_audio.wav",
+            "mac_a.manifest.json",
+            "mac_a.subdir.file.bin",
+        }
+
+    def test_keep_leader_originals_preserves_host_subtree(
+        self, tmp_path, monkeypatch
+    ):
+        """``keep_leader_originals=True`` leaves the Phase-1 host dir intact."""
+        session = _leader(tmp_path)
+        session._output_dir.mkdir(parents=True, exist_ok=True)
+        (session._output_dir / "host_audio.wav").write_bytes(b"x")
+
+        _patch_browser(monkeypatch, [])
+
+        dest = tmp_path / "collected"
+        session.collect_from_followers(
+            destination=dest, keep_leader_originals=True
+        )
+
+        leader_host_dir = tmp_path / "amber-tiger-042" / "mac_a"
+        assert leader_host_dir.exists()
+        assert (session._output_dir / "host_audio.wav").exists()
 
     def test_default_destination_is_data_root_session_id(
         self, tmp_path, monkeypatch
     ):
         """When no destination is passed it defaults to data_root/session_id."""
         session = _leader(tmp_path)
+        leader_ep = _leader_episode_name(session)
         # No peers — fastest happy path that still exercises destination
         # default + manifest writing.
         _patch_browser(monkeypatch, [])
 
         result = session.collect_from_followers()
 
-        expected_dest = tmp_path / "amber-tiger-042"
-        assert (expected_dest / "aggregated_manifest.json").exists()
-        assert result["hosts"] == []
+        expected_root = tmp_path / "amber-tiger-042"
+        assert (expected_root / "aggregated_manifest.json").exists()
+        # Episode dir is created even when leader has no files.
+        assert (expected_root / leader_ep).exists()
+        # Leader self-entry only (no followers).
+        assert len(result["hosts"]) == 1
+        assert result["hosts"][0]["host_id"] == "mac_a"
 
     def test_skips_self_and_peers_without_control_plane(
         self, tmp_path, monkeypatch
@@ -248,7 +381,9 @@ class TestHappyPath:
         # If filtering is broken either of these would trigger an HTTP
         # call against the unmocked httpx → AttributeError or worse.
         result = session.collect_from_followers(destination=tmp_path / "d")
-        assert result["hosts"] == []
+        # Only the leader's own self-entry is present.
+        assert len(result["hosts"]) == 1
+        assert result["hosts"][0]["host_id"] == "mac_a"
 
 
 # ---------------------------------------------------------------------------
@@ -270,8 +405,9 @@ class TestUnreachableFollower:
         result = session.collect_from_followers(
             destination=tmp_path / "d"
         )
-        assert len(result["hosts"]) == 1
-        host = result["hosts"][0]
+        # [0] leader self-entry, [1] follower.
+        assert len(result["hosts"]) == 2
+        host = result["hosts"][1]
         assert host["host_id"] == "mac_b"
         assert host["status"] == "unreachable"
         assert "connection refused" in host["error"]
@@ -282,13 +418,14 @@ class TestUnreachableFollower:
     ):
         """A bad follower must not prevent collection from a healthy one."""
         session = _leader(tmp_path)
+        leader_ep = _leader_episode_name(session)
         bad = _make_announcement(host_id="mac_b", port=7979)
         good = _make_announcement(host_id="mac_c", port=7980)
         _patch_browser(monkeypatch, [bad, good])
 
         good_payload = b"good"
         good_entry = {
-            "path": "ok.bin",
+            "path": "ep_xxx/ok.bin",
             "size": len(good_payload),
             "sha256": hashlib.sha256(good_payload).hexdigest(),
             "mtime_ns": 0,
@@ -321,8 +458,16 @@ class TestUnreachableFollower:
             destination=tmp_path / "d"
         )
         statuses = {h["host_id"]: h["status"] for h in result["hosts"]}
-        assert statuses == {"mac_b": "unreachable", "mac_c": "ok"}
-        assert (tmp_path / "d" / "mac_c" / "ok.bin").read_bytes() == good_payload
+        # Leader is "missing" (no recording), bad follower unreachable,
+        # good follower ok.
+        assert statuses == {
+            "mac_a": "missing",
+            "mac_b": "unreachable",
+            "mac_c": "ok",
+        }
+        assert (
+            tmp_path / "d" / leader_ep / "mac_c.ok.bin"
+        ).read_bytes() == good_payload
 
 
 # ---------------------------------------------------------------------------
@@ -341,7 +486,7 @@ class TestChecksumMismatch:
         # checksum_mismatch.
         bogus_sha = "0" * 64
         entry = {
-            "path": "video.mp4",
+            "path": "ep_xxx/video.mp4",
             "size": 5,
             "sha256": bogus_sha,
             "mtime_ns": 0,
@@ -377,7 +522,8 @@ class TestChecksumMismatch:
         )
         # Exactly two download attempts: original + one retry.
         assert len(download_calls) == 2
-        host = result["hosts"][0]
+        # [0] leader, [1] follower.
+        host = result["hosts"][1]
         assert host["status"] == "checksum_mismatch"
         assert "video.mp4" in host["error"]
         # File was not added to the host's reported file list because
@@ -389,12 +535,13 @@ class TestChecksumMismatch:
     ):
         """If the retry yields the right bytes, the host stays ok."""
         session = _leader(tmp_path)
+        leader_ep = _leader_episode_name(session)
         ann = _make_announcement(host_id="mac_b", port=7979)
         _patch_browser(monkeypatch, [ann])
 
         good_payload = b"correct"
         entry = {
-            "path": "video.mp4",
+            "path": "ep_xxx/video.mp4",
             "size": len(good_payload),
             "sha256": hashlib.sha256(good_payload).hexdigest(),
             "mtime_ns": 0,
@@ -430,13 +577,16 @@ class TestChecksumMismatch:
             destination=tmp_path / "d"
         )
         assert attempts["n"] == 2
-        host = result["hosts"][0]
+        # [0] leader, [1] follower.
+        host = result["hosts"][1]
         assert host["status"] == "ok"
         assert host["error"] is None
-        assert host["files"] == [entry]
-        # Final on-disk content is the good payload.
+        assert len(host["files"]) == 1
+        assert host["files"][0]["path"] == "mac_b.video.mp4"
+        assert host["files"][0]["sha256"] == entry["sha256"]
+        # Final on-disk content is the good payload at the flat path.
         assert (
-            tmp_path / "d" / "mac_b" / "video.mp4"
+            tmp_path / "d" / leader_ep / "mac_b.video.mp4"
         ).read_bytes() == good_payload
 
     def test_verify_disabled_skips_hashing(self, tmp_path, monkeypatch):
@@ -447,7 +597,7 @@ class TestChecksumMismatch:
 
         bogus_sha = "0" * 64
         entry = {
-            "path": "f.bin",
+            "path": "ep_xxx/f.bin",
             "size": 5,
             "sha256": bogus_sha,
             "mtime_ns": 0,
@@ -484,9 +634,11 @@ class TestChecksumMismatch:
         )
         # Only one download — no retry because no verification.
         assert download_calls["n"] == 1
-        host = result["hosts"][0]
+        # [0] leader, [1] follower.
+        host = result["hosts"][1]
         assert host["status"] == "ok"
-        assert host["files"] == [entry]
+        assert len(host["files"]) == 1
+        assert host["files"][0]["path"] == "mac_b.f.bin"
 
 
 # ---------------------------------------------------------------------------
