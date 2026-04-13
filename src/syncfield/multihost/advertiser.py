@@ -218,7 +218,7 @@ class SessionAdvertiser:
         )
         return info_cls(
             SERVICE_TYPE,
-            f"{announcement.session_id}.{SERVICE_TYPE}",
+            f"{announcement.session_id}--{announcement.host_id}.{SERVICE_TYPE}",
             port=port,
             properties=announcement.to_txt_record(),
             server=f"{socket.gethostname()}.local.",

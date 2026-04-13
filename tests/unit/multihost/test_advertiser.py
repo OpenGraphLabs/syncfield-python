@@ -86,7 +86,7 @@ class TestStart:
         assert len(fake_backend.registered) == 1
         info = fake_backend.registered[0]
         assert info.type_ == SERVICE_TYPE
-        assert info.name == f"amber-tiger-042.{SERVICE_TYPE}"
+        assert info.name == f"amber-tiger-042--mac_lead.{SERVICE_TYPE}"
         assert info.properties[b"status"] == b"preparing"
         assert info.properties[b"session_id"] == b"amber-tiger-042"
         assert info.properties[b"host_id"] == b"mac_lead"
