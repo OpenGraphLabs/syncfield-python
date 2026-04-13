@@ -20,7 +20,7 @@ from syncfield.adapters import UVCWebcamStream
 session = sf.SessionOrchestrator(
     host_id="mac_b",  # change per host: mac_c, mac_d, …
     output_dir=Path(__file__).parent / "output",
-    role=sf.FollowerRole(),  # no session_id → auto-discover the leader on LAN
+    role=sf.FollowerRole(session_id="lab_session"),  # match leader.py's session_id — advertises immediately on mDNS so the leader can see this follower before the leader itself starts recording
 )
 
 session.add(UVCWebcamStream("mac_webcam", device_index=0, output_dir=session.output_dir))

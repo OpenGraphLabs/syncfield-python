@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "syncfield"
-version = "0.3.1"
+version = "0.3.2"
 description = "Multi-modal capture orchestration framework with precision sync for Physical AI data collection"
 readme = "README.md"
 license = "Apache-2.0"
