@@ -89,22 +89,20 @@ def _global_aggregation_queue() -> AggregationQueue:
         _QUEUE_THREAD = thread
         _QUEUE = queue
 
-        # Recover any pending aggregation jobs from prior runs.
-        # Search root is configurable via SYNCFIELD_GO3S_RECOVERY_ROOT;
-        # defaults to current working directory.
-        recovery_root = Path(os.environ.get("SYNCFIELD_GO3S_RECOVERY_ROOT", "."))
-        if recovery_root.exists():
-            try:
-                recovered = queue.recover_from_disk(search_root=recovery_root)
-                for job in recovered:
-                    _enqueue_async_marshalled(queue, job)
-                if recovered:
-                    logger.info(
-                        "Go3S aggregation: recovered %d pending job(s) from %s",
-                        len(recovered), recovery_root,
-                    )
-            except Exception:
-                logger.exception("Go3S aggregation recovery scan failed")
+        # Crash-recovery scan is opt-in via SYNCFIELD_GO3S_RECOVERY_ROOT.
+        # It runs on a background thread so singleton init stays sub-second
+        # even when the user points it at a huge tree (e.g. project root
+        # with .git/.venv/node_modules — rglob("aggregation.json") across
+        # that can take seconds and would stall the caller's enqueue path).
+        recovery_env = os.environ.get("SYNCFIELD_GO3S_RECOVERY_ROOT")
+        if recovery_env:
+            recovery_root = Path(recovery_env)
+            threading.Thread(
+                target=_run_recovery_scan,
+                args=(queue, recovery_root, loop),
+                name="go3s-recovery",
+                daemon=True,
+            ).start()
     return _QUEUE
 
 
@@ -112,10 +110,37 @@ async def _enqueue_async(queue: AggregationQueue, job: AggregationJob) -> None:
     queue.enqueue(job)
 
 
-def _enqueue_async_marshalled(queue: AggregationQueue, job: AggregationJob) -> None:
-    """Enqueue from inside the singleton initializer (we know _QUEUE_LOOP is set)."""
-    fut: Future = asyncio.run_coroutine_threadsafe(_enqueue_async(queue, job), _QUEUE_LOOP)
-    fut.result(timeout=5.0)
+def _run_recovery_scan(
+    queue: AggregationQueue,
+    recovery_root: Path,
+    loop: asyncio.AbstractEventLoop,
+) -> None:
+    """Walk recovery_root for aggregation.json files and re-enqueue pending jobs.
+
+    Runs on its own thread so it doesn't block singleton init. Enqueue calls
+    are marshaled back onto the queue's dedicated loop.
+    """
+    try:
+        if not recovery_root.exists():
+            return
+        recovered = queue.recover_from_disk(search_root=recovery_root)
+        for job in recovered:
+            try:
+                fut: Future = asyncio.run_coroutine_threadsafe(
+                    _enqueue_async(queue, job), loop
+                )
+                fut.result(timeout=5.0)
+            except Exception:
+                logger.exception(
+                    "Failed to re-enqueue recovered job %s", job.job_id
+                )
+        if recovered:
+            logger.info(
+                "Go3S aggregation: recovered %d pending job(s) from %s",
+                len(recovered), recovery_root,
+            )
+    except Exception:
+        logger.exception("Go3S aggregation recovery scan failed")
 
 
 def _enqueue_on_global_queue(job: AggregationJob) -> None:
@@ -132,7 +157,11 @@ def _enqueue_on_global_queue(job: AggregationJob) -> None:
     fut: Future = asyncio.run_coroutine_threadsafe(
         _enqueue_async(queue, job), _QUEUE_LOOP
     )
-    fut.result(timeout=5.0)
+    # 30 s headroom: the actual enqueue is O(1), but if the queue's owned
+    # loop is busy dispatching an earlier job's progress callbacks the
+    # marshaled coroutine may queue behind them for a few seconds on a
+    # slow host. 5 s was too tight on a loaded dev machine.
+    fut.result(timeout=30.0)
 
 
 class Go3SStream(StreamBase):

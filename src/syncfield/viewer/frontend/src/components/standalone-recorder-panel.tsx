@@ -23,11 +23,18 @@ export interface StandaloneRecorderPanelProps {
 // Derived status
 // ---------------------------------------------------------------------------
 
-type StatusKind = "recording" | "aggregating" | "ready" | "failed" | "idle";
+type StatusKind =
+  | "connecting"
+  | "connected"
+  | "recording"
+  | "aggregating"
+  | "ready"
+  | "failed"
+  | "idle";
 
 interface DerivedStatus {
   kind: StatusKind;
-  dot: "rec" | "agg" | "ok" | "fail" | "idle";
+  dot: "rec" | "agg" | "ok" | "fail" | "idle" | "connecting";
   label: string;
   // recording
   frameCount?: number;
@@ -42,6 +49,8 @@ function deriveStatus(
   stream: StandaloneRecorderStream,
   agg: AggregationActiveJob | null,
 ): DerivedStatus {
+  // Order matters: active in-session states (recording, aggregating, failed)
+  // take precedence over steady-state indicators (connected/ready, connecting).
   if (stream.sessionState === "recording") {
     return {
       kind: "recording",
@@ -69,6 +78,25 @@ function deriveStatus(
   }
   if (agg?.state === "pending") {
     return { kind: "idle", dot: "idle", label: "Pending aggregation" };
+  }
+  // Session-level connection state — the Go3S BLE handshake takes 3–7 s and
+  // the user needs unambiguous feedback that it's in progress vs complete.
+  if (
+    stream.sessionState === "connecting" ||
+    stream.sessionState === "countdown"
+  ) {
+    return {
+      kind: "connecting",
+      dot: "connecting",
+      label: "Connecting",
+    };
+  }
+  if (stream.sessionState === "connected") {
+    return {
+      kind: "connected",
+      dot: "ok",
+      label: "Connected",
+    };
   }
   return { kind: "idle", dot: "idle", label: "Idle" };
 }
@@ -116,7 +144,8 @@ function StatusRow({
     "inline-block h-2 w-2 shrink-0 rounded-full",
     {
       "bg-recording animate-pulse-recording": status.dot === "rec",
-      "bg-warning animate-pulse-recording": status.dot === "agg",
+      "bg-warning animate-pulse-recording":
+        status.dot === "agg" || status.dot === "connecting",
       "bg-success": status.dot === "ok",
       "bg-destructive": status.dot === "fail",
       "bg-muted": status.dot === "idle",
@@ -146,8 +175,14 @@ function StatusRow({
               : ""}
           </span>
         )}
+        {status.kind === "connecting" && (
+          <span className="text-warning font-medium">Connecting to BLE…</span>
+        )}
+        {status.kind === "connected" && (
+          <span className="text-success font-medium">Connected · ready to record</span>
+        )}
         {status.kind === "ready" && (
-          <span className="text-success font-medium">Ready</span>
+          <span className="text-success font-medium">Ready · file downloaded</span>
         )}
         {status.kind === "failed" && (
           <span className="flex items-center gap-1.5">
