@@ -115,8 +115,8 @@ The `*.timestamps.jsonl` files plus `sync_point.json` are what the SyncField syn
 │  │ id = "mac_webcam"    │      │ id = "iphone"        │     │
 │  │ device_index = 0     │      │ device_index = 1     │     │
 │  │                      │      │                      │     │
-│  │ cv2.VideoCapture     │      │ cv2.VideoCapture     │     │
-│  │   → MP4 writer       │      │   → MP4 writer       │     │
+│  │ PyAV (avfoundation)  │      │ PyAV (avfoundation)  │     │
+│  │   → VideoEncoder     │      │   → VideoEncoder     │     │
 │  │   → timestamps JSONL │      │   → timestamps JSONL │     │
 │  │   → latest_frame     │      │   → latest_frame     │     │
 │  └──────────┬───────────┘      └──────────┬───────────┘     │
@@ -140,10 +140,10 @@ The orchestrator is configured with `SyncToneConfig.default()` (chirp enabled), 
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | Viewer opens but both previews are black | Wrong device indices | Run `python record.py --probe` and pass the correct indices |
-| `cv2.VideoCapture(1)` fails | iPhone not connected to Continuity Camera | Wake the iPhone, hold it near the Mac, check System Settings |
+| `av.open(…)` fails on iPhone index | iPhone not connected to Continuity Camera | Wake the iPhone, hold it near the Mac, check System Settings |
 | iPhone video is 720p instead of 1080p | macOS picked a lower-res stream profile | Try different `--width`/`--height` values; some iPhones cap Continuity at 1280×720 |
 | `ImportError: syncfield.viewer requires the 'viewer' extra` | Missing dev dep | `pip install "syncfield[viewer]"` |
-| `ImportError: UVCWebcamStream requires opencv-python` | Missing UVC extra | `pip install "syncfield[uvc]"` |
+| `ImportError: syncfield video adapters require PyAV` | Missing UVC extra | `pip install "syncfield[uvc]"` |
 | Recording stops after a few seconds | Continuity Camera dropped | Plug the iPhone into power; keep it awake; minimize Bluetooth contention |
 | Frame rate lower than requested | USB bandwidth contention | Lower `--fps`, or plug the webcam into a dedicated USB bus |
 

@@ -287,6 +287,12 @@ class FinalizationReport:
         last_sample_at_ns: Monotonic ns of last sample, or None if empty.
         health_events: Health events observed during recording.
         error: Error message if status is ``"failed"``.
+        jitter_p95_ns: 95th-percentile inter-frame interval (ns) during
+            the recording window. None if fewer than 20 samples were
+            collected, or for non-video streams.
+        jitter_p99_ns: 99th-percentile inter-frame interval (ns) during
+            the recording window. None if fewer than 20 samples were
+            collected.
     """
 
     stream_id: str
@@ -297,6 +303,8 @@ class FinalizationReport:
     last_sample_at_ns: int | None
     health_events: list[HealthEvent]
     error: str | None
+    jitter_p95_ns: int | None = None
+    jitter_p99_ns: int | None = None
 
 
 @dataclass(frozen=True)

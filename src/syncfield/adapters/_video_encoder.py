@@ -1,0 +1,177 @@
+"""VideoEncoder — shared PyAV-based MP4 writer for video adapters.
+
+Used by :class:`~syncfield.adapters.uvc_webcam.UVCWebcamStream` and
+:class:`~syncfield.adapters.oak_camera.OakCameraStream`. The interface is
+deliberately narrow: open with geometry, write BGR numpy frames, close.
+
+The encoder auto-selects the best available H.264 encoder:
+
+* ``h264_videotoolbox`` on macOS (hardware, near-zero CPU)
+* ``libx264`` everywhere else (software, widely available)
+
+All frames are assumed to be BGR24 (numpy ``uint8``, shape
+``(height, width, 3)``) to match the rest of the SDK's convention.
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+from typing import Optional
+
+import numpy as np
+
+try:
+    import av  # type: ignore[import-not-found]
+except ImportError as exc:  # pragma: no cover - exercised via sys.modules patch
+    raise ImportError(
+        "syncfield video adapters require PyAV. "
+        "Install with `pip install syncfield[uvc]` (or [oak], [viewer])."
+    ) from exc
+
+
+def _pick_h264_encoder() -> str:
+    """Return the best H.264 encoder name available in this FFmpeg build."""
+    for candidate in ("h264_videotoolbox", "libx264"):
+        try:
+            av.codec.Codec(candidate, "w")
+        except Exception:  # noqa: BLE001 - PyAV raises generic errors here
+            continue
+        return candidate
+    raise RuntimeError(
+        "No H.264 encoder found in PyAV. Reinstall `av` with libx264 support."
+    )
+
+
+class VideoEncoder:
+    """Thin wrapper around an ``av`` output container + H.264 stream."""
+
+    def __init__(
+        self,
+        container: "av.container.OutputContainer",
+        stream: "av.video.stream.VideoStream",
+    ) -> None:
+        self._container = container
+        self._stream = stream
+        self._closed = False
+
+    @classmethod
+    def open(
+        cls,
+        path: str | Path,
+        *,
+        width: int,
+        height: int,
+        fps: float,
+        codec: Optional[str] = None,
+    ) -> "VideoEncoder":
+        """Open ``path`` for writing and configure the H.264 stream."""
+        chosen_codec = codec or _pick_h264_encoder()
+        container = av.open(str(path), mode="w")
+        stream = container.add_stream(chosen_codec, rate=int(round(fps)))
+        stream.width = int(width)
+        stream.height = int(height)
+        stream.pix_fmt = "yuv420p"
+        return cls(container, stream)
+
+    def write(self, frame_bgr: np.ndarray) -> None:
+        """Encode and mux a single BGR frame.
+
+        Must not be called after :meth:`close`. Callers that interleave
+        writes with other hot-path work should keep the frame buffer
+        alive until this call returns.
+        """
+        if self._closed:
+            raise RuntimeError("VideoEncoder.write called after close")
+        video_frame = av.VideoFrame.from_ndarray(frame_bgr, format="bgr24")
+        for packet in self._stream.encode(video_frame):
+            self._container.mux(packet)
+
+    def close(self) -> None:
+        """Flush the encoder and close the container. Idempotent.
+
+        May raise if the final flush fails. A second ``close()`` is always
+        a no-op. The underlying container is closed even if the flush
+        raises, so resources are not leaked.
+        """
+        if self._closed:
+            return
+        self._closed = True
+        flush_error: Optional[BaseException] = None
+        try:
+            for packet in self._stream.encode(None):
+                self._container.mux(packet)
+        except BaseException as exc:  # noqa: BLE001 - propagate after cleanup
+            flush_error = exc
+        # Always close the container, even if flush raised.
+        try:
+            self._container.close()
+        except Exception:  # noqa: BLE001 - trailer write failure is unrecoverable
+            pass
+        if flush_error is not None:
+            raise flush_error
+
+
+def open_uvc_input(
+    *,
+    device_index: int,
+    width: int,
+    height: int,
+    fps: float,
+    device_name: Optional[str] = None,
+    pixel_format: str = "mjpeg",
+) -> "av.container.InputContainer":
+    """Open a UVC webcam as a PyAV input container.
+
+    Platform dispatch:
+
+    * macOS — ``avfoundation`` with URL ``"<video>:<audio>"``. We pass
+      ``"<index>:none"`` so no audio input is opened.
+    * Linux — ``v4l2`` with URL ``/dev/video<N>``.
+    * Windows — ``dshow`` with URL ``video=<device_name>``. The caller
+      must supply ``device_name`` (DirectShow has no index URL).
+
+    The returned container yields packets via ``.demux()`` which the
+    caller decodes frame-by-frame.
+    """
+    options = {
+        "video_size": f"{int(width)}x{int(height)}",
+        "framerate": str(int(round(fps))),
+        "pixel_format": pixel_format,
+    }
+
+    if sys.platform == "darwin":
+        url = f"{int(device_index)}:none"
+        fmt = "avfoundation"
+    elif sys.platform.startswith("linux"):
+        url = f"/dev/video{int(device_index)}"
+        fmt = "v4l2"
+    elif sys.platform.startswith("win"):
+        if not device_name:
+            raise ValueError(
+                "Windows UVC input requires `device_name` "
+                "(DirectShow has no device-index URL)."
+            )
+        url = f"video={device_name}"
+        fmt = "dshow"
+    else:
+        raise RuntimeError(f"Unsupported platform for UVC input: {sys.platform}")
+
+    return av.open(url, format=fmt, options=options)
+
+
+def compute_jitter_percentiles(
+    intervals_ns: list[int],
+) -> tuple[Optional[int], Optional[int]]:
+    """Return (p95, p99) of inter-frame intervals, or (None, None) if <20 samples.
+
+    At very small sample sizes percentile estimates are noisy and not
+    usefully actionable — better to leave them null than to emit a
+    misleading number.
+    """
+    if len(intervals_ns) < 20:
+        return None, None
+    sorted_iv = sorted(intervals_ns)
+    p95_idx = min(len(sorted_iv) - 1, int(len(sorted_iv) * 0.95))
+    p99_idx = min(len(sorted_iv) - 1, int(len(sorted_iv) * 0.99))
+    return sorted_iv[p95_idx], sorted_iv[p99_idx]

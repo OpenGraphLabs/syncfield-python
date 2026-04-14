@@ -7,7 +7,6 @@ Windows users see a predictable empty list instead of an exception.
 
 from __future__ import annotations
 
-import importlib
 import json
 import sys
 from pathlib import Path
@@ -16,21 +15,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 
-@pytest.fixture
-def mock_cv2(monkeypatch):
-    """Install a fake ``cv2`` so uvc_webcam.py imports cleanly."""
-    fake = MagicMock()
-    fake.VideoCapture.return_value = MagicMock(isOpened=lambda: True)
-    fake.VideoWriter_fourcc = lambda *a: 0
-    monkeypatch.setitem(sys.modules, "cv2", fake)
-    sys.modules.pop("syncfield.adapters.uvc_webcam", None)
-    importlib.import_module("syncfield.adapters.uvc_webcam")
-    yield fake
-    sys.modules.pop("syncfield.adapters.uvc_webcam", None)
-
-
 class TestMacosBranch:
-    def test_parses_system_profiler_output(self, mock_cv2):
+    def test_parses_system_profiler_output(self):
         from syncfield.adapters import uvc_webcam
         from syncfield.adapters.uvc_webcam import UVCWebcamStream
 
@@ -63,7 +49,7 @@ class TestMacosBranch:
         assert devices[1].display_name == "Logitech Brio"
         assert devices[1].construct_kwargs == {"device_index": 1}
 
-    def test_missing_system_profiler_returns_empty(self, mock_cv2):
+    def test_missing_system_profiler_returns_empty(self):
         from syncfield.adapters.uvc_webcam import UVCWebcamStream
 
         with patch.object(sys, "platform", "darwin"), patch(
@@ -71,7 +57,7 @@ class TestMacosBranch:
         ):
             assert UVCWebcamStream.discover() == []
 
-    def test_system_profiler_failure_returns_empty(self, mock_cv2):
+    def test_system_profiler_failure_returns_empty(self):
         from syncfield.adapters.uvc_webcam import UVCWebcamStream
 
         with patch.object(sys, "platform", "darwin"), patch(
@@ -80,7 +66,7 @@ class TestMacosBranch:
         ):
             assert UVCWebcamStream.discover() == []
 
-    def test_malformed_json_returns_empty(self, mock_cv2):
+    def test_malformed_json_returns_empty(self):
         from syncfield.adapters.uvc_webcam import UVCWebcamStream
 
         with patch.object(sys, "platform", "darwin"), patch(
@@ -91,7 +77,7 @@ class TestMacosBranch:
 
 
 class TestLinuxBranch:
-    def test_enumerates_dev_video(self, mock_cv2, tmp_path):
+    def test_enumerates_dev_video(self, tmp_path):
         from syncfield.adapters import uvc_webcam
         from syncfield.adapters.uvc_webcam import UVCWebcamStream
 
@@ -146,7 +132,7 @@ class TestLinuxBranch:
         assert devices[0].display_name == "Integrated Camera"
         assert devices[0].construct_kwargs == {"device_index": 0}
 
-    def test_linux_without_dev_returns_empty(self, mock_cv2):
+    def test_linux_without_dev_returns_empty(self):
         from syncfield.adapters import uvc_webcam
 
         with patch.object(sys, "platform", "linux"), patch.object(
@@ -156,7 +142,7 @@ class TestLinuxBranch:
 
 
 class TestFallbackBranch:
-    def test_unsupported_platform_returns_empty(self, mock_cv2):
+    def test_unsupported_platform_returns_empty(self):
         from syncfield.adapters.uvc_webcam import UVCWebcamStream
 
         with patch.object(sys, "platform", "win32"):
@@ -164,7 +150,7 @@ class TestFallbackBranch:
 
 
 class TestClassAttributes:
-    def test_registry_hints_present(self, mock_cv2):
+    def test_registry_hints_present(self):
         from syncfield.adapters.uvc_webcam import UVCWebcamStream
 
         assert UVCWebcamStream._discovery_kind == "video"

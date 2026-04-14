@@ -26,7 +26,7 @@ Requires the ``viewer`` extra::
 
     pip install 'syncfield[viewer]'
 
-which installs ``fastapi``, ``uvicorn``, and ``opencv-python``.
+which installs ``fastapi``, ``uvicorn``, ``av``, and ``Pillow``.
 """
 
 from __future__ import annotations
