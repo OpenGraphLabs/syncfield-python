@@ -2783,14 +2783,18 @@ class SessionOrchestrator:
                     state = r.json().get("state", "")
                     if state == "recording":
                         return _dc_replace(leader, status="recording")
-                    if state in ("stopped", "idle"):
+                    if state == "stopped":
                         # Fast session wrapped up before we saw
-                        # 'recording'. Mirror the static-leader path:
-                        # treat as observed and let the follower stop.
+                        # 'recording' — treat as observed and let the
+                        # follower stop. ``idle``, ``connected``, and
+                        # ``preparing`` are all PRE-recording states:
+                        # keep polling. Treating them as "done" would
+                        # cause the follower to race ahead of the
+                        # leader and exit before any recording happened.
                         logger.info(
-                            "Leader %s reached state=%s without 'recording' "
-                            "seen; proceeding",
-                            leader.host_id, state,
+                            "Leader %s reached state=stopped without "
+                            "'recording' seen; proceeding",
+                            leader.host_id,
                         )
                         return _dc_replace(leader, status="stopped")
             except httpx.HTTPError as exc:
@@ -2839,15 +2843,18 @@ class SessionOrchestrator:
                             leader.host_id,
                         )
                         return
-                    if state in ("stopped", "idle"):
+                    if state == "stopped":
                         # Leader wrapped up before we observed recording —
                         # this can happen on a fast/short session. Treat
                         # as 'leader done' and return so follower can stop.
+                        # ``idle``/``connected``/``preparing`` are PRE-
+                        # recording states — keep polling on those,
+                        # otherwise the follower races ahead of the
+                        # leader and exits with empty recordings.
                         logger.info(
-                            "Static leader %s reached state=%s without "
-                            "recording — proceeding",
+                            "Static leader %s reached state=stopped "
+                            "without recording — proceeding",
                             leader.host_id,
-                            state,
                         )
                         return
                 elif r.status_code == 503:
