@@ -260,6 +260,12 @@ class UVCWebcamStream(StreamBase):
         sleep briefly and keep trying.
         """
         assert self._input is not None
+        # Errno values for "transient I/O not ready, retry" across
+        # macOS (EAGAIN=35), Linux (EAGAIN=11), and interrupted
+        # syscalls (EINTR=4). Any OSError with one of these is not
+        # fatal — the camera simply hasn't delivered a frame yet.
+        _TRANSIENT_ERRNOS = {4, 11, 35}
+
         frame_iter = iter(self._input.decode(video=0))
         while not self._stop_event.is_set():
             try:
@@ -292,14 +298,29 @@ class UVCWebcamStream(StreamBase):
             except StopIteration:
                 # Device exhausted (explicit end-of-stream).
                 break
-            except BlockingIOError:
-                # EAGAIN from AVFoundation — can surface from next(),
-                # frame.to_ndarray(), or encoder.write() on macOS.
-                # Sleep briefly and retry; it is never fatal.
-                time.sleep(0.001)
-                continue
+            except OSError as exc:
+                # Catch BlockingIOError (subclass of OSError) AND any
+                # other OSError with a transient errno. AVFoundation /
+                # V4L2 can surface EAGAIN as either the specific
+                # BlockingIOError class or a bare OSError(35) / raw
+                # FFmpegError depending on the PyAV version and code
+                # path. errno None is also treated as transient since
+                # PyAV sometimes omits it on "not ready" conditions.
+                if exc.errno in _TRANSIENT_ERRNOS or exc.errno is None:
+                    time.sleep(0.001)
+                    continue
+                # Real OSError (EIO, ENODEV, etc.) — treat as fatal.
+                self._emit_health(
+                    HealthEvent(
+                        stream_id=self.id,
+                        kind=HealthEventKind.ERROR,
+                        at_ns=time.monotonic_ns(),
+                        detail=f"capture loop ended: {exc!r}",
+                    )
+                )
+                return
             except Exception as exc:  # noqa: BLE001 - PyAV surfaces diverse errors here
-                # Genuine error — emit a health event and exit.
+                # Genuine non-OS error — emit a health event and exit.
                 self._emit_health(
                     HealthEvent(
                         stream_id=self.id,
