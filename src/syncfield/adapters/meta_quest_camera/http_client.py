@@ -71,3 +71,84 @@ class QuestHttpClient:
         response = self._client.get("/status")
         response.raise_for_status()
         return QuestStatus.from_json(response.json())
+
+    def start_recording(
+        self,
+        *,
+        session_id: str,
+        host_mono_ns: int,
+        width: int,
+        height: int,
+        fps: int,
+    ) -> "RecordingStartResponse":
+        response = self._client.post(
+            "/recording/start",
+            json={
+                "session_id": session_id,
+                "host_mono_ns": host_mono_ns,
+                "resolution": {"width": width, "height": height},
+                "fps": fps,
+            },
+        )
+        if response.status_code == 409:
+            raise RecordingAlreadyActive(response.json().get("error", ""))
+        response.raise_for_status()
+        return RecordingStartResponse.from_json(response.json())
+
+    def stop_recording(self) -> "RecordingStopResponse":
+        response = self._client.post("/recording/stop", json={})
+        response.raise_for_status()
+        return RecordingStopResponse.from_json(response.json())
+
+
+class RecordingAlreadyActive(RuntimeError):
+    """Raised when POST /recording/start returns 409."""
+
+
+@dataclass(frozen=True)
+class RecordingStartResponse:
+    session_id: str
+    quest_mono_ns_at_start: int
+    delta_ns: int
+    started: bool
+
+    @classmethod
+    def from_json(cls, payload: dict) -> "RecordingStartResponse":
+        return cls(
+            session_id=str(payload["session_id"]),
+            quest_mono_ns_at_start=int(payload["quest_mono_ns_at_start"]),
+            delta_ns=int(payload["delta_ns"]),
+            started=bool(payload["started"]),
+        )
+
+
+@dataclass(frozen=True)
+class PerEyeSummary:
+    frame_count: int
+    bytes: int
+    last_capture_ns: int
+
+    @classmethod
+    def from_json(cls, payload: dict) -> "PerEyeSummary":
+        return cls(
+            frame_count=int(payload["frame_count"]),
+            bytes=int(payload["bytes"]),
+            last_capture_ns=int(payload["last_capture_ns"]),
+        )
+
+
+@dataclass(frozen=True)
+class RecordingStopResponse:
+    session_id: str
+    left: PerEyeSummary
+    right: PerEyeSummary
+    duration_s: float
+
+    @classmethod
+    def from_json(cls, payload: dict) -> "RecordingStopResponse":
+        return cls(
+            session_id=str(payload["session_id"]),
+            left=PerEyeSummary.from_json(payload["left"]),
+            right=PerEyeSummary.from_json(payload["right"]),
+            duration_s=float(payload["duration_s"]),
+        )
