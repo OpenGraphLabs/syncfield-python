@@ -9,6 +9,8 @@ import pytest
 from syncfield.adapters.polling_sensor import PollingSensorStream
 from syncfield.types import SampleEvent
 
+pytestmark = pytest.mark.slow
+
 
 def test_real_thread_emits_samples_at_expected_rate():
     """Run capture thread at 200 Hz for 0.5s, expect ~100 samples +-30%."""

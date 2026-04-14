@@ -84,6 +84,7 @@ pythonpath = ["src"]
 markers = [
     "hardware: tests that require physical hardware (cameras, BLE devices)",
     "slow: integration tests that touch real IO (mDNS sockets, filesystem, etc.)",
+    "real_multihost: opt out of the unit-conftest patch that no-ops SessionOrchestrator._bring_multihost_online — use when the test needs the real control plane / advertiser / browser",
 ]
 
 [dependency-groups]

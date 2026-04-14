@@ -5,8 +5,12 @@ from __future__ import annotations
 import threading
 import time
 
+import pytest
+
 from syncfield.adapters.push_sensor import PushSensorStream
 from syncfield.types import SampleEvent
+
+pytestmark = pytest.mark.slow
 
 
 def test_concurrent_pushers_no_lost_samples():

@@ -127,9 +127,13 @@ class _SlowAdapter(_StubStreamBase):
     _discovery_kind = "sensor"
     _discovery_adapter_type = "slow"
 
+    # Sleep just long enough to exceed the test's deadline; the executor's
+    # shutdown waits on this thread, so keep it small.
+    SLEEP_S = 0.15
+
     @classmethod
     def discover(cls, *, timeout: float = 5.0) -> List[DiscoveredDevice]:
-        time.sleep(2.0)
+        time.sleep(cls.SLEEP_S)
         return []
 
 
@@ -273,7 +277,8 @@ class TestScan:
     def test_slow_adapter_times_out(self):
         register_discoverer(_StubVideoAdapter)
         register_discoverer(_SlowAdapter)
-        report = scan(timeout=0.5, use_cache=False)
+        # Deadline is well below _SlowAdapter.SLEEP_S so it must time out.
+        report = scan(timeout=0.05, use_cache=False)
         # Good adapter should still have landed
         assert len(report.devices) == 2
         assert "slow" in report.timed_out

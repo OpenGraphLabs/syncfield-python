@@ -58,3 +58,84 @@ def _disable_audio_auto_inject():
         "syncfield.orchestrator.SessionOrchestrator._maybe_inject_host_audio"
     ):
         yield
+
+
+class _InertAdvertiser:
+    """Dummy stand-in for SessionAdvertiser used by the unit-test conftest.
+
+    Implements every method the orchestrator calls so swapping it in
+    for the real class is transparent to tests that don't care about
+    advertiser behaviour. Tests that DO assert on advertiser activity
+    must monkey-patch ``syncfield.orchestrator.SessionAdvertiser``
+    themselves — that local patch overrides this conftest default.
+
+    Critical: never touches zeroconf, so no mDNS sockets, no service
+    registration, no NonUniqueNameException under xdist.
+    """
+
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
+    def start(self):
+        pass
+
+    def update_status(self, *args, **kwargs):
+        pass
+
+    def close(self):
+        pass
+
+
+class _InertBrowser:
+    """Dummy stand-in for SessionBrowser. See :class:`_InertAdvertiser`."""
+
+    def __init__(self, session_id=None):
+        self.session_id_filter = session_id
+
+    def start(self):
+        pass
+
+    def close(self):
+        pass
+
+    def current_sessions(self):
+        return []
+
+    def wait_for_observation(self, timeout=30.0):
+        return None
+
+    def wait_for_recording(self, timeout=30.0):
+        return None
+
+    def wait_for_stopped(self, timeout=30.0):
+        return None
+
+
+@pytest.fixture(autouse=True)
+def _disable_multihost_network(request):
+    """Replace mDNS classes with inert dummies so unit tests never hit zeroconf.
+
+    Since refactor 64dd0fd, ``SessionOrchestrator(role=LeaderRole|FollowerRole, ...)``
+    instantiates ``SessionAdvertiser`` (which calls ``zeroconf.register_service``
+    on ``.start()``) and ``SessionBrowser`` (which spawns a ``ServiceBrowser``)
+    inside ``__init__``. Without this fixture, every unit test that uses a
+    role would block on real mDNS — slow on macOS, flaky on shared machines,
+    and a source of NonUniqueNameException collisions under ``pytest-xdist``.
+
+    The control plane is NOT patched: it binds ``port=0`` (OS-assigned),
+    starts uvicorn in a background thread, and is fast enough that tests
+    asserting on ``session._control_plane is not None`` keep working.
+
+    Tests that genuinely need the real ``SessionAdvertiser`` /
+    ``SessionBrowser`` (e.g. multi-host integration smoke tests) must
+    add ``@pytest.mark.real_multihost`` to opt out of this fixture.
+    """
+    if request.node.get_closest_marker("real_multihost"):
+        yield
+        return
+    with patch(
+        "syncfield.orchestrator.SessionAdvertiser", _InertAdvertiser
+    ), patch(
+        "syncfield.orchestrator.SessionBrowser", _InertBrowser
+    ):
+        yield

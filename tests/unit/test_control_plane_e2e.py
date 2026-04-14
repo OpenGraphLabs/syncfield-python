@@ -13,6 +13,8 @@ import syncfield as sf
 from syncfield.multihost.control_plane import DEFAULT_KEEP_ALIVE_AFTER_STOP_SEC
 from tests.unit.conftest import FakeStream
 
+pytestmark = pytest.mark.slow
+
 
 def _with_audio(session: "sf.SessionOrchestrator") -> None:
     stream = FakeStream("mic_for_chirp")
