@@ -237,8 +237,12 @@ class Go3SStream(StreamBase):
             await cam.disconnect()
 
     def _build_job(self) -> AggregationJob:
-        if self._sd_path is None:
-            raise RuntimeError("stop_recording did not return a file path")
+        if not self._sd_path:
+            raise RuntimeError(
+                "stop_recording did not return a file path; the BLE STOP response "
+                "did not contain a /DCIM/... entry. Verify the camera is in video "
+                "mode and reachable."
+            )
         ext = ".mp4" if self._sd_path.lower().endswith(".mp4") else ".insv"
         camera_spec = AggregationCameraSpec(
             stream_id=self.id,

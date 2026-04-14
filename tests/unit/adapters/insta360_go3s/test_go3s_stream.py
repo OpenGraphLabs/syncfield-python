@@ -113,3 +113,18 @@ def test_on_demand_policy_does_not_enqueue(fake_ble, fake_queue, tmp_path):
     # An ID for manual aggregation later should still be exposed
     assert s.pending_aggregation_job is not None
     assert s.pending_aggregation_job.cameras[0].sd_path == "/DCIM/Camera01/VID_FAKE.mp4"
+
+
+def test_stop_recording_raises_when_ble_returns_empty_filepath(fake_ble, fake_queue, tmp_path):
+    """If BLE STOP doesn't echo a /DCIM/... path, surface a clear error."""
+    fake_ble.stop_capture.return_value = CaptureResult(file_path="", ack_host_ns=0)
+    s = Go3SStream(
+        stream_id="overhead",
+        ble_address="AA:BB:CC:DD:EE:FF",
+        output_dir=tmp_path,
+    )
+    s.prepare()
+    s.connect()
+    s.start_recording(session_clock=MagicMock())
+    with pytest.raises(RuntimeError, match="did not return a file path"):
+        s.stop_recording()
