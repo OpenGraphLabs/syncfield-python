@@ -164,10 +164,14 @@ def test_open_uvc_input_macos(
     )
 
     args, kwargs = fake_av.av.open.call_args
-    assert args[0] == "0:none"
+    assert args[0] == "0"
     assert kwargs.get("format") == "avfoundation"
     assert kwargs.get("options", {}).get("video_size") == "1280x720"
     assert kwargs.get("options", {}).get("framerate") == "30"
+    # pixel_format is intentionally omitted by default — forcing mjpeg
+    # or any other value breaks macOS built-in cameras that expose
+    # yuyv422/nv12 only.
+    assert "pixel_format" not in kwargs.get("options", {})
     assert result is input_container
 
 

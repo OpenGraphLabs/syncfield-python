@@ -119,17 +119,27 @@ def open_uvc_input(
     height: int,
     fps: float,
     device_name: Optional[str] = None,
-    pixel_format: str = "mjpeg",
+    pixel_format: Optional[str] = None,
 ) -> "av.container.InputContainer":
     """Open a UVC webcam as a PyAV input container.
 
     Platform dispatch:
 
-    * macOS — ``avfoundation`` with URL ``"<video>:<audio>"``. We pass
-      ``"<index>:none"`` so no audio input is opened.
+    * macOS — ``avfoundation`` with URL ``"<video>"`` (video index only;
+      omitting the ``":<audio>"`` half disables audio capture). The
+      ``"<index>:none"`` form is NOT portable across PyAV's bundled
+      ffmpeg builds — ``avfoundation_read_header`` tries to look up
+      ``"none"`` as an audio device name and fails with EINVAL.
     * Linux — ``v4l2`` with URL ``/dev/video<N>``.
     * Windows — ``dshow`` with URL ``video=<device_name>``. The caller
       must supply ``device_name`` (DirectShow has no index URL).
+
+    Pixel format is left unset by default so avfoundation/v4l2/dshow
+    negotiate whatever the camera natively produces. Forcing a value
+    like ``"mjpeg"`` fails on cameras that don't expose that format
+    (macOS built-in FaceTime cameras expose only ``yuyv422`` /
+    ``nv12``). Pass ``pixel_format`` explicitly only when the caller
+    knows the device supports it.
 
     The returned container yields packets via ``.demux()`` which the
     caller decodes frame-by-frame.
@@ -137,11 +147,12 @@ def open_uvc_input(
     options = {
         "video_size": f"{int(width)}x{int(height)}",
         "framerate": str(int(round(fps))),
-        "pixel_format": pixel_format,
     }
+    if pixel_format is not None:
+        options["pixel_format"] = pixel_format
 
     if sys.platform == "darwin":
-        url = f"{int(device_index)}:none"
+        url = str(int(device_index))
         fmt = "avfoundation"
     elif sys.platform.startswith("linux"):
         url = f"/dev/video{int(device_index)}"
