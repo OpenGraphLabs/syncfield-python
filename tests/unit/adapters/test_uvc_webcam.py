@@ -185,3 +185,104 @@ class TestFourPhaseLifecycle:
         # Sanity: jitter should be on the order of pace_seconds (1ms = 1_000_000 ns)
         # — allow generous bounds for CI load.
         assert 0 < report.jitter_p95_ns < 100_000_000  # < 100ms
+
+
+class TestDecoderResilience:
+    """The capture loop must tolerate transient decoder errors.
+
+    AVFoundation on macOS raises ``BlockingIOError`` (EAGAIN, errno 35)
+    during camera warmup and occasionally between frames. Linux V4L2
+    surfaces the same under EAGAIN=11. Interrupted syscalls (EINTR=4)
+    fall in the same bucket. None should kill the capture thread.
+    """
+
+    def test_blocking_io_error_does_not_kill_loop(
+        self, mock_av_generous, tmp_path
+    ):
+        """Inject EAGAIN into the decode iterator; loop must keep going."""
+        import numpy as np
+        from unittest.mock import MagicMock
+
+        from syncfield.adapters.uvc_webcam import UVCWebcamStream
+
+        # A generator that ``raise``s without ever yielding becomes
+        # dead after the first next(), so we use an iterator class
+        # that keeps state across next() calls: first 3 calls raise
+        # EAGAIN, subsequent 50 yield real BGR frames.
+        class FlakyIter:
+            def __init__(self) -> None:
+                self._eagain_left = 3
+                self._i = 0
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                if self._eagain_left > 0:
+                    self._eagain_left -= 1
+                    raise BlockingIOError(
+                        35, "Resource temporarily unavailable", "0"
+                    )
+                if self._i >= 50:
+                    raise StopIteration
+                time.sleep(0.001)
+                frame = MagicMock(name=f"Frame-{self._i}")
+                frame.to_ndarray = MagicMock(
+                    return_value=np.full(
+                        (48, 64, 3), self._i % 256, dtype=np.uint8
+                    )
+                )
+                self._i += 1
+                return frame
+
+        mock_av_generous.input_container.decode = MagicMock(
+            return_value=FlakyIter()
+        )
+
+        stream = UVCWebcamStream(
+            "cam", device_index=0, output_dir=tmp_path, fps=30.0
+        )
+        stream.prepare()
+        stream.connect()
+        stream.start_recording(_clock())
+        time.sleep(0.1)
+        report = stream.stop_recording()
+        stream.disconnect()
+
+        assert report.frame_count >= 1
+        assert not any(
+            "BlockingIOError" in (h.detail or "")
+            for h in report.health_events
+        )
+
+    def test_fatal_os_error_still_ends_loop(
+        self, mock_av_generous, tmp_path
+    ):
+        """Non-transient OSError (e.g. ENODEV=19) still emits + exits."""
+        from unittest.mock import MagicMock
+
+        from syncfield.adapters.uvc_webcam import UVCWebcamStream
+
+        class FatalIter:
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                raise OSError(19, "No such device", "99")
+
+        mock_av_generous.input_container.decode = MagicMock(
+            return_value=FatalIter()
+        )
+
+        stream = UVCWebcamStream(
+            "cam", device_index=99, output_dir=tmp_path, fps=30.0
+        )
+        stream.prepare()
+        stream.connect()
+        time.sleep(0.05)
+        stream.disconnect()
+
+        collected = stream._collected_health  # noqa: SLF001
+        assert any(
+            "No such device" in (h.detail or "") for h in collected
+        ), f"expected fatal OSError in health events, got {collected!r}"

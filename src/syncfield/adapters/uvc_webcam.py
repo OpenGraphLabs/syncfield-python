@@ -254,20 +254,29 @@ class UVCWebcamStream(StreamBase):
 
         The loop exits when ``_stop_event`` fires or the input container
         is exhausted (device disconnect).
+
+        Transient OS errors (EAGAIN / EINTR) raised by AVFoundation or
+        V4L2 during camera warmup are NOT fatal — the demuxer is just
+        saying "no frame ready yet, try again." We sleep briefly and
+        keep polling. Only genuinely fatal errors surface as a health
+        event and terminate the thread.
         """
         assert self._input is not None
-        try:
-            for frame in self._input.decode(video=0):
+        # Errno values treated as transient "retry soon":
+        # macOS EAGAIN=35, Linux EAGAIN=11, EINTR=4. ``None`` is also
+        # treated as transient because PyAV sometimes omits errno on
+        # "not ready" conditions.
+        _TRANSIENT_ERRNOS = {4, 11, 35}
+
+        frame_iter = iter(self._input.decode(video=0))
+        while not self._stop_event.is_set():
+            try:
+                frame = next(frame_iter)
                 capture_ns = time.monotonic_ns()
-                # Jitter collection runs only during the recording window so preview
-                # intervals don't pollute the report and so the capture thread never
-                # mutates the list while stop_recording() is reading it.
                 if self._recording:
                     if self._prev_capture_ns is not None:
                         self._intervals_ns.append(capture_ns - self._prev_capture_ns)
                     self._prev_capture_ns = capture_ns
-                if self._stop_event.is_set():
-                    break
 
                 frame_bgr = frame.to_ndarray(format="bgr24")
 
@@ -288,18 +297,39 @@ class UVCWebcamStream(StreamBase):
                             capture_ns=capture_ns,
                         )
                     )
-        except Exception as exc:  # noqa: BLE001 - PyAV surfaces diverse errors here
-            # Device disconnect or decode error — emit a health event so the
-            # orchestrator sees a first-class signal, then exit the thread.
-            self._emit_health(
-                HealthEvent(
-                    stream_id=self.id,
-                    kind=HealthEventKind.ERROR,
-                    at_ns=time.monotonic_ns(),
-                    detail=f"capture loop ended: {exc!r}",
+            except StopIteration:
+                # Device exhausted (explicit end-of-stream).
+                break
+            except OSError as exc:
+                # AVFoundation / V4L2 can surface "not ready" as:
+                # - av.error.BlockingIOError (subclass of OSError)
+                # - bare OSError(35) on macOS, OSError(11) on Linux
+                # - FFmpegError with errno=None
+                # All are transient and must not kill the capture loop.
+                if exc.errno in _TRANSIENT_ERRNOS or exc.errno is None:
+                    time.sleep(0.001)
+                    continue
+                # Real OSError (EIO, ENODEV, etc.) — treat as fatal.
+                self._emit_health(
+                    HealthEvent(
+                        stream_id=self.id,
+                        kind=HealthEventKind.ERROR,
+                        at_ns=time.monotonic_ns(),
+                        detail=f"capture loop ended: {exc!r}",
+                    )
                 )
-            )
-            return
+                return
+            except Exception as exc:  # noqa: BLE001 - PyAV surfaces diverse errors here
+                # Genuine non-OS error — emit a health event and exit.
+                self._emit_health(
+                    HealthEvent(
+                        stream_id=self.id,
+                        kind=HealthEventKind.ERROR,
+                        at_ns=time.monotonic_ns(),
+                        detail=f"capture loop ended: {exc!r}",
+                    )
+                )
+                return
 
     # ------------------------------------------------------------------
     # Live preview
