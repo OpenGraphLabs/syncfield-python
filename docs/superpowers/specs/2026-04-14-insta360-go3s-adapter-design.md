@@ -92,7 +92,7 @@ Go3SStream(
     stream_id: str,
     ble_address: str,                      # BLE MAC or CoreBluetooth UUID
     output_dir: Path,                      # episode dir provided by orchestrator
-    aggregation_policy: Literal["eager", "on_demand", "between_sessions"] = "eager",
+    aggregation_policy: Literal["eager", "on_demand"] = "eager",
     video_mode: Literal["video"] = "video",
 )
 ```
@@ -221,7 +221,8 @@ PENDING ──► RUNNING ──► COMPLETED
 `aggregation_policy`:
 - `eager` (default single-host): on `stop_recording()`, auto-enqueue. Worker starts immediately.
 - `on_demand` (auto-forced in multihost leader/follower): do not enqueue; viewer "Aggregate now" button triggers enqueue.
-- `between_sessions`: enqueue on `stop_recording()` but worker only runs when orchestrator state == `IDLE`. If a new recording starts while the worker is mid-download, the worker finishes the in-flight file (BLE trigger for the new recording is independent — no interference), then pauses before the next file until the orchestrator returns to `IDLE`.
+
+v1 supports `eager` (default) and `on_demand`. Future work: `between_sessions` policy that defers aggregation until the orchestrator returns to IDLE state — would require orchestrator-level coordination.
 
 **Multihost autodetection**: on `session.add(Go3SStream(...))`, if session's role is `LeaderRole` or `FollowerRole`, orchestrator downgrades `eager` → `on_demand` with a health event explaining why.
 
@@ -300,7 +301,7 @@ New commands:
 - `test_osc_client.py` — mocked aiohttp responses for `/osc/info`, `listFiles`, downloads including partial/truncated streams.
 - `test_wifi_switcher.py` — each platform impl unit tested with `subprocess.run` mocked; factory selection test per `sys.platform`.
 - `test_aggregation_queue.py` — job lifecycle, retry, crash recovery from `aggregation.json`, listener notifications.
-- `test_go3s_stream.py` — lifecycle with fake BLE client, policy resolution (eager / on_demand / between_sessions), multihost auto-downgrade.
+- `test_go3s_stream.py` — lifecycle with fake BLE client, policy resolution (eager / on_demand), multihost auto-downgrade.
 
 ### Integration tests
 - `tests/integration/test_go3s_session_e2e.py` — full session with mocked BLE + mocked OSC server + temp WiFi switcher; verifies episode dir contents, manifest entries, aggregation.json, and finalization reports.
