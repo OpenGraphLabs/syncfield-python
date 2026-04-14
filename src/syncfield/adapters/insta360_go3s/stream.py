@@ -124,6 +124,9 @@ class Go3SStream(StreamBase):
         wifi_password: Camera AP password (Insta360 default is ``"88888888"``).
     """
 
+    _discovery_kind = "video"
+    _discovery_adapter_type = "insta360_go3s"
+
     def __init__(
         self,
         stream_id: str,
@@ -261,6 +264,45 @@ class Go3SStream(StreamBase):
     def _derive_ssid_from_address(address: str) -> str:
         suffix = address.replace(":", "").upper()[-12:]
         return f"Go3S-{suffix}.OSC"
+
+    @classmethod
+    def discover(cls, *, timeout: float = 5.0) -> list:
+        """Enumerate Go3S cameras currently advertising over BLE.
+
+        Filters by case-insensitive ``"go 3"`` / ``"go3"`` substring on the
+        advertised name. Each result has ``construct_kwargs`` pre-populated
+        with the BLE address so the discovery modal can build a working
+        :class:`Go3SStream` without further user input.
+        """
+        from syncfield.discovery import DiscoveredDevice
+        from syncfield.discovery._ble import scan_peripherals
+
+        peripherals = scan_peripherals(timeout=timeout)
+        results = []
+        for peripheral in peripherals:
+            name = (getattr(peripheral, "name", None) or "").strip()
+            lowered = name.lower()
+            if "go 3" not in lowered and "go3" not in lowered:
+                continue
+            address = getattr(peripheral, "address", None) or ""
+            results.append(
+                DiscoveredDevice(
+                    adapter_type="insta360_go3s",
+                    adapter_cls=cls,
+                    kind="video",
+                    display_name=name or "Insta360 Go3S",
+                    description=(
+                        f"Insta360 Go3S · {address[:8]}…"
+                        if address
+                        else "Insta360 Go3S"
+                    ),
+                    device_id=address or name,
+                    construct_kwargs={
+                        "ble_address": address,
+                    },
+                )
+            )
+        return results
 
     def _run_async(self, coro) -> None:
         """Bridge sync Stream API to the async BLE helper.

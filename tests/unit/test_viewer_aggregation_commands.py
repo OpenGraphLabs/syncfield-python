@@ -1,4 +1,5 @@
-from unittest.mock import MagicMock
+from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -92,3 +93,26 @@ def test_orchestrator_aggregate_episode_finds_pending_job():
         ):
             session.aggregate_episode("ep_test")
         fake_queue.enqueue.assert_called_once()
+
+
+@patch("syncfield.adapters.insta360_go3s.stream.Go3SBLECamera")
+def test_add_go3s_stream_creates_stream_and_adds_to_orchestrator(_mock_cam, tmp_path):
+    """add_go3s_stream creates a Go3SStream with the given address and adds it."""
+    from syncfield.adapters.insta360_go3s import Go3SStream
+    from syncfield.orchestrator import SessionOrchestrator
+    from syncfield.viewer.server import handle_control_command
+
+    session = SessionOrchestrator(host_id="mac", output_dir=tmp_path)
+    result = handle_control_command(
+        session,
+        {
+            "command": "add_go3s_stream",
+            "address": "AA:BB:CC:DD:EE:FF",
+        },
+    )
+    assert result["ok"] is True
+    assert result["stream_id"].startswith("go3s_cam_")
+    # Verify the stream was actually registered
+    added = session._streams[result["stream_id"]]
+    assert isinstance(added, Go3SStream)
+    assert added._ble_address == "AA:BB:CC:DD:EE:FF"

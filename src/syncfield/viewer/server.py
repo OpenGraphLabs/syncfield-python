@@ -276,11 +276,21 @@ def _attach_aggregation_listener(server: "ViewerServer") -> None:
 # ---------------------------------------------------------------------------
 
 
+def _next_default_id(orchestrator: "SessionOrchestrator", prefix: str) -> str:
+    """Return the next available stream id ``<prefix>_N`` not already in use."""
+    existing = {s.id for s in orchestrator._streams.values()}
+    n = 1
+    while f"{prefix}_{n}" in existing:
+        n += 1
+    return f"{prefix}_{n}"
+
+
 def handle_control_command(orchestrator: "SessionOrchestrator", payload: dict) -> dict:
     """Dispatch an aggregation control command from a WebSocket client.
 
-    Handles the three aggregation commands introduced in T14.  All other
-    (legacy) commands continue to be handled inside ``_handle_command``.
+    Handles the three aggregation commands introduced in T14, plus the T17
+    ``add_go3s_stream`` command.  All other (legacy) commands continue to be
+    handled inside ``_handle_command``.
 
     Returns a ``{"ok": True}`` dict on success, or
     ``{"ok": False, "error": "<message>"}`` on failure — including
@@ -297,6 +307,19 @@ def handle_control_command(orchestrator: "SessionOrchestrator", payload: dict) -
         if cmd == "cancel_aggregation":
             orchestrator.cancel_aggregation(payload["job_id"])
             return {"ok": True}
+        if cmd == "add_go3s_stream":
+            try:
+                from syncfield.adapters.insta360_go3s import Go3SStream
+            except ImportError as e:
+                return {"ok": False, "error": f"Go3S adapter not available: {e}"}
+            stream_id = payload.get("stream_id") or _next_default_id(orchestrator, "go3s_cam")
+            stream = Go3SStream(
+                stream_id=stream_id,
+                ble_address=payload["address"],
+                output_dir=orchestrator.output_dir,
+            )
+            orchestrator.add(stream)
+            return {"ok": True, "stream_id": stream.id}
         return {"ok": False, "error": f"unknown command: {cmd}"}
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
@@ -1760,6 +1783,14 @@ class ViewerServer:
             )
             if not result.get("ok"):
                 logger.warning("Aggregation command %r failed: %s", action, result.get("error"))
+        elif action == "add_go3s_stream":
+            # Route Go3S stream-add command through the T17 dispatcher.
+            go3s_payload = {**msg, "command": action}
+            result = await asyncio.to_thread(
+                handle_control_command, self._session, go3s_payload
+            )
+            if not result.get("ok"):
+                logger.warning("add_go3s_stream failed: %s", result.get("error"))
         else:
             logger.warning("Unknown action: %s", action)
 
