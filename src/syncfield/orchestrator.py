@@ -3087,6 +3087,57 @@ class SessionOrchestrator:
         )
 
 
+    # ------------------------------------------------------------------
+    # Aggregation control — Go3S on-demand / retry
+    # ------------------------------------------------------------------
+
+    def aggregate_episode(self, episode_id: str) -> None:
+        """Trigger on-demand aggregation for an episode that is pending.
+
+        Searches all registered streams for a Go3S stream whose
+        ``pending_aggregation_job`` matches *episode_id* and enqueues
+        that job on the global aggregation queue.
+
+        Raises:
+            RuntimeError: If the Go3S adapter is not installed.
+            KeyError: If no matching pending job is found.
+        """
+        try:
+            from syncfield.adapters.insta360_go3s.stream import (
+                _enqueue_on_global_queue,
+            )
+        except ImportError:
+            raise RuntimeError("Go3S adapter not installed (missing 'camera' extra)")
+
+        for stream in self._streams.values():
+            pending = getattr(stream, "pending_aggregation_job", None)
+            if pending is not None and pending.episode_id == episode_id:
+                _enqueue_on_global_queue(pending)
+                return
+        raise KeyError(f"No pending aggregation for episode {episode_id!r}")
+
+    def retry_aggregation(self, job_id: str) -> None:
+        """Re-enqueue a previously-failed aggregation job.
+
+        Delegates to :meth:`AggregationQueue.retry` on the global queue.
+
+        Raises:
+            RuntimeError: If the Go3S adapter is not installed.
+        """
+        try:
+            from syncfield.adapters.insta360_go3s.stream import _global_aggregation_queue
+        except ImportError:
+            raise RuntimeError("Go3S adapter not installed (missing 'camera' extra)")
+        _global_aggregation_queue().retry(job_id)
+
+    def cancel_aggregation(self, job_id: str) -> None:  # noqa: ARG002
+        """Cancel an in-flight or queued aggregation job.
+
+        Not implemented in v1 — raises ``NotImplementedError``.
+        """
+        raise NotImplementedError("cancel_aggregation deferred to v2")
+
+
 class _ControlPlaneOrchestratorAdapter:
     """Narrow adapter between SessionOrchestrator and FastAPI routes.
 
