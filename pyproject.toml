@@ -81,6 +81,7 @@ packages = ["src/syncfield"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+asyncio_mode = "auto"
 markers = [
     "hardware: tests that require physical hardware (cameras, BLE devices)",
     "slow: integration tests that touch real IO (mDNS sockets, filesystem, etc.)",
@@ -90,6 +91,7 @@ markers = [
 [dependency-groups]
 dev = [
     "pytest>=8.4.2",
+    "pytest-asyncio>=1.2.0",
     "pytest-mock>=3.12.0",
     "pytest-timeout>=2.4.0",
     "pytest-xdist>=3.6.0",
