@@ -86,9 +86,9 @@ export function ControlPanel({
             onClick={() => onCommand("aggregate_all_pending")}
             disabled={!canSync}
             variant="default"
-            title="Dock the Go3S camera, enable its WiFi, then click to download all pending episode files."
+            title="Dock the Go3S camera, enable its WiFi, then click to download videos for every pending episode."
           >
-            Sync Go3S
+            Collect Videos
           </Button>
         </>
       )}

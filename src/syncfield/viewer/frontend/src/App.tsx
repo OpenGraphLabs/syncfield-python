@@ -13,6 +13,7 @@ import { DiscoveryModal } from "@/components/discovery-modal";
 import { ClusterPanel } from "@/components/cluster-panel";
 import { Footer } from "@/components/footer";
 import { StopResultBanner } from "@/components/stop-result-banner";
+import { CollectResultBanner } from "@/components/collect-result-banner";
 import { TaskSelector } from "@/components/task-selector";
 import { useTasks } from "@/hooks/use-tasks";
 import { ReviewPage } from "@/components/review/review-page";
@@ -75,8 +76,15 @@ function RecordView({
   mode: ViewMode;
   onModeChange: (m: ViewMode) => void;
 }) {
-  const { snapshot, countdown, stopResult, sendCommand, dismissStopResult } =
-    useSession();
+  const {
+    snapshot,
+    countdown,
+    stopResult,
+    collectResult,
+    sendCommand,
+    dismissStopResult,
+    dismissCollectResult,
+  } = useSession();
   const taskState = useTasks();
   const discovery = useDiscovery();
   const cluster = useCluster();
@@ -138,6 +146,14 @@ function RecordView({
       {/* Stop result banner */}
       {stopResult && (
         <StopResultBanner result={stopResult} onDismiss={dismissStopResult} />
+      )}
+
+      {/* Collect Videos result banner */}
+      {collectResult && (
+        <CollectResultBanner
+          result={collectResult}
+          onDismiss={dismissCollectResult}
+        />
       )}
 
       {/* Aggregation status bar — visible only when a job is running or failed */}

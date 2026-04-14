@@ -1834,6 +1834,11 @@ class ViewerServer:
             )
             if not result.get("ok"):
                 logger.warning("Aggregation command %r failed: %s", action, result.get("error"))
+            # Echo a typed result back so the UI can surface a toast/banner.
+            await self._broadcast_message({
+                "type": f"{action}_result",
+                **result,
+            })
         elif action == "add_go3s_stream":
             # Route Go3S stream-add command through the T17 dispatcher.
             go3s_payload = {**msg, "command": action}

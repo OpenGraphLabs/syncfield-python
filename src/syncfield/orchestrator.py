@@ -3166,9 +3166,13 @@ class SessionOrchestrator:
             )
 
         queue = _global_aggregation_queue()
-        # recover_from_disk returns PENDING/RUNNING jobs and normalizes
-        # RUNNING to PENDING so they're re-enqueued safely.
-        candidates = queue.recover_from_disk(search_root=self.output_dir)
+        # IMPORTANT: output_dir points at the CURRENT episode dir
+        # (``ep_<timestamp>``). Aggregation manifests from PRIOR episodes
+        # live in sibling directories under _data_root, so that's where we
+        # must scan. recover_from_disk returns PENDING/RUNNING jobs and
+        # normalizes RUNNING to PENDING so they're re-enqueued safely.
+        search_root = getattr(self, "_data_root", self.output_dir)
+        candidates = queue.recover_from_disk(search_root=search_root)
 
         enqueued: list[str] = []
         skipped: list[dict] = []

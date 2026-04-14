@@ -9,12 +9,22 @@ import { isCountdown, isSnapshot, isStopResult } from "@/lib/types";
 
 export type ConnectionStatus = "connecting" | "connected" | "disconnected";
 
+export interface CollectResultEvent {
+  type: "aggregate_all_pending_result";
+  ok: boolean;
+  enqueued?: string[];
+  skipped?: Array<{ episode_id?: string; path?: string; reason: string }>;
+  error?: string;
+}
+
 interface UseSessionReturn {
   snapshot: SessionSnapshot | null;
   countdown: number | null;
   stopResult: StopResultEvent | null;
+  collectResult: CollectResultEvent | null;
   sendCommand: (action: ControlAction, data?: Record<string, unknown>) => void;
   dismissStopResult: () => void;
+  dismissCollectResult: () => void;
   connectionStatus: ConnectionStatus;
 }
 
@@ -30,6 +40,7 @@ export function useSession(): UseSessionReturn {
   const [snapshot, setSnapshot] = useState<SessionSnapshot | null>(null);
   const [countdown, setCountdown] = useState<number | null>(null);
   const [stopResult, setStopResult] = useState<StopResultEvent | null>(null);
+  const [collectResult, setCollectResult] = useState<CollectResultEvent | null>(null);
   const [connectionStatus, setConnectionStatus] =
     useState<ConnectionStatus>("connecting");
 
@@ -69,6 +80,10 @@ export function useSession(): UseSessionReturn {
           }
         } else if (isStopResult(msg)) {
           setStopResult(msg);
+        } else if (
+          (msg as CollectResultEvent).type === "aggregate_all_pending_result"
+        ) {
+          setCollectResult(msg as CollectResultEvent);
         }
       } catch {
         // Ignore malformed messages
@@ -117,11 +132,16 @@ export function useSession(): UseSessionReturn {
   const dismissStopResult = useCallback(() => {
     setStopResult(null);
   }, []);
+  const dismissCollectResult = useCallback(() => {
+    setCollectResult(null);
+  }, []);
 
   return {
     snapshot,
     countdown,
     stopResult,
+    collectResult,
+    dismissCollectResult,
     sendCommand,
     dismissStopResult,
     connectionStatus,
