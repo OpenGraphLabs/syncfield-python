@@ -471,26 +471,83 @@ class ViewerServer:
             orch = self._session
             _require_leader(orch)
 
+            from syncfield.types import SessionState
+
             announcements = await asyncio.to_thread(
                 self._snapshot_peer_announcements
             )
+
+            # The leader's own session.start() is what flips its mDNS
+            # advert from "preparing" to "recording" — which is the
+            # signal auto-discover followers inside _maybe_wait_for_leader
+            # are blocking on. Running it in parallel with the fan-out
+            # lets followers that called start() on their own unblock
+            # via the advert, while the fan-out still covers followers
+            # that only called connect().
+            leader_task: Optional[asyncio.Task] = None
+            if orch.state is not SessionState.RECORDING:
+                leader_task = asyncio.create_task(
+                    self._start_recording(countdown_s=3)
+                )
+
             hosts = await self._fan_out_session_command(
                 announcements, path="/session/start",
             )
-            return JSONResponse({"hosts": hosts})
+
+            leader_error: Optional[str] = None
+            if leader_task is not None:
+                try:
+                    await leader_task
+                except Exception as exc:
+                    logger.exception(
+                        "Leader start failed during cluster start"
+                    )
+                    leader_error = str(exc)
+
+            payload: Dict[str, Any] = {"hosts": hosts}
+            if leader_error is not None:
+                payload["leader_error"] = leader_error
+                return JSONResponse(payload, status_code=500)
+            return JSONResponse(payload)
 
         @app.post("/api/cluster/stop")
         async def api_cluster_stop() -> JSONResponse:
             orch = self._session
             _require_leader(orch)
 
+            from syncfield.types import SessionState
+
             announcements = await asyncio.to_thread(
                 self._snapshot_peer_announcements
             )
+
+            # Mirror api_cluster_start: the leader's own session.stop()
+            # flips the advert to "stopped", which followers observing
+            # via wait_for_stopped depend on. Fan-out alone doesn't stop
+            # the leader.
+            leader_task: Optional[asyncio.Task] = None
+            if orch.state is SessionState.RECORDING:
+                leader_task = asyncio.create_task(self._stop_and_report())
+
             hosts = await self._fan_out_session_command(
                 announcements, path="/session/stop",
             )
-            return JSONResponse({"hosts": hosts})
+
+            leader_error: Optional[str] = None
+            if leader_task is not None:
+                try:
+                    await leader_task
+                except Exception as exc:
+                    logger.exception(
+                        "Leader stop failed during cluster stop"
+                    )
+                    leader_error = str(exc)
+
+            payload: Dict[str, Any] = {"hosts": hosts}
+            if leader_error is not None:
+                payload["leader_error"] = leader_error
+                return JSONResponse(payload, status_code=500)
+            return JSONResponse(payload)
 
         @app.post("/api/cluster/collect")
         async def api_cluster_collect() -> JSONResponse:
