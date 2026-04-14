@@ -300,6 +300,15 @@ class SessionOrchestrator:
         self._advertiser: Optional[SessionAdvertiser] = None
         self._browser: Optional[SessionBrowser] = None
         self._observed_leader: Optional[SessionAnnouncement] = None
+        # Signals set by the follower's /session/config route handler
+        # the moment the leader's distribute POST lands. Leader only
+        # POSTs after transitioning to RECORDING, so this is a
+        # ground-truth cross-host wake-up signal that does not depend
+        # on mDNS TXT propagation or on HTTP polling of the leader's
+        # /health endpoint (both of which can be flaky on WiFi). Paired
+        # with the HTTP poll in :meth:`_wait_for_leader_recording_state`
+        # as a belt-and-braces mechanism.
+        self._leader_recording_signal: threading.Event = threading.Event()
         # Background thread a follower uses to block on
         # ``SessionBrowser.wait_for_observation`` without stalling
         # :meth:`connect`. Populated by
@@ -1637,6 +1646,11 @@ class SessionOrchestrator:
             # time where the stream set is final.
             self._validate_multihost_audio_requirement()
 
+            # Reset cross-host signals before blocking on the leader —
+            # a stale "set" from a prior recording would otherwise make
+            # _wait_for_leader_recording_state return immediately.
+            self._leader_recording_signal.clear()
+
             # Refresh the capability snapshot read by control-plane route
             # handlers (POST /session/config). The cache was initialized
             # to False when the control plane came up at __init__ (no
@@ -2785,6 +2799,17 @@ class SessionOrchestrator:
             base,
         )
         while time.monotonic() < deadline:
+            # TCP signal path: leader's POST /session/config arrived,
+            # which only happens after leader transitioned to RECORDING.
+            # More reliable than /health polling because it does not
+            # depend on the follower's HTTP request completing — the
+            # leader pushed the event to us.
+            if self._leader_recording_signal.is_set():
+                logger.info(
+                    "Leader %s reached RECORDING (via POST /session/config)",
+                    leader.host_id,
+                )
+                return _dc_replace(leader, status="recording")
             try:
                 r = httpx.get(
                     f"{base}/health", headers=headers, timeout=2.0
@@ -2792,6 +2817,10 @@ class SessionOrchestrator:
                 if r.status_code == 200:
                     state = r.json().get("state", "")
                     if state == "recording":
+                        logger.info(
+                            "Leader %s reached RECORDING (via /health poll)",
+                            leader.host_id,
+                        )
                         return _dc_replace(leader, status="recording")
                     if state == "stopped":
                         # Fast session wrapped up before we saw
@@ -3209,8 +3238,18 @@ class _ControlPlaneOrchestratorAdapter:
         same config the leader distributed. Mirrors what the leader
         does in _distribute_config_to_followers after a successful
         push.
+
+        Also fires the follower's recording-signal event: the leader
+        only POSTs this endpoint after transitioning its own state to
+        ``RECORDING``, so the POST's arrival is proof that the leader
+        is recording now. This unblocks
+        :meth:`SessionOrchestrator._wait_for_leader_recording_state`
+        via TCP regardless of whether the follower's HTTP /health
+        poll or mDNS TXT observation had already seen the transition
+        — both of which can be silently delayed on WiFi.
         """
         self._orch._applied_session_config = config
+        self._orch._leader_recording_signal.set()
 
     def host_output_dir(self) -> Optional[Path]:
         """Return the directory holding this host's recorded files.
