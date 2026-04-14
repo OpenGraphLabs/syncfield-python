@@ -48,10 +48,17 @@ session = sf.SessionOrchestrator(
 )
 session.add(UVCWebcamStream("mac_webcam", device_index=0, output_dir=session.output_dir))
 session.add(UVCWebcamStream("iphone",     device_index=1, output_dir=session.output_dir))
+# Both WT901BLE units advertise the same name ("WT901BLE68"), so they must be
+# distinguished by address. Resolved via active-scan on 2026-04-14.
 session.add(BLEImuGenericStream(
     "wrist_left_imu",
     profile=WIT_WT901BLE_200HZ,
-    ble_name="WT901BLE",
+    address="5622CCC4-A621-96DC-A7B5-E7650370E8A3",
+))
+session.add(BLEImuGenericStream(
+    "wrist_right_imu",
+    profile=WIT_WT901BLE_200HZ,
+    address="6E22ED0E-72CD-0175-6F29-0BA8D502CBAB",
 ))
 session.add(Go3SStream(
     "go3s_overhead",
