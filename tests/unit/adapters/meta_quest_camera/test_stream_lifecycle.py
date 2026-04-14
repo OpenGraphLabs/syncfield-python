@@ -88,3 +88,74 @@ class TestConnectDisconnect:
         )
         with pytest.raises(httpx.ConnectError):
             stream.connect()
+
+
+import json
+from syncfield.clock import SessionClock, SyncPoint
+
+
+def _full_quest_transport(left_mp4=b"LEFT_MP4", right_mp4=b"RIGHT_MP4"):
+    state = {"recording": False}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/status":
+            return httpx.Response(200, json={
+                "recording": state["recording"], "session_id": None,
+                "last_preview_capture_ns": 0,
+                "left_camera_ready": True, "right_camera_ready": True,
+                "storage_free_bytes": 1_000_000_000,
+            })
+        if path.startswith("/preview/"):
+            return httpx.Response(200, headers={
+                "Content-Type": "multipart/x-mixed-replace; boundary=syncfield"
+            }, content=b"")
+        if path == "/recording/start":
+            state["recording"] = True
+            return httpx.Response(200, json={
+                "session_id": "ep_x", "quest_mono_ns_at_start": 0,
+                "delta_ns": 0, "started": True,
+            })
+        if path == "/recording/stop":
+            state["recording"] = False
+            return httpx.Response(200, json={
+                "session_id": "ep_x",
+                "left":  {"frame_count": 2, "bytes": len(left_mp4),  "last_capture_ns": 2},
+                "right": {"frame_count": 2, "bytes": len(right_mp4), "last_capture_ns": 2},
+                "duration_s": 0.1,
+            })
+        if path == "/recording/files/left":
+            return httpx.Response(200, headers={"Content-Length": str(len(left_mp4))}, content=left_mp4)
+        if path == "/recording/files/right":
+            return httpx.Response(200, headers={"Content-Length": str(len(right_mp4))}, content=right_mp4)
+        if path == "/recording/timestamps/left" or path == "/recording/timestamps/right":
+            body = (
+                b'{"frame_number":0,"capture_ns":1}\n'
+                b'{"frame_number":1,"capture_ns":2}\n'
+            )
+            return httpx.Response(200, headers={"Content-Length": str(len(body))}, content=body)
+        return httpx.Response(404)
+
+    return httpx.MockTransport(handler)
+
+
+class TestRecordingRoundtrip:
+    def test_full_recording_lifecycle(self, tmp_path):
+        stream = MetaQuestCameraStream(
+            id="quest_cam",
+            quest_host="test",
+            output_dir=tmp_path,
+            _transport=_full_quest_transport(),
+        )
+        stream.connect()
+        clock = SessionClock(sync_point=SyncPoint.create_now("test_host"))
+
+        stream.start_recording(clock)
+        report = stream.stop_recording()
+        stream.disconnect()
+
+        assert report.status == "completed"
+        assert (tmp_path / "quest_cam_left.mp4").read_bytes() == b"LEFT_MP4"
+        assert (tmp_path / "quest_cam_right.mp4").read_bytes() == b"RIGHT_MP4"
+        assert (tmp_path / "quest_cam_left.timestamps.jsonl").exists()
+        assert (tmp_path / "quest_cam_right.timestamps.jsonl").exists()

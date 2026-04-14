@@ -9,10 +9,13 @@ from typing import Optional, Tuple
 
 import httpx
 
+from syncfield.adapters.meta_quest_camera.file_puller import RecordingFilePuller
 from syncfield.adapters.meta_quest_camera.http_client import QuestHttpClient
 from syncfield.adapters.meta_quest_camera.preview import MjpegPreviewConsumer
+from syncfield.adapters.meta_quest_camera.timestamps import TimestampTailReader
+from syncfield.clock import SessionClock
 from syncfield.stream import DeviceKey, StreamBase
-from syncfield.types import HealthEvent, HealthEventKind, StreamCapabilities
+from syncfield.types import FinalizationReport, HealthEvent, HealthEventKind, SampleEvent, StreamCapabilities
 
 
 logger = logging.getLogger(__name__)
@@ -69,6 +72,11 @@ class MetaQuestCameraStream(StreamBase):
         self._preview_left: Optional[MjpegPreviewConsumer] = None
         self._preview_right: Optional[MjpegPreviewConsumer] = None
         self._connected = False
+        self._timestamp_tail: Optional[TimestampTailReader] = None
+        self._session_id: Optional[str] = None
+        self._first_at: Optional[int] = None
+        self._last_at: Optional[int] = None
+        self._frame_count = 0
 
     @property
     def device_key(self) -> Optional[DeviceKey]:
@@ -109,6 +117,83 @@ class MetaQuestCameraStream(StreamBase):
             self._http.close()
             self._http = None
         self._connected = False
+
+    # ------------------------------------------------------------------
+
+    def prepare(self) -> None:
+        pass
+
+    def start_recording(self, session_clock: SessionClock) -> None:
+        if self._http is None:
+            raise RuntimeError("start_recording() called before connect()")
+
+        self._session_id = f"ep_{int(time.monotonic_ns())}"
+        self._frame_count = 0
+        self._first_at = None
+        self._last_at = None
+
+        self._http.start_recording(
+            session_id=self._session_id,
+            host_mono_ns=session_clock.sync_point.monotonic_ns,
+            width=self._resolution[0],
+            height=self._resolution[1],
+            fps=self._fps,
+        )
+
+        # Tail the LEFT eye's chunked timestamps endpoint; right eye's exact
+        # per-frame ts lives in the authoritative JSONL written by the puller.
+        url = (
+            f"http://{self._quest_host}:{self._quest_port}"
+            f"/recording/timestamps/left"
+        )
+        self._timestamp_tail = TimestampTailReader(
+            url=url,
+            stream_id=self.id,
+            on_sample=self._handle_tail_sample,
+            transport=self._transport,
+            clock_domain=self.CLOCK_DOMAIN,
+            uncertainty_ns=self.UNCERTAINTY_NS,
+        )
+        self._timestamp_tail.start()
+
+    def stop_recording(self) -> FinalizationReport:
+        if self._http is None:
+            raise RuntimeError("stop_recording() called before connect()")
+
+        try:
+            self._http.stop_recording()
+            if self._timestamp_tail is not None:
+                self._timestamp_tail.stop()
+                self._timestamp_tail = None
+
+            puller = RecordingFilePuller(
+                client=self._http, stream_id=self.id, output_dir=self._output_dir
+            )
+            artifacts = puller.pull_all()
+            status = "completed"
+            error: Optional[str] = None
+        except Exception as exc:
+            status = "failed"
+            error = str(exc)
+            artifacts = None
+
+        return FinalizationReport(
+            stream_id=self.id,
+            status=status,
+            frame_count=self._frame_count,
+            file_path=artifacts.left_mp4 if artifacts is not None else None,
+            first_sample_at_ns=self._first_at,
+            last_sample_at_ns=self._last_at,
+            health_events=list(self._collected_health),
+            error=error,
+        )
+
+    def _handle_tail_sample(self, event: SampleEvent) -> None:
+        if self._first_at is None:
+            self._first_at = event.capture_ns
+        self._last_at = event.capture_ns
+        self._frame_count += 1
+        self._emit_sample(event)
 
     # ------------------------------------------------------------------
 
