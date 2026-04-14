@@ -77,9 +77,19 @@ def resolve_via_dns_sd(
         logger.debug("dns-sd fallback: cannot extract instance from %r", name)
         return None
 
+    # dns-sd -L expects service_type WITHOUT the trailing domain
+    # (e.g. "_syncfield._tcp"), with the domain as a separate arg
+    # ("local."). Passing the fully-qualified "_syncfield._tcp.local."
+    # makes dns-sd silently produce no output, so we strip it here.
+    short_service_type = service_type.rstrip(".")
+    if short_service_type.endswith(".local"):
+        short_service_type = short_service_type[: -len(".local")]
+
+    cmd = ["dns-sd", "-L", instance, short_service_type, "local."]
+    logger.debug("dns-sd fallback: running %s", cmd)
     try:
         proc = subprocess.Popen(
-            ["dns-sd", "-L", instance, service_type, "local."],
+            cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -186,9 +196,11 @@ def _resolve_via_dns_sd_g(
     hostname: str, *, timeout: float
 ) -> Optional[str]:
     """Run ``dns-sd -G v4 <hostname>.`` and return the first IPv4 line."""
+    cmd = ["dns-sd", "-G", "v4", hostname.rstrip(".") + "."]
+    logger.debug("dns-sd fallback: running %s", cmd)
     try:
         proc = subprocess.Popen(
-            ["dns-sd", "-G", "v4", hostname.rstrip(".") + "."],
+            cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
