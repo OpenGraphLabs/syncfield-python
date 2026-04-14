@@ -11,7 +11,6 @@ import { HealthTable } from "@/components/health-table";
 import { CountdownOverlay } from "@/components/countdown-overlay";
 import { DiscoveryModal } from "@/components/discovery-modal";
 import { ClusterPanel } from "@/components/cluster-panel";
-import { ClusterDiscoveryModal } from "@/components/cluster-discovery-modal";
 import { Footer } from "@/components/footer";
 import { StopResultBanner } from "@/components/stop-result-banner";
 import { TaskSelector } from "@/components/task-selector";
@@ -78,7 +77,6 @@ function RecordView({
   const discovery = useDiscovery();
   const cluster = useCluster();
   const [discoveryOpen, setDiscoveryOpen] = useState(false);
-  const [clusterDiscoveryOpen, setClusterDiscoveryOpen] = useState(false);
 
   useEffect(() => {
     const state = snapshot?.state ?? "idle";
@@ -159,12 +157,7 @@ function RecordView({
 
         {(streamList.length > 0 || cluster.available) && (
           <div className="hidden w-72 shrink-0 overflow-y-auto border-l lg:block">
-            {cluster.available && (
-              <ClusterPanel
-                cluster={cluster}
-                onDiscoverAcrossCluster={() => setClusterDiscoveryOpen(true)}
-              />
-            )}
+            {cluster.available && <ClusterPanel cluster={cluster} />}
             {streamList.length > 0 && (
               <>
                 <div className="px-3 py-2.5">
@@ -191,11 +184,6 @@ function RecordView({
         onAdd={discovery.addDevice}
       />
 
-      <ClusterDiscoveryModal
-        isOpen={clusterDiscoveryOpen}
-        onClose={() => setClusterDiscoveryOpen(false)}
-        cluster={cluster}
-      />
     </div>
   );
 }

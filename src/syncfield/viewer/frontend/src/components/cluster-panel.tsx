@@ -11,20 +11,21 @@ import { ClusterConfigBadge } from "./cluster-config-badge";
 
 interface ClusterPanelProps {
   cluster: UseClusterReturn;
-  onDiscoverAcrossCluster?: () => void;
 }
 
 /**
  * Sidebar panel summarising the multi-host cluster: aggregate status
  * strip, peer list with live per-host stream health, the applied config,
- * and leader-only actions.
+ * and the leader-only Collect Data action.
+ *
+ * Cluster-wide start/stop is driven by the header's Record/Stop buttons —
+ * the leader's ``session.start()`` flips the mDNS advert (and serves
+ * state=recording on /health), which is what every follower listens for.
+ * A separate cluster-only trigger would only duplicate that path.
  *
  * Renders nothing when `cluster.available === false` (single-host session).
  */
-export function ClusterPanel({
-  cluster,
-  onDiscoverAcrossCluster,
-}: ClusterPanelProps) {
+export function ClusterPanel({ cluster }: ClusterPanelProps) {
   if (!cluster.available) return null;
 
   const peers = cluster.peers;
@@ -90,22 +91,10 @@ export function ClusterPanel({
         )}
       </ul>
 
-      {/* Action row */}
+      {/* Action row — leader-only */}
       {cluster.isLeader && (
-        <div className="flex flex-col gap-2 border-t pt-3">
+        <div className="border-t pt-3">
           <ClusterControls cluster={cluster} summary={summary} />
-          {onDiscoverAcrossCluster && (
-            <button
-              onClick={onDiscoverAcrossCluster}
-              className={cn(
-                "self-start rounded-lg border px-3 py-1 text-xs font-medium",
-                "transition-colors hover:bg-foreground/5",
-              )}
-              title="Ask every follower to list the devices it can see (for cross-cluster device setup)"
-            >
-              Discover Across Cluster
-            </button>
-          )}
         </div>
       )}
     </div>
