@@ -1,3 +1,4 @@
+import { useEffect, useRef, useState } from "react";
 import { cn } from "@/lib/utils";
 
 // ---------------------------------------------------------------------------
@@ -18,10 +19,18 @@ export interface AggregationActiveDisplay {
 
 const STAGE_LABELS: Record<string, string> = {
   starting: "Starting…",
-  switching_wifi: "Switching WiFi to camera AP…",
-  probing: "Probing camera…",
-  downloading: "Downloading",
-  restoring_wifi: "Restoring WiFi…",
+  switching_wifi: "Connecting to camera WiFi…",
+  probing: "Reaching camera…",
+  downloading: "Downloading video",
+  restoring_wifi: "Restoring your WiFi…",
+};
+
+const STAGE_HINTS: Record<string, string> = {
+  switching_wifi:
+    "Tap the camera screen to wake it if this takes more than ~15 s.",
+  probing: "Waiting for the camera's HTTP server…",
+  downloading: "",
+  restoring_wifi: "Putting you back on your original network.",
 };
 
 function stageLabel(stage: string | null): string | null {
@@ -44,6 +53,28 @@ export function AggregationStatusBar({
   onRetry,
   onViewDetails,
 }: AggregationStatusBarProps) {
+  const stageForEffect = active?.stage ?? null;
+  const jobIdForEffect = active?.jobId ?? null;
+  const [elapsedSec, setElapsedSec] = useState(0);
+  const stageStartRef = useRef<number>(Date.now());
+
+  // Reset the per-stage timer whenever the job id OR stage changes,
+  // so the "Xs" we display is time-in-current-stage, not total wall
+  // time — much more informative when a job hangs on switching_wifi
+  // but moves quickly once downloading starts.
+  useEffect(() => {
+    stageStartRef.current = Date.now();
+    setElapsedSec(0);
+  }, [stageForEffect, jobIdForEffect]);
+
+  useEffect(() => {
+    if (!active) return;
+    const t = setInterval(() => {
+      setElapsedSec(Math.floor((Date.now() - stageStartRef.current) / 1000));
+    }, 500);
+    return () => clearInterval(t);
+  }, [active]);
+
   if (!active) return null;
 
   const pct = active.totalBytes
@@ -94,7 +125,11 @@ export function AggregationStatusBar({
 
   // Running state
   const stageText = stageLabel(active.stage);
+  const stageHint = active.stage ? STAGE_HINTS[active.stage] ?? "" : "";
   const isDownloading = active.stage === "downloading";
+  // Red flag: switching_wifi stuck over 25 s → surface a prompt.
+  const switchingTooLong =
+    active.stage === "switching_wifi" && elapsedSec >= 25;
   return (
     <div
       className="flex items-center gap-3 border-b bg-warning/5 px-4 py-2 text-xs"
@@ -125,10 +160,13 @@ export function AggregationStatusBar({
         )}
       </span>
 
-      {/* Stage label — shown during pre-download phases where byte
-          progress would otherwise be 0%. */}
+      {/* Stage label + elapsed — shown during pre-download phases where
+          byte progress would otherwise be 0% and the user can't tell
+          whether anything is happening. */}
       {stageText && !isDownloading && (
-        <span className="text-muted italic tabular-nums">{stageText}</span>
+        <span className="text-muted italic tabular-nums">
+          {stageText} ({elapsedSec}s)
+        </span>
       )}
 
       {/* Progress bar — meaningful only during the download phase when
@@ -159,6 +197,24 @@ export function AggregationStatusBar({
           {formatBytes(active.currentBytes)} downloaded
         </span>
       ) : null}
+
+      {/* Contextual hint (e.g. "tap camera screen to wake it") — only
+          surfaces during the phase that could stall. Elevated visibility
+          once switching has lingered past ~25 s. */}
+      {stageHint && !isDownloading && (
+        <span
+          className={cn(
+            "hidden md:inline text-[11px]",
+            switchingTooLong
+              ? "text-destructive font-medium"
+              : "text-muted italic",
+          )}
+        >
+          {switchingTooLong
+            ? "Camera still hasn't accepted the connection — tap its screen to wake it."
+            : stageHint}
+        </span>
+      )}
 
       {/* Optional View Details */}
       {onViewDetails && (

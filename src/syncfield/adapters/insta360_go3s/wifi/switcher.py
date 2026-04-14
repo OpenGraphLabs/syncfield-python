@@ -36,12 +36,17 @@ class WifiSwitcher(abc.ABC):
     def restore(self, prev_ssid: Optional[str], prev_password: Optional[str] = None) -> None:
         """Default restore: reconnect to ``prev_ssid`` if it's known.
 
-        ``prev_password`` is rarely required (the OS keychain usually
-        remembers it) but supported for completeness.
+        Best-effort — restore must NEVER raise, otherwise a transient
+        failure leaves the user stranded without their lab WiFi. If the
+        subclass can do a lightweight reconnect without the full DHCP
+        verification, it should override this.
         """
         if prev_ssid is None:
             return
-        self.connect(prev_ssid, prev_password or "")
+        try:
+            self.connect(prev_ssid, prev_password or "")
+        except Exception:
+            pass
 
 
 # ----- macOS -----
@@ -249,6 +254,54 @@ class MacWifiSwitcher(WifiSwitcher):
             f"WiFi → turn ON. Or dock it in the Action Pod.\n"
             f"Last diagnostic: {last_diagnostic}"
         )
+
+    def restore(self, prev_ssid: Optional[str], prev_password: Optional[str] = None) -> None:
+        """Restore a previously-joined WiFi without the camera-specific DHCP check.
+
+        The full ``connect()`` flow verifies the host got a ``192.168.42.x``
+        lease — correct for the camera AP but wrong for the user's lab WiFi
+        (which hands out some other subnet). Doing the check during restore
+        would cause every restore to falsely "fail", leaving the user
+        stranded. This path only:
+          1. Runs ``networksetup -setairportnetwork`` with a short timeout.
+          2. Verifies the SSID changed back to the previous one.
+          3. Returns silently on any failure (best-effort — the worst case
+             is the user's laptop stays on the camera AP, which they can
+             fix manually from the WiFi menu).
+        """
+        if not prev_ssid:
+            return
+        logger.info(
+            "[MacWifiSwitcher] restoring WiFi to %r (iface=%s)",
+            prev_ssid, self.interface,
+        )
+        try:
+            subprocess.run(
+                [
+                    "networksetup", "-setairportnetwork",
+                    self.interface, prev_ssid, prev_password or "",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=20,
+            )
+        except Exception as e:
+            logger.warning(
+                "[MacWifiSwitcher] restore to %r raised: %s", prev_ssid, e,
+            )
+            return
+        # Best-effort verify; no retry, no DHCP check.
+        time.sleep(2)
+        actual = self.current_ssid()
+        if actual == prev_ssid:
+            logger.info("[MacWifiSwitcher] restore OK (ssid=%r)", actual)
+        else:
+            logger.warning(
+                "[MacWifiSwitcher] restore verify: expected %r, got %r "
+                "(best-effort only — not retrying to avoid compounding delays)",
+                prev_ssid, actual,
+            )
 
 
 # ----- Linux -----
