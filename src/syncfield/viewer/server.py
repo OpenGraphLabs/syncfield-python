@@ -23,6 +23,7 @@ import dataclasses
 import io
 import json
 import logging
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
@@ -228,10 +229,6 @@ def _require_leader(orch) -> None:
 # Aggregation listener wiring
 # ---------------------------------------------------------------------------
 
-# Rolling window of completed/failed jobs (trimmed to 5 most recent).
-_recent_agg_jobs: List[Any] = []
-
-
 def _attach_aggregation_listener(server: "ViewerServer") -> None:
     """Best-effort: subscribe to the global Go3S aggregation queue.
 
@@ -252,13 +249,16 @@ def _attach_aggregation_listener(server: "ViewerServer") -> None:
         else:
             active = None
             if progress.state in (AggregationState.COMPLETED, AggregationState.FAILED):
-                _recent_agg_jobs.append(progress)
-                if len(_recent_agg_jobs) > 5:
-                    del _recent_agg_jobs[: len(_recent_agg_jobs) - 5]
+                with server._agg_lock:
+                    server._recent_agg_jobs.append(progress)
+                    if len(server._recent_agg_jobs) > 5:
+                        del server._recent_agg_jobs[: len(server._recent_agg_jobs) - 5]
+        with server._agg_lock:
+            recent = list(server._recent_agg_jobs)
         server._agg_state = AggregationSnapshot(
             active_job=active,
             queue_length=0,  # populated by queue if exposed; staying 0 in v1
-            recent_jobs=list(_recent_agg_jobs),
+            recent_jobs=recent,
         )
 
     try:
@@ -351,6 +351,8 @@ class ViewerServer:
         self._sync_endpoint = sync_endpoint.rstrip("/")
         self._ws_clients: Set[WebSocket] = set()
         self._agg_state: Optional[AggregationSnapshot] = None
+        self._recent_agg_jobs: list = []
+        self._agg_lock = threading.Lock()
 
         self.app = FastAPI(title=title, docs_url=None, redoc_url=None)
         self._setup_middleware()
