@@ -268,8 +268,17 @@ class UVCWebcamStream(StreamBase):
         # "not ready" conditions.
         _TRANSIENT_ERRNOS = {4, 11, 35}
 
-        frame_iter = iter(self._input.decode(video=0))
+        # PyAV's container.decode() is a generator that DIES when any
+        # exception (including BlockingIOError/EAGAIN) propagates out of
+        # it — subsequent next() calls raise StopIteration against a
+        # dead iterator. For live camera inputs where EAGAIN is routine
+        # during warmup and between frames, we therefore track the
+        # iterator explicitly and recreate it after every EAGAIN so the
+        # capture thread keeps pulling fresh packets from the container.
+        frame_iter = None
         while not self._stop_event.is_set():
+            if frame_iter is None:
+                frame_iter = iter(self._input.decode(video=0))
             try:
                 frame = next(frame_iter)
                 capture_ns = time.monotonic_ns()
@@ -298,7 +307,9 @@ class UVCWebcamStream(StreamBase):
                         )
                     )
             except StopIteration:
-                # Device exhausted (explicit end-of-stream).
+                # The decode generator ended cleanly. For a live capture
+                # device this means the container was closed / the device
+                # was disconnected. Exit the loop.
                 break
             except OSError as exc:
                 # AVFoundation / V4L2 can surface "not ready" as:
@@ -306,7 +317,9 @@ class UVCWebcamStream(StreamBase):
                 # - bare OSError(35) on macOS, OSError(11) on Linux
                 # - FFmpegError with errno=None
                 # All are transient and must not kill the capture loop.
+                # The generator is dead after any exception — recreate.
                 if exc.errno in _TRANSIENT_ERRNOS or exc.errno is None:
+                    frame_iter = None
                     time.sleep(0.001)
                     continue
                 # Real OSError (EIO, ENODEV, etc.) — treat as fatal.
