@@ -173,12 +173,15 @@ class StreamCapabilities:
             (wireless, USB unplug); the orchestrator treats it more defensively.
         produces_file: True if the stream writes a file (e.g. video) rather
             than an in-memory sample stream.
+        live_preview: True if the stream should route to a live video preview
+            (rather than a standalone recorder panel). Defaults to True.
     """
 
     provides_audio_track: bool = False
     supports_precise_timestamps: bool = False
     is_removable: bool = False
     produces_file: bool = False
+    live_preview: bool = True
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -186,6 +189,7 @@ class StreamCapabilities:
             "supports_precise_timestamps": self.supports_precise_timestamps,
             "is_removable": self.is_removable,
             "produces_file": self.produces_file,
+            "live_preview": self.live_preview,
         }
 
 
@@ -280,7 +284,11 @@ class FinalizationReport:
 
     Attributes:
         stream_id: Stream that was finalized.
-        status: One of ``"completed"``, ``"partial"``, ``"failed"``.
+        status: One of ``"completed"``, ``"partial"``, ``"failed"``,
+            ``"pending_aggregation"``. The ``"pending_aggregation"`` status
+            indicates the stream finished its synchronous lifecycle but a
+            background aggregation job is still required to land all artifacts
+            on disk.
         frame_count: Number of samples/frames produced.
         file_path: Path to any file the stream wrote, or None.
         first_sample_at_ns: Monotonic ns of first sample, or None if empty.
@@ -296,7 +304,7 @@ class FinalizationReport:
     """
 
     stream_id: str
-    status: Literal["completed", "partial", "failed"]
+    status: Literal["completed", "partial", "failed", "pending_aggregation"]
     frame_count: int
     file_path: Path | None
     first_sample_at_ns: int | None
