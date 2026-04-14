@@ -2727,9 +2727,82 @@ class SessionOrchestrator:
         self._maybe_start_follower_advertising_post_observation()
 
         # Phase 2: wait for leader to actually reach recording status.
-        recording_ann = self._browser.wait_for_recording(timeout=remaining)
+        recording_ann = self._wait_for_leader_recording_state(
+            self._observed_leader, remaining
+        )
         # Refresh to latest (status changed).
         self._observed_leader = recording_ann
+
+    def _wait_for_leader_recording_state(
+        self, leader: "SessionAnnouncement", timeout: float
+    ) -> "SessionAnnouncement":
+        """Wait for the observed mDNS leader to report ``state=recording``.
+
+        Cross-network mDNS TXT updates are unreliable on consumer WiFi —
+        APs with IGMP snooping, multicast rate-limiting, or band-split
+        SSIDs routinely drop them between clients. The browser's
+        ``wait_for_recording`` condition variable then never fires even
+        though the leader HAS actually transitioned. Symptom: follower
+        times out while the leader is happily recording.
+
+        Fix: after the observation phase has already populated
+        ``leader.control_plane_port`` and ``leader.resolved_address``,
+        poll ``GET /health`` directly over LAN-unicast HTTP. That
+        endpoint returns the authoritative orchestrator state and does
+        not depend on mDNS multicast reaching us. The browser keeps
+        running in parallel; we just stop trusting it as the sole
+        wake-up signal for the status flip.
+
+        Falls back to the browser's ``wait_for_recording`` when the
+        observed leader advertised no control plane (older leader, or
+        test doubles that don't populate those fields) so existing
+        loopback paths and unit tests keep working.
+        """
+        if leader.control_plane_port is None or not leader.resolved_address:
+            return self._browser.wait_for_recording(timeout=timeout)
+
+        import httpx
+        from dataclasses import replace as _dc_replace
+
+        deadline = time.monotonic() + timeout
+        base = f"http://{leader.resolved_address}:{leader.control_plane_port}"
+        headers = {"Authorization": f"Bearer {leader.session_id}"}
+        poll_interval = 0.5
+
+        logger.info(
+            "Follower polling leader /health at %s for state=recording "
+            "(mDNS TXT updates can be dropped cross-WiFi)",
+            base,
+        )
+        while time.monotonic() < deadline:
+            try:
+                r = httpx.get(
+                    f"{base}/health", headers=headers, timeout=2.0
+                )
+                if r.status_code == 200:
+                    state = r.json().get("state", "")
+                    if state == "recording":
+                        return _dc_replace(leader, status="recording")
+                    if state in ("stopped", "idle"):
+                        # Fast session wrapped up before we saw
+                        # 'recording'. Mirror the static-leader path:
+                        # treat as observed and let the follower stop.
+                        logger.info(
+                            "Leader %s reached state=%s without 'recording' "
+                            "seen; proceeding",
+                            leader.host_id, state,
+                        )
+                        return _dc_replace(leader, status="stopped")
+            except httpx.HTTPError as exc:
+                logger.debug(
+                    "leader /health poll transient error: %s", exc
+                )
+            time.sleep(poll_interval)
+
+        raise TimeoutError(
+            f"leader {leader.host_id} did not reach state=recording "
+            f"within {timeout:.1f}s (HTTP poll on {base})"
+        )
 
     def _poll_static_leader_until_recording(self) -> None:
         """Poll the static leader's /health until state == 'recording'.
@@ -2853,7 +2926,56 @@ class SessionOrchestrator:
                 "wait_for_leader_stopped() requires an active SessionBrowser; "
                 "call start() first"
             )
-        return self._browser.wait_for_stopped(timeout=timeout)
+        return self._wait_for_leader_stopped_state(timeout)
+
+    def _wait_for_leader_stopped_state(
+        self, timeout: float
+    ) -> SessionAnnouncement:
+        """HTTP-primary wait for the observed leader to reach 'stopped'.
+
+        Mirrors :meth:`_wait_for_leader_recording_state`: mDNS TXT
+        updates aren't guaranteed to cross WiFi, so we poll the leader's
+        authoritative ``/health`` endpoint when we have its address.
+        Falls back to the browser's ``wait_for_stopped`` only when the
+        observed leader never advertised a control plane (legacy path).
+        """
+        leader = self._observed_leader
+        if (
+            leader is None
+            or leader.control_plane_port is None
+            or not leader.resolved_address
+        ):
+            return self._browser.wait_for_stopped(timeout=timeout)
+
+        import httpx
+        from dataclasses import replace as _dc_replace
+
+        deadline = time.monotonic() + timeout
+        base = f"http://{leader.resolved_address}:{leader.control_plane_port}"
+        headers = {"Authorization": f"Bearer {leader.session_id}"}
+
+        while time.monotonic() < deadline:
+            try:
+                r = httpx.get(
+                    f"{base}/health", headers=headers, timeout=2.0
+                )
+                if r.status_code == 200:
+                    state = r.json().get("state", "")
+                    if state in ("stopped", "idle"):
+                        return _dc_replace(leader, status="stopped")
+                elif r.status_code in (404, 503):
+                    # Control plane tearing down == stopped from our
+                    # perspective.
+                    return _dc_replace(leader, status="stopped")
+            except httpx.HTTPError:
+                # Control plane gone (keep-alive expired) == stopped.
+                return _dc_replace(leader, status="stopped")
+            time.sleep(0.5)
+
+        raise TimeoutError(
+            f"leader {leader.host_id} did not reach state=stopped within "
+            f"{timeout:.1f}s (HTTP poll on {base})"
+        )
 
     def _poll_static_leader_until_stopped(self, timeout: float) -> None:
         """Poll the static leader's /health until it reports stopped/idle.

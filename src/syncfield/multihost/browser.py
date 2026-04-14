@@ -475,17 +475,21 @@ class SessionBrowser:
 
 
 def _extract_ipv4(info: Any) -> Optional[str]:
-    """Return the first IPv4 address on *info*, or ``None``.
+    """Return the first dialable address on *info*, or ``None``.
 
-    Prefers the modern ``info.parsed_addresses()`` API (zeroconf >= 0.39)
-    which already returns dotted-quad strings. Falls back to the legacy
-    ``info.addresses`` (list of 4-byte packed addresses) decoded with
-    :func:`socket.inet_ntoa` when the modern accessor isn't available,
-    e.g. on older zeroconf releases or minimal test doubles.
+    Prefers a dotted-quad IPv4 (from ``info.parsed_addresses()`` or the
+    legacy ``info.addresses`` packed-bytes list). Falls back to a
+    ``.local`` mDNS hostname when no IPv4 was resolvable: macOS's
+    getaddrinfo routes ``.local`` lookups through mDNSResponder, so
+    httpx and the standard library can still dial it. Without this
+    fallback, a dns-sd-only resolution with failed hostname→IPv4
+    step would drop ``resolved_address`` to ``None`` and every
+    downstream POST/GET against the peer would silently redirect to
+    ``127.0.0.1`` via :meth:`SessionOrchestrator._follower_base_url`.
 
     Any exception short-circuits to ``None`` rather than crashing the
-    browser — address resolution is best-effort and the caller will
-    transparently fall back to ``127.0.0.1`` downstream.
+    browser — address resolution is best-effort and callers handle the
+    missing-address case.
     """
     try:
         parsed = info.parsed_addresses()
@@ -510,4 +514,12 @@ def _extract_ipv4(info: Any) -> Optional[str]:
                     return socket.inet_ntoa(bytes(packed))
                 except OSError:  # pragma: no cover - malformed packed addr
                     continue
+
+    # Hostname-only fallback: dns-sd fallback's _ResolvedInfo exposes a
+    # normalised ``.local`` hostname when it couldn't resolve the peer
+    # to packed IPv4. httpx + macOS getaddrinfo can dial that directly
+    # via mDNSResponder.
+    hostname = getattr(info, "hostname", None)
+    if isinstance(hostname, str) and hostname:
+        return hostname
     return None
