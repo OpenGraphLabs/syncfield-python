@@ -261,16 +261,9 @@ class UVCWebcamStream(StreamBase):
         """
         assert self._input is not None
         frame_iter = iter(self._input.decode(video=0))
-        try:
-            while not self._stop_event.is_set():
-                try:
-                    frame = next(frame_iter)
-                except StopIteration:
-                    break
-                except BlockingIOError:
-                    time.sleep(0.001)
-                    continue
-
+        while not self._stop_event.is_set():
+            try:
+                frame = next(frame_iter)
                 capture_ns = time.monotonic_ns()
                 if self._recording:
                     if self._prev_capture_ns is not None:
@@ -296,18 +289,26 @@ class UVCWebcamStream(StreamBase):
                             capture_ns=capture_ns,
                         )
                     )
-        except Exception as exc:  # noqa: BLE001 - PyAV surfaces diverse errors here
-            # Device disconnect or decode error — emit a health event so the
-            # orchestrator sees a first-class signal, then exit the thread.
-            self._emit_health(
-                HealthEvent(
-                    stream_id=self.id,
-                    kind=HealthEventKind.ERROR,
-                    at_ns=time.monotonic_ns(),
-                    detail=f"capture loop ended: {exc!r}",
+            except StopIteration:
+                # Device exhausted (explicit end-of-stream).
+                break
+            except BlockingIOError:
+                # EAGAIN from AVFoundation — can surface from next(),
+                # frame.to_ndarray(), or encoder.write() on macOS.
+                # Sleep briefly and retry; it is never fatal.
+                time.sleep(0.001)
+                continue
+            except Exception as exc:  # noqa: BLE001 - PyAV surfaces diverse errors here
+                # Genuine error — emit a health event and exit.
+                self._emit_health(
+                    HealthEvent(
+                        stream_id=self.id,
+                        kind=HealthEventKind.ERROR,
+                        at_ns=time.monotonic_ns(),
+                        detail=f"capture loop ended: {exc!r}",
+                    )
                 )
-            )
-            return
+                return
 
     # ------------------------------------------------------------------
     # Live preview
