@@ -8,10 +8,14 @@ the right subclass based on ``sys.platform``.
 from __future__ import annotations
 
 import abc
+import logging
 import shutil
 import subprocess
 import sys
+import time
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 
 class WifiSwitcherError(RuntimeError):
@@ -42,12 +46,30 @@ class WifiSwitcher(abc.ABC):
 # ----- macOS -----
 
 class MacWifiSwitcher(WifiSwitcher):
+    """macOS WiFi switcher using ``networksetup``.
+
+    ``networksetup -setairportnetwork`` is surprisingly brittle on modern macOS:
+    it can return 0 without actually switching, it can hang silently waiting
+    for Location permission, and the DHCP lease on the camera AP takes a
+    moment to settle. This impl mirrors the recorder's production-validated
+    ``download_go3s_wifi.py`` flow: bounded timeouts, post-switch SSID
+    verification, DHCP IP verification, and up to 3 retries.
+    """
+
+    #: Expected IP prefix the Go3S AP hands out over DHCP.
+    _CAMERA_IP_PREFIX = "192.168.42."
+    #: Seconds to wait for DHCP to assign an IP after the SSID switches.
+    _DHCP_WAIT_SEC = 15
+    #: How many times to retry the full switch on failure.
+    _MAX_RETRIES = 3
+
     def current_ssid(self) -> Optional[str]:
         result = subprocess.run(
             ["networksetup", "-getairportnetwork", self.interface],
             capture_output=True,
             text=True,
             check=False,
+            timeout=10,
         )
         line = (result.stdout or "").strip()
         prefix = "Current Wi-Fi Network: "
@@ -55,17 +77,90 @@ class MacWifiSwitcher(WifiSwitcher):
             return line[len(prefix):].strip() or None
         return None
 
-    def connect(self, ssid: str, password: str) -> None:
-        result = subprocess.run(
-            ["networksetup", "-setairportnetwork", self.interface, ssid, password],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if result.returncode != 0 or "Could not" in (result.stdout or ""):
-            raise WifiSwitcherError(
-                f"networksetup failed: rc={result.returncode} stdout={result.stdout!r} stderr={result.stderr!r}"
+    def _get_interface_ip(self) -> Optional[str]:
+        try:
+            r = subprocess.run(
+                ["ipconfig", "getifaddr", self.interface],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=5,
             )
+            if r.returncode == 0 and r.stdout.strip():
+                return r.stdout.strip()
+        except Exception:
+            pass
+        return None
+
+    def connect(self, ssid: str, password: str) -> None:
+        last_diagnostic = ""
+        for attempt in range(1, self._MAX_RETRIES + 1):
+            logger.info(
+                "[MacWifiSwitcher] setairportnetwork %s %r (attempt %d/%d)",
+                self.interface, ssid, attempt, self._MAX_RETRIES,
+            )
+            try:
+                result = subprocess.run(
+                    [
+                        "networksetup", "-setairportnetwork",
+                        self.interface, ssid, password,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=30,
+                )
+            except subprocess.TimeoutExpired:
+                last_diagnostic = (
+                    "`networksetup -setairportnetwork` hung for 30s — likely "
+                    "waiting for Location permission. Grant it in "
+                    "System Settings → Privacy & Security → Location Services."
+                )
+                logger.warning("[MacWifiSwitcher] %s", last_diagnostic)
+                continue
+
+            if result.returncode != 0:
+                last_diagnostic = (
+                    f"rc={result.returncode} stdout={result.stdout!r} "
+                    f"stderr={result.stderr!r}"
+                )
+                logger.warning("[MacWifiSwitcher] %s", last_diagnostic)
+
+            # networksetup can return 0 without actually switching — verify.
+            time.sleep(2)
+            actual = self.current_ssid()
+            if actual != ssid:
+                last_diagnostic = (
+                    f"SSID verify failed: expected {ssid!r}, got {actual!r}. "
+                    "If the camera AP isn't in range or its password is "
+                    "wrong, macOS silently falls back to the last known "
+                    "network."
+                )
+                logger.warning("[MacWifiSwitcher] %s", last_diagnostic)
+                continue
+            logger.info("[MacWifiSwitcher] SSID switched to %r", ssid)
+
+            # Wait for DHCP to assign a 192.168.42.x IP.
+            for i in range(self._DHCP_WAIT_SEC):
+                time.sleep(1)
+                ip = self._get_interface_ip()
+                if ip and ip.startswith(self._CAMERA_IP_PREFIX):
+                    logger.info(
+                        "[MacWifiSwitcher] DHCP ok: iface=%s ip=%s",
+                        self.interface, ip,
+                    )
+                    return
+            last_diagnostic = (
+                f"DHCP did not assign a {self._CAMERA_IP_PREFIX}x address "
+                f"within {self._DHCP_WAIT_SEC}s (got {ip!r}). The camera "
+                "AP is reachable but isn't serving DHCP — reboot the camera."
+            )
+            logger.warning("[MacWifiSwitcher] %s", last_diagnostic)
+
+        raise WifiSwitcherError(
+            f"Failed to switch WiFi to {ssid!r} after {self._MAX_RETRIES} "
+            f"attempts. Last diagnostic: {last_diagnostic}"
+        )
 
 
 # ----- Linux -----

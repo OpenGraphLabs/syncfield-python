@@ -54,16 +54,46 @@ class OscHttpClient:
         return f"{self._scheme}://{self._host}{path}"
 
     async def probe(self, *, timeout: float = 5.0) -> OscCameraInfo:
-        async with aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=timeout)
-        ) as s:
-            async with s.get(self._url("/osc/info")) as r:
-                r.raise_for_status()
-                data = await r.json()
-        return OscCameraInfo(
-            manufacturer=data.get("manufacturer", ""),
-            model=data.get("model", ""),
-            firmware_version=data.get("firmwareVersion", ""),
+        """GET /osc/info on whichever port the camera happens to serve on.
+
+        Insta360 cameras sometimes expose OSC on 80, sometimes 6666 (SDK
+        port), depending on firmware. If the host was given without an
+        explicit port, try each fallback in sequence and use the first
+        that responds. Once the probe lands, ``_host`` is rewritten to
+        include the winning port so ``list_files`` and ``download``
+        target the same endpoint.
+        """
+        if ":" in self._host:
+            # Host already carries a port — honor it exactly.
+            ports_to_try: tuple[int, ...] = ()
+        else:
+            ports_to_try = FALLBACK_PORTS
+
+        last_error: Exception | None = None
+        candidates: list[str] = [self._host] if not ports_to_try else [
+            f"{self._host}:{port}" for port in ports_to_try
+        ]
+        for host_with_port in candidates:
+            url = f"{self._scheme}://{host_with_port}/osc/info"
+            try:
+                async with aiohttp.ClientSession(
+                    timeout=aiohttp.ClientTimeout(total=timeout)
+                ) as s:
+                    async with s.get(url) as r:
+                        r.raise_for_status()
+                        data = await r.json(content_type=None)
+                # Stick to the winning host:port for subsequent requests.
+                self._host = host_with_port
+                return OscCameraInfo(
+                    manufacturer=data.get("manufacturer", ""),
+                    model=data.get("model", ""),
+                    firmware_version=data.get("firmwareVersion", ""),
+                )
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                last_error = e
+                continue
+        raise aiohttp.ClientError(
+            f"OSC probe failed on all candidates {candidates}: {last_error}"
         )
 
     async def list_files(self) -> list[OscFileEntry]:

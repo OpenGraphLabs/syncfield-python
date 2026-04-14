@@ -220,6 +220,11 @@ class Go3SStream(StreamBase):
         self._ble_loop: Optional[asyncio.AbstractEventLoop] = None
         self._ble_thread: Optional[threading.Thread] = None
         self._ble_lock = threading.Lock()
+        # Last aggregation state we emitted a health event for; used to
+        # avoid spamming progress-every-chunk events — we only emit on
+        # state transitions (running/completed/failed) and phase changes.
+        self._last_agg_state_emitted: Optional[str] = None
+        self._agg_listener = None  # type: ignore[assignment]
         self.pending_aggregation_job: Optional[AggregationJob] = None
         """Last job built by stop_recording() — set after each stop, never cleared.
 
@@ -312,6 +317,10 @@ class Go3SStream(StreamBase):
                 f"{self._wifi_ssid!r}"
             ),
         ))
+
+        # Subscribe to the global aggregation queue so job state changes
+        # for THIS stream surface in the stream's health log.
+        self._subscribe_to_aggregation_queue()
 
     def start_recording(self, session_clock: SessionClock) -> None:
         """Fire BLE start_capture over the persistent link.
@@ -406,8 +415,87 @@ class Go3SStream(StreamBase):
             error=None,
         )
 
+    def _subscribe_to_aggregation_queue(self) -> None:
+        """Bridge global aggregation queue → per-stream health log.
+
+        The global queue emits progress for all jobs in all streams. We
+        filter to events mentioning *this* stream's id and only emit a
+        health event on meaningful state transitions (running / completed
+        / failed / failed-to-connect) — never per-chunk progress, which
+        would spam the sidebar.
+        """
+        if self._agg_listener is not None:
+            return
+        try:
+            from .aggregation.types import AggregationState as _AS
+        except ImportError:
+            return
+
+        def on_progress(progress) -> None:
+            if progress.current_stream_id and progress.current_stream_id != self.id:
+                return
+            state_value = (
+                progress.state.value
+                if hasattr(progress.state, "value")
+                else str(progress.state)
+            )
+            # Dedup per (job, state) so we only emit on real transitions.
+            key = f"{progress.job_id}:{state_value}"
+            if key == self._last_agg_state_emitted:
+                return
+            self._last_agg_state_emitted = key
+
+            if state_value == "running":
+                kind = HealthEventKind.HEARTBEAT
+                detail = f"Aggregation running (job={progress.job_id})"
+            elif state_value == "completed":
+                kind = HealthEventKind.HEARTBEAT
+                detail = f"Aggregation completed (job={progress.job_id})"
+            elif state_value == "failed":
+                kind = HealthEventKind.ERROR
+                detail = (
+                    f"Aggregation failed (job={progress.job_id}): "
+                    f"{progress.error or 'unknown error'}"
+                )
+            else:
+                return
+
+            try:
+                self._emit_health(HealthEvent(
+                    stream_id=self.id,
+                    kind=kind,
+                    at_ns=time.monotonic_ns(),
+                    detail=detail,
+                ))
+            except Exception:
+                # Listener callbacks run on the aggregation thread; never
+                # let a health-emit error take down the worker.
+                logger.warning(
+                    "Go3SStream: failed to emit aggregation health event",
+                    exc_info=True,
+                )
+
+        try:
+            _global_aggregation_queue().subscribe(on_progress)
+            self._agg_listener = on_progress
+        except Exception:
+            logger.warning(
+                "Go3SStream: could not subscribe to aggregation queue",
+                exc_info=True,
+            )
+
+    def _unsubscribe_from_aggregation_queue(self) -> None:
+        if self._agg_listener is None:
+            return
+        try:
+            _global_aggregation_queue().unsubscribe(self._agg_listener)
+        except Exception:
+            pass
+        self._agg_listener = None
+
     def disconnect(self) -> None:
         """Close the BLE session and tear down the BLE event loop thread."""
+        self._unsubscribe_from_aggregation_queue()
         self._force_disconnect_cam()
         with self._ble_lock:
             loop = self._ble_loop

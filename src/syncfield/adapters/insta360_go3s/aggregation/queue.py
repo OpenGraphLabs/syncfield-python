@@ -283,22 +283,40 @@ class Go3SAggregationDownloader(AggregationDownloader):
         target_dir: Path,
         on_chunk: ChunkCallback,
     ) -> None:
+        _log.info(
+            "[aggregation] begin: stream=%s ssid=%r sd=%r",
+            camera.stream_id, camera.wifi_ssid, camera.sd_path,
+        )
         prev_ssid = self._switcher.current_ssid()
+        _log.info("[aggregation] prev_ssid=%r", prev_ssid)
         try:
-            self._switcher.connect(camera.wifi_ssid, camera.wifi_password)
-            await self._wait_for_ap()
-            osc = self._osc_factory(self._ap_host)
-            await osc.probe(timeout=5.0)
+            _log.info("[aggregation] step 1/4: switching WiFi to %r", camera.wifi_ssid)
+            # WiFi switching is synchronous (subprocess); run it off the
+            # queue's asyncio loop so we don't block progress callbacks
+            # from other jobs that might arrive concurrently.
+            await asyncio.to_thread(
+                self._switcher.connect,
+                camera.wifi_ssid,
+                camera.wifi_password,
+            )
+            _log.info("[aggregation] step 2/4: probing camera at %s", self._ap_host)
+            osc = await self._wait_for_ap()  # returns the probed client
             local_path = target_dir / camera.local_filename
+            _log.info(
+                "[aggregation] step 3/4: downloading %s -> %s",
+                camera.sd_path, local_path,
+            )
             await osc.download(
                 remote_path=camera.sd_path,
                 local_path=local_path,
                 expected_size=camera.size_bytes or None,
                 on_progress=lambda done, total: on_chunk(camera.stream_id, done, total),
             )
+            _log.info("[aggregation] step 4/4: download done (%s)", local_path)
         finally:
             try:
-                self._switcher.restore(prev_ssid)
+                _log.info("[aggregation] restoring WiFi to %r", prev_ssid)
+                await asyncio.to_thread(self._switcher.restore, prev_ssid)
             except Exception:
                 _log.warning(
                     "Go3SAggregationDownloader: failed to restore WiFi to %s",
@@ -306,17 +324,34 @@ class Go3SAggregationDownloader(AggregationDownloader):
                     exc_info=True,
                 )
 
-    async def _wait_for_ap(self) -> None:
+    async def _wait_for_ap(self) -> Any:
+        """Probe the camera's OSC endpoint until it responds.
+
+        Returns the probed OscHttpClient-like object so the caller can reuse
+        it without paying another round of port fallback during list_files /
+        download.
+        """
         deadline = asyncio.get_running_loop().time() + self._wait_for_ap_timeout
         last_error: Exception | None = None
-        for _ in range(self._ap_probe_attempts):
+        for attempt in range(1, self._ap_probe_attempts + 1):
             if asyncio.get_running_loop().time() > deadline:
                 break
             try:
                 osc = self._osc_factory(self._ap_host)
-                await osc.probe(timeout=2.0)
-                return
+                info = await osc.probe(timeout=3.0)
+                _log.info(
+                    "[aggregation] OSC probe ok (attempt %d): model=%r fw=%r",
+                    attempt, info.model, info.firmware_version,
+                )
+                return osc
             except Exception as e:
                 last_error = e
+                _log.warning(
+                    "[aggregation] OSC probe attempt %d failed: %s",
+                    attempt, e,
+                )
                 await asyncio.sleep(self._ap_probe_interval)
-        raise RuntimeError(f"camera AP unreachable: {last_error}")
+        raise RuntimeError(
+            f"camera AP unreachable at {self._ap_host} after "
+            f"{self._ap_probe_attempts} probes: {last_error}"
+        )
