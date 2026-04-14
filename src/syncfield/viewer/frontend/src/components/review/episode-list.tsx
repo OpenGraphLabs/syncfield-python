@@ -3,14 +3,16 @@ import { useEpisodes } from "@/hooks/use-episodes";
 import { cn } from "@/lib/utils";
 import { EpisodeCard } from "./episode-card";
 import { EpisodeTable } from "./episode-table";
+import type { AggregationSnapshotWS } from "@/lib/types";
 
 type ListViewMode = "grid" | "table";
 
 interface EpisodeListProps {
   onSelect: (episodeId: string) => void;
+  aggregation?: AggregationSnapshotWS;
 }
 
-export function EpisodeList({ onSelect }: EpisodeListProps) {
+export function EpisodeList({ onSelect, aggregation }: EpisodeListProps) {
   const { episodes, isLoading, error, refresh } = useEpisodes();
   const [viewMode, setViewMode] = useState<ListViewMode>("table");
 
@@ -86,11 +88,16 @@ export function EpisodeList({ onSelect }: EpisodeListProps) {
                 key={ep.id}
                 episode={ep}
                 onClick={() => onSelect(ep.id)}
+                aggregation={aggregation}
               />
             ))}
           </div>
         ) : (
-          <EpisodeTable episodes={episodes} onSelect={onSelect} />
+          <EpisodeTable
+            episodes={episodes}
+            onSelect={onSelect}
+            aggregation={aggregation}
+          />
         )}
       </div>
     </div>

@@ -17,6 +17,10 @@ import { TaskSelector } from "@/components/task-selector";
 import { useTasks } from "@/hooks/use-tasks";
 import { ReviewPage } from "@/components/review/review-page";
 import type { ViewMode } from "@/components/segment-control";
+import {
+  AggregationStatusBar,
+  mapActiveAggregation,
+} from "@/components/aggregation-status-bar";
 
 // ---------------------------------------------------------------------------
 // URL-based routing: /record and /review
@@ -128,6 +132,12 @@ function RecordView({
       {stopResult && (
         <StopResultBanner result={stopResult} onDismiss={dismissStopResult} />
       )}
+
+      {/* Aggregation status bar — visible only when a job is running or failed */}
+      <AggregationStatusBar
+        active={mapActiveAggregation(snapshot?.aggregation)}
+        onRetry={(jobId) => sendCommand("retry_aggregation", { job_id: jobId })}
+      />
 
       <div className="flex flex-1 overflow-hidden">
         <div className="flex-1 overflow-y-auto p-4">

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { EpisodeList } from "./episode-list";
 import { EpisodeDetail } from "./episode-detail";
+import { useSession } from "@/hooks/use-session";
 
 /**
  * Review mode — browse episodes and analyze sync quality.
@@ -13,6 +14,7 @@ import { EpisodeDetail } from "./episode-detail";
  * direct links work.
  */
 export function ReviewPage() {
+  const { snapshot } = useSession();
   const [episodeId, setEpisodeId] = useState<string | null>(
     getEpisodeIdFromUrl,
   );
@@ -38,7 +40,12 @@ export function ReviewPage() {
     return <EpisodeDetail episodeId={episodeId} onBack={handleBack} />;
   }
 
-  return <EpisodeList onSelect={handleSelect} />;
+  return (
+    <EpisodeList
+      onSelect={handleSelect}
+      aggregation={snapshot?.aggregation}
+    />
+  );
 }
 
 function getEpisodeIdFromUrl(): string | null {

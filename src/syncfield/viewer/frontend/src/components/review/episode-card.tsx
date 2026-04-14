@@ -1,13 +1,36 @@
 import type { EpisodeSummary } from "@/lib/review-types";
+import type { AggregationSnapshotWS } from "@/lib/types";
 import { cn } from "@/lib/utils";
+import { AggregationBadge } from "@/components/aggregation-status-bar";
 
 interface EpisodeCardProps {
   episode: EpisodeSummary;
   onClick: () => void;
+  aggregation?: AggregationSnapshotWS;
 }
 
-export function EpisodeCard({ episode, onClick }: EpisodeCardProps) {
+/** Derive aggregation state + percent for this episode. */
+function getAggState(
+  episodeId: string,
+  aggregation: AggregationSnapshotWS | undefined,
+): { state: string | undefined; percent: number | undefined } {
+  if (!aggregation) return { state: undefined, percent: undefined };
+  const active = aggregation.active_job;
+  if (active && active.episode_id === episodeId) {
+    const pct =
+      active.current_total_bytes > 0
+        ? Math.round((active.current_bytes / active.current_total_bytes) * 100)
+        : 0;
+    return { state: active.state, percent: pct };
+  }
+  const recent = aggregation.recent_jobs.find((j) => j.episode_id === episodeId);
+  if (recent) return { state: recent.state, percent: undefined };
+  return { state: undefined, percent: undefined };
+}
+
+export function EpisodeCard({ episode, onClick, aggregation }: EpisodeCardProps) {
   const date = formatDate(episode.created_at);
+  const { state: aggState, percent: aggPct } = getAggState(episode.id, aggregation);
 
   return (
     <button
@@ -59,6 +82,9 @@ export function EpisodeCard({ episode, onClick }: EpisodeCardProps) {
             <span className="font-mono text-[10px] text-muted">
               {episode.host_id}
             </span>
+          )}
+          {aggregation && aggState && (
+            <AggregationBadge state={aggState} percent={aggPct} />
           )}
         </div>
       </div>
