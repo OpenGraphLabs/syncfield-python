@@ -94,7 +94,7 @@ def test_mac_connect_retries_and_raises_when_ssid_never_switches(mock_run):
     mock_run.side_effect = fake_run
 
     sw = MacWifiSwitcher(interface="en0")
-    with pytest.raises(WifiSwitcherError, match="after 3 attempts"):
+    with pytest.raises(WifiSwitcherError, match="after 2 attempts"):
         sw.connect("does-not-exist", "x")
 
 

@@ -6,6 +6,17 @@
 The Go3S is BLE-triggered (start/stop only). The video file is pulled from the
 camera's WiFi AP automatically after stop_recording() — aggregation runs in a
 background queue and does not block subsequent recordings.
+
+Go3S prerequisites (critical — otherwise aggregation will fail):
+  1. Turn the camera ON and unlock it.
+  2. **Enable the camera's WiFi AP**: swipe down from the top of the screen
+     → WiFi → turn ON. Or dock it in the Action Pod (keeps WiFi persistently
+     on). Without this, the camera broadcasts BLE but no OSC HTTP AP, and
+     aggregation will fail at the "Switching WiFi" stage.
+  3. Default AP password is "88888888" (Insta360 factory default).
+  4. On macOS, grant Location Services permission to Python / your terminal
+     when the OS prompts on first aggregation run (required for
+     networksetup to switch WiFi networks).
 """
 
 from pathlib import Path

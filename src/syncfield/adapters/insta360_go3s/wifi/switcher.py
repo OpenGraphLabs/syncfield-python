@@ -8,6 +8,7 @@ the right subclass based on ``sys.platform``.
 from __future__ import annotations
 
 import abc
+import json
 import logging
 import shutil
 import subprocess
@@ -61,7 +62,45 @@ class MacWifiSwitcher(WifiSwitcher):
     #: Seconds to wait for DHCP to assign an IP after the SSID switches.
     _DHCP_WAIT_SEC = 15
     #: How many times to retry the full switch on failure.
-    _MAX_RETRIES = 3
+    _MAX_RETRIES = 2
+
+    def _scan_visible_ssids(self) -> Optional[set[str]]:
+        """Return the set of SSIDs macOS currently sees, or None on error.
+
+        Uses ``system_profiler`` because the classic ``airport -s`` tool is
+        deprecated in modern macOS. Parsing is best-effort — if the JSON
+        schema differs across versions or the command fails, return None
+        so callers can fall back to just trying the connect.
+        """
+        try:
+            r = subprocess.run(
+                ["system_profiler", "-json", "SPAirPortDataType"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=10,
+            )
+            if r.returncode != 0 or not r.stdout.strip():
+                return None
+            data = json.loads(r.stdout)
+        except Exception:
+            return None
+
+        ssids: set[str] = set()
+
+        def _walk(obj: object) -> None:
+            if isinstance(obj, dict):
+                for k, v in obj.items():
+                    if k.endswith("_ssid_string") or k == "_name":
+                        if isinstance(v, str) and v:
+                            ssids.add(v)
+                    _walk(v)
+            elif isinstance(obj, list):
+                for item in obj:
+                    _walk(item)
+
+        _walk(data)
+        return ssids or None
 
     def current_ssid(self) -> Optional[str]:
         result = subprocess.run(
@@ -93,6 +132,28 @@ class MacWifiSwitcher(WifiSwitcher):
         return None
 
     def connect(self, ssid: str, password: str) -> None:
+        # Fast path: if we can enumerate visible SSIDs cleanly (no <redacted>
+        # entries — which appear on macOS when Location Services isn't
+        # granted to system_profiler), and the target isn't among them,
+        # the camera's WiFi AP is simply OFF. networksetup would otherwise
+        # spend tens of seconds fruitlessly retrying with an opaque error.
+        visible = self._scan_visible_ssids()
+        scan_is_useful = (
+            visible is not None
+            and len(visible) >= 3
+            and not any("redacted" in s.lower() for s in visible)
+        )
+        if scan_is_useful:
+            lowered = {s.lower() for s in visible}
+            if ssid.lower() not in lowered:
+                raise WifiSwitcherError(
+                    f"Go3S WiFi AP {ssid!r} is not broadcasting. "
+                    "On the camera: swipe down from the top of the "
+                    "screen → WiFi → turn ON (or dock it in the Action "
+                    "Pod, which keeps WiFi on). Then retry the "
+                    "aggregation from the viewer."
+                )
+
         last_diagnostic = ""
         for attempt in range(1, self._MAX_RETRIES + 1):
             logger.info(
@@ -159,7 +220,11 @@ class MacWifiSwitcher(WifiSwitcher):
 
         raise WifiSwitcherError(
             f"Failed to switch WiFi to {ssid!r} after {self._MAX_RETRIES} "
-            f"attempts. Last diagnostic: {last_diagnostic}"
+            f"attempts.\n"
+            f"Most common cause: the camera's WiFi AP is OFF.\n"
+            f"  On the camera: swipe down from the top of the screen → "
+            f"WiFi → turn ON. Or dock it in the Action Pod.\n"
+            f"Last diagnostic: {last_diagnostic}"
         )
 
 
