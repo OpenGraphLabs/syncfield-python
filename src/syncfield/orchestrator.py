@@ -1445,6 +1445,28 @@ class SessionOrchestrator:
                         f"physical device {new_key} is already registered "
                         f"as stream {existing.id!r}"
                     )
+        # Multihost role-aware policy downgrade for Go3S streams: the leader/
+        # follower communicate over lab WiFi (mDNS). Switching the host adapter
+        # to a camera AP during a session breaks coordination. Force on_demand
+        # so aggregation runs only when explicitly triggered by the viewer.
+        try:
+            from syncfield.adapters.insta360_go3s import Go3SStream as _Go3SStream
+            if (
+                isinstance(stream, _Go3SStream)
+                and stream._aggregation_policy == "eager"
+                and isinstance(self._role, (LeaderRole, FollowerRole))
+            ):
+                stream._aggregation_policy = "on_demand"
+                logger.info(
+                    "Go3S stream %r: aggregation_policy downgraded eager→on_demand "
+                    "for multihost role %r (lab WiFi must stay connected for mDNS)",
+                    stream.id,
+                    self._role.kind,
+                )
+        except ImportError:
+            # Adapter not installed (no 'camera' extra); nothing to downgrade.
+            pass
+
         self._streams[stream.id] = stream
         stream.on_health(self._on_stream_health)
 
