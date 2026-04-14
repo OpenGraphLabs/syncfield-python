@@ -222,3 +222,16 @@ class MetaQuestCameraStream(StreamBase):
             decode_jpeg=True,
             on_health=_on_health,
         )
+
+    @property
+    def latest_frame_left(self):
+        """Most-recent decoded BGR preview frame from the left camera, or None."""
+        if self._preview_left is None:
+            return None
+        return self._preview_left.latest_frame
+
+    @property
+    def latest_frame_right(self):
+        if self._preview_right is None:
+            return None
+        return self._preview_right.latest_frame

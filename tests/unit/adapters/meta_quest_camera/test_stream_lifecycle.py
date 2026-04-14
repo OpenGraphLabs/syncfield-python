@@ -159,3 +159,23 @@ class TestRecordingRoundtrip:
         assert (tmp_path / "quest_cam_right.mp4").read_bytes() == b"RIGHT_MP4"
         assert (tmp_path / "quest_cam_left.timestamps.jsonl").exists()
         assert (tmp_path / "quest_cam_right.timestamps.jsonl").exists()
+
+
+class TestLatestFrame:
+    def test_latest_frame_none_before_connect(self, tmp_path):
+        stream = MetaQuestCameraStream(
+            id="quest_cam", quest_host="test", output_dir=tmp_path,
+        )
+        assert stream.latest_frame_left is None
+        assert stream.latest_frame_right is None
+
+    def test_latest_frame_reads_from_preview_consumers(self, tmp_path):
+        stream = MetaQuestCameraStream(
+            id="quest_cam", quest_host="test", output_dir=tmp_path,
+            _transport=_status_only_transport(),
+        )
+        stream.connect()
+        # Consumers returned empty body in the fixture, so latest_frame stays None.
+        assert stream.latest_frame_left is None
+        assert stream.latest_frame_right is None
+        stream.disconnect()
