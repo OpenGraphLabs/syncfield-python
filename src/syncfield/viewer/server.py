@@ -246,15 +246,21 @@ def _attach_aggregation_listener(server: "ViewerServer") -> None:
         return
 
     def on_progress(progress) -> None:
-        if progress.state == AggregationState.RUNNING:
+        # RUNNING and FAILED both surface to the status bar so the user
+        # sees in-flight progress and errors (with a Retry button).
+        # COMPLETED clears the bar and is archived to recent_jobs for the
+        # episode-list badges.
+        if progress.state in (AggregationState.RUNNING, AggregationState.FAILED):
             active = progress
         else:
             active = None
-            if progress.state in (AggregationState.COMPLETED, AggregationState.FAILED):
-                with server._agg_lock:
-                    server._recent_agg_jobs.append(progress)
-                    if len(server._recent_agg_jobs) > 5:
-                        del server._recent_agg_jobs[: len(server._recent_agg_jobs) - 5]
+
+        if progress.state in (AggregationState.COMPLETED, AggregationState.FAILED):
+            with server._agg_lock:
+                server._recent_agg_jobs.append(progress)
+                if len(server._recent_agg_jobs) > 5:
+                    del server._recent_agg_jobs[: len(server._recent_agg_jobs) - 5]
+
         with server._agg_lock:
             recent = list(server._recent_agg_jobs)
         server._agg_state = AggregationSnapshot(

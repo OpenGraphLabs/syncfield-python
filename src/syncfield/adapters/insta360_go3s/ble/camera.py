@@ -102,6 +102,15 @@ class Go3SBLECamera:
         # is_connected report False immediately on async drops.
         self._disconnect_observed: bool = False
 
+        # BLE advertised name, captured during connect(). Used by the stream
+        # layer to derive the camera's WiFi AP SSID (pattern: "{ble_name}.OSC").
+        self._ble_name: Optional[str] = None
+
+    @property
+    def ble_name(self) -> Optional[str]:
+        """BLE advertised name captured during connect() (e.g. 'GO 3S 1TEBJJ')."""
+        return self._ble_name
+
     # ── properties ────────────────────────────────────────────────────────────
 
     @property
@@ -178,6 +187,10 @@ class Go3SBLECamera:
                     attempt,
                     device,
                 )
+                # Capture BLE name for WiFi SSID derivation upstream.
+                name = getattr(device, "name", None)
+                if name:
+                    self._ble_name = name.strip()
 
                 self._client = BleakClient(
                     device,

@@ -252,13 +252,36 @@ class Go3SStream(StreamBase):
             raise
 
         self._cam = cam
+
+        # Derive the WiFi AP SSID from the BLE advertised name. Insta360's
+        # iOS SDK pattern: SSID = "{ble_name}.OSC" (with the exact spacing of
+        # the BLE name preserved, e.g. "GO 3S 1TEBJJ.OSC"). The user can
+        # override this by passing wifi_ssid=... to the constructor.
         if self._wifi_ssid is None:
-            self._wifi_ssid = self._derive_ssid_from_address(self._ble_address)
+            ble_name = cam.ble_name
+            if ble_name:
+                self._wifi_ssid = (
+                    ble_name if ble_name.endswith(".OSC") else f"{ble_name}.OSC"
+                )
+            else:
+                self._emit_health(HealthEvent(
+                    stream_id=self.id,
+                    kind=HealthEventKind.WARNING,
+                    at_ns=time.monotonic_ns(),
+                    detail=(
+                        "Go3S BLE connected but no advertised name — pass "
+                        "wifi_ssid=... to Go3SStream for aggregation to work."
+                    ),
+                ))
+
         self._emit_health(HealthEvent(
             stream_id=self.id,
             kind=HealthEventKind.HEARTBEAT,
             at_ns=time.monotonic_ns(),
-            detail="Go3S BLE link open and authed",
+            detail=(
+                f"Go3S BLE link open and authed; WiFi SSID="
+                f"{self._wifi_ssid!r}"
+            ),
         ))
 
     def start_recording(self, session_clock: SessionClock) -> None:
@@ -318,10 +341,31 @@ class Go3SStream(StreamBase):
                 "camera is in video mode."
             )
 
-        job = self._build_job()
+        try:
+            job = self._build_job()
+        except RuntimeError as e:
+            return self._failed_report(str(e))
+
         self.pending_aggregation_job = job
         if self._aggregation_policy == "eager":
-            self._enqueue_job(job)
+            try:
+                self._enqueue_job(job)
+            except Exception as e:
+                return self._failed_report(
+                    f"Failed to enqueue aggregation job: {e}. "
+                    "The camera stopped recording successfully, but the "
+                    "background download queue is unreachable. Retry from "
+                    "the viewer once the queue is healthy."
+                )
+            self._emit_health(HealthEvent(
+                stream_id=self.id,
+                kind=HealthEventKind.HEARTBEAT,
+                at_ns=time.monotonic_ns(),
+                detail=(
+                    f"Aggregation enqueued (job={job.job_id}, "
+                    f"ssid={self._wifi_ssid!r}, sd={self._sd_path!r})"
+                ),
+            ))
         return FinalizationReport(
             stream_id=self.id,
             status="pending_aggregation",
@@ -446,11 +490,17 @@ class Go3SStream(StreamBase):
                 "did not contain a /DCIM/... entry. Verify the camera is in video "
                 "mode and reachable."
             )
+        if not self._wifi_ssid:
+            raise RuntimeError(
+                "Cannot build aggregation job without a WiFi SSID. BLE name "
+                "was not captured during connect(); pass wifi_ssid=... to the "
+                "Go3SStream constructor (expected format: 'GO 3S XXXXXX.OSC')."
+            )
         ext = ".mp4" if self._sd_path.lower().endswith(".mp4") else ".insv"
         camera_spec = AggregationCameraSpec(
             stream_id=self.id,
             ble_address=self._ble_address,
-            wifi_ssid=self._wifi_ssid or self._derive_ssid_from_address(self._ble_address),
+            wifi_ssid=self._wifi_ssid,
             wifi_password=self._wifi_password,
             sd_path=self._sd_path,
             local_filename=f"{self.id}{ext}",
@@ -467,10 +517,6 @@ class Go3SStream(StreamBase):
     def _enqueue_job(self, job: AggregationJob) -> None:
         _enqueue_on_global_queue(job)
 
-    @staticmethod
-    def _derive_ssid_from_address(address: str) -> str:
-        suffix = address.replace(":", "").upper()[-12:]
-        return f"Go3S-{suffix}.OSC"
 
     @classmethod
     def discover(cls, *, timeout: float = 5.0) -> list:

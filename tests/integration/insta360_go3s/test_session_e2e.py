@@ -20,6 +20,7 @@ class FakeBleCamera:
     def __init__(self, address: str):
         self.address = address
         self.is_connected = False
+        self.ble_name = "GO 3S TEST"
 
     async def connect(self, sync_timeout: float = 2.0, auth_timeout: float = 1.0, discovery_timeout: float = 5.0):
         self.is_connected = True
