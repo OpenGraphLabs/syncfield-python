@@ -21,7 +21,7 @@ class FakeBleCamera:
         self.address = address
         self.is_connected = False
 
-    async def connect(self, sync_timeout: float = 2.0, auth_timeout: float = 1.0):
+    async def connect(self, sync_timeout: float = 2.0, auth_timeout: float = 1.0, discovery_timeout: float = 5.0):
         self.is_connected = True
 
     async def set_video_mode(self):

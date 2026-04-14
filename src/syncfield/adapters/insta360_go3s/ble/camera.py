@@ -24,7 +24,7 @@ import time
 from dataclasses import dataclass
 from typing import Dict, Optional
 
-from bleak import BleakClient
+from bleak import BleakClient, BleakScanner
 
 from syncfield.adapters.insta360_go3s.ble.protocol import (
     CMD_CHECK_AUTH,
@@ -98,14 +98,35 @@ class Go3SBLECamera:
         # Raw bytes of the last notify frame (kept for video-path scanning).
         self._last_raw: Optional[bytes] = None
 
+        # Flipped by the BleakClient disconnected_callback; lets
+        # is_connected report False immediately on async drops.
+        self._disconnect_observed: bool = False
+
     # ── properties ────────────────────────────────────────────────────────────
 
     @property
     def is_connected(self) -> bool:
-        """True when the underlying BleakClient reports a live connection."""
-        if self._client is None:
+        """True when the underlying BleakClient reports a live connection.
+
+        ``_disconnect_observed`` is flipped by the BleakClient disconnect
+        callback — if the peripheral dropped the link asynchronously,
+        ``self._client.is_connected`` may still momentarily return True, so
+        we combine both signals for an accurate view.
+        """
+        if self._client is None or self._disconnect_observed:
             return False
         return bool(self._client.is_connected)
+
+    def _on_ble_disconnect(self, _client) -> None:
+        """BleakClient disconnect callback — marks the link as dead.
+
+        This fires when the camera (or CoreBluetooth) drops the connection
+        asynchronously, so that subsequent ``is_connected`` checks correctly
+        report the state and the stream layer's ``_ensure_ble_connected``
+        can trigger a transparent reconnect.
+        """
+        logger.warning("[Go3SBLECamera] Peripheral %s disconnected", self._address)
+        self._disconnect_observed = True
 
     # ── public API ────────────────────────────────────────────────────────────
 
@@ -114,23 +135,86 @@ class Go3SBLECamera:
         *,
         sync_timeout: float = 2.0,
         auth_timeout: float = 1.0,
+        discovery_timeout: float = 8.0,
     ) -> None:
         """Open BLE connection and complete the SYNC + auth handshake.
 
         Steps:
-        1. Connect via BleakClient.
-        2. Subscribe to notifications (this is when the camera sends SYNC).
-        3. Wait up to *sync_timeout* for SYNC; if it doesn't arrive, nudge
+        1. Resolve the peripheral via BleakScanner.find_device_by_address.
+           This is REQUIRED on macOS CoreBluetooth: BleakClient(address_str)
+           will time out if CoreBluetooth hasn't seen the peripheral since
+           process start. On Linux/Windows the scan is cheap and harmless.
+        2. Connect via BleakClient(ble_device).
+        3. Subscribe to notifications (this is when the camera sends SYNC).
+        4. Wait up to *sync_timeout* for SYNC; if it doesn't arrive, nudge
            the camera with a single ``0x00`` trigger byte.
-        4. Send the SYNC response packet (camera expects it).
-        5. Send CMD_CHECK_AUTH and wait up to *auth_timeout* for STATUS_OK.
+        5. Send the SYNC response packet (camera expects it).
+        6. Send CMD_CHECK_AUTH and wait up to *auth_timeout* for STATUS_OK.
         """
         self._sync_received_event.clear()
         self._pending_acks.clear()
+        self._disconnect_observed = False
 
-        self._client = BleakClient(self._address)
-        await self._client.connect()
-        logger.debug("[Go3SBLECamera] Connected to %s", self._address)
+        # ── Resolve + connect with one retry ────────────────────────────────
+        # macOS CoreBluetooth can hold a stale half-connect reference when
+        # a prior process crashed mid-handshake. The symptom is that
+        # BleakClient.connect() times out even though the peripheral is
+        # advertising strongly. Re-doing the scan + fresh BleakClient
+        # typically clears the state.
+        last_error: Optional[BaseException] = None
+        for attempt in (1, 2):
+            try:
+                device = await BleakScanner.find_device_by_address(
+                    self._address, timeout=discovery_timeout
+                )
+                if device is None:
+                    raise RuntimeError(
+                        f"Go3S peripheral {self._address!r} not found within "
+                        f"{discovery_timeout}s. Verify the camera is powered on, "
+                        f"in range, and advertising (check its BLE status light)."
+                    )
+                logger.debug(
+                    "[Go3SBLECamera] Resolved peripheral (attempt %d): %s",
+                    attempt,
+                    device,
+                )
+
+                self._client = BleakClient(
+                    device,
+                    timeout=15.0,
+                    disconnected_callback=self._on_ble_disconnect,
+                )
+                await self._client.connect()
+                logger.debug(
+                    "[Go3SBLECamera] Connected to %s on attempt %d",
+                    self._address,
+                    attempt,
+                )
+                break
+            except Exception as e:
+                last_error = e
+                logger.warning(
+                    "[Go3SBLECamera] Connect attempt %d failed: %s. %s",
+                    attempt,
+                    e,
+                    "Retrying with fresh scan..." if attempt == 1 else "Giving up.",
+                )
+                # Tear down any half-constructed client so the next scan
+                # doesn't race against a zombie.
+                if self._client is not None:
+                    try:
+                        await self._client.disconnect()
+                    except Exception:
+                        pass
+                    self._client = None
+                if attempt == 2:
+                    raise RuntimeError(
+                        f"Failed to connect to Go3S {self._address!r} after 2 "
+                        f"attempts: {last_error}. If this persists, power-cycle "
+                        f"the camera and try again."
+                    ) from last_error
+                # Small pause before retrying to let CoreBluetooth settle.
+                await asyncio.sleep(0.5)
 
         # Subscribe — FakeBleakClient (and real cameras) emit SYNC here.
         await self._client.start_notify(NOTIFY_CHAR_UUID, self._on_notify)

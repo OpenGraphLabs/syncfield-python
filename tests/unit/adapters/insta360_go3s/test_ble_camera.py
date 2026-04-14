@@ -83,7 +83,13 @@ class FakeBleakClient:
 def fake_client(monkeypatch):
     instances: list[FakeBleakClient] = []
 
-    def factory(address, *args, **kwargs):
+    def factory(device_or_address, *args, **kwargs):
+        # macOS path passes a BLEDevice object; Linux/Windows historically
+        # accept a str. For tests we accept either and extract an address.
+        if isinstance(device_or_address, str):
+            address = device_or_address
+        else:
+            address = getattr(device_or_address, "address", str(device_or_address))
         c = FakeBleakClient(address)
         instances.append(c)
         return c
@@ -91,6 +97,26 @@ def fake_client(monkeypatch):
     monkeypatch.setattr(
         "syncfield.adapters.insta360_go3s.ble.camera.BleakClient",
         factory,
+    )
+
+    # Stub BleakScanner.find_device_by_address so the test doesn't try to do
+    # a real 8-second BLE scan during connect().
+    class _FakeDevice:
+        def __init__(self, address: str):
+            self.address = address
+            self.name = "GO 3S FAKE"
+
+        def __repr__(self) -> str:
+            return f"_FakeDevice({self.address!r})"
+
+    class _FakeScanner:
+        @staticmethod
+        async def find_device_by_address(address, timeout=5.0):
+            return _FakeDevice(address)
+
+    monkeypatch.setattr(
+        "syncfield.adapters.insta360_go3s.ble.camera.BleakScanner",
+        _FakeScanner,
     )
     return instances
 

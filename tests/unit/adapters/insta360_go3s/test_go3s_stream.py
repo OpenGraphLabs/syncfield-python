@@ -130,7 +130,7 @@ def test_ble_link_is_held_across_start_stop_no_rehandshake(monkeypatch, tmp_path
             instantiations.append(address)
             self.address = address
             self.is_connected = False
-        async def connect(self, sync_timeout=2.0, auth_timeout=1.0):
+        async def connect(self, sync_timeout=2.0, auth_timeout=1.0, discovery_timeout=5.0):
             self.is_connected = True
         async def start_capture(self):
             return 111

@@ -230,8 +230,17 @@ class Go3SStream(StreamBase):
         cam = Go3SBLECamera(self._ble_address)
         try:
             self._run_on_ble_loop(
-                cam.connect(sync_timeout=3.0, auth_timeout=3.0),
-                timeout=12.0,
+                # Budget: per attempt = 8s scan + 15s BleakClient.connect +
+                # 3s sync + 3s auth ≈ 29s. With one retry on failure (macOS
+                # CoreBluetooth stuck-state recovery) and a 0.5s inter-attempt
+                # sleep, worst case ≈ 60s. In practice the common path (fresh
+                # process, advertising peripheral) is 3–5s total.
+                cam.connect(
+                    sync_timeout=3.0,
+                    auth_timeout=3.0,
+                    discovery_timeout=8.0,
+                ),
+                timeout=60.0,
             )
         except Exception as e:
             self._emit_health(HealthEvent(
