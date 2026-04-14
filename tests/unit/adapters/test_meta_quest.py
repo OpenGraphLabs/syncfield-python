@@ -300,6 +300,116 @@ class TestLifecycle:
         assert len(event.channels["hand_joints"]) == 156
 
 
+# ---------------------------------------------------------------------------
+# Clock metadata (clock_domain + uncertainty_ns) emitted on SampleEvent
+# ---------------------------------------------------------------------------
+
+
+class TestClockMetadata:
+    def test_sample_event_has_remote_quest_clock_domain(self):
+        from syncfield.clock import SessionClock, SyncPoint
+
+        port = _find_free_port()
+        stream = MetaQuestHandStream("test", port=port)
+        received = []
+        stream.on_sample(lambda e: received.append(e))
+
+        stream.connect()
+        stream.start_recording(SessionClock(sync_point=SyncPoint.create_now("h")))
+        _send_packet(port, _make_quest3_packet())
+        time.sleep(0.2)
+        stream.stop_recording()
+        stream.disconnect()
+
+        assert received, "expected at least one sample"
+        assert received[0].clock_domain == "remote_quest3"
+        assert received[0].uncertainty_ns == 10_000_000
+
+
+# ---------------------------------------------------------------------------
+# Connection health — is_connected property + DROP/HEARTBEAT/RECONNECT
+# ---------------------------------------------------------------------------
+
+
+class TestConnectionHealth:
+    def test_is_connected_false_before_any_packet(self):
+        stream = MetaQuestHandStream("test", port=0)
+        assert stream.is_connected is False
+
+    def test_is_connected_true_after_recent_packet(self):
+        port = _find_free_port()
+        stream = MetaQuestHandStream("test", port=port)
+        stream.connect()
+        try:
+            _send_packet(port, _make_quest3_packet())
+            time.sleep(0.2)
+            assert stream.is_connected is True
+        finally:
+            stream.disconnect()
+
+    def test_heartbeat_emitted_on_first_packet(self):
+        port = _find_free_port()
+        stream = MetaQuestHandStream("test", port=port)
+        events = []
+        stream.on_health(lambda e: events.append(e))
+
+        stream.connect()
+        try:
+            _send_packet(port, _make_quest3_packet())
+            time.sleep(0.2)
+        finally:
+            stream.disconnect()
+
+        kinds = [e.kind.value for e in events]
+        assert "heartbeat" in kinds
+
+    def test_drop_emitted_after_silence(self):
+        # Shorten timeout so the watchdog fires quickly in tests.
+        port = _find_free_port()
+        stream = MetaQuestHandStream("test", port=port)
+        stream.CONNECTION_TIMEOUT_S = 0.3  # override at instance level
+        events = []
+        stream.on_health(lambda e: events.append(e))
+
+        stream.connect()
+        try:
+            # Mark the stream connected, then let the receive loop's
+            # 1-second socket timeout fire once with no further packets.
+            _send_packet(port, _make_quest3_packet())
+            time.sleep(0.2)
+            assert stream.is_connected is True
+            # Wait long enough for silence to exceed CONNECTION_TIMEOUT_S
+            # and for at least one recv timeout tick (socket timeout = 1.0s).
+            time.sleep(1.5)
+        finally:
+            stream.disconnect()
+
+        kinds = [e.kind.value for e in events]
+        assert "drop" in kinds, f"expected drop in {kinds}"
+
+    def test_reconnect_emitted_after_drop_resumes(self):
+        port = _find_free_port()
+        stream = MetaQuestHandStream("test", port=port)
+        stream.CONNECTION_TIMEOUT_S = 0.3
+        events = []
+        stream.on_health(lambda e: events.append(e))
+
+        stream.connect()
+        try:
+            _send_packet(port, _make_quest3_packet())
+            time.sleep(0.2)
+            time.sleep(1.5)  # allow drop to fire
+            _send_packet(port, _make_quest3_packet())
+            time.sleep(0.2)
+        finally:
+            stream.disconnect()
+
+        kinds = [e.kind.value for e in events]
+        assert "drop" in kinds
+        assert "reconnect" in kinds
+        assert kinds.index("reconnect") > kinds.index("drop")
+
+
 def _find_free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
         s.bind(("127.0.0.1", 0))

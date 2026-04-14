@@ -119,6 +119,12 @@ class MetaQuestHandStream(StreamBase):
     BUFFER_SIZE = 65536
     CONNECTION_TIMEOUT_S = 2.0
 
+    # Samples arrive via WiFi UDP from a remote Quest device, so they do
+    # not share the host monotonic clock domain. Tag them separately so
+    # downstream sync tooling can account for the wireless jitter.
+    CLOCK_DOMAIN = "remote_quest3"
+    UNCERTAINTY_NS = 10_000_000  # 10 ms — typical WiFi jitter budget
+
     _discovery_kind = "sensor"
     _discovery_adapter_type = "meta_quest"
 
@@ -152,7 +158,11 @@ class MetaQuestHandStream(StreamBase):
         self._first_at: Optional[int] = None
         self._last_at: Optional[int] = None
         self._consecutive_errors = 0
-        self._last_packet_mono = 0.0
+        self._last_packet_mono: float = 0.0
+        # "waiting"  = socket is up, no packet has ever been received yet
+        # "connected" = a packet arrived within CONNECTION_TIMEOUT_S
+        # "lost"     = had packets, none for > CONNECTION_TIMEOUT_S (DROP emitted)
+        self._connection_state: str = "waiting"
 
     # ------------------------------------------------------------------
     # 4-phase lifecycle
@@ -168,6 +178,8 @@ class MetaQuestHandStream(StreamBase):
         self._first_at = None
         self._last_at = None
         self._consecutive_errors = 0
+        self._last_packet_mono = 0.0
+        self._connection_state = "waiting"
 
         self._create_socket()
         self._receive_thread = threading.Thread(
@@ -248,6 +260,22 @@ class MetaQuestHandStream(StreamBase):
         self._socket.bind((self._host, self._port))
         self._socket.settimeout(1.0)
 
+    @property
+    def is_connected(self) -> bool:
+        """True when a packet has arrived within ``CONNECTION_TIMEOUT_S``.
+
+        Mirrors the recorder's ``is_connected`` semantics: the socket
+        being open is not enough — the Quest must actually be streaming.
+        Callers can poll this from any thread; it reads a float that
+        CPython updates atomically.
+        """
+        if self._last_packet_mono == 0.0:
+            return False
+        return (
+            time.monotonic() - self._last_packet_mono
+            <= self.CONNECTION_TIMEOUT_S
+        )
+
     def _receive_loop(self) -> None:
         while not self._stop_event.is_set():
             if self._socket is None:
@@ -256,10 +284,28 @@ class MetaQuestHandStream(StreamBase):
                 data, _ = self._socket.recvfrom(self.BUFFER_SIZE)
                 self._process_packet(data)
             except TimeoutError:
+                # The 1-second recv timeout doubles as a watchdog tick —
+                # use it to notice when the Quest has stopped streaming.
+                self._check_connection_timeout()
                 continue
             except Exception as exc:
                 if not self._stop_event.is_set():
                     self._handle_socket_error(exc)
+
+    def _check_connection_timeout(self) -> None:
+        """Emit DROP if we had packets and now haven't seen one for > timeout."""
+        if self._connection_state != "connected":
+            return
+        if self._last_packet_mono == 0.0:
+            return
+        silence_s = time.monotonic() - self._last_packet_mono
+        if silence_s > self.CONNECTION_TIMEOUT_S:
+            self._connection_state = "lost"
+            self._emit_health(HealthEvent(
+                self.id, HealthEventKind.DROP,
+                time.monotonic_ns(),
+                f"No packet for {silence_s:.1f}s (timeout {self.CONNECTION_TIMEOUT_S}s)",
+            ))
 
     def _handle_socket_error(self, error: Exception) -> None:
         self._consecutive_errors += 1
@@ -292,6 +338,7 @@ class MetaQuestHandStream(StreamBase):
 
         self._last_packet_mono = time.monotonic()
         self._consecutive_errors = 0
+        self._update_connection_state_on_packet(capture_ns)
 
         # Build channels from packet
         channels = self._parse_channels(packet)
@@ -307,6 +354,25 @@ class MetaQuestHandStream(StreamBase):
                 frame_number=frame_number,
                 capture_ns=capture_ns,
                 channels=channels,
+                uncertainty_ns=self.UNCERTAINTY_NS,
+                clock_domain=self.CLOCK_DOMAIN,
+            ))
+
+    def _update_connection_state_on_packet(self, at_ns: int) -> None:
+        """Emit HEARTBEAT on first packet, RECONNECT after a drop."""
+        prev = self._connection_state
+        if prev == "connected":
+            return
+        self._connection_state = "connected"
+        if prev == "waiting":
+            self._emit_health(HealthEvent(
+                self.id, HealthEventKind.HEARTBEAT,
+                at_ns, "First Quest 3 packet received",
+            ))
+        elif prev == "lost":
+            self._emit_health(HealthEvent(
+                self.id, HealthEventKind.RECONNECT,
+                at_ns, "Quest 3 packet stream resumed",
             ))
 
     def _parse_channels(self, packet: Dict[str, Any]) -> Dict[str, Any]:

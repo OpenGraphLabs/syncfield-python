@@ -2094,6 +2094,7 @@ class SessionOrchestrator:
             if not active[0]:
                 return
             try:
+                clock_domain = event.clock_domain or host_id
                 if isinstance(writer, SensorWriter):
                     writer.write(
                         SensorSample(
@@ -2101,7 +2102,7 @@ class SessionOrchestrator:
                             capture_ns=event.capture_ns,
                             channels=event.channels or {},
                             clock_source="host_monotonic",
-                            clock_domain=host_id,
+                            clock_domain=clock_domain,
                             uncertainty_ns=event.uncertainty_ns,
                         )
                     )
@@ -2111,7 +2112,7 @@ class SessionOrchestrator:
                             frame_number=event.frame_number,
                             capture_ns=event.capture_ns,
                             clock_source="host_monotonic",
-                            clock_domain=host_id,
+                            clock_domain=clock_domain,
                             uncertainty_ns=event.uncertainty_ns,
                         )
                     )

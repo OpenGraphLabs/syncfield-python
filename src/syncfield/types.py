@@ -257,13 +257,21 @@ class HealthEvent:
 
 @dataclass(frozen=True)
 class SampleEvent:
-    """A stream reports a sample (timestamp + optional channels) to the orchestrator."""
+    """A stream reports a sample (timestamp + optional channels) to the orchestrator.
+
+    ``clock_domain`` lets an adapter override the default host clock domain
+    when the timestamp's *origin* is a remote device rather than the local
+    monotonic clock (e.g. a Meta Quest streaming poses over WiFi). Leaving
+    it ``None`` — the common case for on-host captures — makes the
+    orchestrator stamp the host's id so all local streams share one domain.
+    """
 
     stream_id: str
     frame_number: int
     capture_ns: int
     channels: dict[str, "ChannelValue"] | None = None
     uncertainty_ns: int = 5_000_000
+    clock_domain: str | None = None
 
 
 @dataclass
