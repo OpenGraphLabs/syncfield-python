@@ -91,13 +91,21 @@ class FollowerRole:
             labs where the operator does not want to type an id.
         leader_wait_timeout_sec: Maximum time
             :meth:`SessionOrchestrator.start` blocks waiting for a
-            leader to reach ``status="recording"``. Default ``60`` s —
-            enough for a human operator to start the leader after the
-            follower without rushing.
+            leader to reach ``status="recording"``. Default ``3600`` s
+            (1 hour) — matches :meth:`wait_for_leader_stopped`'s
+            timeout and covers interactive multi-machine workflows
+            where the operator walks between hosts, connects devices
+            in the leader viewer, and clicks Record at their own pace.
+            A tighter bound (e.g. ``60`` s) was previously the default
+            but kept biting operators mid-setup: the follower would
+            exit before Record was ever pressed, and the leader's
+            cluster panel then flipped the follower to ``unreachable``
+            when the follower process died. Tests can still pass a
+            short value explicitly to fail fast.
     """
 
     session_id: Optional[str] = None
-    leader_wait_timeout_sec: float = 60.0
+    leader_wait_timeout_sec: float = 3600.0
 
     #: TCP port the control plane will prefer when it binds. ``7878``
     #: matches ``syncfield.multihost.control_plane.DEFAULT_CONTROL_PLANE_PORT``

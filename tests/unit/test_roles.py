@@ -53,7 +53,7 @@ class TestFollowerRole:
         assert FollowerRole().kind == "follower"
 
     def test_default_wait_timeout(self):
-        assert FollowerRole().leader_wait_timeout_sec == 60.0
+        assert FollowerRole().leader_wait_timeout_sec == 3600.0
 
     def test_wait_timeout_override(self):
         assert FollowerRole(leader_wait_timeout_sec=5.0).leader_wait_timeout_sec == 5.0
