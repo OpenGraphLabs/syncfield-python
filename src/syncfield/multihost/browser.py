@@ -70,6 +70,16 @@ class SessionBrowser:
             the operator doesn't want to enter a session id by hand.
     """
 
+    #: Seconds between periodic re-resolutions of every known session.
+    #: python-zeroconf's ``update_service`` listener callback is
+    #: unreliable on macOS (mDNSResponder contends with python-zeroconf
+    #: for unicast SRV/TXT replies), so we can't depend on it firing
+    #: when the leader flips its advertised status from ``"preparing"``
+    #: to ``"recording"``. The poll loop re-runs :meth:`_refresh` for
+    #: every known announcement on an interval so the dns-sd fallback
+    #: picks up the current TXT record from mDNSResponder's own cache.
+    _POLL_INTERVAL_SEC = 1.0
+
     def __init__(self, session_id: Optional[str] = None) -> None:
         self._session_id_filter = session_id
         self._zc: Any = None
@@ -77,6 +87,8 @@ class SessionBrowser:
         self._sessions: Dict[str, SessionAnnouncement] = {}
         self._lock = threading.Lock()
         self._update_event = threading.Condition(self._lock)
+        self._poll_thread: Optional[threading.Thread] = None
+        self._poll_stop = threading.Event()
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -95,6 +107,13 @@ class SessionBrowser:
             browser_factory = _get_service_browser_cls()
             self._zc = zc_factory()
             self._browser = browser_factory(self._zc, SERVICE_TYPE, self)
+            self._poll_stop.clear()
+            self._poll_thread = threading.Thread(
+                target=self._poll_loop,
+                name=f"session-browser-poll-{self._session_id_filter or 'any'}",
+                daemon=True,
+            )
+            self._poll_thread.start()
             logger.info(
                 "SessionBrowser started (filter session_id=%s)",
                 self._session_id_filter,
@@ -105,6 +124,9 @@ class SessionBrowser:
 
         Safe to call multiple times — the second call is a no-op.
         """
+        # Signal the poll thread to exit BEFORE we mutate protected state.
+        # The thread blocks on self._poll_stop; setting it unblocks cleanly.
+        self._poll_stop.set()
         with self._lock:
             if self._zc is None:
                 return
@@ -263,6 +285,47 @@ class SessionBrowser:
             self._sessions.pop(name, None)
             self._update_event.notify_all()
         logger.info("SessionBrowser lost peer: %s", name)
+
+    # ------------------------------------------------------------------
+    # Periodic re-resolution loop
+    # ------------------------------------------------------------------
+
+    def _poll_loop(self) -> None:
+        """Periodically re-resolve every known peer.
+
+        Works around python-zeroconf's unreliable ``update_service``
+        callback on macOS: when a leader flips its TXT status from
+        ``"preparing"`` to ``"recording"``, the multicast update often
+        doesn't make it through to python-zeroconf's listener (the
+        OS-level ``mDNSResponder`` intercepts unicast replies). By
+        re-running :meth:`_refresh` on a timer, we force the dns-sd
+        subprocess fallback to query ``mDNSResponder``'s local cache
+        directly — which DID observe the update.
+
+        Runs as a daemon thread spawned from :meth:`start` and exits
+        cleanly when :meth:`close` sets ``self._poll_stop``.
+        """
+        while not self._poll_stop.is_set():
+            # Sleep first so we don't race with the initial add_service
+            # callbacks, which are already handling first resolution.
+            if self._poll_stop.wait(self._POLL_INTERVAL_SEC):
+                return
+
+            with self._lock:
+                zc = self._zc
+                names = list(self._sessions.keys())
+            if zc is None:
+                return
+            for name in names:
+                if self._poll_stop.is_set():
+                    return
+                try:
+                    self._refresh(zc, name)
+                except Exception as exc:  # pragma: no cover - best-effort
+                    logger.debug(
+                        "SessionBrowser poll refresh failed for %s: %s",
+                        name, exc,
+                    )
 
     #: Default ``get_service_info`` timeout, in milliseconds.
     #: zeroconf's listener callbacks fire as soon as the service name

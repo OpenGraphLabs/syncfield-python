@@ -400,6 +400,7 @@ class SessionOrchestrator:
             self._start_control_plane()
             started_control_plane = True
             self._maybe_start_advertising()
+            self._maybe_start_session_browser()
             self._maybe_start_follower_browser_in_background()
         except Exception:
             if self._advertiser is not None:
@@ -682,23 +683,18 @@ class SessionOrchestrator:
         if config is None:
             return  # single-host or follower — nothing to distribute
 
-        # Leaders don't hold a browser during the session — advertiser only.
-        # Bootstrap a short-lived browser here so we can discover followers
-        # that are currently in the 'preparing' phase. Filter on our own
-        # session_id so we only see our cluster.
-        #
-        # Skip the mDNS bootstrap entirely when static peers are set —
-        # :meth:`_discover_followers_in_preparing` short-circuits to the
-        # static list and never touches the browser. This is the macOS
-        # loopback escape hatch; see :meth:`set_static_peers`.
+        # The leader's long-lived browser was started in
+        # :meth:`_bring_multihost_online`; by the time start() runs,
+        # it has usually already resolved any followers that were up
+        # when this process launched. Only bootstrap a short-lived
+        # browser as a fallback if the long-lived one isn't present
+        # (e.g. static-peers mode skips it, but _discover_followers_in_preparing
+        # short-circuits to the static list and never touches the browser).
         leader_owned_browser = False
         if self._browser is None and not self._static_peers:
             self._browser = SessionBrowser(session_id=self.session_id)
             self._browser.start()
             leader_owned_browser = True
-            # Let zeroconf converge; mDNS advertisements re-broadcast
-            # every few seconds by default, so ~1.5s is usually enough
-            # to see every follower that's already up and advertising.
             _time.sleep(1.5)
 
         try:
@@ -2523,34 +2519,59 @@ class SessionOrchestrator:
         )
         self._advertiser.start()
 
-    def _maybe_start_follower_browser_in_background(self) -> None:
-        """Spin up the follower's mDNS browser on a background daemon thread.
+    def _maybe_start_session_browser(self) -> None:
+        """Start a long-lived mDNS browser for any multi-host role.
 
-        Called from :meth:`connect` so the follower can begin watching
-        for the leader the moment its devices are open — well before
-        the operator clicks Record. Critically, this MUST NOT block:
-        :meth:`connect` needs to return quickly so the viewer can
-        render live preview frames. The browser itself runs inside
-        zeroconf's own worker thread; we additionally spawn a tiny
-        observer thread that blocks on :meth:`SessionBrowser.wait_for_observation`
-        with ``timeout=float("inf")``. As soon as any matching leader
-        appears (in any status), the observer thread records it on
+        Leaders and followers both benefit from a persistent browser:
+
+        - Leaders use it so the viewer's cluster panel
+          (``/api/cluster/peers``) can render observed followers
+          immediately, without bootstrapping a fresh browser per poll
+          (which on macOS has to wait for the dns-sd subprocess
+          fallback to resolve SRV/TXT records every call).
+        - Followers use it both for the cluster panel and for the
+          background observer thread spawned by
+          :meth:`_maybe_start_follower_browser_in_background`.
+
+        Filter: leaders know their session_id at construction time, so
+        we scope the browser to it. Auto-discover followers pass
+        ``session_id=None`` and learn it after observation.
+
+        No-op for single-host sessions, and no-op if a browser is
+        already running.
+        """
+        if self._role is None:
+            return
+        if self._browser is not None:
+            return
+        if isinstance(self._role, FollowerRole):
+            filter_session_id = getattr(self._role, "session_id", None)
+        else:
+            filter_session_id = self.session_id
+        browser = SessionBrowser(session_id=filter_session_id)
+        browser.start()
+        self._browser = browser
+
+    def _maybe_start_follower_browser_in_background(self) -> None:
+        """Spawn the follower's background leader-observation thread.
+
+        Called from :meth:`_bring_multihost_online` AFTER
+        :meth:`_maybe_start_session_browser` has created the shared
+        browser. The observer thread blocks on
+        :meth:`SessionBrowser.wait_for_observation` with
+        ``timeout=float("inf")``. As soon as any matching leader
+        appears (in any status), the observer records it on
         :attr:`_observed_leader` and, if this is an auto-discover
         follower that was waiting for a session_id, starts its own
         advertiser so the leader can discover it in return.
 
-        No-op for leaders and single-host sessions, and no-op if the
-        browser is already running (so calling this twice is safe).
+        No-op for leaders and single-host sessions.
         """
         if not isinstance(self._role, FollowerRole):
             return
-        if self._browser is not None:
-            return  # already started by a previous connect() or start() path
-
-        role_session_id = getattr(self._role, "session_id", None)
-        browser = SessionBrowser(session_id=role_session_id)
-        browser.start()
-        self._browser = browser
+        if self._browser is None:
+            return  # _maybe_start_session_browser didn't run — defensive guard
+        browser = self._browser
 
         def _watch_for_leader() -> None:
             # Daemon thread — must never raise into the interpreter top.
@@ -2670,13 +2691,12 @@ class SessionOrchestrator:
             self._observed_leader = self._static_leader
             return
 
-        # Browser was normally started by connect() via
-        # :meth:`_maybe_start_follower_browser_in_background`. Guard
-        # defensively — if someone called start() without connecting
-        # (legacy one-shot path from IDLE) we may already be inside
-        # the auto-connect call that set the browser up; but if a
-        # future code path bypasses connect, start the browser now.
+        # Browser is normally started at construction time via
+        # :meth:`_maybe_start_session_browser`. Guard defensively —
+        # if a future code path skips that, start both the browser
+        # and the observer thread now.
         if self._browser is None:
+            self._maybe_start_session_browser()
             self._maybe_start_follower_browser_in_background()
 
         assert self._browser is not None  # set by the helper above
