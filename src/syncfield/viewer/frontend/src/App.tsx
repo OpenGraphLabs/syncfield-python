@@ -139,6 +139,11 @@ function RecordView({
                   stream={stream}
                   canRemove={canRemove}
                   onRemove={handleRemoveStream}
+                  sessionState={state}
+                  aggregation={snapshot?.aggregation}
+                  onRetryAggregation={(jobId) =>
+                    sendCommand("retry_aggregation", { job_id: jobId })
+                  }
                 />
               ))}
             </div>

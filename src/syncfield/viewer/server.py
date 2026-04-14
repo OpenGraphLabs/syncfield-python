@@ -92,6 +92,11 @@ def snapshot_to_dict(snapshot: SessionSnapshot) -> Dict[str, Any]:
             "produces_file": s.produces_file,
             "health_count": s.health_count,
             "problem_count": problem_count_by_stream.get(sid, 0),
+            "capabilities": {
+                "live_preview": getattr(s, "live_preview", True),
+                "provides_audio_track": s.provides_audio_track,
+                "produces_file": s.produces_file,
+            },
         }
 
     health_log: List[Dict[str, Any]] = []
@@ -1745,6 +1750,16 @@ class ViewerServer:
                     "error": f"Cancel failed: {exc}",
                     "streams": {},
                 })
+        elif action in ("retry_aggregation", "cancel_aggregation", "aggregate_episode"):
+            # Route aggregation control commands through the T14 dispatcher.
+            # The payload uses the same key names expected by handle_control_command
+            # (it reads "command" from the dict), so we normalise here.
+            agg_payload = {**msg, "command": action}
+            result = await asyncio.to_thread(
+                handle_control_command, self._session, agg_payload
+            )
+            if not result.get("ok"):
+                logger.warning("Aggregation command %r failed: %s", action, result.get("error"))
         else:
             logger.warning("Unknown action: %s", action)
 

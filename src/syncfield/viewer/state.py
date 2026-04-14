@@ -80,6 +80,7 @@ class StreamSnapshot:
     latest_frame: Any  # numpy array or None — kept as Any so numpy is optional
     plot_points: Dict[str, Tuple[List[float], List[float]]]
     health_count: int
+    live_preview: bool = True
 
 
 # ---------------------------------------------------------------------------
