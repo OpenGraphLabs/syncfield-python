@@ -128,3 +128,79 @@ def test_stop_recording_raises_when_ble_returns_empty_filepath(fake_ble, fake_qu
     s.start_recording(session_clock=MagicMock())
     with pytest.raises(RuntimeError, match="did not return a file path"):
         s.stop_recording()
+
+
+def test_recovery_scan_picks_up_pending_aggregation(tmp_path, monkeypatch):
+    """A leftover aggregation.json from a prior run is re-enqueued at startup."""
+    import json
+    import time as _time
+    from syncfield.adapters.insta360_go3s.aggregation.types import (
+        AggregationCameraSpec, AggregationJob, AggregationState,
+    )
+
+    # Reset the singleton so the test triggers fresh init.
+    import syncfield.adapters.insta360_go3s.stream as _stream_mod
+    monkeypatch.setattr(_stream_mod, "_QUEUE", None)
+    monkeypatch.setattr(_stream_mod, "_QUEUE_LOOP", None)
+    monkeypatch.setattr(_stream_mod, "_QUEUE_THREAD", None)
+    monkeypatch.setenv("SYNCFIELD_GO3S_RECOVERY_ROOT", str(tmp_path))
+
+    # Plant a pending aggregation manifest.
+    ep_dir = tmp_path / "ep_recover"
+    ep_dir.mkdir()
+    job = AggregationJob(
+        job_id="agg_recover",
+        episode_id="ep_recover",
+        episode_dir=ep_dir,
+        cameras=[AggregationCameraSpec(
+            stream_id="overhead",
+            ble_address="AA:BB",
+            wifi_ssid="Go3S-X.OSC",
+            wifi_password="88888888",
+            sd_path="/DCIM/Camera01/X.mp4",
+            local_filename="overhead.mp4",
+            size_bytes=0,
+        )],
+        state=AggregationState.PENDING,
+    )
+    job.write_manifest()
+
+    # Stub the production downloader so it succeeds without real WiFi.
+    from syncfield.adapters.insta360_go3s.aggregation.queue import (
+        AggregationDownloader,
+    )
+
+    class NoOpDownloader(AggregationDownloader):
+        async def run(self, camera, target_dir, on_chunk):
+            pass  # instant "success"
+
+    monkeypatch.setattr(
+        _stream_mod,
+        "Go3SAggregationDownloader",
+        lambda *args, **kwargs: NoOpDownloader(),
+    )
+    # Stub wifi_switcher_for_platform so init doesn't probe real networks.
+    monkeypatch.setattr(
+        _stream_mod,
+        "wifi_switcher_for_platform",
+        lambda: MagicMock(),
+    )
+
+    from syncfield.adapters.insta360_go3s.stream import _global_aggregation_queue
+    _global_aggregation_queue()
+
+    # Give the worker a moment to drain the recovered job.
+    for _ in range(40):
+        manifest = json.loads((ep_dir / "aggregation.json").read_text())
+        if manifest["state"] == "completed":
+            break
+        _time.sleep(0.05)
+
+    assert manifest["state"] == "completed", (
+        f"recovered job not processed: state={manifest['state']}"
+    )
+
+    # Teardown: reset singleton so later tests start fresh if they need it.
+    monkeypatch.setattr(_stream_mod, "_QUEUE", None)
+    monkeypatch.setattr(_stream_mod, "_QUEUE_LOOP", None)
+    monkeypatch.setattr(_stream_mod, "_QUEUE_THREAD", None)

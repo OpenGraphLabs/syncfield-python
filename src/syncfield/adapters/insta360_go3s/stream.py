@@ -2,11 +2,15 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import os
 import threading
 import time
 from concurrent.futures import Future
 from pathlib import Path
 from typing import Literal, Optional
+
+logger = logging.getLogger(__name__)
 
 from syncfield.clock import SessionClock
 from syncfield.stream import StreamBase
@@ -84,11 +88,34 @@ def _global_aggregation_queue() -> AggregationQueue:
         _QUEUE_LOOP = loop
         _QUEUE_THREAD = thread
         _QUEUE = queue
+
+        # Recover any pending aggregation jobs from prior runs.
+        # Search root is configurable via SYNCFIELD_GO3S_RECOVERY_ROOT;
+        # defaults to current working directory.
+        recovery_root = Path(os.environ.get("SYNCFIELD_GO3S_RECOVERY_ROOT", "."))
+        if recovery_root.exists():
+            try:
+                recovered = queue.recover_from_disk(search_root=recovery_root)
+                for job in recovered:
+                    _enqueue_async_marshalled(queue, job)
+                if recovered:
+                    logger.info(
+                        "Go3S aggregation: recovered %d pending job(s) from %s",
+                        len(recovered), recovery_root,
+                    )
+            except Exception:
+                logger.exception("Go3S aggregation recovery scan failed")
     return _QUEUE
 
 
 async def _enqueue_async(queue: AggregationQueue, job: AggregationJob) -> None:
     queue.enqueue(job)
+
+
+def _enqueue_async_marshalled(queue: AggregationQueue, job: AggregationJob) -> None:
+    """Enqueue from inside the singleton initializer (we know _QUEUE_LOOP is set)."""
+    fut: Future = asyncio.run_coroutine_threadsafe(_enqueue_async(queue, job), _QUEUE_LOOP)
+    fut.result(timeout=5.0)
 
 
 def _enqueue_on_global_queue(job: AggregationJob) -> None:
