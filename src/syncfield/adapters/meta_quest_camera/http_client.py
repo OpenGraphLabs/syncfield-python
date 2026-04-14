@@ -100,6 +100,59 @@ class QuestHttpClient:
         response.raise_for_status()
         return RecordingStopResponse.from_json(response.json())
 
+    def download_file(
+        self,
+        path: str,
+        dest,
+        *,
+        max_retries: int = 3,
+        chunk_size: int = 64 * 1024,
+    ) -> int:
+        """Download a binary resource, streaming to ``dest`` on disk.
+
+        Resumes with ``Range`` headers on transient failure up to
+        ``max_retries`` times. Returns the total number of bytes written.
+        The caller is responsible for verifying the expected size against
+        the value returned by ``/recording/stop``.
+        """
+        from pathlib import Path
+
+        dest = Path(dest)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+
+        written = 0
+        expected_total: Optional[int] = None
+
+        for attempt in range(max_retries):
+            headers = {}
+            mode = "wb"
+            if written > 0:
+                headers["Range"] = f"bytes={written}-"
+                mode = "ab"
+
+            try:
+                with self._client.stream("GET", path, headers=headers) as response:
+                    response.raise_for_status()
+                    if expected_total is None:
+                        cl = response.headers.get("Content-Length")
+                        cr = response.headers.get("Content-Range")
+                        if cr and "/" in cr:
+                            expected_total = int(cr.rsplit("/", 1)[1])
+                        elif cl is not None and written == 0:
+                            expected_total = int(cl)
+                    with open(dest, mode) as fh:
+                        for chunk in response.iter_bytes(chunk_size):
+                            fh.write(chunk)
+                            written += len(chunk)
+                if expected_total is None or written >= expected_total:
+                    return written
+            except httpx.HTTPError:
+                if attempt == max_retries - 1:
+                    raise
+                continue
+
+        return written
+
 
 class RecordingAlreadyActive(RuntimeError):
     """Raised when POST /recording/start returns 409."""
