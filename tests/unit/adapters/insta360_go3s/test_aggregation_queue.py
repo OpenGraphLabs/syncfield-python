@@ -159,3 +159,109 @@ async def test_shutdown_drains_queued_jobs_so_waiters_do_not_hang(tmp_path):
     final2 = await asyncio.wait_for(handle2.wait(), timeout=1.0)
     assert final2.state == AggregationState.FAILED
     assert "shut down" in (final2.error or "")
+
+
+class FakeSwitcher:
+    def __init__(self):
+        self.calls: list[tuple[str, str | None]] = []
+        self._current: str | None = "LabWiFi"
+
+    def current_ssid(self) -> str | None:
+        return self._current
+
+    def connect(self, ssid: str, password: str) -> None:
+        self.calls.append(("connect", ssid))
+        self._current = ssid
+
+    def restore(self, prev_ssid: str | None, prev_password: str | None = None) -> None:
+        self.calls.append(("restore", prev_ssid))
+        self._current = prev_ssid
+
+
+class FakeOscClient:
+    def __init__(self, *, fail_probe: bool = False, fail_download: bool = False):
+        self.fail_probe = fail_probe
+        self.fail_download = fail_download
+        self.downloads: list[tuple[str, Path]] = []
+
+    async def probe(self, *, timeout: float = 5.0):
+        if self.fail_probe:
+            raise RuntimeError("probe failed")
+        from syncfield.adapters.insta360_go3s.wifi.osc_client import OscCameraInfo
+        return OscCameraInfo(manufacturer="Insta360", model="Go 3S", firmware_version="x")
+
+    async def download(self, *, remote_path: str, local_path: Path,
+                       expected_size: int | None = None, on_progress=None,
+                       port_overrides=None) -> None:
+        self.downloads.append((remote_path, local_path))
+        if self.fail_download:
+            raise RuntimeError("download failed")
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        local_path.write_bytes(b"x" * (expected_size or 0))
+        if on_progress:
+            on_progress(expected_size or 0, expected_size or 0)
+
+
+@pytest.mark.asyncio
+async def test_production_downloader_switches_downloads_restores(tmp_path):
+    from syncfield.adapters.insta360_go3s.aggregation.queue import (
+        Go3SAggregationDownloader,
+    )
+
+    sw = FakeSwitcher()
+    osc = FakeOscClient()
+
+    def osc_factory(host: str):
+        return osc
+
+    downloader = Go3SAggregationDownloader(
+        switcher=sw,
+        osc_factory=osc_factory,
+        wait_for_ap_timeout=0.1,
+        ap_probe_attempts=1,
+    )
+    cam = AggregationCameraSpec(
+        stream_id="overhead",
+        ble_address="AA:BB",
+        wifi_ssid="Go3S-CAFEBABE.OSC",
+        wifi_password="88888888",
+        sd_path="/DCIM/Camera01/VID.mp4",
+        local_filename="overhead.mp4",
+        size_bytes=12,
+    )
+    progress: list[tuple[str, int, int]] = []
+    await downloader.run(cam, tmp_path, lambda sid, d, t: progress.append((sid, d, t)))
+
+    assert sw.calls == [("connect", "Go3S-CAFEBABE.OSC"), ("restore", "LabWiFi")]
+    assert (tmp_path / "overhead.mp4").exists()
+    assert progress[-1] == ("overhead", 12, 12)
+
+
+@pytest.mark.asyncio
+async def test_production_downloader_restores_wifi_even_on_failure(tmp_path):
+    from syncfield.adapters.insta360_go3s.aggregation.queue import (
+        Go3SAggregationDownloader,
+    )
+
+    sw = FakeSwitcher()
+    osc = FakeOscClient(fail_download=True)
+
+    downloader = Go3SAggregationDownloader(
+        switcher=sw,
+        osc_factory=lambda host: osc,
+        wait_for_ap_timeout=0.1,
+        ap_probe_attempts=1,
+    )
+    cam = AggregationCameraSpec(
+        stream_id="overhead",
+        ble_address="AA:BB",
+        wifi_ssid="Go3S-CAFEBABE.OSC",
+        wifi_password="88888888",
+        sd_path="/DCIM/Camera01/VID.mp4",
+        local_filename="overhead.mp4",
+        size_bytes=12,
+    )
+    with pytest.raises(RuntimeError):
+        await downloader.run(cam, tmp_path, lambda *args: None)
+    # Restore must still be called
+    assert ("restore", "LabWiFi") in sw.calls
