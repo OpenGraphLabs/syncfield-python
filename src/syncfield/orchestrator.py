@@ -1657,9 +1657,19 @@ class SessionOrchestrator:
             # Multi-host: wait for leader BEFORE touching the
             # filesystem, so an auto-discover follower never mkdirs
             # the `_pending_session` placeholder path.
-            self._transition(SessionState.PREPARING)
+            #
+            # State stays CONNECTED through the (potentially minutes-
+            # long) _maybe_wait_for_leader block — a follower sitting
+            # idle with its devices open and its control plane up is
+            # semantically "ready", not "preparing". Only once the
+            # leader flips to recording do we transition to PREPARING
+            # for the actual pre-record work (config fetch, stream
+            # start, chirp). Leaders also go CONNECTED→PREPARING here,
+            # but since _maybe_wait_for_leader is a no-op on the leader
+            # path the transition is effectively immediate.
             try:
                 self._maybe_wait_for_leader()
+                self._transition(SessionState.PREPARING)
                 self._rewrite_output_dir_for_observed_session()
                 self._maybe_start_follower_advertising_post_observation()
                 self._fetch_config_from_leader()
