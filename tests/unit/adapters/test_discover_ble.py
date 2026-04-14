@@ -136,10 +136,10 @@ class TestBLEImuDiscover:
         assert all(d.accepts_output_dir is False for d in devices)
         assert all(d.kind == "sensor" for d in devices)
 
-    def test_all_devices_carry_warning(self, mock_bleak):
+    def test_all_devices_carry_profile_warning(self, mock_bleak):
         """Every generic BLE peripheral should be flagged as needing a
-        characteristic_uuid — that's what causes scan_and_add to skip
-        them so users get a clear INFO log."""
+        BLEImuProfile — that's what causes scan_and_add to skip them so
+        users get a clear INFO log."""
         from syncfield.adapters.ble_imu import BLEImuGenericStream
 
         with patch(
@@ -149,7 +149,39 @@ class TestBLEImuDiscover:
             (device,) = BLEImuGenericStream.discover()
 
         assert len(device.warnings) == 1
-        assert "characteristic_uuid" in device.warnings[0]
+        assert "BLEImuProfile" in device.warnings[0]
+
+    def test_discovered_device_carries_address_in_construct_kwargs(
+        self, mock_bleak
+    ):
+        from syncfield.adapters.ble_imu import BLEImuGenericStream
+
+        with patch(
+            "syncfield.discovery._ble.scan_peripherals",
+            return_value=[_peripheral("Some Sensor", "11:22:33:44:55:66")],
+        ):
+            (device,) = BLEImuGenericStream.discover()
+
+        assert device.construct_kwargs == {"address": "11:22:33:44:55:66"}
+
+    def test_wit_family_names_are_excluded(self, mock_bleak):
+        """WiT WT9xx / WT8xx / HWT9xx / HWT8xx don't belong to the
+        generic adapter — they have their own profile presets and
+        should surface via a device-family-specific discovery path."""
+        from syncfield.adapters.ble_imu import BLEImuGenericStream
+
+        scan_result = [
+            _peripheral("WT901BLE68", "AA:01"),
+            _peripheral("HWT9011-DCL", "AA:02"),
+            _peripheral("Nordic Thingy", "AA:03"),
+        ]
+        with patch(
+            "syncfield.discovery._ble.scan_peripherals", return_value=scan_result
+        ):
+            devices = BLEImuGenericStream.discover()
+
+        names = {d.display_name for d in devices}
+        assert names == {"Nordic Thingy"}
 
     def test_unnamed_peripheral_gets_fallback_label(self, mock_bleak):
         from syncfield.adapters.ble_imu import BLEImuGenericStream

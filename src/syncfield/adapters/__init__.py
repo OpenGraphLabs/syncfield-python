@@ -76,8 +76,18 @@ except ImportError:
     pass
 
 try:
-    from syncfield.adapters.ble_imu import BLEImuGenericStream  # noqa: F401
-    __all__.append("BLEImuGenericStream")
+    from syncfield.adapters.ble_imu import (  # noqa: F401
+        BLEImuGenericStream,
+        BLEImuProfile,
+        ChannelSpec,
+        ConfigWrite,
+    )
+    __all__ += [
+        "BLEImuGenericStream",
+        "BLEImuProfile",
+        "ChannelSpec",
+        "ConfigWrite",
+    ]
     _safe_register(BLEImuGenericStream)
 except ImportError:
     pass
