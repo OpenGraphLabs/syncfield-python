@@ -307,10 +307,10 @@ class Go3SAggregationDownloader(AggregationDownloader):
                 )
 
     async def _wait_for_ap(self) -> None:
-        deadline = asyncio.get_event_loop().time() + self._wait_for_ap_timeout
+        deadline = asyncio.get_running_loop().time() + self._wait_for_ap_timeout
         last_error: Exception | None = None
         for _ in range(self._ap_probe_attempts):
-            if asyncio.get_event_loop().time() > deadline:
+            if asyncio.get_running_loop().time() > deadline:
                 break
             try:
                 osc = self._osc_factory(self._ap_host)

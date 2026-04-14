@@ -289,7 +289,7 @@ class Go3SBLECamera:
         assert self._client is not None, "Not connected"
 
         seq = self._next_seq()
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         fut: asyncio.Future = loop.create_future()
         self._pending_acks[seq] = fut
 
