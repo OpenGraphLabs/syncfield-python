@@ -244,6 +244,7 @@ type DerivedState =
   | "ready"
   | "stopped"
   | "idle"
+  | "resolving"
   | "unreachable";
 
 const STATE_DOT: Record<DerivedState, string> = {
@@ -252,6 +253,7 @@ const STATE_DOT: Record<DerivedState, string> = {
   ready: "bg-success",
   stopped: "bg-muted",
   idle: "bg-muted",
+  resolving: "bg-muted animate-pulse",
   unreachable: "bg-destructive",
 };
 
@@ -261,6 +263,7 @@ const STATE_LABEL: Record<DerivedState, string> = {
   ready: "ready",
   stopped: "stopped",
   idle: "idle",
+  resolving: "resolving…",
   unreachable: "unreachable",
 };
 
@@ -303,11 +306,14 @@ export function derivePeerState(
     }
   }
 
-  // Fall back to the mDNS advert.
+  // Fall back to the mDNS advert, including the server-synthesised
+  // "resolving" status emitted for peers seen via PTR but not yet
+  // resolved via SRV/TXT.
   const advert = peer.status;
   if (advert === "recording") return "recording";
   if (advert === "preparing") return "preparing";
   if (advert === "stopped") return "stopped";
+  if (advert === "resolving") return "resolving";
   return "idle";
 }
 

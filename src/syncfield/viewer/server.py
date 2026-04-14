@@ -418,7 +418,10 @@ class ViewerServer:
             announcements = await asyncio.to_thread(
                 self._snapshot_peer_announcements
             )
-            peers = self._build_peer_list(announcements)
+            pending_host_ids = await asyncio.to_thread(
+                self._snapshot_pending_host_ids
+            )
+            peers = self._build_peer_list(announcements, pending_host_ids)
             return JSONResponse({
                 "session_id": orch.session_id,
                 "self_host_id": orch.host_id,
@@ -644,7 +647,42 @@ class ViewerServer:
             except Exception:
                 logger.debug("SessionBrowser close raised", exc_info=True)
 
-    def _build_peer_list(self, announcements: List[Any]) -> List[Dict[str, Any]]:
+    def _snapshot_pending_host_ids(self) -> List[str]:
+        """Return the host_ids of peers whose TXT is still resolving.
+
+        Parses ``<session_id>--<host_id>`` from the mDNS instance names
+        the orchestrator's browser has seen via PTR but not yet resolved
+        via SRV/TXT. Used by ``/api/cluster/peers`` so the UI shows a
+        "resolving…" row the moment the peer appears on the network,
+        instead of waiting for the dns-sd fallback to complete.
+        """
+        orch = self._session
+        browser = getattr(orch, "_browser", None)
+        if browser is None:
+            return []
+        try:
+            names = browser.pending_peer_names()
+        except AttributeError:
+            return []  # older browser without pending tracking
+        except Exception:
+            logger.debug("pending_peer_names failed", exc_info=True)
+            return []
+
+        host_ids: List[str] = []
+        for name in names:
+            instance = name.split(".", 1)[0]
+            # Format: "<session_id>--<host_id>"
+            if "--" in instance:
+                host_ids.append(instance.split("--", 1)[1])
+            else:
+                host_ids.append(instance)
+        return host_ids
+
+    def _build_peer_list(
+        self,
+        announcements: List[Any],
+        pending_host_ids: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
         """Assemble the peer list response (self + other announcements).
 
         Per the endpoint contract, role derivation is pragmatic:
@@ -693,6 +731,29 @@ class ViewerServer:
                 "chirp_enabled": ann.chirp_enabled,
                 "control_plane_port": ann.control_plane_port,
                 "resolved_address": ann.resolved_address,
+                "is_self": False,
+                "reachable": None,
+            })
+
+        # Tentative entries for peers the browser has seen via PTR but
+        # hasn't finished resolving (mDNS SRV/TXT can take several
+        # seconds cross-network). Surfacing them as "resolving" lets
+        # the operator see that the peer IS on the way — previously
+        # the UI showed "no peers discovered" until full resolution.
+        for host_id in pending_host_ids or []:
+            if host_id in seen_host_ids:
+                continue
+            seen_host_ids.add(host_id)
+            peers.append({
+                "host_id": host_id,
+                "role": "follower"
+                if self_role_kind == "leader"
+                else "follower",
+                "status": "resolving",
+                "sdk_version": "",
+                "chirp_enabled": False,
+                "control_plane_port": None,
+                "resolved_address": None,
                 "is_self": False,
                 "reachable": None,
             })

@@ -85,6 +85,18 @@ class SessionBrowser:
         self._zc: Any = None
         self._browser: Any = None
         self._sessions: Dict[str, SessionAnnouncement] = {}
+        # Names whose PTR record was observed (via ``add_service`` /
+        # ``update_service``) but whose SRV/TXT has not yet been
+        # successfully resolved. Tracked separately from ``_sessions``
+        # so:
+        #   1) :meth:`_poll_loop` can retry these at the poll interval,
+        #      whereas previously it iterated ``_sessions.keys()`` only
+        #      and a peer that never resolved was never retried.
+        #   2) :meth:`pending_peer_names` can surface them to the UI
+        #      as tentative entries ("resolving…") — the viewer's
+        #      cluster panel shows them immediately on PTR observation
+        #      instead of waiting for the full TXT resolution.
+        self._pending_names: set[str] = set()
         self._lock = threading.Lock()
         self._update_event = threading.Condition(self._lock)
         self._poll_thread: Optional[threading.Thread] = None
@@ -274,6 +286,15 @@ class SessionBrowser:
 
     def add_service(self, zc: Any, type_: str, name: str) -> None:
         logger.info("SessionBrowser add_service callback: %s", name)
+        # Register as pending immediately so the UI + poll loop know
+        # about the peer before TXT resolution completes. Only peers
+        # that pass the session-id prefix filter matter; the filter is
+        # re-checked inside :meth:`_refresh` as the single source of
+        # truth so we don't duplicate it here.
+        with self._update_event:
+            if self._pending_matches_filter(name):
+                self._pending_names.add(name)
+                self._update_event.notify_all()
         self._refresh(zc, name)
 
     def update_service(self, zc: Any, type_: str, name: str) -> None:
@@ -283,8 +304,35 @@ class SessionBrowser:
     def remove_service(self, zc: Any, type_: str, name: str) -> None:
         with self._update_event:
             self._sessions.pop(name, None)
+            self._pending_names.discard(name)
             self._update_event.notify_all()
         logger.info("SessionBrowser lost peer: %s", name)
+
+    def _pending_matches_filter(self, name: str) -> bool:
+        """Check the same session-id prefix filter ``_refresh`` uses.
+
+        Peers in other sessions are ignored entirely — we don't want
+        them cluttering the pending set or the cluster panel.
+        """
+        if self._session_id_filter is None:
+            return True
+        instance = name.split(".", 1)[0]
+        return (
+            instance == self._session_id_filter
+            or instance.startswith(self._session_id_filter + "--")
+        )
+
+    def pending_peer_names(self) -> List[str]:
+        """Return full mDNS instance names of peers whose TXT is still resolving.
+
+        Used by the viewer's ``/api/cluster/peers`` endpoint to render
+        a tentative "resolving…" row the moment a PTR record is
+        observed, so the operator sees the peer is on the way instead
+        of staring at a "no peers discovered yet" list while the dns-sd
+        fallback grinds through cross-network SRV/TXT lookups.
+        """
+        with self._lock:
+            return [n for n in self._pending_names if n not in self._sessions]
 
     # ------------------------------------------------------------------
     # Periodic re-resolution loop
@@ -313,7 +361,11 @@ class SessionBrowser:
 
             with self._lock:
                 zc = self._zc
-                names = list(self._sessions.keys())
+                # Iterate BOTH resolved and pending peers. Previously we
+                # only retried ``_sessions.keys()``, which meant a peer
+                # whose first resolution failed (common on flaky WiFi)
+                # was never re-attempted and stayed invisible forever.
+                names = list(self._sessions.keys() | self._pending_names)
             if zc is None:
                 return
             for name in names:
@@ -327,13 +379,27 @@ class SessionBrowser:
                         name, exc,
                     )
 
-    #: Default ``get_service_info`` timeout, in milliseconds.
-    #: zeroconf's listener callbacks fire as soon as the service name
-    #: is known, sometimes before the TXT record has been fully
-    #: resolved. Passing an explicit timeout tells zeroconf to wait
-    #: for the full resolution before returning, which is what we
-    #: want so the browser never sees a half-populated announcement.
+    #: ``get_service_info`` timeout on non-macOS platforms, in
+    #: milliseconds. zeroconf's listener callbacks fire as soon as the
+    #: service name is known, sometimes before the TXT record has
+    #: been fully resolved — waiting here gives the full resolution a
+    #: chance before we return.
     _GET_INFO_TIMEOUT_MS = 5000
+
+    #: ``get_service_info`` timeout on macOS. Shorter because macOS's
+    #: mDNSResponder owns port 5353 and usually intercepts the unicast
+    #: SRV/TXT replies zeroconf is waiting on, so zeroconf almost
+    #: always returns None anyway. Waiting the full 5 s on every peer
+    #: just blocks the poll loop — drop straight to the dns-sd
+    #: subprocess fallback after 1.5 s instead.
+    _GET_INFO_TIMEOUT_MS_DARWIN = 1500
+
+    #: Timeout for the macOS ``dns-sd -L`` subprocess fallback, in
+    #: seconds. Bumped from 5 s to give cross-network SRV/TXT queries
+    #: room on slower WiFi — the 5 s ceiling was making the fallback
+    #: consistently fail for a peer on a different machine even though
+    #: mDNSResponder eventually had the data.
+    _DNS_SD_FALLBACK_TIMEOUT_SEC = 10.0
 
     def _refresh(self, zc: Any, name: str) -> None:
         """Re-fetch the TXT record for *name* and update ``_sessions``.
@@ -366,10 +432,22 @@ class SessionBrowser:
             ):
                 return
         logger.debug("_refresh: invoked for %s", name)
+
+        from syncfield.multihost._dns_sd_fallback import (
+            is_macos,
+            resolve_via_dns_sd,
+        )
+        macos = is_macos()
+        zc_timeout_ms = (
+            self._GET_INFO_TIMEOUT_MS_DARWIN
+            if macos
+            else self._GET_INFO_TIMEOUT_MS
+        )
+
         try:
             try:
                 info = zc.get_service_info(
-                    SERVICE_TYPE, name, timeout=self._GET_INFO_TIMEOUT_MS
+                    SERVICE_TYPE, name, timeout=zc_timeout_ms
                 )
             except TypeError:
                 # Fake backends in unit tests don't accept timeout —
@@ -378,19 +456,23 @@ class SessionBrowser:
                 info = zc.get_service_info(SERVICE_TYPE, name)
         except Exception as exc:  # pragma: no cover - best-effort
             logger.warning("get_service_info failed for %s: %s", name, exc)
-            return
+            info = None
 
-        if info is None:
-            # Retry once — same-machine mDNS resolution often races on
-            # first call, especially on macOS loopback.
+        # Skip the zeroconf retry on macOS: mDNSResponder intercepts
+        # unicast replies so retrying zeroconf's own query just burns
+        # more timeout budget with the same None result. Go straight
+        # to the dns-sd fallback (which talks to mDNSResponder's cache
+        # directly). Non-macOS platforms keep the legacy retry.
+        if info is None and not macos:
             logger.warning(
-                "_refresh: first get_service_info returned None for %s; retrying...",
+                "_refresh: first get_service_info returned None for %s; "
+                "retrying...",
                 name,
             )
             try:
                 try:
                     info = zc.get_service_info(
-                        SERVICE_TYPE, name, timeout=self._GET_INFO_TIMEOUT_MS
+                        SERVICE_TYPE, name, timeout=zc_timeout_ms
                     )
                 except TypeError:
                     info = zc.get_service_info(SERVICE_TYPE, name)
@@ -398,25 +480,24 @@ class SessionBrowser:
                 logger.warning(
                     "get_service_info retry failed for %s: %s", name, exc
                 )
-                return
+                info = None
 
         if info is None or not getattr(info, "properties", None):
-            # macOS fallback: try the system dns-sd before giving up.
-            from syncfield.multihost._dns_sd_fallback import (
-                is_macos,
-                resolve_via_dns_sd,
-            )
-            if is_macos():
-                logger.info(
-                    "_refresh: get_service_info returned None/empty for %s; "
-                    "trying macOS dns-sd fallback...",
+            if macos:
+                logger.debug(
+                    "_refresh: zeroconf returned None/empty for %s; "
+                    "using macOS dns-sd fallback...",
                     name,
                 )
-                info = resolve_via_dns_sd(name, SERVICE_TYPE)
+                info = resolve_via_dns_sd(
+                    name,
+                    SERVICE_TYPE,
+                    timeout=self._DNS_SD_FALLBACK_TIMEOUT_SEC,
+                )
                 if info is None:
-                    logger.warning(
-                        "_refresh: macOS dns-sd fallback also failed for %s — "
-                        "peer not resolved",
+                    logger.debug(
+                        "_refresh: macOS dns-sd fallback did not resolve %s "
+                        "this round; will retry on next poll tick",
                         name,
                     )
                     return
@@ -456,6 +537,8 @@ class SessionBrowser:
         with self._update_event:
             previous = self._sessions.get(name)
             self._sessions[name] = ann
+            # Peer is now fully resolved; drop any pending placeholder.
+            self._pending_names.discard(name)
             self._update_event.notify_all()
         if previous is None:
             logger.info(
