@@ -94,3 +94,36 @@ class TestMjpegPreviewConsumer:
             assert consumer.latest_frame.capture_ns == 200
         finally:
             consumer.stop()
+
+
+class TestMjpegPreviewReconnect:
+    def test_on_health_fires_on_stream_error(self):
+        call_count = {"n": 0}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            call_count["n"] += 1
+            # Return malformed body so the parser raises.
+            return httpx.Response(
+                200,
+                headers={"Content-Type": "multipart/x-mixed-replace; boundary=syncfield"},
+                content=b"--syncfield\r\nContent-Type: image/jpeg\r\n\r\n",
+            )
+
+        events: list[tuple[str, str]] = []
+
+        consumer = MjpegPreviewConsumer(
+            url="http://test/preview/left",
+            boundary=b"syncfield",
+            transport=httpx.MockTransport(handler),
+            decode_jpeg=False,
+            on_health=lambda kind, detail: events.append((kind, detail)),
+        )
+        consumer.start()
+        try:
+            deadline = time.time() + 1.5
+            while time.time() < deadline and not events:
+                time.sleep(0.01)
+        finally:
+            consumer.stop()
+        assert events, "expected at least one health event"
+        assert events[0][0] == "drop"
