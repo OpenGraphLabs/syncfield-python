@@ -44,3 +44,53 @@ class TestMjpegParser:
         data = b"--" + BOUNDARY + b"\r\nContent-Type: image/jpeg\r\n\r\nbody\r\n"
         with pytest.raises(ValueError):
             list(iter_mjpeg_frames(io.BytesIO(data), boundary=BOUNDARY))
+
+
+import time
+
+import httpx
+
+from syncfield.adapters.meta_quest_camera.preview import MjpegPreviewConsumer
+
+
+def _mjpeg_transport(parts: list[bytes]):
+    body = b"".join(parts)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={
+                "Content-Type": "multipart/x-mixed-replace; boundary=syncfield",
+            },
+            content=body,
+        )
+
+    return httpx.MockTransport(handler)
+
+
+class TestMjpegPreviewConsumer:
+    def test_updates_latest_frame(self):
+        # Valid JPEG magic bytes — cv2.imdecode will accept this minimally.
+        # For the unit test we skip decoding and test the raw-bytes path.
+        parts = [_part(b"\xff\xd8ONE\xff\xd9", 100), _part(b"\xff\xd8TWO\xff\xd9", 200)]
+        transport = _mjpeg_transport(parts)
+
+        consumer = MjpegPreviewConsumer(
+            url="http://test/preview/left",
+            boundary=b"syncfield",
+            transport=transport,
+            decode_jpeg=False,  # raw bytes mode for tests
+        )
+        consumer.start()
+        try:
+            # Wait up to 1 s for the consumer to process both frames.
+            deadline = time.time() + 1.0
+            while time.time() < deadline:
+                frame = consumer.latest_frame
+                if frame is not None and frame.capture_ns == 200:
+                    break
+                time.sleep(0.01)
+            assert consumer.latest_frame is not None
+            assert consumer.latest_frame.capture_ns == 200
+        finally:
+            consumer.stop()
