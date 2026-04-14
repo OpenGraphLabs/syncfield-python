@@ -85,13 +85,14 @@ class TestResolveViaDnsSd:
             "x._syncfield._tcp.local.", "_syncfield._tcp.local."
         ) is None
 
-    def test_returns_none_when_hostname_resolution_fails(self, monkeypatch):
+    def test_falls_back_to_hostname_when_ip_resolution_fails(self, monkeypatch):
+        """When socket.gethostbyname + dns-sd -G all fail, we still
+        return success with the .local hostname stored on the value
+        object — httpx + macOS getaddrinfo can resolve it at
+        request time via mDNSResponder."""
         import socket as real_socket
         monkeypatch.setattr(fb.platform, "system", lambda: "Darwin")
 
-        # Each subprocess.Popen call (one for -L, possibly more for -G
-        # IP-fallback variants) needs a fresh fake_proc so readline()
-        # iterators don't leak across invocations.
         def make_fake_proc():
             p = MagicMock()
             p.stdout.readline.side_effect = (
@@ -107,16 +108,22 @@ class TestResolveViaDnsSd:
             fb.socket, "gethostbyname",
             MagicMock(side_effect=real_socket.gaierror("not found")),
         )
-        # inet_aton on parsed IP-from-dns-sd-G also needs to fail so the
-        # full fallback chain returns None.
         monkeypatch.setattr(
             fb.socket, "inet_aton",
             MagicMock(side_effect=OSError("no addr")),
         )
-        assert fb.resolve_via_dns_sd(
+
+        info = fb.resolve_via_dns_sd(
             "lab_session--mac_a._syncfield._tcp.local.",
             "_syncfield._tcp.local.",
-        ) is None
+        )
+        assert info is not None
+        assert info.port == 7878
+        # Empty packed addresses, but hostname-only fallback populates
+        # parsed_addresses() with the .local hostname.
+        assert info._addresses == []
+        assert info.hostname == "testhost.local"
+        assert info.parsed_addresses() == ["testhost.local"]
 
 
 class TestResolvedInfo:

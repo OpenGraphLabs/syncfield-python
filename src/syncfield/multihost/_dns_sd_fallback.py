@@ -33,14 +33,28 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class _ResolvedInfo:
-    """Subset of `zeroconf.ServiceInfo` the browser actually uses."""
+    """Subset of `zeroconf.ServiceInfo` the browser actually uses.
+
+    ``_addresses`` may be empty if hostname-to-IPv4 resolution failed
+    (e.g. on a network where unicast UDP is blocked but mDNS PTR
+    multicast still flows). In that case ``hostname`` carries the
+    .local hostname which httpx + macOS getaddrinfo can resolve at
+    request time via mDNSResponder.
+    """
 
     port: int
     properties: Dict[bytes, bytes]
     _addresses: List[bytes]  # packed IPv4 (4-byte bytes) per address
+    hostname: Optional[str] = None  # normalised .local hostname
 
     def parsed_addresses(self) -> List[str]:
-        return [socket.inet_ntoa(a) for a in self._addresses]
+        ips = [socket.inet_ntoa(a) for a in self._addresses]
+        if ips:
+            return ips
+        # Hostname-only fallback — return the .local hostname so the
+        # browser's resolved_address gets populated with something
+        # httpx can dial.
+        return [self.hostname] if self.hostname else []
 
     @property
     def addresses(self) -> List[bytes]:
@@ -107,27 +121,38 @@ def resolve_via_dns_sd(
             )
             return None
 
-        # Resolve hostname -> IPv4. dns-sd output sometimes carries a
-        # doubled .local suffix when the Mac's HostName is already set
-        # to something ending in .local (e.g. "Jerryui-MacBookPro.local"
-        # → "Jerryui-MacBookPro.local.local."). Try several normalised
-        # variants in order; the first that resolves wins.
+        # Try to resolve the hostname to an IPv4 address. dns-sd output
+        # sometimes carries a doubled .local suffix when the Mac's HostName
+        # is already set to something ending in .local. We attempt several
+        # normalised hostname variants and a dns-sd -G subprocess. If
+        # everything fails, we still return success with the *hostname*
+        # itself stored on the value object — httpx + macOS getaddrinfo
+        # can resolve a .local hostname directly via mDNSResponder, so the
+        # control-plane URLs still work even without a packed IPv4.
+        normalized_hostname = _normalize_hostname(host)
         addr_packed = _resolve_hostname_to_packed_ipv4(host, timeout=timeout)
-        if addr_packed is None:
-            logger.debug(
-                "dns-sd fallback: could not resolve hostname %r to IPv4 "
-                "(tried gethostbyname variants + dns-sd -G)",
-                host,
-            )
-            return None
 
         return _ResolvedInfo(
             port=port,
             properties=txt_props,
-            _addresses=[addr_packed],
+            _addresses=[addr_packed] if addr_packed is not None else [],
+            hostname=normalized_hostname,
         )
     finally:
         _terminate_subprocess(proc)
+
+
+def _normalize_hostname(host: str) -> str:
+    """Return a sensible single-.local hostname for use in URLs.
+
+    dns-sd's ``-L`` output often shows ``host.local.local.`` when the
+    Mac's HostName already ends in ``.local``. macOS httpx /
+    getaddrinfo wants ``host.local`` (single .local, no trailing dot).
+    """
+    raw = host.rstrip(".")
+    while raw.endswith(".local.local"):
+        raw = raw[: -len(".local")]
+    return raw
 
 
 def _hostname_variants(host: str) -> List[str]:
