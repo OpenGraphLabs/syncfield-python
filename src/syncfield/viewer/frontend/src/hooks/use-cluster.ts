@@ -56,8 +56,11 @@ export function useCluster(): UseClusterReturn {
     }
   }, []);
 
-  // Poll /peers + /config every 3s.
+  // Poll /peers + /config every 3s. Skip polling after cluster is known
+  // unavailable (single-host mode returns 409 on every cluster endpoint —
+  // continuing to poll floods the DevTools console with error logs).
   useEffect(() => {
+    if (!available) return;
     let cancelled = false;
     async function tick() {
       if (cancelled) return;
@@ -76,10 +79,11 @@ export function useCluster(): UseClusterReturn {
       cancelled = true;
       clearInterval(timer);
     };
-  }, [fetchJson, refreshTrigger]);
+  }, [fetchJson, refreshTrigger, available]);
 
-  // Poll /health every 1s.
+  // Poll /health every 1s — same single-host skip.
   useEffect(() => {
+    if (!available) return;
     let cancelled = false;
     async function tick() {
       if (cancelled) return;
@@ -92,7 +96,7 @@ export function useCluster(): UseClusterReturn {
       cancelled = true;
       clearInterval(timer);
     };
-  }, [fetchJson, refreshTrigger]);
+  }, [fetchJson, refreshTrigger, available]);
 
   useEffect(
     () => () => {

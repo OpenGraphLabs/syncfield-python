@@ -169,15 +169,38 @@ class MacWifiSwitcher(WifiSwitcher):
                     capture_output=True,
                     text=True,
                     check=False,
-                    timeout=30,
+                    timeout=20,
                 )
             except subprocess.TimeoutExpired:
                 last_diagnostic = (
-                    "`networksetup -setairportnetwork` hung for 30s — likely "
+                    "`networksetup -setairportnetwork` hung for 20s — likely "
                     "waiting for Location permission. Grant it in "
                     "System Settings → Privacy & Security → Location Services."
                 )
                 logger.warning("[MacWifiSwitcher] %s", last_diagnostic)
+                continue
+
+            combined = f"{result.stdout or ''} {result.stderr or ''}"
+
+            # networksetup on modern macOS returns rc=0 even when the join
+            # fails — the real signal is in stdout. Error -3925 / "Failed
+            # to join" indicates the camera's AP is broadcasting but the
+            # association was refused (typical cause: camera WiFi is in
+            # standby — needs the camera screen awake to accept clients).
+            if (
+                "Failed to join" in combined
+                or "-3925" in combined
+                or "could not find" in combined.lower()
+            ):
+                last_diagnostic = (
+                    f"networksetup reported {combined.strip()!r}. "
+                    "The camera's WiFi AP refused the connection. "
+                    "Wake the camera (tap its screen) so WiFi is actively "
+                    "listening, then retry. If that doesn't help, toggle "
+                    "WiFi OFF then ON in the camera settings."
+                )
+                logger.warning("[MacWifiSwitcher] %s", last_diagnostic)
+                time.sleep(1)
                 continue
 
             if result.returncode != 0:
