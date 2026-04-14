@@ -97,6 +97,8 @@ def snapshot_to_dict(snapshot: SessionSnapshot) -> Dict[str, Any]:
                 "live_preview": getattr(s, "live_preview", True),
                 "provides_audio_track": s.provides_audio_track,
                 "produces_file": s.produces_file,
+                "supports_precise_timestamps": getattr(s, "supports_precise_timestamps", False),
+                "is_removable": getattr(s, "is_removable", False),
             },
         }
 
