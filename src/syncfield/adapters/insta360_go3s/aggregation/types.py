@@ -81,6 +81,17 @@ class AggregationJob:
 
 @dataclass
 class AggregationProgress:
+    """Point-in-time aggregation status broadcast to subscribers.
+
+    ``stage`` is a short machine-readable token describing the current
+    step (``"switching_wifi"``, ``"waiting_for_ap"``, ``"probing"``,
+    ``"downloading"``, ``"restoring_wifi"``). It stays in sync with the
+    downloader's phase so the UI can show meaningful feedback even
+    before the first download byte arrives — WiFi switch + DHCP wait can
+    take 10–30 s before any chunk callback fires, and without a stage
+    hint the bar would sit at "0% · 0 B / 0 B" looking stuck.
+    """
+
     job_id: str
     episode_id: str
     state: AggregationState
@@ -89,6 +100,7 @@ class AggregationProgress:
     current_stream_id: Optional[str] = None
     current_bytes: int = 0
     current_total_bytes: int = 0
+    stage: Optional[str] = None
     error: Optional[str] = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -101,5 +113,6 @@ class AggregationProgress:
             "current_stream_id": self.current_stream_id,
             "current_bytes": self.current_bytes,
             "current_total_bytes": self.current_total_bytes,
+            "stage": self.stage,
             "error": self.error,
         }

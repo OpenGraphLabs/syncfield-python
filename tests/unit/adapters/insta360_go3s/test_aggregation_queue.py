@@ -24,7 +24,7 @@ class FakeDownloader(AggregationDownloader):
         self.actions: list[str] = []
 
     async def run(self, camera: AggregationCameraSpec, target_dir: Path,
-                  on_chunk: Any) -> None:
+                  on_chunk: Any, on_stage: Any = None) -> None:
         self.actions.append(f"download:{camera.stream_id}")
         if camera.stream_id in self.fail_on:
             raise RuntimeError(f"injected failure for {camera.stream_id}")
@@ -135,7 +135,7 @@ async def test_shutdown_drains_queued_jobs_so_waiters_do_not_hang(tmp_path):
     may_finish = asyncio.Event()
 
     class SlowDownloader(AggregationDownloader):
-        async def run(self, camera, target_dir, on_chunk):
+        async def run(self, camera, target_dir, on_chunk, on_stage=None):
             started.set()
             await may_finish.wait()
             (target_dir / camera.local_filename).write_bytes(b"x" * 12)

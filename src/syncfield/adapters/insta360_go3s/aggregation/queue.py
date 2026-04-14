@@ -28,6 +28,7 @@ _log = logging.getLogger(__name__)
 
 ProgressListener = Callable[[AggregationProgress], None]
 ChunkCallback = Callable[[str, int, int], None]  # (stream_id, done, total)
+StageCallback = Callable[[str, str], None]  # (stream_id, stage_token)
 
 
 class AggregationDownloader(abc.ABC):
@@ -39,6 +40,7 @@ class AggregationDownloader(abc.ABC):
         camera: AggregationCameraSpec,
         target_dir: Path,
         on_chunk: ChunkCallback,
+        on_stage: Optional[StageCallback] = None,
     ) -> None: ...
 
 
@@ -173,6 +175,10 @@ class AggregationQueue:
         for camera in job.cameras:
             if camera.done:
                 continue
+            # Mutable box so chunk_cb and stage_cb share the latest stage;
+            # otherwise chunk updates would reset stage to None in the UI.
+            stage_box = {"stage": "starting"}
+
             current = AggregationProgress(
                 job_id=job.job_id,
                 episode_id=job.episode_id,
@@ -182,10 +188,13 @@ class AggregationQueue:
                 current_stream_id=camera.stream_id,
                 current_bytes=0,
                 current_total_bytes=camera.size_bytes,
+                stage=stage_box["stage"],
             )
             self._notify(current)
 
-            def chunk_cb(stream_id: str, done: int, total: int, *, _cam=camera) -> None:
+            def chunk_cb(
+                stream_id: str, done: int, total: int, *, _cam=camera,
+            ) -> None:
                 p = AggregationProgress(
                     job_id=job.job_id,
                     episode_id=job.episode_id,
@@ -195,11 +204,31 @@ class AggregationQueue:
                     current_stream_id=_cam.stream_id,
                     current_bytes=done,
                     current_total_bytes=total,
+                    stage=stage_box["stage"],
+                )
+                self._notify(p)
+
+            def stage_cb(
+                stream_id: str, stage: str, *, _cam=camera,
+            ) -> None:
+                stage_box["stage"] = stage
+                p = AggregationProgress(
+                    job_id=job.job_id,
+                    episode_id=job.episode_id,
+                    state=AggregationState.RUNNING,
+                    cameras_total=len(job.cameras),
+                    cameras_done=sum(1 for c in job.cameras if c.done),
+                    current_stream_id=_cam.stream_id,
+                    current_bytes=0,
+                    current_total_bytes=0,
+                    stage=stage,
                 )
                 self._notify(p)
 
             try:
-                await self._downloader.run(camera, job.episode_dir, chunk_cb)
+                await self._downloader.run(
+                    camera, job.episode_dir, chunk_cb, on_stage=stage_cb,
+                )
                 camera.done = True
                 camera.error = None
             except Exception as e:
@@ -282,15 +311,25 @@ class Go3SAggregationDownloader(AggregationDownloader):
         camera: AggregationCameraSpec,
         target_dir: Path,
         on_chunk: ChunkCallback,
+        on_stage: Optional[StageCallback] = None,
     ) -> None:
         _log.info(
             "[aggregation] begin: stream=%s ssid=%r sd=%r",
             camera.stream_id, camera.wifi_ssid, camera.sd_path,
         )
+
+        def stage(tok: str) -> None:
+            if on_stage is not None:
+                try:
+                    on_stage(camera.stream_id, tok)
+                except Exception:
+                    pass
+
         prev_ssid = self._switcher.current_ssid()
         _log.info("[aggregation] prev_ssid=%r", prev_ssid)
         try:
             _log.info("[aggregation] step 1/4: switching WiFi to %r", camera.wifi_ssid)
+            stage("switching_wifi")
             # WiFi switching is synchronous (subprocess); run it off the
             # queue's asyncio loop so we don't block progress callbacks
             # from other jobs that might arrive concurrently.
@@ -300,12 +339,14 @@ class Go3SAggregationDownloader(AggregationDownloader):
                 camera.wifi_password,
             )
             _log.info("[aggregation] step 2/4: probing camera at %s", self._ap_host)
+            stage("probing")
             osc = await self._wait_for_ap()  # returns the probed client
             local_path = target_dir / camera.local_filename
             _log.info(
                 "[aggregation] step 3/4: downloading %s -> %s",
                 camera.sd_path, local_path,
             )
+            stage("downloading")
             await osc.download(
                 remote_path=camera.sd_path,
                 local_path=local_path,
@@ -316,6 +357,7 @@ class Go3SAggregationDownloader(AggregationDownloader):
         finally:
             try:
                 _log.info("[aggregation] restoring WiFi to %r", prev_ssid)
+                stage("restoring_wifi")
                 await asyncio.to_thread(self._switcher.restore, prev_ssid)
             except Exception:
                 _log.warning(

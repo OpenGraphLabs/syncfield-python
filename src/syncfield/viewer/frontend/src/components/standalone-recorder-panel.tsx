@@ -60,10 +60,17 @@ function deriveStatus(
     };
   }
   if (agg?.state === "running") {
+    const STAGE_LABELS: Record<string, string> = {
+      starting: "starting…",
+      switching_wifi: "switching WiFi…",
+      probing: "probing camera…",
+      downloading: "downloading",
+      restoring_wifi: "restoring WiFi…",
+    };
     return {
       kind: "aggregating",
       dot: "agg",
-      label: "Aggregating",
+      label: (agg.stage && STAGE_LABELS[agg.stage]) ?? "Aggregating",
       currentBytes: agg.current_bytes,
       totalBytes: agg.current_total_bytes,
       camerasDone: agg.cameras_done,
@@ -166,13 +173,12 @@ function StatusRow({
         )}
         {status.kind === "aggregating" && (
           <span className="text-warning font-medium">
-            Aggregating
-            {status.camerasTotal
-              ? ` · ${status.camerasDone ?? 0}/${status.camerasTotal}`
-              : ""}
+            {status.label}
             {status.totalBytes
-              ? ` (${formatBytes(status.currentBytes ?? 0)} / ${formatBytes(status.totalBytes)})`
-              : ""}
+              ? ` · ${formatBytes(status.currentBytes ?? 0)} / ${formatBytes(status.totalBytes)}`
+              : status.currentBytes
+                ? ` · ${formatBytes(status.currentBytes)}`
+                : ""}
           </span>
         )}
         {status.kind === "connecting" && (

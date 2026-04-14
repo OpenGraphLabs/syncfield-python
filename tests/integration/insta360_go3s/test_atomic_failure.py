@@ -22,7 +22,7 @@ class FlakyDownloader(AggregationDownloader):
     def __init__(self):
         self.attempts = 0
 
-    async def run(self, camera, target_dir, on_chunk):
+    async def run(self, camera, target_dir, on_chunk, on_stage=None):
         self.attempts += 1
         if self.attempts == 1:
             raise RuntimeError("simulated WiFi switch failure")

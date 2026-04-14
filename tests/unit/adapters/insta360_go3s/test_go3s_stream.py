@@ -233,7 +233,7 @@ def test_recovery_scan_picks_up_pending_aggregation(tmp_path, monkeypatch):
     )
 
     class NoOpDownloader(AggregationDownloader):
-        async def run(self, camera, target_dir, on_chunk):
+        async def run(self, camera, target_dir, on_chunk, on_stage=None):
             pass  # instant "success"
 
     monkeypatch.setattr(

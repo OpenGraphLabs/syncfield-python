@@ -54,6 +54,10 @@ export interface AggregationActiveJob {
   current_stream_id: string | null;
   current_bytes: number;
   current_total_bytes: number;
+  /** Current pipeline phase — useful when the bar would otherwise sit at
+   *  0% during a lengthy WiFi switch. One of "switching_wifi" | "probing" |
+   *  "downloading" | "restoring_wifi" | "starting" | null. */
+  stage: string | null;
   error: string | null;
 }
 

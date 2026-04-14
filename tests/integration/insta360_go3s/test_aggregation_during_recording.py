@@ -22,7 +22,7 @@ class SlowDownloader(AggregationDownloader):
         self.may_finish = asyncio.Event()
         self.completed: list[str] = []
 
-    async def run(self, camera, target_dir, on_chunk):
+    async def run(self, camera, target_dir, on_chunk, on_stage=None):
         self.in_flight.set()
         await self.may_finish.wait()
         target = target_dir / camera.local_filename

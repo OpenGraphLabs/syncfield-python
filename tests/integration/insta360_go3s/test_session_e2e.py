@@ -39,7 +39,7 @@ class FakeBleCamera:
 
 
 class FakeDownloader(AggregationDownloader):
-    async def run(self, camera, target_dir, on_chunk):
+    async def run(self, camera, target_dir, on_chunk, on_stage=None):
         target = target_dir / camera.local_filename
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(b"VID_E2E_FAKE_CONTENT")

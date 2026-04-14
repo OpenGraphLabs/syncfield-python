@@ -13,6 +13,20 @@ export interface AggregationActiveDisplay {
   totalBytes: number;
   camerasDone: number;
   camerasTotal: number;
+  stage: string | null;
+}
+
+const STAGE_LABELS: Record<string, string> = {
+  starting: "Starting…",
+  switching_wifi: "Switching WiFi to camera AP…",
+  probing: "Probing camera…",
+  downloading: "Downloading",
+  restoring_wifi: "Restoring WiFi…",
+};
+
+function stageLabel(stage: string | null): string | null {
+  if (!stage) return null;
+  return STAGE_LABELS[stage] ?? stage;
 }
 
 interface AggregationStatusBarProps {
@@ -79,6 +93,8 @@ export function AggregationStatusBar({
   }
 
   // Running state
+  const stageText = stageLabel(active.stage);
+  const isDownloading = active.stage === "downloading";
   return (
     <div
       className="flex items-center gap-3 border-b bg-warning/5 px-4 py-2 text-xs"
@@ -109,22 +125,40 @@ export function AggregationStatusBar({
         )}
       </span>
 
-      {/* Progress bar */}
+      {/* Stage label — shown during pre-download phases where byte
+          progress would otherwise be 0%. */}
+      {stageText && !isDownloading && (
+        <span className="text-muted italic tabular-nums">{stageText}</span>
+      )}
+
+      {/* Progress bar — meaningful only during the download phase when
+          totalBytes is known. In pre-download phases, show an
+          indeterminate-style pulsing bar instead of a fixed 0%. */}
       <div
         className="h-1.5 w-24 shrink-0 overflow-hidden rounded-full bg-warning/20"
         aria-hidden="true"
       >
-        <div
-          className="h-full rounded-full bg-warning transition-all duration-300"
-          style={{ width: `${pct}%` }}
-        />
+        {isDownloading && active.totalBytes > 0 ? (
+          <div
+            className="h-full rounded-full bg-warning transition-all duration-300"
+            style={{ width: `${pct}%` }}
+          />
+        ) : (
+          <div className="h-full w-full animate-pulse-recording rounded-full bg-warning/60" />
+        )}
       </div>
 
-      {/* Bytes / percent */}
-      <span className="tabular-nums text-muted">
-        {pct}% · {formatBytes(active.currentBytes)} /{" "}
-        {formatBytes(active.totalBytes)}
-      </span>
+      {/* Bytes / percent — only during download phase. */}
+      {isDownloading && active.totalBytes > 0 ? (
+        <span className="tabular-nums text-muted">
+          {pct}% · {formatBytes(active.currentBytes)} /{" "}
+          {formatBytes(active.totalBytes)}
+        </span>
+      ) : isDownloading ? (
+        <span className="tabular-nums text-muted">
+          {formatBytes(active.currentBytes)} downloaded
+        </span>
+      ) : null}
 
       {/* Optional View Details */}
       {onViewDetails && (
@@ -168,6 +202,7 @@ export function mapActiveAggregation(
     totalBytes: job.current_total_bytes,
     camerasDone: job.cameras_done,
     camerasTotal: job.cameras_total,
+    stage: job.stage ?? null,
   };
 }
 
