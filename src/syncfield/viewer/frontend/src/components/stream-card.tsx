@@ -3,7 +3,7 @@ import { formatCount, formatHz } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import { AudioLevelChart } from "./audio-level-chart";
 import { VideoPreview } from "./video-preview";
-import { SensorChart } from "./sensor-chart";
+import { SensorPanel } from "./sensor-panel";
 
 interface StreamCardProps {
   stream: StreamSnapshot;
@@ -15,7 +15,9 @@ interface StreamCardProps {
  * Per-stream card with variant body by kind.
  *
  * - **video** — MJPEG preview via `<img>`
- * - **sensor** — Real-time SVG line chart via SSE
+ * - **sensor** — 3D pose cube (for IMUs emitting roll/pitch/yaw) or
+ *   real-time SVG line chart (everything else), dispatched by
+ *   :component:`SensorPanel`
  * - **audio / custom** — Minimal stats placeholder
  */
 export function StreamCard({ stream, canRemove, onRemove }: StreamCardProps) {
@@ -65,7 +67,7 @@ export function StreamCard({ stream, canRemove, onRemove }: StreamCardProps) {
         ) : stream.kind === "audio" ? (
           <AudioLevelChart streamId={stream.id} />
         ) : stream.kind === "sensor" ? (
-          <SensorChart streamId={stream.id} />
+          <SensorPanel streamId={stream.id} />
         ) : (
           <div className="flex h-full min-h-[180px] items-center justify-center text-xs text-muted">
             No preview
