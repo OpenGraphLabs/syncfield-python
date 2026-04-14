@@ -1558,6 +1558,39 @@ class ViewerServer:
                 logger.exception("Failed to read waveform")
                 return JSONResponse({"error": str(exc)}, status_code=500)
 
+        @app.get("/api/episodes/{episode_id}/sensor/{stream_id}")
+        async def api_episode_sensor(
+            episode_id: str, stream_id: str,
+        ) -> JSONResponse:
+            """Return recorded sensor samples for Review-mode playback.
+
+            Reads ``{stream_id}.jsonl`` (one ``SensorSample`` per line)
+            and returns a compact per-channel representation:
+
+              ``{t: float[], channels: {name: float[]}, count, duration_s}``
+
+            ``t`` is seconds relative to the first sample so the
+            frontend can align with ``<video>.currentTime``. When the
+            recording has more than ``MAX_POINTS`` samples we stride-
+            decimate so the payload stays small and SVG rendering stays
+            cheap — the resulting curve is faithful because inter-
+            sample period is already ≤5 ms for 200 Hz IMUs.
+            """
+            ep_dir = self._session.output_dir.parent / episode_id
+            jsonl_path = ep_dir / f"{stream_id}.jsonl"
+            if not jsonl_path.is_file():
+                return JSONResponse(
+                    {"error": f"Sensor file not found: {stream_id}.jsonl"},
+                    status_code=404,
+                )
+
+            try:
+                data = await asyncio.to_thread(_read_sensor_jsonl, jsonl_path)
+                return JSONResponse(data)
+            except Exception as exc:
+                logger.exception("Failed to read sensor jsonl")
+                return JSONResponse({"error": str(exc)}, status_code=500)
+
     # ------------------------------------------------------------------
     # Static files (built React app)
     # ------------------------------------------------------------------
@@ -1909,6 +1942,84 @@ def _read_wav_envelope(wav_path: Path, num_points: int = 1000) -> dict:
         "duration_s": round(duration_s, 3),
         "channels": n_channels,
         "envelope": envelope,
+    }
+
+
+def _read_sensor_jsonl(jsonl_path: Path, max_points: int = 2000) -> dict:
+    """Read a sensor ``{stream_id}.jsonl`` and return a compact playback form.
+
+    Each line is a :class:`~syncfield.types.SensorSample` dict. We
+    convert to column-oriented arrays (one per channel) plus a single
+    ``t`` array of seconds-relative-to-first-sample — the shape the
+    viewer's Review mode consumes. Files with more than ``max_points``
+    rows are stride-decimated to keep the payload small; at 200 Hz
+    this still yields >5 ms resolution per visible point which is
+    well below what a human notices in the playback scrubber.
+
+    Non-numeric or underscore-prefixed auxiliary channels are dropped
+    so they don't flood the response. The first sample's
+    ``capture_ns`` is used as the zero reference for ``t``.
+    """
+    import json as json_mod
+
+    capture_ns: list[int] = []
+    channel_buffers: dict[str, list[float]] = {}
+
+    with open(jsonl_path, "r") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json_mod.loads(line)
+            except json_mod.JSONDecodeError:
+                continue
+            ts = row.get("capture_ns")
+            if ts is None:
+                continue
+            ch = row.get("channels") or {}
+
+            capture_ns.append(int(ts))
+            for name, value in ch.items():
+                if not isinstance(value, (int, float)):
+                    continue
+                if name.startswith("_") or "timestamp" in name:
+                    continue
+                buf = channel_buffers.get(name)
+                if buf is None:
+                    buf = [float("nan")] * (len(capture_ns) - 1)
+                    channel_buffers[name] = buf
+                buf.append(float(value))
+            # Pad any channel that didn't appear on this row so all
+            # buffers stay the same length as capture_ns.
+            for name, buf in channel_buffers.items():
+                if len(buf) < len(capture_ns):
+                    buf.append(float("nan"))
+
+    total = len(capture_ns)
+    if total == 0:
+        return {"t": [], "channels": {}, "count": 0, "duration_s": 0.0}
+
+    t0 = capture_ns[0]
+    # Stride-decimate if oversized — keep roughly evenly-spaced points
+    # plus the last sample so the trailing edge stays accurate.
+    stride = max(1, total // max_points)
+    keep = list(range(0, total, stride))
+    if keep[-1] != total - 1:
+        keep.append(total - 1)
+
+    t_seconds = [round((capture_ns[i] - t0) / 1e9, 6) for i in keep]
+    channels_out = {
+        name: [round(buf[i], 6) for i in keep]
+        for name, buf in channel_buffers.items()
+    }
+    duration_s = round((capture_ns[-1] - t0) / 1e9, 6)
+
+    return {
+        "t": t_seconds,
+        "channels": channels_out,
+        "count": total,
+        "duration_s": duration_s,
     }
 
 

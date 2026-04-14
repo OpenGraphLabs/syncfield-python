@@ -6,9 +6,9 @@ import { useDriftData } from "@/hooks/use-drift-data";
 import { SyncButton } from "./sync-button";
 import { SyncQualityPanel } from "./sync-quality-panel";
 import { ReviewVideoPlayer } from "./review-video-player";
+import { ReviewStreamCell } from "./review-stream-cell";
 import { ReviewTimeline } from "./review-timeline";
 import { DriftChart } from "./drift-chart";
-import { WaveformChart } from "./waveform-chart";
 import { SyncComparisonModal } from "./sync-comparison-modal";
 
 interface EpisodeDetailProps {
@@ -83,18 +83,22 @@ function EpisodeDetailInner({
   const syncReport = episode.sync_report;
   const fps = syncReport?.summary.actual_mean_fps ?? 30;
 
-  // Separate audio from video/sensor streams
-  const audioStreams = streams.filter((sid) => {
-    const meta = episode.manifest?.streams[sid];
-    return meta?.kind === "audio";
-  });
-  const nonAudioStreams = streams.filter((sid) => !audioStreams.includes(sid));
+  // Build a map of stream id → manifest kind for the ReviewStreamCell
+  // dispatcher. Missing entries default to "video" to stay compatible
+  // with older manifests.
+  const kindOf = (sid: string): string =>
+    episode.manifest?.streams[sid]?.kind ?? "video";
 
+  // Primary = explicit sync-report choice if available, otherwise the
+  // first *video* stream (Review's big tile is meant to play back an
+  // MP4). Falls back to the first stream overall if no video exists.
+  const firstVideoStream = streams.find((s) => kindOf(s) === "video");
   const primaryStream =
-    syncReport?.summary.primary_stream ?? nonAudioStreams[0] ?? "";
-  const secondaryVideoStreams = nonAudioStreams.filter(
-    (s) => s !== primaryStream,
-  );
+    syncReport?.summary.primary_stream ??
+    firstVideoStream ??
+    streams[0] ??
+    "";
+  const secondaryStreams = streams.filter((s) => s !== primaryStream);
 
   // Get drift for the compare target
   const compareResult = compareStream
@@ -103,9 +107,9 @@ function EpisodeDetailInner({
   const compareDriftMs = compareResult?.offset_ms ?? 0;
 
   return (
-    <div className="flex h-full flex-col">
+    <div className="flex min-h-0 flex-1 flex-col">
       {/* Header */}
-      <div className="flex items-center gap-3 border-b px-4 py-2">
+      <div className="flex shrink-0 items-center gap-3 border-b px-4 py-2">
         <button
           onClick={onBack}
           className="text-xs text-muted transition-colors hover:text-foreground"
@@ -148,48 +152,78 @@ function EpisodeDetailInner({
       )}
 
       {/* Main content */}
-      <div className="flex flex-1 overflow-hidden">
-        {/* Left: Videos + Timeline + Drift chart */}
-        <div className="flex flex-1 flex-col">
-          {/* Video area */}
-          <div className="flex flex-1 gap-1 bg-black/95 p-2">
-            {primaryStream && (
-              <ReviewVideoPlayer
-                episodeId={episodeId}
-                streamId={primaryStream}
-                isPrimary
-                videoRef={playback.videoRef}
-              />
-            )}
-            {secondaryVideoStreams.map((sid) => {
-              const streamResult = syncReport?.streams[sid];
-              return (
+      <div className="flex min-h-0 flex-1 overflow-hidden">
+        {/* Left: stream panels + timeline. The left column is a strict
+            flex-column with ``min-h-0``: primary + secondary shrink to
+            fit whatever vertical budget remains after the header and
+            the (always-visible) timeline are laid out. The timeline
+            carries ``shrink-0`` so it's *never* the thing that gets
+            clipped when the viewport is short — the user must always
+            be able to reach the play/scrub controls without scrolling. */}
+        <div className="flex min-h-0 flex-1 flex-col bg-black/95">
+          {primaryStream && (
+            <div className="flex min-h-0 flex-[2] p-2">
+              {kindOf(primaryStream) === "video" ? (
                 <ReviewVideoPlayer
-                  key={sid}
                   episodeId={episodeId}
-                  streamId={sid}
-                  isPrimary={false}
-                  syncTime={playback.currentTime}
-                  isPlaying={playback.isPlaying}
-                  driftMs={streamResult?.offset_ms}
-                  onClick={
-                    syncReport ? () => handleStreamClick(sid) : undefined
-                  }
+                  streamId={primaryStream}
+                  isPrimary
+                  videoRef={playback.videoRef}
                 />
-              );
-            })}
-          </div>
+              ) : (
+                <ReviewStreamCell
+                  episodeId={episodeId}
+                  streamId={primaryStream}
+                  kind={kindOf(primaryStream)}
+                  currentTime={playback.currentTime}
+                  isPrimary
+                />
+              )}
+            </div>
+          )}
 
-          {/* Timeline */}
-          <ReviewTimeline
-            currentTime={playback.currentTime}
-            duration={playback.duration}
-            isPlaying={playback.isPlaying}
-            playbackRate={playback.playbackRate}
-            onSeek={playback.seek}
-            onToggle={playback.toggle}
-            onSetRate={playback.setPlaybackRate}
-          />
+          {secondaryStreams.length > 0 && (
+            <div className="grid min-h-0 flex-1 auto-rows-fr gap-2 p-2 grid-cols-[repeat(auto-fit,minmax(220px,1fr))]">
+              {secondaryStreams.map((sid) => {
+                const kind = kindOf(sid);
+                const streamResult = syncReport?.streams[sid];
+                return (
+                  <div key={sid} className="flex min-h-0 min-w-0">
+                    <ReviewStreamCell
+                      episodeId={episodeId}
+                      streamId={sid}
+                      kind={kind}
+                      currentTime={playback.currentTime}
+                      syncTime={
+                        kind === "video" ? playback.currentTime : undefined
+                      }
+                      isPlaying={
+                        kind === "video" ? playback.isPlaying : undefined
+                      }
+                      driftMs={streamResult?.offset_ms}
+                      onClick={
+                        kind === "video" && syncReport
+                          ? () => handleStreamClick(sid)
+                          : undefined
+                      }
+                    />
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
+          <div className="shrink-0">
+            <ReviewTimeline
+              currentTime={playback.currentTime}
+              duration={playback.duration}
+              isPlaying={playback.isPlaying}
+              playbackRate={playback.playbackRate}
+              onSeek={playback.seek}
+              onToggle={playback.toggle}
+              onSetRate={playback.setPlaybackRate}
+            />
+          </div>
         </div>
 
         {/* Right sidebar */}
@@ -205,19 +239,6 @@ function EpisodeDetailInner({
           {(episode.has_synced_videos || driftData) && (
             <div className="border-t">
               <DriftChart data={driftData} isLoading={driftLoading} />
-            </div>
-          )}
-
-          {/* Audio waveform for audio streams */}
-          {audioStreams.length > 0 && (
-            <div className="border-t">
-              {audioStreams.map((sid) => (
-                <WaveformChart
-                  key={sid}
-                  episodeId={episodeId}
-                  streamId={sid}
-                />
-              ))}
             </div>
           )}
         </div>
