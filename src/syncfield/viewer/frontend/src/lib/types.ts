@@ -2,6 +2,15 @@
 // Snapshot types — mirrors the Python SessionSnapshot / StreamSnapshot
 // ---------------------------------------------------------------------------
 
+export interface StreamCapabilities {
+  provides_audio_track: boolean;
+  supports_precise_timestamps: boolean;
+  is_removable: boolean;
+  produces_file: boolean;
+  /** False for standalone-recorder streams (e.g. Insta360 Go3S) that have no live MJPEG feed. */
+  live_preview: boolean;
+}
+
 export interface StreamSnapshot {
   id: string;
   kind: "video" | "audio" | "sensor" | "custom";
@@ -13,6 +22,8 @@ export interface StreamSnapshot {
   health_count: number;
   /** Count of non-heartbeat events (warnings/errors/drops). */
   problem_count: number;
+  /** Stream capabilities declared by the adapter. May be absent on older servers. */
+  capabilities?: StreamCapabilities;
 }
 
 export interface ChirpInfo {
@@ -28,6 +39,30 @@ export interface HealthEntry {
   detail: string | null;
 }
 
+// ---------------------------------------------------------------------------
+// Aggregation types (Insta360 Go3S)
+// ---------------------------------------------------------------------------
+
+export type AggregationState = "pending" | "running" | "completed" | "failed";
+
+export interface AggregationActiveJob {
+  job_id: string;
+  episode_id: string;
+  state: AggregationState;
+  cameras_total: number;
+  cameras_done: number;
+  current_stream_id: string | null;
+  current_bytes: number;
+  current_total_bytes: number;
+  error: string | null;
+}
+
+export interface AggregationSnapshotWS {
+  active_job: AggregationActiveJob | null;
+  queue_length: number;
+  recent_jobs: AggregationActiveJob[];
+}
+
 export interface SessionSnapshot {
   type: "snapshot";
   state: SessionState;
@@ -37,6 +72,8 @@ export interface SessionSnapshot {
   streams: Record<string, StreamSnapshot>;
   health_log: HealthEntry[];
   output_dir: string;
+  /** Aggregation state for Go3S streams; present when a Go3S adapter is active. */
+  aggregation?: AggregationSnapshotWS;
 }
 
 export type SessionState =
@@ -86,7 +123,10 @@ export type ControlAction =
   | "disconnect"
   | "record"
   | "stop"
-  | "cancel";
+  | "cancel"
+  | "retry_aggregation"
+  | "cancel_aggregation"
+  | "aggregate_episode";
 
 export interface ControlCommand {
   action: ControlAction;

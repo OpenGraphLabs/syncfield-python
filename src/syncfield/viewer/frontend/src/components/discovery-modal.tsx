@@ -2,6 +2,25 @@ import { useEffect, useState } from "react";
 import type { DiscoveredDevice } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
+/**
+ * Returns true when the BLE device name matches the Insta360 Go 3S pattern.
+ * Matches names like "Insta360 Go 3S", "Go 3S *", or "go3s_*".
+ */
+function isGo3SDevice(name: string | undefined): boolean {
+  if (!name) return false;
+  const lower = name.toLowerCase();
+  return lower.includes("go 3") || lower.includes("go3");
+}
+
+/**
+ * Human-readable device type label derived from the discovered device's
+ * adapter / name. Falls back to the raw adapter string for unknown types.
+ */
+function deviceTypeLabel(device: DiscoveredDevice): string {
+  if (isGo3SDevice(device.name)) return "Insta360 Go3S";
+  return device.adapter;
+}
+
 interface DiscoveryModalProps {
   isOpen: boolean;
   onClose: () => void;
@@ -135,7 +154,7 @@ export function DiscoveryModal({
                         {device.name}
                       </div>
                       <div className="text-[10px] text-muted">
-                        {device.adapter} · {device.kind}
+                        {deviceTypeLabel(device)} · {device.kind}
                       </div>
                     </div>
                   </label>

@@ -13,6 +13,7 @@ Adapter                    Requires                               Install
 ``BLEImuGenericStream``    ``bleak``                              ``syncfield[ble]``
 ``OgloTactileStream``      ``bleak``                              ``syncfield[ble]``
 ``OakCameraStream``        ``depthai`` + ``av``                   ``syncfield[oak]``
+``Go3SStream``             ``bleak`` + ``aiohttp``                ``syncfield[camera]``
 =========================  =====================================  =============================
 
 Users who need a specific optional adapter can always import it directly
@@ -103,5 +104,12 @@ try:
     from syncfield.adapters.oak_camera import OakCameraStream  # noqa: F401
     __all__.append("OakCameraStream")
     _safe_register(OakCameraStream)
+except ImportError:
+    pass
+
+try:
+    from syncfield.adapters.insta360_go3s import Go3SStream  # noqa: F401
+    __all__.append("Go3SStream")
+    _safe_register(Go3SStream)
 except ImportError:
     pass

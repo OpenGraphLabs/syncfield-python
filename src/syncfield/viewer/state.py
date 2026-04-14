@@ -25,6 +25,24 @@ from typing import Any, Deque, Dict, List, Optional, Tuple
 
 
 # ---------------------------------------------------------------------------
+# Aggregation snapshot
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class AggregationSnapshot:
+    """Mutable aggregation state surfaced into the viewer snapshot.
+
+    Uses a plain (non-frozen) dataclass so the listener in server.py can
+    update it in-place without reconstructing the SessionSnapshot.
+    """
+
+    active_job: Optional[Any] = None  # AggregationProgress; Any for optional-extra safety
+    queue_length: int = 0
+    recent_jobs: List[Any] = field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
 # Stream-level snapshot
 # ---------------------------------------------------------------------------
 
@@ -62,6 +80,7 @@ class StreamSnapshot:
     latest_frame: Any  # numpy array or None — kept as Any so numpy is optional
     plot_points: Dict[str, Tuple[List[float], List[float]]]
     health_count: int
+    live_preview: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -118,6 +137,7 @@ class SessionSnapshot:
     elapsed_s: float
     streams: Dict[str, StreamSnapshot]
     health_log: List[HealthEntry]
+    aggregation: Optional[AggregationSnapshot] = None
 
 
 # ---------------------------------------------------------------------------

@@ -206,6 +206,7 @@ class SessionPoller:
                 latest_frame=latest_frame,
                 plot_points=plot_points,
                 health_count=len(buffer._health),
+                live_preview=getattr(stream.capabilities, "live_preview", True),
             )
 
         # Merge health events into a session-wide, time-sorted log.

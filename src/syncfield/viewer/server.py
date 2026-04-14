@@ -23,6 +23,7 @@ import dataclasses
 import io
 import json
 import logging
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
@@ -36,7 +37,7 @@ from starlette.responses import FileResponse, StreamingResponse
 
 from syncfield.orchestrator import SessionOrchestrator
 from syncfield.viewer.poller import SessionPoller
-from syncfield.viewer.state import HealthEntry, SessionSnapshot, StreamSnapshot
+from syncfield.viewer.state import AggregationSnapshot, HealthEntry, SessionSnapshot, StreamSnapshot
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +48,17 @@ STATIC_DIR = Path(__file__).parent / "static"
 # ---------------------------------------------------------------------------
 # Snapshot serialization
 # ---------------------------------------------------------------------------
+
+
+def _serialize_aggregation(agg) -> Dict[str, Any]:
+    """Serialize an AggregationSnapshot (or None) to a JSON-serializable dict."""
+    if agg is None:
+        return {"active_job": None, "queue_length": 0, "recent_jobs": []}
+    return {
+        "active_job": agg.active_job.to_dict() if agg.active_job else None,
+        "queue_length": getattr(agg, "queue_length", 0),
+        "recent_jobs": [j.to_dict() for j in getattr(agg, "recent_jobs", [])],
+    }
 
 
 def snapshot_to_dict(snapshot: SessionSnapshot) -> Dict[str, Any]:
@@ -81,6 +93,13 @@ def snapshot_to_dict(snapshot: SessionSnapshot) -> Dict[str, Any]:
             "produces_file": s.produces_file,
             "health_count": s.health_count,
             "problem_count": problem_count_by_stream.get(sid, 0),
+            "capabilities": {
+                "live_preview": getattr(s, "live_preview", True),
+                "provides_audio_track": s.provides_audio_track,
+                "produces_file": s.produces_file,
+                "supports_precise_timestamps": getattr(s, "supports_precise_timestamps", False),
+                "is_removable": getattr(s, "is_removable", False),
+            },
         }
 
     health_log: List[Dict[str, Any]] = []
@@ -107,6 +126,7 @@ def snapshot_to_dict(snapshot: SessionSnapshot) -> Dict[str, Any]:
         "streams": streams,
         "health_log": health_log,
         "output_dir": snapshot.output_dir,
+        "aggregation": _serialize_aggregation(getattr(snapshot, "aggregation", None)),
     }
 
 
@@ -208,6 +228,106 @@ def _require_leader(orch) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Aggregation listener wiring
+# ---------------------------------------------------------------------------
+
+def _attach_aggregation_listener(server: "ViewerServer") -> None:
+    """Best-effort: subscribe to the global Go3S aggregation queue.
+
+    No-op if the Go3S camera extra is not installed.  Updates
+    ``server._agg_state`` so the broadcast loop can inject the latest
+    aggregation state into each WS snapshot without requiring a poller
+    change.
+    """
+    try:
+        from syncfield.adapters.insta360_go3s.stream import _global_aggregation_queue
+        from syncfield.adapters.insta360_go3s.aggregation.types import AggregationState
+    except ImportError:
+        return
+
+    def on_progress(progress) -> None:
+        if progress.state == AggregationState.RUNNING:
+            active = progress
+        else:
+            active = None
+            if progress.state in (AggregationState.COMPLETED, AggregationState.FAILED):
+                with server._agg_lock:
+                    server._recent_agg_jobs.append(progress)
+                    if len(server._recent_agg_jobs) > 5:
+                        del server._recent_agg_jobs[: len(server._recent_agg_jobs) - 5]
+        with server._agg_lock:
+            recent = list(server._recent_agg_jobs)
+        server._agg_state = AggregationSnapshot(
+            active_job=active,
+            queue_length=0,  # populated by queue if exposed; staying 0 in v1
+            recent_jobs=recent,
+        )
+
+    try:
+        _global_aggregation_queue().subscribe(on_progress)
+    except Exception:
+        logger.warning(
+            "Failed to subscribe to global aggregation queue; "
+            "aggregation state will not be surfaced in the WS snapshot.",
+            exc_info=True,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Aggregation control command dispatcher
+# ---------------------------------------------------------------------------
+
+
+def _next_default_id(orchestrator: "SessionOrchestrator", prefix: str) -> str:
+    """Return the next available stream id ``<prefix>_N`` not already in use."""
+    existing = {s.id for s in orchestrator._streams.values()}
+    n = 1
+    while f"{prefix}_{n}" in existing:
+        n += 1
+    return f"{prefix}_{n}"
+
+
+def handle_control_command(orchestrator: "SessionOrchestrator", payload: dict) -> dict:
+    """Dispatch an aggregation control command from a WebSocket client.
+
+    Handles the three aggregation commands introduced in T14, plus the T17
+    ``add_go3s_stream`` command.  All other (legacy) commands continue to be
+    handled inside ``_handle_command``.
+
+    Returns a ``{"ok": True}`` dict on success, or
+    ``{"ok": False, "error": "<message>"}`` on failure — including
+    ``NotImplementedError`` for commands deferred to v2.
+    """
+    cmd = payload.get("command")
+    try:
+        if cmd == "aggregate_episode":
+            orchestrator.aggregate_episode(payload["episode_id"])
+            return {"ok": True}
+        if cmd == "retry_aggregation":
+            orchestrator.retry_aggregation(payload["job_id"])
+            return {"ok": True}
+        if cmd == "cancel_aggregation":
+            orchestrator.cancel_aggregation(payload["job_id"])
+            return {"ok": True}
+        if cmd == "add_go3s_stream":
+            try:
+                from syncfield.adapters.insta360_go3s import Go3SStream
+            except ImportError as e:
+                return {"ok": False, "error": f"Go3S adapter not available: {e}"}
+            stream_id = payload.get("stream_id") or _next_default_id(orchestrator, "go3s_cam")
+            stream = Go3SStream(
+                stream_id=stream_id,
+                ble_address=payload["address"],
+                output_dir=orchestrator.output_dir,
+            )
+            orchestrator.add(stream)
+            return {"ok": True, "stream_id": stream.id}
+        return {"ok": False, "error": f"unknown command: {cmd}"}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+# ---------------------------------------------------------------------------
 # Server class
 # ---------------------------------------------------------------------------
 
@@ -232,6 +352,9 @@ class ViewerServer:
         self._title = title
         self._sync_endpoint = sync_endpoint.rstrip("/")
         self._ws_clients: Set[WebSocket] = set()
+        self._agg_state: Optional[AggregationSnapshot] = None
+        self._recent_agg_jobs: list = []
+        self._agg_lock = threading.Lock()
 
         self.app = FastAPI(title=title, docs_url=None, redoc_url=None)
         self._setup_middleware()
@@ -240,6 +363,7 @@ class ViewerServer:
         self._setup_task_routes()
         self._setup_episode_routes()
         self._setup_static()
+        _attach_aggregation_listener(self)
 
     # ------------------------------------------------------------------
     # Middleware
@@ -1619,6 +1743,12 @@ class ViewerServer:
             snapshot = self._poller.get_snapshot()
             if snapshot is not None:
                 try:
+                    # Inject current aggregation state if the poller snapshot
+                    # doesn't carry one (the default case for non-Go3S sessions).
+                    if snapshot.aggregation is None and self._agg_state is not None:
+                        snapshot = dataclasses.replace(
+                            snapshot, aggregation=self._agg_state
+                        )
                     payload = snapshot_to_dict(snapshot)
                     await ws.send_text(json.dumps(payload))
                 except Exception:
@@ -1680,6 +1810,24 @@ class ViewerServer:
                     "error": f"Cancel failed: {exc}",
                     "streams": {},
                 })
+        elif action in ("retry_aggregation", "cancel_aggregation", "aggregate_episode"):
+            # Route aggregation control commands through the T14 dispatcher.
+            # The payload uses the same key names expected by handle_control_command
+            # (it reads "command" from the dict), so we normalise here.
+            agg_payload = {**msg, "command": action}
+            result = await asyncio.to_thread(
+                handle_control_command, self._session, agg_payload
+            )
+            if not result.get("ok"):
+                logger.warning("Aggregation command %r failed: %s", action, result.get("error"))
+        elif action == "add_go3s_stream":
+            # Route Go3S stream-add command through the T17 dispatcher.
+            go3s_payload = {**msg, "command": action}
+            result = await asyncio.to_thread(
+                handle_control_command, self._session, go3s_payload
+            )
+            if not result.get("ok"):
+                logger.warning("add_go3s_stream failed: %s", result.get("error"))
         else:
             logger.warning("Unknown action: %s", action)
 

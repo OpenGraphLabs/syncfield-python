@@ -53,12 +53,18 @@ multihost = [
     "uvicorn[standard]>=0.24.0",
     "httpx>=0.25.0",
 ]
+# Insta360 Go3S adapter: BLE trigger via bleak + WiFi/OSC HTTP download via aiohttp.
+camera = [
+    "bleak>=0.21",
+    "aiohttp>=3.9",
+]
 all = [
     "sounddevice>=0.4.6",
     "numpy>=1.21",
     "av>=12.0.0",
     "Pillow>=10.0.0",
     "bleak>=0.21",
+    "aiohttp>=3.9",
     "depthai>=3.0.0",
     "fastapi>=0.104.0",
     "uvicorn[standard]>=0.24.0",
@@ -81,6 +87,7 @@ packages = ["src/syncfield"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+asyncio_mode = "auto"
 markers = [
     "hardware: tests that require physical hardware (cameras, BLE devices)",
     "slow: integration tests that touch real IO (mDNS sockets, filesystem, etc.)",
@@ -90,6 +97,8 @@ markers = [
 [dependency-groups]
 dev = [
     "pytest>=8.4.2",
+    "pytest-aiohttp>=1.1.0",
+    "pytest-asyncio>=1.2.0",
     "pytest-mock>=3.12.0",
     "pytest-timeout>=2.4.0",
     "pytest-xdist>=3.6.0",

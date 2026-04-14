@@ -167,6 +167,7 @@ class TestStreamCapabilities:
         assert caps.supports_precise_timestamps is False
         assert caps.is_removable is False
         assert caps.produces_file is False
+        assert caps.live_preview is True
 
     def test_to_dict_round_trip(self):
         caps = StreamCapabilities(
@@ -181,6 +182,7 @@ class TestStreamCapabilities:
             "supports_precise_timestamps": False,
             "is_removable": True,
             "produces_file": True,
+            "live_preview": True,
         }
 
 
