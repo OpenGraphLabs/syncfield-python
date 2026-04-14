@@ -50,16 +50,7 @@ class TestResolveViaDnsSd:
 
     def test_parses_dns_sd_output(self, monkeypatch):
         monkeypatch.setattr(fb.platform, "system", lambda: "Darwin")
-
-        # Build a fake subprocess whose stdout yields our sample lines.
-        # Simulate select() always reporting ready, then EOF.
-        fake_proc = MagicMock()
-        fake_proc.stdout.readline.side_effect = SAMPLE_DNS_SD_OUTPUT.splitlines(keepends=True) + [""]
-        fake_proc.terminate = MagicMock()
-        fake_proc.wait = MagicMock()
-
-        monkeypatch.setattr(fb.subprocess, "Popen", MagicMock(return_value=fake_proc))
-        monkeypatch.setattr(fb.select, "select", lambda r, w, x, t: (r, [], []))
+        _patch_pty_returning(monkeypatch, SAMPLE_DNS_SD_OUTPUT)
         monkeypatch.setattr(fb.socket, "gethostbyname", lambda h: "192.168.1.5")
         monkeypatch.setattr(fb.socket, "inet_aton", lambda a: b"\xc0\xa8\x01\x05")
 
@@ -92,18 +83,7 @@ class TestResolveViaDnsSd:
         request time via mDNSResponder."""
         import socket as real_socket
         monkeypatch.setattr(fb.platform, "system", lambda: "Darwin")
-
-        def make_fake_proc():
-            p = MagicMock()
-            p.stdout.readline.side_effect = (
-                SAMPLE_DNS_SD_OUTPUT.splitlines(keepends=True) + [""]
-            )
-            return p
-
-        monkeypatch.setattr(
-            fb.subprocess, "Popen", MagicMock(side_effect=lambda *a, **kw: make_fake_proc())
-        )
-        monkeypatch.setattr(fb.select, "select", lambda r, w, x, t: (r, [], []))
+        _patch_pty_returning(monkeypatch, SAMPLE_DNS_SD_OUTPUT)
         monkeypatch.setattr(
             fb.socket, "gethostbyname",
             MagicMock(side_effect=real_socket.gaierror("not found")),
@@ -119,11 +99,32 @@ class TestResolveViaDnsSd:
         )
         assert info is not None
         assert info.port == 7878
-        # Empty packed addresses, but hostname-only fallback populates
-        # parsed_addresses() with the .local hostname.
         assert info._addresses == []
         assert info.hostname == "testhost.local"
         assert info.parsed_addresses() == ["testhost.local"]
+
+
+def _patch_pty_returning(monkeypatch, dns_sd_output: str) -> None:
+    """Helper: patch pty/subprocess/os/select so the dns-sd fallback
+    'reads' the supplied output via the new pty-based code path."""
+    output_bytes = dns_sd_output.encode("utf-8")
+    state = {"buf": output_bytes, "consumed": False}
+
+    monkeypatch.setattr(fb.pty, "openpty", MagicMock(return_value=(7, 8)))
+    monkeypatch.setattr(fb.os, "close", MagicMock())
+    monkeypatch.setattr(fb.subprocess, "Popen", MagicMock(return_value=MagicMock()))
+    monkeypatch.setattr(fb.select, "select", lambda r, w, x, t: (r, [], []))
+
+    def fake_os_read(fd, n):
+        if state["consumed"]:
+            return b""  # EOF — terminates the read loop
+        chunk = state["buf"][:n]
+        state["buf"] = state["buf"][n:]
+        if not state["buf"]:
+            state["consumed"] = True
+        return chunk
+
+    monkeypatch.setattr(fb.os, "read", fake_os_read)
 
 
 class TestResolvedInfo:

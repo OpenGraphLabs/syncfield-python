@@ -288,6 +288,20 @@ class SessionBrowser:
         the keyword argument is forwarded via ``**kwargs`` so the
         fake only needs to accept what it cares about.
         """
+        # Cheap session-id prefix filter: skip refresh entirely for
+        # services that aren't part of our cluster. Production names
+        # are "<session_id>--<host_id>" (SessionAdvertiser); some tests
+        # register the bare "<session_id>" form, so accept both.
+        # Skipping resolution for stale / other-cluster services avoids
+        # minutes of stacked 5-second dns-sd subprocess timeouts on
+        # busy networks.
+        if self._session_id_filter is not None:
+            instance = name.split(".", 1)[0]
+            if not (
+                instance == self._session_id_filter
+                or instance.startswith(self._session_id_filter + "--")
+            ):
+                return
         logger.debug("_refresh: invoked for %s", name)
         try:
             try:

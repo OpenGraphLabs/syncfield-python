@@ -20,13 +20,15 @@ gated by `platform.system() == "Darwin"` at the call site.
 from __future__ import annotations
 
 import logging
+import os
 import platform
+import pty
 import select
 import socket
 import subprocess
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -101,19 +103,17 @@ def resolve_via_dns_sd(
 
     cmd = ["dns-sd", "-L", instance, short_service_type, "local."]
     logger.debug("dns-sd fallback: running %s", cmd)
-    try:
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-    except (OSError, FileNotFoundError) as exc:
-        logger.debug("dns-sd fallback: failed to spawn subprocess: %s", exc)
+    # Spawn under a pty so dns-sd line-buffers its stdout. With a plain
+    # subprocess.PIPE, stdio block-buffers (~8KB) and a single resolve's
+    # 100-byte output never reaches our select() until the process exits
+    # — and dns-sd never exits on its own.
+    pty_resources = _spawn_with_pty(cmd)
+    if pty_resources is None:
         return None
+    proc, master_fd = pty_resources
 
     try:
-        host, port, txt_props = _read_dns_sd_output(proc, timeout)
+        host, port, txt_props = _read_dns_sd_output_pty(master_fd, timeout)
         if not (host and port):
             logger.debug(
                 "dns-sd fallback: did not receive both host and port within "
@@ -139,6 +139,10 @@ def resolve_via_dns_sd(
             hostname=normalized_hostname,
         )
     finally:
+        try:
+            os.close(master_fd)
+        except OSError:
+            pass
         _terminate_subprocess(proc)
 
 
@@ -341,6 +345,143 @@ def _read_dns_sd_output(
             return host, port, txt_props
 
     return host, port, txt_props
+
+
+def _spawn_with_pty(
+    cmd: List[str],
+) -> Optional[Tuple[subprocess.Popen, int]]:
+    """Spawn *cmd* with stdout/stderr connected to a new pty.
+
+    Returns (Popen, master_fd) on success, None on failure. Caller
+    closes master_fd and terminates the subprocess.
+
+    Why pty: dns-sd block-buffers its stdout when it's a pipe (default
+    stdio behaviour for non-tty output). Resolutions are tiny (~100B)
+    so they never reach us until the process exits — and dns-sd never
+    exits on its own. A pty makes dns-sd think it's connected to a
+    terminal, which switches stdio to line-buffered mode and our
+    select() sees data immediately.
+    """
+    try:
+        master_fd, slave_fd = pty.openpty()
+    except OSError as exc:
+        logger.debug("dns-sd fallback: pty.openpty failed: %s", exc)
+        return None
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=slave_fd,
+            stderr=slave_fd,
+            stdin=subprocess.DEVNULL,
+            close_fds=True,
+        )
+    except (OSError, FileNotFoundError) as exc:
+        logger.debug("dns-sd fallback: failed to spawn subprocess: %s", exc)
+        try:
+            os.close(master_fd)
+        except OSError:
+            pass
+        try:
+            os.close(slave_fd)
+        except OSError:
+            pass
+        return None
+    # Parent doesn't need its end of the slave any more.
+    try:
+        os.close(slave_fd)
+    except OSError:
+        pass
+    return proc, master_fd
+
+
+def _read_dns_sd_output_pty(
+    master_fd: int, timeout: float
+) -> Tuple[Optional[str], Optional[int], Dict[bytes, bytes]]:
+    """Pty version of :func:`_read_dns_sd_output`.
+
+    Reads bytes from the pty master_fd and feeds them into a small
+    line buffer. The parsing logic for ``can be reached at`` and
+    ``key=value`` lines is identical to the pipe version.
+    """
+    deadline = time.monotonic() + timeout
+    host: Optional[str] = None
+    port: Optional[int] = None
+    txt_props: Dict[bytes, bytes] = {}
+    buf = bytearray()
+
+    while time.monotonic() < deadline:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            ready, _, _ = select.select([master_fd], [], [], min(remaining, 0.25))
+        except (ValueError, OSError):
+            break
+        if not ready:
+            continue
+
+        try:
+            chunk = os.read(master_fd, 4096)
+        except OSError:
+            break
+        if not chunk:
+            break
+        buf.extend(chunk)
+
+        # Process each completed line.
+        while b"\n" in buf or b"\r" in buf:
+            for sep in (b"\r\n", b"\n", b"\r"):
+                idx = buf.find(sep)
+                if idx >= 0:
+                    line_bytes = bytes(buf[:idx])
+                    del buf[: idx + len(sep)]
+                    break
+            else:
+                break
+            try:
+                line = line_bytes.decode("utf-8", errors="replace")
+            except Exception:
+                continue
+            host, port = _maybe_parse_reachable(line, host, port)
+            txt_props.update(_maybe_parse_txt(line))
+
+        if host and port and txt_props:
+            return host, port, txt_props
+
+    return host, port, txt_props
+
+
+def _maybe_parse_reachable(
+    line: str, host: Optional[str], port: Optional[int]
+) -> Tuple[Optional[str], Optional[int]]:
+    if "can be reached at" not in line:
+        return host, port
+    tail = line.split("can be reached at", 1)[1].strip()
+    host_port = tail.split()[0] if tail else ""
+    if ":" not in host_port:
+        return host, port
+    h, p = host_port.rsplit(":", 1)
+    try:
+        return h, int(p)
+    except ValueError:
+        return host, port
+
+
+def _maybe_parse_txt(line: str) -> Dict[bytes, bytes]:
+    if "=" not in line:
+        return {}
+    out: Dict[bytes, bytes] = {}
+    for token in line.strip().split():
+        if "=" not in token:
+            continue
+        k, v = token.split("=", 1)
+        if v.startswith('"') and v.endswith('"') and len(v) >= 2:
+            v = v[1:-1]
+        try:
+            out[k.encode("utf-8")] = v.encode("utf-8")
+        except UnicodeEncodeError:
+            continue
+    return out
 
 
 def _terminate_subprocess(proc: subprocess.Popen) -> None:
