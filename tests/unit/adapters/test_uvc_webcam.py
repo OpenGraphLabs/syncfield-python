@@ -185,3 +185,73 @@ class TestFourPhaseLifecycle:
         # Sanity: jitter should be on the order of pace_seconds (1ms = 1_000_000 ns)
         # — allow generous bounds for CI load.
         assert 0 < report.jitter_p95_ns < 100_000_000  # < 100ms
+
+
+class TestDecoderResilience:
+    """The capture loop must tolerate transient decoder errors.
+
+    AVFoundation on macOS raises ``BlockingIOError`` (EAGAIN) during
+    camera warmup and occasionally between frames. We must not treat
+    those as fatal — the loop should sleep briefly and keep polling.
+    """
+
+    def test_blocking_io_error_does_not_kill_loop(
+        self, mock_av_generous, tmp_path
+    ):
+        """Inject EAGAIN into the decode iterator; loop must survive."""
+        import numpy as np
+        from unittest.mock import MagicMock
+
+        from syncfield.adapters.uvc_webcam import UVCWebcamStream
+
+        # A generator that `raise`s without ever yielding becomes dead
+        # after the first next() call, so we use an iterator class that
+        # preserves state across next() calls: first 3 calls raise
+        # EAGAIN, subsequent 50 calls yield real BGR frames.
+        class FlakyIter:
+            def __init__(self) -> None:
+                self._eagain_left = 3
+                self._i = 0
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                if self._eagain_left > 0:
+                    self._eagain_left -= 1
+                    raise BlockingIOError(
+                        35, "Resource temporarily unavailable", "0"
+                    )
+                if self._i >= 50:
+                    raise StopIteration
+                time.sleep(0.001)
+                frame = MagicMock(name=f"Frame-{self._i}")
+                frame.to_ndarray = MagicMock(
+                    return_value=np.full(
+                        (48, 64, 3), self._i % 256, dtype=np.uint8
+                    )
+                )
+                self._i += 1
+                return frame
+
+        mock_av_generous.input_container.decode = MagicMock(
+            return_value=FlakyIter()
+        )
+
+        stream = UVCWebcamStream(
+            "cam", device_index=0, output_dir=tmp_path, fps=30.0
+        )
+        stream.prepare()
+        stream.connect()
+        stream.start_recording(_clock())
+        time.sleep(0.1)  # let the loop churn through EAGAINs + real frames
+        report = stream.stop_recording()
+        stream.disconnect()
+
+        # Must have recorded at least one real frame after absorbing EAGAINs.
+        assert report.frame_count >= 1
+        # No health event emitted — EAGAIN is not a fatal error.
+        assert not any(
+            "BlockingIOError" in (h.detail or "")
+            for h in report.health_events
+        )

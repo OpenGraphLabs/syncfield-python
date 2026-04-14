@@ -254,20 +254,28 @@ class UVCWebcamStream(StreamBase):
 
         The loop exits when ``_stop_event`` fires or the input container
         is exhausted (device disconnect).
+
+        ``BlockingIOError`` (EAGAIN) is NOT fatal — AVFoundation raises
+        it during camera warmup and occasionally between frames. We
+        sleep briefly and keep trying.
         """
         assert self._input is not None
+        frame_iter = iter(self._input.decode(video=0))
         try:
-            for frame in self._input.decode(video=0):
+            while not self._stop_event.is_set():
+                try:
+                    frame = next(frame_iter)
+                except StopIteration:
+                    break
+                except BlockingIOError:
+                    time.sleep(0.001)
+                    continue
+
                 capture_ns = time.monotonic_ns()
-                # Jitter collection runs only during the recording window so preview
-                # intervals don't pollute the report and so the capture thread never
-                # mutates the list while stop_recording() is reading it.
                 if self._recording:
                     if self._prev_capture_ns is not None:
                         self._intervals_ns.append(capture_ns - self._prev_capture_ns)
                     self._prev_capture_ns = capture_ns
-                if self._stop_event.is_set():
-                    break
 
                 frame_bgr = frame.to_ndarray(format="bgr24")
 
