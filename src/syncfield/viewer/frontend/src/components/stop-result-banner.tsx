@@ -1,3 +1,4 @@
+import type { ReactElement } from "react";
 import type { StopResultEvent } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
@@ -108,21 +109,36 @@ function StreamStatus({
 }) {
   const ok = info.status === "completed" && info.file_exists !== false;
   const hasWarning = info.warning != null;
+  // Go3S-style standalone recorders finish recording with
+  // status="pending_aggregation" + 0 frames — that's the expected happy
+  // path, not a failure. Render with a distinct "pending" affordance.
+  const isPending = info.status === "pending_aggregation";
+
+  let icon: ReactElement;
+  if (isPending) {
+    icon = <span className="text-muted">⧖</span>;
+  } else if (ok && !hasWarning) {
+    icon = <span className="text-success">✓</span>;
+  } else if (ok && hasWarning) {
+    icon = <span className="text-warning">⚠</span>;
+  } else {
+    icon = <span className="text-destructive">✗</span>;
+  }
 
   return (
     <div className="flex items-center gap-1 text-[11px]">
-      {ok && !hasWarning ? (
-        <span className="text-success">✓</span>
-      ) : ok && hasWarning ? (
-        <span className="text-warning">⚠</span>
-      ) : (
-        <span className="text-destructive">✗</span>
-      )}
+      {icon}
       <span className="font-mono">{streamId}</span>
-      <span className="text-muted">
-        {info.frame_count.toLocaleString()} frames
-      </span>
-      {info.error && (
+      {isPending ? (
+        <span className="text-muted">
+          awaiting collection · click “Collect Videos”
+        </span>
+      ) : (
+        <span className="text-muted">
+          {info.frame_count.toLocaleString()} frames
+        </span>
+      )}
+      {info.error && !isPending && (
         <span className="text-destructive">— {info.error}</span>
       )}
       {hasWarning && !info.error && (
