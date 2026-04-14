@@ -80,6 +80,7 @@ def test_full_lifecycle_enqueues_aggregation(fake_ble, fake_queue, tmp_path):
         stream_id="overhead",
         ble_address="AA:BB:CC:DD:EE:FF",
         output_dir=tmp_path,
+        aggregation_policy="eager",  # default is on_demand; test the eager path
     )
     s.prepare()
     s.connect()

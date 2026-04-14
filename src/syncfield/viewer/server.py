@@ -315,6 +315,9 @@ def handle_control_command(orchestrator: "SessionOrchestrator", payload: dict) -
         if cmd == "cancel_aggregation":
             orchestrator.cancel_aggregation(payload["job_id"])
             return {"ok": True}
+        if cmd == "aggregate_all_pending":
+            result = orchestrator.aggregate_all_pending()
+            return {"ok": True, **result}
         if cmd == "add_go3s_stream":
             try:
                 from syncfield.adapters.insta360_go3s import Go3SStream
@@ -1816,7 +1819,12 @@ class ViewerServer:
                     "error": f"Cancel failed: {exc}",
                     "streams": {},
                 })
-        elif action in ("retry_aggregation", "cancel_aggregation", "aggregate_episode"):
+        elif action in (
+            "retry_aggregation",
+            "cancel_aggregation",
+            "aggregate_episode",
+            "aggregate_all_pending",
+        ):
             # Route aggregation control commands through the T14 dispatcher.
             # The payload uses the same key names expected by handle_control_command
             # (it reads "command" from the dict), so we normalise here.

@@ -130,7 +130,8 @@ export type ControlAction =
   | "cancel"
   | "retry_aggregation"
   | "cancel_aggregation"
-  | "aggregate_episode";
+  | "aggregate_episode"
+  | "aggregate_all_pending";
 
 export interface ControlCommand {
   action: ControlAction;

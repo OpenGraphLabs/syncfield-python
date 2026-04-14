@@ -189,7 +189,7 @@ class Go3SStream(StreamBase):
         *,
         ble_address: str,
         output_dir: Path,
-        aggregation_policy: AggregationPolicy = "eager",
+        aggregation_policy: AggregationPolicy = "on_demand",
         wifi_ssid: Optional[str] = None,
         wifi_password: str = "88888888",
     ):
@@ -385,6 +385,21 @@ class Go3SStream(StreamBase):
             return self._failed_report(str(e))
 
         self.pending_aggregation_job = job
+
+        # Always persist the aggregation manifest to disk so a later
+        # Sync (including after viewer restart) can find the episode.
+        # For the wrist-mount workflow the camera's WiFi is typically
+        # OFF during recording; the user docks the camera later and
+        # clicks Sync in the viewer, at which point recovery_from_disk
+        # + the queue pick up every pending job.
+        try:
+            job.write_manifest()
+        except Exception as e:
+            logger.warning(
+                "Go3SStream(%s): could not persist aggregation manifest: %s",
+                self.id, e,
+            )
+
         if self._aggregation_policy == "eager":
             try:
                 self._enqueue_job(job)
@@ -402,6 +417,17 @@ class Go3SStream(StreamBase):
                 detail=(
                     f"Aggregation enqueued (job={job.job_id}, "
                     f"ssid={self._wifi_ssid!r}, sd={self._sd_path!r})"
+                ),
+            ))
+        else:
+            # on_demand: persist only; the user will trigger Sync later.
+            self._emit_health(HealthEvent(
+                stream_id=self.id,
+                kind=HealthEventKind.HEARTBEAT,
+                at_ns=time.monotonic_ns(),
+                detail=(
+                    f"Aggregation pending — queued for manual Sync "
+                    f"(job={job.job_id}, sd={self._sd_path!r})"
                 ),
             ))
         return FinalizationReport(

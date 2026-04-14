@@ -118,7 +118,14 @@ function RecordView({
         }
       />
 
-      <ControlPanel state={state} hasTask={taskState.currentTask !== null} onCommand={sendCommand} />
+      <ControlPanel
+        state={state}
+        hasTask={taskState.currentTask !== null}
+        onCommand={sendCommand}
+        hasGo3sStream={Object.values(snapshot?.streams ?? {}).some(
+          (s) => s.kind === "video" && s.capabilities?.live_preview === false,
+        )}
+      />
       <TaskSelector
         tasks={taskState.tasks}
         currentTask={taskState.currentTask}

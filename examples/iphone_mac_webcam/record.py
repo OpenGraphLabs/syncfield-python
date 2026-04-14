@@ -3,20 +3,30 @@
     pip install "syncfield[uvc,ble,viewer,camera]"
     python record.py
 
-The Go3S is BLE-triggered (start/stop only). The video file is pulled from the
-camera's WiFi AP automatically after stop_recording() — aggregation runs in a
-background queue and does not block subsequent recordings.
+Workflow (wrist-mount + later dock-and-sync):
+  1. Wear the Go3S on your wrist. Its WiFi is OFF — only BLE is needed.
+  2. Click **Record** in the viewer → all sensors + Go3S start in sync.
+  3. Click **Stop** → recording ends, episode dir now contains an
+     ``aggregation.json`` with the SD file path for the Go3S clip.
+     (No file download yet.)
+  4. Optional: record more episodes the same way.
+  5. When ready to pull videos off the camera:
+     a. Dock the Go3S in the Action Pod (or turn WiFi ON manually via
+        the camera: swipe down → WiFi → ON).
+     b. Make sure the camera's WiFi AP (e.g. "GO 3S 1TEBJJ.OSC") is
+        visible in macOS WiFi menu.
+     c. Click **Sync Go3S** in the viewer. The background queue walks
+        every pending ``aggregation.json`` under the output directory,
+        switches to the camera AP, downloads each file, and restores
+        the original WiFi network.
 
-Go3S prerequisites (critical — otherwise aggregation will fail):
-  1. Turn the camera ON and unlock it.
-  2. **Enable the camera's WiFi AP**: swipe down from the top of the screen
-     → WiFi → turn ON. Or dock it in the Action Pod (keeps WiFi persistently
-     on). Without this, the camera broadcasts BLE but no OSC HTTP AP, and
-     aggregation will fail at the "Switching WiFi" stage.
-  3. Default AP password is "88888888" (Insta360 factory default).
-  4. On macOS, grant Location Services permission to Python / your terminal
-     when the OS prompts on first aggregation run (required for
-     networksetup to switch WiFi networks).
+Go3S policy defaults to ``on_demand`` so recording never blocks on WiFi
+availability. Pass ``aggregation_policy="eager"`` if you want stop to
+auto-download (only useful when camera is docked the whole time).
+
+macOS one-time setup (unavoidable — OS-enforced):
+  * Grant Location Services permission to Python / your terminal app when
+    prompted — required for programmatic WiFi switching on macOS 13+.
 """
 
 from pathlib import Path

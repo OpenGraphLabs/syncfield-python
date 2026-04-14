@@ -65,6 +65,7 @@ async def test_recording_succeeds_while_aggregation_runs(tmp_path):
                 stream_id="overhead",
                 ble_address="AA:BB:CC:DD:EE:FF",
                 output_dir=ep1,
+                aggregation_policy="eager",
             )
             session.add(stream)
 

@@ -3137,6 +3137,53 @@ class SessionOrchestrator:
         """
         raise NotImplementedError("cancel_aggregation deferred to v2")
 
+    def aggregate_all_pending(self) -> dict:
+        """Scan ``output_dir`` for episodes with pending aggregation manifests and enqueue them all.
+
+        This is the "Sync now" path for the wrist-mount workflow: the user
+        records multiple episodes while the Go3S camera's WiFi is off, then
+        docks the camera, enables WiFi, and clicks a single button in the
+        viewer to download every pending episode's file in one pass.
+
+        Returns:
+            dict with ``enqueued``: list of job ids, and ``skipped``: list of
+            ``{episode_id, reason}`` for manifests that could not be enqueued.
+
+        Raises:
+            RuntimeError: If the Go3S adapter is not installed.
+        """
+        try:
+            from syncfield.adapters.insta360_go3s.stream import (
+                _enqueue_on_global_queue,
+                _global_aggregation_queue,
+            )
+            from syncfield.adapters.insta360_go3s.aggregation.types import (
+                AggregationState,
+            )
+        except ImportError:
+            raise RuntimeError(
+                "Go3S adapter not installed (missing 'camera' extra)"
+            )
+
+        queue = _global_aggregation_queue()
+        # recover_from_disk returns PENDING/RUNNING jobs and normalizes
+        # RUNNING to PENDING so they're re-enqueued safely.
+        candidates = queue.recover_from_disk(search_root=self.output_dir)
+
+        enqueued: list[str] = []
+        skipped: list[dict] = []
+        for job in candidates:
+            if job.state == AggregationState.COMPLETED:
+                continue
+            try:
+                _enqueue_on_global_queue(job)
+                enqueued.append(job.job_id)
+            except Exception as e:
+                skipped.append(
+                    {"episode_id": job.episode_id, "reason": f"enqueue: {e}"}
+                )
+        return {"enqueued": enqueued, "skipped": skipped}
+
 
 class _ControlPlaneOrchestratorAdapter:
     """Narrow adapter between SessionOrchestrator and FastAPI routes.

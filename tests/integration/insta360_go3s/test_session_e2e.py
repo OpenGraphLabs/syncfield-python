@@ -65,6 +65,7 @@ async def test_e2e_record_then_aggregate(tmp_path):
                 stream_id="overhead",
                 ble_address="AA:BB:CC:DD:EE:FF",
                 output_dir=ep_dir,
+                aggregation_policy="eager",
             )
             session.add(stream)
             # Stream lifecycle methods call asyncio.run() internally, which

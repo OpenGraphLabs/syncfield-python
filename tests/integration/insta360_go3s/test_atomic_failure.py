@@ -64,6 +64,7 @@ async def test_failure_then_retry(tmp_path):
                 stream_id="overhead",
                 ble_address="AA:BB:CC:DD:EE:FF",
                 output_dir=ep,
+                aggregation_policy="eager",
             )
             session.add(stream)
             await asyncio.to_thread(stream.prepare)
