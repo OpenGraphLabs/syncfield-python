@@ -7,10 +7,13 @@ parsing. Accepts a ``transport`` kwarg so unit tests can inject
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Optional
 
 import httpx
+
+logger = logging.getLogger(__name__)
 
 
 DEFAULT_TIMEOUT_S = 10.0
@@ -99,6 +102,17 @@ class QuestHttpClient:
         response = self._client.post("/recording/stop", json={})
         response.raise_for_status()
         return RecordingStopResponse.from_json(response.json())
+
+    def delete_recording(self) -> None:
+        """Tell the Quest to clean up the just-pulled session files.
+
+        Best-effort: we swallow HTTP errors because the files are already on disk.
+        """
+        try:
+            response = self._client.delete("/recording/files")
+            response.raise_for_status()
+        except httpx.HTTPError as exc:
+            logger.warning("DELETE /recording/files failed: %s", exc)
 
     def download_file(
         self,

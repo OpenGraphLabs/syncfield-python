@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import logging
-import time
 from pathlib import Path
 from typing import Optional, Tuple
+
+import time
 
 import httpx
 
@@ -127,7 +128,10 @@ class MetaQuestCameraStream(StreamBase):
         if self._http is None:
             raise RuntimeError("start_recording() called before connect()")
 
-        self._session_id = f"ep_{int(time.monotonic_ns())}"
+        self._session_id = (
+            f"ep_{session_clock.sync_point.timestamp_ms}"
+            f"_{session_clock.sync_point.host_id}"
+        )
         self._frame_count = 0
         self._first_at = None
         self._last_at = None
@@ -161,7 +165,7 @@ class MetaQuestCameraStream(StreamBase):
             raise RuntimeError("stop_recording() called before connect()")
 
         try:
-            self._http.stop_recording()
+            stop_response = self._http.stop_recording()
             if self._timestamp_tail is not None:
                 self._timestamp_tail.stop()
                 self._timestamp_tail = None
@@ -170,8 +174,33 @@ class MetaQuestCameraStream(StreamBase):
                 client=self._http, stream_id=self.id, output_dir=self._output_dir
             )
             artifacts = puller.pull_all()
-            status = "completed"
-            error: Optional[str] = None
+
+            # Verify file sizes match the /stop response (spec §4.3).
+            size_errors = []
+            left_actual = artifacts.left_mp4.stat().st_size
+            if left_actual != stop_response.left.bytes:
+                size_errors.append(
+                    f"left size mismatch: expected {stop_response.left.bytes} bytes,"
+                    f" got {left_actual} bytes on disk"
+                )
+            right_actual = artifacts.right_mp4.stat().st_size
+            if right_actual != stop_response.right.bytes:
+                size_errors.append(
+                    f"right size mismatch: expected {stop_response.right.bytes} bytes,"
+                    f" got {right_actual} bytes on disk"
+                )
+
+            if size_errors:
+                status = "partial"
+                error: Optional[str] = "; ".join(size_errors)
+                logger.warning(
+                    "[%s] Recording files may be truncated: %s", self.id, error
+                )
+            else:
+                # All good — tell the Quest to clean up the session files.
+                self._http.delete_recording()
+                status = "completed"
+                error = None
         except Exception as exc:
             status = "failed"
             error = str(exc)

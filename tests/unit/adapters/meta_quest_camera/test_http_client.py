@@ -117,6 +117,35 @@ class TestStopRecording:
         assert res.duration_s == pytest.approx(3.33)
 
 
+class TestDeleteRecording:
+    def test_delete_recording_sends_delete_and_returns_cleanly(self, quest_host, quest_port):
+        received = {"method": None, "path": None}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            received["method"] = request.method
+            received["path"] = request.url.path
+            return httpx.Response(204)
+
+        client = QuestHttpClient(
+            host=quest_host, port=quest_port, transport=_mock_transport(handler)
+        )
+        # Should not raise; returns None
+        result = client.delete_recording()
+        assert result is None
+        assert received["method"] == "DELETE"
+        assert received["path"] == "/recording/files"
+
+    def test_delete_recording_swallows_http_error(self, quest_host, quest_port):
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(500, json={"error": "internal"})
+
+        client = QuestHttpClient(
+            host=quest_host, port=quest_port, transport=_mock_transport(handler)
+        )
+        # Should NOT raise even on 500
+        client.delete_recording()
+
+
 class TestDownload:
     def test_download_file_writes_all_bytes(self, quest_host, quest_port, tmp_path):
         payload = b"\x00\x01\x02" * 1024  # 3 KiB
