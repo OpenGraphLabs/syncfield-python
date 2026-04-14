@@ -97,15 +97,17 @@ def resolve_via_dns_sd(
             )
             return None
 
-        # Resolve hostname -> IPv4. macOS's getaddrinfo also goes through
-        # mDNSResponder for ``.local.`` names, so this is reliable here.
-        try:
-            addr_str = socket.gethostbyname(host.rstrip("."))
-            addr_packed = socket.inet_aton(addr_str)
-        except (socket.gaierror, OSError) as exc:
+        # Resolve hostname -> IPv4. dns-sd output sometimes carries a
+        # doubled .local suffix when the Mac's HostName is already set
+        # to something ending in .local (e.g. "Jerryui-MacBookPro.local"
+        # → "Jerryui-MacBookPro.local.local."). Try several normalised
+        # variants in order; the first that resolves wins.
+        addr_packed = _resolve_hostname_to_packed_ipv4(host, timeout=timeout)
+        if addr_packed is None:
             logger.debug(
-                "dns-sd fallback: hostname resolution failed for %s: %s",
-                host, exc,
+                "dns-sd fallback: could not resolve hostname %r to IPv4 "
+                "(tried gethostbyname variants + dns-sd -G)",
+                host,
             )
             return None
 
@@ -114,6 +116,115 @@ def resolve_via_dns_sd(
             properties=txt_props,
             _addresses=[addr_packed],
         )
+    finally:
+        _terminate_subprocess(proc)
+
+
+def _hostname_variants(host: str) -> List[str]:
+    """Yield reasonable normalisations of an mDNS hostname.
+
+    dns-sd's ``-L`` output occasionally produces ``host.local.local.``
+    when the Mac's HostName already ends with ``.local``. macOS's
+    ``getaddrinfo`` won't resolve the doubled form, but it WILL resolve
+    the deduplicated one. Return the original (minus trailing dot) plus
+    the dedup'd variant plus the bare hostname so the caller can probe
+    each.
+    """
+    raw = host.rstrip(".")
+    seen: List[str] = []
+
+    def _add(candidate: str) -> None:
+        if candidate and candidate not in seen:
+            seen.append(candidate)
+
+    _add(raw)
+
+    # Collapse repeated trailing ``.local`` segments to a single one.
+    if raw.endswith(".local.local"):
+        _add(raw[: -len(".local")])
+    elif raw.endswith(".local.local."):
+        _add(raw[: -len(".local.")])
+
+    # Bare host (no .local suffix). Can succeed if the OS resolver picks
+    # up the .local appropriately or if /etc/hosts has the bare form.
+    if raw.endswith(".local"):
+        _add(raw[: -len(".local")])
+
+    return seen
+
+
+def _resolve_hostname_to_packed_ipv4(
+    host: str, *, timeout: float
+) -> Optional[bytes]:
+    """Resolve a hostname to a packed 4-byte IPv4 address, or None.
+
+    Tries each normalised variant via ``socket.gethostbyname`` first.
+    Falls back to ``dns-sd -G v4`` (also via macOS's mDNSResponder) if
+    every variant fails — useful when ``getaddrinfo`` for ``.local.``
+    names doesn't end up calling mDNSResponder for some reason.
+    """
+    for candidate in _hostname_variants(host):
+        try:
+            addr_str = socket.gethostbyname(candidate)
+            return socket.inet_aton(addr_str)
+        except (socket.gaierror, OSError):
+            continue
+
+    # Final fallback: ask dns-sd directly. -G v4 keeps emitting on
+    # multiple interfaces; we just need the first valid IPv4.
+    for candidate in _hostname_variants(host):
+        addr_str = _resolve_via_dns_sd_g(candidate, timeout=timeout)
+        if addr_str:
+            try:
+                return socket.inet_aton(addr_str)
+            except OSError:
+                continue
+    return None
+
+
+def _resolve_via_dns_sd_g(
+    hostname: str, *, timeout: float
+) -> Optional[str]:
+    """Run ``dns-sd -G v4 <hostname>.`` and return the first IPv4 line."""
+    try:
+        proc = subprocess.Popen(
+            ["dns-sd", "-G", "v4", hostname.rstrip(".") + "."],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except (OSError, FileNotFoundError):
+        return None
+
+    try:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                ready, _, _ = select.select(
+                    [proc.stdout], [], [], min(remaining, 0.25)
+                )
+            except (ValueError, OSError):
+                break
+            if not ready:
+                continue
+            line = proc.stdout.readline()
+            if not line:
+                break
+            # Format: ``HH:MM:SS.mmm Add 2 14 hostname.local. 192.168.1.5``
+            tokens = line.strip().split()
+            if not tokens:
+                continue
+            for token in reversed(tokens):
+                # Pick the token that parses as a valid IPv4.
+                try:
+                    socket.inet_aton(token)
+                    return token
+                except OSError:
+                    continue
+        return None
     finally:
         _terminate_subprocess(proc)
 

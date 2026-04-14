@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "syncfield"
-version = "0.3.7"
+version = "0.3.8"
 description = "Multi-modal capture orchestration framework with precision sync for Physical AI data collection"
 readme = "README.md"
 license = "Apache-2.0"
@@ -88,4 +88,6 @@ markers = [
 dev = [
     "pytest>=8.4.2",
     "pytest-mock>=3.12.0",
+    "pytest-timeout>=2.4.0",
+    "pytest-xdist>=3.6.0",
 ]
