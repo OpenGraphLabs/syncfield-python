@@ -19,9 +19,10 @@ from syncfield.orchestrator import SessionOrchestrator
 class FakeBleCamera:
     def __init__(self, address: str):
         self.address = address
+        self.is_connected = False
 
     async def connect(self, sync_timeout: float = 2.0, auth_timeout: float = 1.0):
-        pass
+        self.is_connected = True
 
     async def set_video_mode(self):
         pass
@@ -33,7 +34,7 @@ class FakeBleCamera:
         return CaptureResult(file_path="/DCIM/Camera01/VID_E2E.mp4", ack_host_ns=23456)
 
     async def disconnect(self):
-        pass
+        self.is_connected = False
 
 
 class FakeDownloader(AggregationDownloader):

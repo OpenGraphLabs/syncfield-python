@@ -33,12 +33,15 @@ class FlakyDownloader(AggregationDownloader):
 
 
 class FakeBleCamera:
-    def __init__(self, address): self.address = address
-    async def connect(self, sync_timeout=2.0, auth_timeout=1.0): pass
+    def __init__(self, address):
+        self.address = address
+        self.is_connected = False
+    async def connect(self, sync_timeout=2.0, auth_timeout=1.0):
+        self.is_connected = True
     async def set_video_mode(self): pass
     async def start_capture(self): return 1
     async def stop_capture(self): return CaptureResult(file_path="/DCIM/Camera01/VID.mp4", ack_host_ns=2)
-    async def disconnect(self): pass
+    async def disconnect(self): self.is_connected = False
 
 
 @pytest.mark.asyncio

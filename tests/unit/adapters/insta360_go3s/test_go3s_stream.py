@@ -115,8 +115,65 @@ def test_on_demand_policy_does_not_enqueue(fake_ble, fake_queue, tmp_path):
     assert s.pending_aggregation_job.cameras[0].sd_path == "/DCIM/Camera01/VID_FAKE.mp4"
 
 
-def test_stop_recording_raises_when_ble_returns_empty_filepath(fake_ble, fake_queue, tmp_path):
-    """If BLE STOP doesn't echo a /DCIM/... path, surface a clear error."""
+def test_ble_link_is_held_across_start_stop_no_rehandshake(monkeypatch, tmp_path):
+    """Regression guard: connect() opens BLE once; start/stop reuse the link.
+
+    Before persistent-BLE refactor, every command re-ran SYNC + CHECK_AUTH
+    (~4–7 s on macOS). The fix is to hold the connection open across the
+    recording window. This test fails if Go3SBLECamera is instantiated more
+    than once per session.
+    """
+    instantiations = []
+
+    class RecordingCam:
+        def __init__(self, address):
+            instantiations.append(address)
+            self.address = address
+            self.is_connected = False
+        async def connect(self, sync_timeout=2.0, auth_timeout=1.0):
+            self.is_connected = True
+        async def start_capture(self):
+            return 111
+        async def stop_capture(self):
+            return CaptureResult(file_path="/DCIM/Camera01/VID.mp4", ack_host_ns=222)
+        async def disconnect(self):
+            self.is_connected = False
+
+    monkeypatch.setattr(
+        "syncfield.adapters.insta360_go3s.stream.Go3SBLECamera", RecordingCam
+    )
+    monkeypatch.setattr(
+        "syncfield.adapters.insta360_go3s.stream._global_aggregation_queue",
+        lambda: MagicMock(spec=AggregationQueue),
+    )
+
+    s = Go3SStream(
+        stream_id="overhead",
+        ble_address="AA:BB:CC:DD:EE:FF",
+        output_dir=tmp_path,
+    )
+    s.prepare()
+    s.connect()
+    s.start_recording(session_clock=MagicMock())
+    report = s.stop_recording()
+    s.disconnect()
+
+    assert report.status == "pending_aggregation"
+    assert len(instantiations) == 1, (
+        f"Expected exactly one Go3SBLECamera instantiation; got "
+        f"{len(instantiations)}. Each extra instantiation means another "
+        f"SYNC + CHECK_AUTH handshake (~4–7 s latency)."
+    )
+
+
+def test_stop_recording_returns_failed_when_ble_returns_empty_filepath(fake_ble, fake_queue, tmp_path):
+    """If BLE STOP doesn't echo a /DCIM/... path, return status='failed'.
+
+    We do NOT raise here — raising would interrupt the orchestrator's stop
+    fan-out across other streams. Instead, surface a FinalizationReport with
+    status='failed' and a clear error message so the viewer and caller can
+    see that the camera may still be recording.
+    """
     fake_ble.stop_capture.return_value = CaptureResult(file_path="", ack_host_ns=0)
     s = Go3SStream(
         stream_id="overhead",
@@ -126,8 +183,12 @@ def test_stop_recording_raises_when_ble_returns_empty_filepath(fake_ble, fake_qu
     s.prepare()
     s.connect()
     s.start_recording(session_clock=MagicMock())
-    with pytest.raises(RuntimeError, match="did not return a file path"):
-        s.stop_recording()
+    report = s.stop_recording()
+    assert report.status == "failed"
+    assert "did not return a file path" in (report.error or "")
+    # No aggregation should have been enqueued for a failed stop
+    assert not fake_queue.enqueue.called
+    assert s.pending_aggregation_job is None
 
 
 def test_recovery_scan_picks_up_pending_aggregation(tmp_path, monkeypatch):

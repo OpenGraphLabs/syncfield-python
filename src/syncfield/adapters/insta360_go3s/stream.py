@@ -183,6 +183,14 @@ class Go3SStream(StreamBase):
         self._start_ack_ns: Optional[int] = None
         self._stop_ack_ns: Optional[int] = None
         self._sd_path: Optional[str] = None
+        # Persistent BLE session — opened at connect(), held through start/stop,
+        # closed at disconnect(). Without this the SYNC + CHECK_AUTH handshake
+        # (~4–7 s on macOS) would fire on every start_recording / stop_recording
+        # call, adding intolerable latency to the Record / Stop UX.
+        self._cam: Optional[Go3SBLECamera] = None
+        self._ble_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._ble_thread: Optional[threading.Thread] = None
+        self._ble_lock = threading.Lock()
         self.pending_aggregation_job: Optional[AggregationJob] = None
         """Last job built by stop_recording() — set after each stop, never cleared.
 
@@ -208,19 +216,103 @@ class Go3SStream(StreamBase):
         )
 
     def connect(self) -> None:
-        # Quick BLE handshake to verify reachability + auto-derive SSID; then disconnect.
-        self._run_async(self._verify_reachable())
+        """Open a persistent BLE session (idempotent).
+
+        The SYNC + CHECK_AUTH handshake is performed here so that
+        ``start_recording`` / ``stop_recording`` can dispatch their commands
+        over an already-authenticated link (< 1 s per call instead of 4–7 s).
+        """
+        if self._cam is not None and self._cam.is_connected:
+            return
+        # Defensive teardown of any stale instance before opening a new one.
+        self._force_disconnect_cam()
+
+        cam = Go3SBLECamera(self._ble_address)
+        try:
+            self._run_on_ble_loop(
+                cam.connect(sync_timeout=3.0, auth_timeout=3.0),
+                timeout=12.0,
+            )
+        except Exception as e:
+            self._emit_health(HealthEvent(
+                stream_id=self.id,
+                kind=HealthEventKind.ERROR,
+                at_ns=time.monotonic_ns(),
+                detail=f"Go3S BLE connect failed: {e}",
+            ))
+            raise
+
+        self._cam = cam
+        if self._wifi_ssid is None:
+            self._wifi_ssid = self._derive_ssid_from_address(self._ble_address)
+        self._emit_health(HealthEvent(
+            stream_id=self.id,
+            kind=HealthEventKind.HEARTBEAT,
+            at_ns=time.monotonic_ns(),
+            detail="Go3S BLE link open and authed",
+        ))
 
     def start_recording(self, session_clock: SessionClock) -> None:
-        self._run_async(self._do_start())
+        """Fire BLE start_capture over the persistent link.
+
+        If the link has dropped since connect(), reconnect once before sending.
+        """
+        self._ensure_ble_connected()
+        assert self._cam is not None
+        self._start_ack_ns = self._run_on_ble_loop(
+            self._cam.start_capture(),
+            timeout=5.0,
+        )
 
     def stop_recording(self) -> FinalizationReport:
-        self._run_async(self._do_stop())
+        """Fire BLE stop_capture; retry once with reconnect if the first attempt fails.
+
+        If both attempts fail, return ``status="failed"`` with a clear error so
+        the orchestrator and viewer reflect that the device may still be recording
+        and needs manual intervention. Aggregation is NOT enqueued in that case
+        (the SD file path is unknown).
+        """
+        result_or_error = self._attempt_stop()
+        if isinstance(result_or_error, Exception):
+            # One retry with a fresh BLE connection.
+            self._emit_health(HealthEvent(
+                stream_id=self.id,
+                kind=HealthEventKind.RECONNECT,
+                at_ns=time.monotonic_ns(),
+                detail=f"Go3S stop failed, retrying with fresh BLE: {result_or_error}",
+            ))
+            self._force_disconnect_cam()
+            try:
+                self.connect()
+            except Exception as e_reconnect:
+                return self._failed_report(
+                    f"stop_recording: reconnect for retry failed ({e_reconnect}); "
+                    f"original error: {result_or_error}. "
+                    "Camera may still be recording — stop it manually via the "
+                    "Insta360 app or the camera button."
+                )
+            result_or_error = self._attempt_stop()
+            if isinstance(result_or_error, Exception):
+                return self._failed_report(
+                    f"stop_recording failed after retry: {result_or_error}. "
+                    "Camera may still be recording — stop it manually via the "
+                    "Insta360 app or the camera button."
+                )
+
+        self._stop_ack_ns = result_or_error.ack_host_ns
+        self._sd_path = result_or_error.file_path
+
+        if not self._sd_path:
+            return self._failed_report(
+                "stop_recording did not return a file path; the BLE STOP "
+                "response did not contain a /DCIM/... entry. Verify the "
+                "camera is in video mode."
+            )
+
         job = self._build_job()
         self.pending_aggregation_job = job
         if self._aggregation_policy == "eager":
             self._enqueue_job(job)
-        # "on_demand": leave job pending; orchestrator/viewer triggers later.
         return FinalizationReport(
             stream_id=self.id,
             status="pending_aggregation",
@@ -233,35 +325,110 @@ class Go3SStream(StreamBase):
         )
 
     def disconnect(self) -> None:
-        # Aggregation runs independently; nothing to tear down synchronously.
-        pass
+        """Close the BLE session and tear down the BLE event loop thread."""
+        self._force_disconnect_cam()
+        with self._ble_lock:
+            loop = self._ble_loop
+            thread = self._ble_thread
+            self._ble_loop = None
+            self._ble_thread = None
+        if loop is not None:
+            try:
+                loop.call_soon_threadsafe(loop.stop)
+            except RuntimeError:
+                pass
+        if thread is not None:
+            thread.join(timeout=2.0)
 
     # ----- internals -----
 
-    async def _verify_reachable(self) -> None:
-        cam = Go3SBLECamera(self._ble_address)
-        await cam.connect(sync_timeout=2.0, auth_timeout=1.0)
-        if self._wifi_ssid is None:
-            self._wifi_ssid = self._derive_ssid_from_address(self._ble_address)
-        await cam.disconnect()
+    def _ensure_ble_connected(self) -> None:
+        """If connect() was skipped or the link dropped, reopen transparently."""
+        if self._cam is not None and self._cam.is_connected:
+            return
+        logger.warning(
+            "Go3SStream(%s): BLE link not open at command time; reconnecting",
+            self.id,
+        )
+        self._force_disconnect_cam()
+        self.connect()
 
-    async def _do_start(self) -> None:
-        cam = Go3SBLECamera(self._ble_address)
-        await cam.connect()
+    def _attempt_stop(self):
+        """Run a single stop_capture attempt. Returns CaptureResult or the Exception."""
         try:
-            self._start_ack_ns = await cam.start_capture()
-        finally:
-            await cam.disconnect()
+            self._ensure_ble_connected()
+            assert self._cam is not None
+            return self._run_on_ble_loop(
+                self._cam.stop_capture(),
+                timeout=10.0,
+            )
+        except Exception as e:
+            return e
 
-    async def _do_stop(self) -> None:
-        cam = Go3SBLECamera(self._ble_address)
-        await cam.connect()
+    def _failed_report(self, error_message: str) -> FinalizationReport:
+        """Build a FinalizationReport with status='failed' and surface a health event."""
+        self._emit_health(HealthEvent(
+            stream_id=self.id,
+            kind=HealthEventKind.ERROR,
+            at_ns=time.monotonic_ns(),
+            detail=error_message,
+        ))
+        return FinalizationReport(
+            stream_id=self.id,
+            status="failed",
+            frame_count=0,
+            file_path=None,
+            first_sample_at_ns=self._start_ack_ns,
+            last_sample_at_ns=self._stop_ack_ns,
+            health_events=list(self._collected_health),
+            error=error_message,
+        )
+
+    def _force_disconnect_cam(self) -> None:
+        """Best-effort teardown of the cached BLE client; swallow errors."""
+        cam = self._cam
+        self._cam = None
+        if cam is None:
+            return
         try:
-            result = await cam.stop_capture()
-            self._stop_ack_ns = result.ack_host_ns
-            self._sd_path = result.file_path
-        finally:
-            await cam.disconnect()
+            self._run_on_ble_loop(cam.disconnect(), timeout=3.0)
+        except Exception:
+            pass
+
+    def _ensure_ble_loop(self) -> asyncio.AbstractEventLoop:
+        """Lazy-create a dedicated daemon thread running an asyncio loop for BLE."""
+        with self._ble_lock:
+            loop = self._ble_loop
+            thread = self._ble_thread
+            if loop is not None and loop.is_running():
+                return loop
+
+            loop = asyncio.new_event_loop()
+            ready = threading.Event()
+
+            def _run() -> None:
+                asyncio.set_event_loop(loop)
+                ready.set()
+                loop.run_forever()
+                # run_forever returns when loop.stop() is called; close the loop.
+                loop.close()
+
+            thread = threading.Thread(
+                target=_run,
+                name=f"go3s-ble-{self.id}",
+                daemon=True,
+            )
+            thread.start()
+            ready.wait(timeout=2.0)
+            self._ble_loop = loop
+            self._ble_thread = thread
+            return loop
+
+    def _run_on_ble_loop(self, coro, *, timeout: float):
+        """Marshal a coroutine onto the stream's private BLE loop + wait."""
+        loop = self._ensure_ble_loop()
+        fut: Future = asyncio.run_coroutine_threadsafe(coro, loop)
+        return fut.result(timeout=timeout)
 
     def _build_job(self) -> AggregationJob:
         if not self._sd_path:
@@ -335,12 +502,3 @@ class Go3SStream(StreamBase):
             )
         return results
 
-    def _run_async(self, coro) -> None:
-        """Bridge sync Stream API to the async BLE helper.
-
-        Each call creates a fresh asyncio loop. If called from inside an
-        already-running loop (e.g., from an async test), ``asyncio.run()``
-        will raise ``RuntimeError`` — that's intentional; callers must
-        arrange a thread boundary themselves.
-        """
-        asyncio.run(coro)
