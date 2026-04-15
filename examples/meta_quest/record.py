@@ -82,7 +82,7 @@ session.add(MetaQuestCameraStream(
     quest_host=QUEST_IP,
     output_dir=session.output_dir,
     fps=30,
-    resolution=(1280, 720),
+    resolution=(1280, 960),  # Quest 3 PCA native (4:3) — 16:9 makes Convert silently fail
 ))
 
 # Wrist IMUs — same two WT901BLE units used in examples/iphone_mac_webcam.

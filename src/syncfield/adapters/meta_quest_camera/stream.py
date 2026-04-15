@@ -59,7 +59,12 @@ logger = logging.getLogger(__name__)
 # Matches the Quest companion Unity app's default HTTP port.
 DEFAULT_QUEST_HTTP_PORT = 14045
 DEFAULT_FPS = 30
-DEFAULT_RESOLUTION: Tuple[int, int] = (1280, 720)
+# Quest 3 PCA's native sensor is 1280x960 (4:3). Asking ARFoundation
+# to resize to a different aspect ratio (e.g. 1280x720) makes Meta's
+# XRCpuImage.Convert silently produce no output — preview goes black.
+# Match native to keep the encode path lossless and the conversion path
+# trivial.
+DEFAULT_RESOLUTION: Tuple[int, int] = (1280, 960)
 
 # Multipart boundary string the Quest sender embeds in /preview/{eye}
 # Content-Type. Lives here (not in the consumer) because it is part of

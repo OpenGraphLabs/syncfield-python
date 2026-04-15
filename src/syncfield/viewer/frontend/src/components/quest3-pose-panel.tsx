@@ -34,8 +34,13 @@ const HAND_CONNECTIONS: [number, number][] = [
 ];
 
 const COLORS = {
-  left: "#22d3ee",
-  right: "#fb923c",
+  // Egocentric viewer: when you face the rig from outside, your right
+  // hand sits on the screen's left side and vice-versa. Map the hand
+  // colours to the spatial side a human reads naturally:
+  //   left hand  → orange (sits on the right of the rendered frame)
+  //   right hand → cyan   (sits on the left of the rendered frame)
+  left: "#fb923c",   // orange
+  right: "#22d3ee",  // cyan
   head: "#111827",
   bg: "#FAF8F6",
   grid: "#e5e0d8",
