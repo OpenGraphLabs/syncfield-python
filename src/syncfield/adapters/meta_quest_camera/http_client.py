@@ -103,6 +103,27 @@ class QuestHttpClient:
         response.raise_for_status()
         return RecordingStopResponse.from_json(response.json())
 
+    def clock_sync(self, host_mono_ns: int) -> None:
+        """POST host's monotonic clock to Quest so server-side deltaNs is set.
+
+        Streaming-mode adapters call this on connect — without it
+        Quest's PassthroughCameraRecorder._deltaNs stays zero and every
+        X-Frame-Capture-Ns header carries raw Quest uptime instead of
+        the host clock projection, which breaks cross-modal alignment.
+
+        Best-effort: HTTP errors are logged but do not propagate. Worst
+        case capture_ns leaks raw Quest uptime — post-hoc tooling can
+        still recover absolute alignment via the SampleEvent's
+        ``quest_native_ns`` channel.
+        """
+        try:
+            response = self._client.post(
+                "/clock/sync", json={"host_mono_ns": int(host_mono_ns)}
+            )
+            response.raise_for_status()
+        except httpx.HTTPError as exc:
+            logger.warning("POST /clock/sync failed: %s", exc)
+
     def delete_recording(self) -> None:
         """Tell the Quest to clean up the just-pulled session files.
 

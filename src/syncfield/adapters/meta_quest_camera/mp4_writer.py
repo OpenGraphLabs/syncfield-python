@@ -1,14 +1,20 @@
 """StreamingVideoRecorder — MJPEG-passthrough recorder for Quest streams.
 
 Takes raw JPEG bytes (as produced by Quest's ``/preview/{eye}`` endpoint)
-and writes them directly into an MP4 container *without re-encoding*,
-plus a sidecar timestamps JSONL with both the host-projected and the
-Quest-native nanosecond timestamps for every frame.
+and writes them directly into an MP4 container *without re-encoding*.
+
+The orchestrator's auto-jsonl writer captures every per-frame
+:class:`~syncfield.types.SampleEvent` we emit, so this recorder
+deliberately does NOT write its own ``*.timestamps.jsonl`` — that
+sidecar would either collide with the orchestrator's authoritative
+record or duplicate its content. ``quest_native_ns`` (needed for
+post-hoc clock-drift correction) rides through the SampleEvent's
+``channels`` dict instead.
 
 Designed to be fed by an :class:`~syncfield.adapters.meta_quest_camera.preview.MjpegPreviewConsumer`'s
 frame-sink callback — the recorder doesn't own the network connection.
 That keeps the same MJPEG channel serving both the live viewer panel
-*and* the recording artifact at no extra Quest-side cost.
+and the recording artifact at no extra Quest-side cost.
 
 Why MJPEG passthrough rather than re-encode to H.264:
 
@@ -23,13 +29,12 @@ Why MJPEG passthrough rather than re-encode to H.264:
 
 from __future__ import annotations
 
-import json
 import logging
 import threading
 from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
-from typing import IO, Optional
+from typing import Optional
 
 try:
     import av  # type: ignore[import-not-found]
@@ -54,7 +59,6 @@ class StreamingVideoResult:
     """Returned by :meth:`StreamingVideoRecorder.stop`."""
 
     output_path: Path
-    timestamps_path: Path
     frame_count: int
     first_capture_ns: Optional[int]
     last_capture_ns: Optional[int]
@@ -70,15 +74,15 @@ class StreamingVideoRecorder:
 
     Lifecycle::
 
-        recorder = StreamingVideoRecorder(output_dir=..., ...)
+        recorder = StreamingVideoRecorder(output_dir=..., stream_id=..., ...)
         recorder.start()
         # called repeatedly from the network / sink thread:
         recorder.write_frame(jpeg, host_ns, quest_native_ns)
         result = recorder.stop()
 
     ``write_frame`` may be called from any thread; an instance lock
-    serialises mux / JSONL / state mutations so :meth:`stop` is safe
-    to invoke while a sink is still pushing frames in.
+    serialises mux / state mutations so :meth:`stop` is safe to invoke
+    while a sink is still pushing frames in.
 
     Calls to ``write_frame`` against an unstarted or already-stopped
     recorder are silent no-ops, which simplifies the sink wiring on
@@ -90,14 +94,12 @@ class StreamingVideoRecorder:
         *,
         output_dir: Path,
         stream_id: str,
-        side: str,
         fps: int,
         width: int,
         height: int,
     ) -> None:
         self._output_dir = Path(output_dir)
         self._stream_id = stream_id
-        self._side = side
         self._fps = max(1, int(fps))
         self._width = int(width)
         self._height = int(height)
@@ -105,7 +107,6 @@ class StreamingVideoRecorder:
         self._lock = threading.Lock()
         self._container: Optional["av.container.OutputContainer"] = None
         self._stream: Optional["av.video.stream.VideoStream"] = None
-        self._timestamps_file: Optional[IO[str]] = None
 
         self._frame_count = 0
         self._write_errors = 0
@@ -117,22 +118,18 @@ class StreamingVideoRecorder:
 
     @property
     def output_path(self) -> Path:
-        return self._output_dir / f"{self._stream_id}_{self._side}.mp4"
-
-    @property
-    def timestamps_path(self) -> Path:
-        return self._output_dir / f"{self._stream_id}_{self._side}.timestamps.jsonl"
+        return self._output_dir / f"{self._stream_id}.mp4"
 
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
     def start(self) -> None:
-        """Open the MP4 container and timestamps JSONL.
+        """Open the MP4 container.
 
         No-op if the recorder is already started. After a :meth:`stop`,
-        a fresh ``start()`` reopens the files (overwriting whatever
-        was written previously).
+        a fresh ``start()`` reopens the file (overwriting whatever was
+        written previously).
         """
         with self._lock:
             if self._container is not None:
@@ -157,18 +154,16 @@ class StreamingVideoRecorder:
                 container.close()
                 raise
 
-            timestamps_file = open(self.timestamps_path, "w", encoding="utf-8")
             self._container = container
             self._stream = stream
-            self._timestamps_file = timestamps_file
             self._frame_count = 0
             self._write_errors = 0
             self._first_capture_ns = None
             self._last_capture_ns = None
             self._first_pts_us = None
             logger.info(
-                "[%s/%s] streaming recorder open → %s (%dx%d @ %d fps)",
-                self._stream_id, self._side, self.output_path,
+                "[%s] streaming recorder open → %s (%dx%d @ %d fps)",
+                self._stream_id, self.output_path,
                 self._width, self._height, self._fps,
             )
 
@@ -178,12 +173,17 @@ class StreamingVideoRecorder:
         host_ns: int,
         quest_native_ns: Optional[int] = None,
     ) -> None:
-        """Mux one JPEG packet and emit one timestamp line."""
+        """Mux one JPEG packet into the MP4."""
+        # quest_native_ns is accepted (and intentionally unused here)
+        # for symmetry with the sink callback signature; the value is
+        # persisted via the SampleEvent's channels dict in the
+        # orchestrator's jsonl rather than a recorder-side sidecar.
+        del quest_native_ns
+
         with self._lock:
             container = self._container
             stream = self._stream
-            ts_file = self._timestamps_file
-            if container is None or stream is None or ts_file is None:
+            if container is None or stream is None:
                 # Not started or already stopped — silently drop.
                 return
 
@@ -202,17 +202,6 @@ class StreamingVideoRecorder:
                 packet.duration = max(1, _MP4_TIME_BASE_DEN // self._fps)
                 container.mux(packet)
 
-                ts_line = json.dumps({
-                    "frame_number": self._frame_count,
-                    "capture_ns": int(host_ns),
-                    "quest_native_ns": (
-                        int(quest_native_ns) if quest_native_ns else None
-                    ),
-                    "clock_domain": "remote_quest3",
-                    "uncertainty_ns": 10_000_000,
-                })
-                ts_file.write(ts_line + "\n")
-
                 if self._first_capture_ns is None:
                     self._first_capture_ns = int(host_ns)
                 self._last_capture_ns = int(host_ns)
@@ -223,13 +212,13 @@ class StreamingVideoRecorder:
                 # drowning logcat if the container goes permanently bad.
                 if self._write_errors == 1 or self._write_errors % 30 == 0:
                     logger.warning(
-                        "[%s/%s] mux error (frame #%d, total errors=%d): %s",
-                        self._stream_id, self._side, self._frame_count,
+                        "[%s] mux error (frame #%d, total errors=%d): %s",
+                        self._stream_id, self._frame_count,
                         self._write_errors, exc,
                     )
 
     def stop(self) -> StreamingVideoResult:
-        """Flush + close everything and return the artifact paths.
+        """Flush + close the container and return the artifact path.
 
         Idempotent. A second ``stop()`` returns the same result and
         does no further I/O. Errors during close are logged but do not
@@ -238,38 +227,27 @@ class StreamingVideoRecorder:
         """
         with self._lock:
             container = self._container
-            ts_file = self._timestamps_file
             self._container = None
             self._stream = None
-            self._timestamps_file = None
 
             if container is not None:
                 try:
                     container.close()
                 except BaseException as exc:  # noqa: BLE001
                     logger.warning(
-                        "[%s/%s] container close error: %s",
-                        self._stream_id, self._side, exc,
-                    )
-            if ts_file is not None:
-                try:
-                    ts_file.close()
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning(
-                        "[%s/%s] timestamps close error: %s",
-                        self._stream_id, self._side, exc,
+                        "[%s] container close error: %s",
+                        self._stream_id, exc,
                     )
 
             result = StreamingVideoResult(
                 output_path=self.output_path,
-                timestamps_path=self.timestamps_path,
                 frame_count=self._frame_count,
                 first_capture_ns=self._first_capture_ns,
                 last_capture_ns=self._last_capture_ns,
                 write_errors=self._write_errors,
             )
             logger.info(
-                "[%s/%s] streaming recorder closed: %d frames, %d write errors",
-                self._stream_id, self._side, result.frame_count, result.write_errors,
+                "[%s] streaming recorder closed: %d frames, %d write errors",
+                self._stream_id, result.frame_count, result.write_errors,
             )
             return result

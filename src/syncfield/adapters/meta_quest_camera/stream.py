@@ -1,24 +1,28 @@
-"""MetaQuestCameraStream — streaming-only adapter for Quest 3 stereo cameras.
+"""MetaQuestCameraStream — single-eye streaming adapter for Quest 3 PCA.
 
-The Quest companion app exposes a 720p MJPEG stream per eye over HTTP
-(``/preview/{left|right}``). This adapter:
+The Quest companion app exposes the primary passthrough camera as a
+1280×960 MJPEG stream over HTTP (``/preview/left``). This adapter:
 
-* keeps one persistent MJPEG consumer per eye while connected (powering
+* keeps one persistent MJPEG consumer alive while connected (powering
   the viewer's video panel via the decoded ``latest_frame``);
 * on :meth:`start_recording`, attaches a :class:`StreamingVideoRecorder`
-  *sink* to each consumer so the same JPEG bytes are muxed straight
-  into per-eye MP4 files on the Mac plus a sidecar timestamps JSONL —
-  no Quest-side disk write, no end-of-session "pull" stage.
+  *sink* to the consumer so the same JPEG bytes are muxed straight into
+  ``{stream_id}.mp4`` on the Mac — no Quest-side disk write, no
+  end-of-session pull;
+* on :meth:`connect`, POSTs the host's monotonic-ns to Quest's
+  ``/clock/sync`` endpoint so subsequent frame timestamps are projected
+  into the Mac clock domain (otherwise jsonl ``capture_ns`` would carry
+  raw Quest uptime, breaking cross-modal sync).
 
-Why streaming-only:
+Why single-eye:
 
-* **No stop-time wait.** The previous design recorded MJPEG-AVI on the
-  Quest then pulled ~90 MB per eye over HTTP after stop. On a 4G-class
-  WiFi link that took 30 s+ and looked like a hang in the viewer.
-* **Single channel.** Both viewer preview and recording read the same
-  stream — fewer Quest-side resources, fewer failure modes.
-* **Bit-exact quality.** Frames are muxed without re-encoding so what
-  the viewer sees is exactly what ends up in the file.
+ARFoundation's ``cameraManager.TryAcquireLatestCpuImage`` only exposes
+the "primary" passthrough camera — there's no per-eye selector. The
+old design ran two MJPEG consumers + recorders against the same source
+camera and produced bit-different but content-identical files
+(~30 MB / minute wasted). True per-eye stereo would need either a
+Camera2 NDK wrapper or an XR-backend swap to OVR plugin (see PR #75
+retrospective). Until then, one stream is the honest representation.
 
 See ``docs/superpowers/specs/2026-04-13-metaquest-stereo-camera-design.md``
 for the broader protocol design.
@@ -59,12 +63,15 @@ logger = logging.getLogger(__name__)
 # Matches the Quest companion Unity app's default HTTP port.
 DEFAULT_QUEST_HTTP_PORT = 14045
 DEFAULT_FPS = 30
-# Quest 3 PCA's native sensor is 1280x960 (4:3). Asking ARFoundation
-# to resize to a different aspect ratio (e.g. 1280x720) makes Meta's
+# Quest 3 PCA's native sensor is 1280×960 (4:3). Asking ARFoundation to
+# resize to a different aspect ratio (e.g. 1280×720) makes Meta's
 # XRCpuImage.Convert silently produce no output — preview goes black.
-# Match native to keep the encode path lossless and the conversion path
-# trivial.
 DEFAULT_RESOLUTION: Tuple[int, int] = (1280, 960)
+
+# We pull from /preview/left only. /preview/right serves identical
+# bytes from the same primary camera — recording it would just waste
+# disk space and bandwidth.
+_PRIMARY_EYE = "left"
 
 # Multipart boundary string the Quest sender embeds in /preview/{eye}
 # Content-Type. Lives here (not in the consumer) because it is part of
@@ -73,21 +80,18 @@ _PREVIEW_BOUNDARY = b"syncfield"
 
 
 class MetaQuestCameraStream(StreamBase):
-    """Stream + record Meta Quest 3 stereo passthrough cameras over HTTP.
-
-    The Quest sender (``opengraph-studio/unity/SyncFieldQuest3Sender``)
-    publishes a 720p MJPEG stream per eye on UDP / TCP port
-    ``quest_port`` (default 14045). Connecting opens both streams and
-    keeps them alive for the lifetime of the adapter; recording is then
-    a cheap toggle that attaches a passthrough MP4 writer to each
-    stream.
+    """Stream + record the Quest 3 primary passthrough camera over HTTP.
 
     Files written under ``output_dir`` per recorded session:
 
-    ``{stream_id}_left.mp4``        MJPEG-in-MP4, no re-encode
-    ``{stream_id}_right.mp4``       MJPEG-in-MP4, no re-encode
-    ``{stream_id}_left.timestamps.jsonl``   per-frame host + quest-native ns
-    ``{stream_id}_right.timestamps.jsonl``  per-frame host + quest-native ns
+    ``{stream_id}.mp4``  — MJPEG-in-MP4, no re-encode
+
+    The orchestrator additionally writes
+    ``{stream_id}.timestamps.jsonl`` from the per-frame
+    :class:`SampleEvent` stream, which carries both ``capture_ns``
+    (host-projected monotonic ns) and ``quest_native_ns`` (raw Quest
+    uptime in ns, exposed as a scalar channel for post-hoc clock-drift
+    correction).
     """
 
     CLOCK_DOMAIN = "remote_quest3"
@@ -122,18 +126,16 @@ class MetaQuestCameraStream(StreamBase):
         self._transport = _transport
 
         self._http: Optional[QuestHttpClient] = None
-        self._preview_left: Optional[MjpegPreviewConsumer] = None
-        self._preview_right: Optional[MjpegPreviewConsumer] = None
+        self._preview: Optional[MjpegPreviewConsumer] = None
         self._connected = False
 
         # Per-recording state — non-None only between start_recording
         # and stop_recording.
-        self._recorder_left: Optional[StreamingVideoRecorder] = None
-        self._recorder_right: Optional[StreamingVideoRecorder] = None
+        self._recorder: Optional[StreamingVideoRecorder] = None
         self._session_id: Optional[str] = None
         self._first_at: Optional[int] = None
         self._last_at: Optional[int] = None
-        self._frame_count = 0  # frames sample-emitted (left eye is authoritative)
+        self._frame_count = 0  # frames sample-emitted
 
     @property
     def device_key(self) -> Optional[DeviceKey]:
@@ -158,17 +160,23 @@ class MetaQuestCameraStream(StreamBase):
             port=self._quest_port,
             transport=self._transport,
         )
-        # Probe reachability up front so a missing Quest fails the
-        # whole connect() instead of silently flapping inside the
-        # preview consumer's reconnect loop.
+        # Probe reachability up front so a missing Quest fails the whole
+        # connect() instead of silently flapping inside the preview
+        # consumer's reconnect loop.
         self._http.status()
-        self._preview_left = self._make_preview("left")
-        self._preview_right = self._make_preview("right")
-        self._preview_left.start()
-        self._preview_right.start()
+
+        # Calibrate the host↔Quest monotonic offset BEFORE the consumer
+        # starts pulling frames. The very first JPEG header that arrives
+        # will then carry an X-Frame-Capture-Ns already in the host
+        # clock domain, so the orchestrator's jsonl is consistent from
+        # frame 0.
+        self._push_clock_sync()
+
+        self._preview = self._make_preview(_PRIMARY_EYE)
+        self._preview.start()
         self._connected = True
         logger.info(
-            "[%s] connected to Quest %s:%d",
+            "[%s] connected to Quest %s:%d (single-eye streaming)",
             self.id, self._quest_host, self._quest_port,
         )
 
@@ -176,7 +184,7 @@ class MetaQuestCameraStream(StreamBase):
         # If a recording is somehow still active when disconnect() is
         # called, finalise it best-effort first so the MP4 trailer
         # gets written and the file is playable.
-        if self._recorder_left is not None or self._recorder_right is not None:
+        if self._recorder is not None:
             try:
                 self.stop_recording()
             except Exception as exc:  # noqa: BLE001
@@ -184,11 +192,9 @@ class MetaQuestCameraStream(StreamBase):
                     "[%s] disconnect-time stop_recording failed: %s", self.id, exc,
                 )
 
-        for consumer in (self._preview_left, self._preview_right):
-            if consumer is not None:
-                consumer.stop()
-        self._preview_left = None
-        self._preview_right = None
+        if self._preview is not None:
+            self._preview.stop()
+            self._preview = None
         if self._http is not None:
             self._http.close()
             self._http = None
@@ -197,7 +203,7 @@ class MetaQuestCameraStream(StreamBase):
     def start_recording(self, session_clock: SessionClock) -> None:
         if not self._connected:
             raise RuntimeError("start_recording() called before connect()")
-        if self._recorder_left is not None or self._recorder_right is not None:
+        if self._recorder is not None:
             raise RuntimeError("recording already in progress")
 
         self._session_id = (
@@ -208,33 +214,19 @@ class MetaQuestCameraStream(StreamBase):
         self._first_at = None
         self._last_at = None
 
-        # Stand up one writer per eye. Both write under the orchestrator's
-        # output_dir using the stream-id prefix, so the four artifacts of
-        # this session sit next to each other in the episode folder.
-        self._recorder_left = StreamingVideoRecorder(
+        self._recorder = StreamingVideoRecorder(
             output_dir=self._output_dir,
             stream_id=self.id,
-            side="left",
             fps=self._fps,
             width=self._resolution[0],
             height=self._resolution[1],
         )
-        self._recorder_right = StreamingVideoRecorder(
-            output_dir=self._output_dir,
-            stream_id=self.id,
-            side="right",
-            fps=self._fps,
-            width=self._resolution[0],
-            height=self._resolution[1],
-        )
-        self._recorder_left.start()
-        self._recorder_right.start()
+        self._recorder.start()
 
-        # Hot-attach sinks. The preview consumers stay running across
-        # the recording cycle — viewer feed never blanks.
-        assert self._preview_left is not None and self._preview_right is not None
-        self._preview_left.set_frame_sink(self._make_sink(self._recorder_left, "left"))
-        self._preview_right.set_frame_sink(self._make_sink(self._recorder_right, "right"))
+        # Hot-attach the sink. The preview consumer keeps running across
+        # the recording cycle so the viewer feed never blanks.
+        assert self._preview is not None
+        self._preview.set_frame_sink(self._make_sink(self._recorder))
 
         logger.info(
             "[%s] streaming recording started (session=%s, %dx%d @ %dfps)",
@@ -243,24 +235,20 @@ class MetaQuestCameraStream(StreamBase):
         )
 
     def stop_recording(self) -> FinalizationReport:
-        # Detach sinks first so no more frames land in a half-closed
+        # Detach sink first so no more frames land in a half-closed
         # writer while we flush.
-        if self._preview_left is not None:
-            self._preview_left.set_frame_sink(None)
-        if self._preview_right is not None:
-            self._preview_right.set_frame_sink(None)
+        if self._preview is not None:
+            self._preview.set_frame_sink(None)
 
-        result_left = self._recorder_left.stop() if self._recorder_left else None
-        result_right = self._recorder_right.stop() if self._recorder_right else None
-        self._recorder_left = None
-        self._recorder_right = None
+        result = self._recorder.stop() if self._recorder else None
+        self._recorder = None
 
-        status, error = self._classify_outcome(result_left, result_right)
+        status, error = self._classify_outcome(result)
         return FinalizationReport(
             stream_id=self.id,
             status=status,
             frame_count=self._frame_count,
-            file_path=result_left.output_path if result_left is not None else None,
+            file_path=result.output_path if result is not None else None,
             first_sample_at_ns=self._first_at,
             last_sample_at_ns=self._last_at,
             health_events=list(self._collected_health),
@@ -271,27 +259,32 @@ class MetaQuestCameraStream(StreamBase):
     # Internals
     # ------------------------------------------------------------------
 
+    def _push_clock_sync(self) -> None:
+        """POST host's monotonic ns to Quest so deltaNs is set server-side.
+
+        Without this hook Quest's _deltaNs stays at zero and every
+        X-Frame-Capture-Ns header carries raw Quest uptime instead of
+        the host clock projection — cross-modal sync (audio, IMUs)
+        breaks because timestamps are in the wrong domain.
+        """
+        if self._http is None:
+            return
+        host_mono_ns = time.monotonic_ns()
+        self._http.clock_sync(host_mono_ns)
+        logger.info(
+            "[%s] Pushed clock sync host_mono_ns=%d to Quest",
+            self.id, host_mono_ns,
+        )
+
     def _classify_outcome(
-        self,
-        left: Optional[StreamingVideoResult],
-        right: Optional[StreamingVideoResult],
+        self, result: Optional[StreamingVideoResult],
     ) -> Tuple[str, Optional[str]]:
-        """Map per-eye write results to (status, error_message)."""
-        if left is None or right is None:
+        if result is None:
             return "failed", "recorder was not started"
-        if left.frame_count == 0 and right.frame_count == 0:
+        if result.frame_count == 0:
             return "failed", "no frames received during recording"
-        msgs = []
-        if left.write_errors > 0 or right.write_errors > 0:
-            msgs.append(
-                f"mux errors left={left.write_errors} right={right.write_errors}"
-            )
-        if left.frame_count == 0 or right.frame_count == 0:
-            msgs.append(
-                f"single-eye recording: left={left.frame_count} right={right.frame_count}"
-            )
-        if msgs:
-            return "partial", "; ".join(msgs)
+        if result.write_errors > 0:
+            return "partial", f"{result.write_errors} mux errors"
         return "completed", None
 
     def _make_preview(self, side: str) -> MjpegPreviewConsumer:
@@ -301,10 +294,10 @@ class MetaQuestCameraStream(StreamBase):
             boundary=_PREVIEW_BOUNDARY,
             transport=self._transport,
             decode_jpeg=True,
-            on_health=self._make_health_callback(side),
+            on_health=self._make_health_callback(),
         )
 
-    def _make_health_callback(self, side: str):
+    def _make_health_callback(self):
         kind_map = {
             "drop": HealthEventKind.DROP,
             "reconnect": HealthEventKind.RECONNECT,
@@ -317,43 +310,45 @@ class MetaQuestCameraStream(StreamBase):
                     stream_id=self.id,
                     kind=kind_map.get(kind, HealthEventKind.WARNING),
                     at_ns=time.monotonic_ns(),
-                    detail=f"[{side}] {detail}",
+                    detail=detail,
                 )
             )
 
         return _on_health
 
-    def _make_sink(self, recorder: StreamingVideoRecorder, side: str):
+    def _make_sink(self, recorder: StreamingVideoRecorder):
         """Build the per-frame sink the preview consumer calls.
 
         The sink does two things on each frame:
 
-        1. Mux the JPEG into the per-eye MP4 + emit a timestamp line.
-        2. Emit a SampleEvent through ``StreamBase`` so the orchestrator
-           sees the recording progressing (viewer counter, sync stats).
-
-        Only the LEFT-eye sink emits SampleEvents — emitting from both
-        would double-count frames for what is, conceptually, one
-        synchronised stereo capture per tick.
+        1. Mux the JPEG into the MP4 (no re-encode).
+        2. Emit a SampleEvent so the orchestrator's auto-jsonl captures
+           the per-frame timestamps. ``quest_native_ns`` rides in
+           ``channels`` so post-hoc tooling can correct host↔Quest
+           clock drift over a long session.
         """
-        is_authoritative = side == "left"
 
         def _sink(frame: MjpegFrame) -> None:
             recorder.write_frame(
                 frame.jpeg_bytes, frame.capture_ns, frame.quest_native_ns,
             )
-            if not is_authoritative:
-                return
             if self._first_at is None:
                 self._first_at = frame.capture_ns
             self._last_at = frame.capture_ns
             frame_number = self._frame_count
             self._frame_count += 1
+
+            channels: dict = {}
+            if frame.quest_native_ns is not None:
+                # Surface as a scalar channel so the orchestrator's
+                # jsonl writer naturally persists it under "channels".
+                channels["quest_native_ns"] = float(frame.quest_native_ns)
+
             self._emit_sample(SampleEvent(
                 stream_id=self.id,
                 frame_number=frame_number,
                 capture_ns=frame.capture_ns,
-                channels={},  # video stream has no scalar channels
+                channels=channels,
                 uncertainty_ns=self.UNCERTAINTY_NS,
                 clock_domain=self.CLOCK_DOMAIN,
             ))
@@ -365,34 +360,8 @@ class MetaQuestCameraStream(StreamBase):
     # ------------------------------------------------------------------
 
     @property
-    def latest_frame_left(self):
-        """Most-recent decoded BGR preview frame from the left camera, or None."""
-        if self._preview_left is None:
-            return None
-        return self._preview_left.latest_frame
-
-    @property
-    def latest_frame_right(self):
-        if self._preview_right is None:
-            return None
-        return self._preview_right.latest_frame
-
-    @property
     def latest_frame(self):
-        """Single-eye preview for the viewer panel.
-
-        Quest 3's ARFoundation only exposes the "primary" passthrough
-        camera, so /preview/left and /preview/right currently carry
-        identical pixels. Showing a side-by-side composite would waste
-        space + bandwidth without conveying any extra information.
-        Surface the left eye alone; we fall back to right if left
-        hasn't produced its first decoded frame yet.
-
-        True per-eye stereo would need either a Camera2 NDK wrapper or
-        a full XR backend swap to OVR plugin (see PR #75 retrospective).
-        Until then, one stream is the honest representation.
-        """
-        left = self.latest_frame_left
-        if left is not None:
-            return left
-        return self.latest_frame_right
+        """Most-recent decoded BGR preview frame, or None."""
+        if self._preview is None:
+            return None
+        return self._preview.latest_frame

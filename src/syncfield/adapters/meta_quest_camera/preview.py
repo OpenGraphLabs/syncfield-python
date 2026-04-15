@@ -315,10 +315,11 @@ def _decode_jpeg(data: bytes):
     from PIL import Image
 
     img = Image.open(io.BytesIO(data)).convert("RGB")
-    # Quest's passthrough camera frames arrive Y-flipped (OpenGL
-    # texture-origin convention): without this transpose the viewer
-    # shows the scene upside-down. Flip before the numpy handoff.
-    img = img.transpose(Image.FLIP_TOP_BOTTOM)
+    # Quest 3 PCA frames natively use OpenGL Y-up texture origin —
+    # they would arrive upside-down, but the Quest sender now applies
+    # XRCpuImage.Transformation.MirrorY at encode time so the JPEG
+    # bytes already carry the right-way-up image. No client-side flip
+    # needed; doing one would invert again.
     # The viewer server re-encodes frames assuming BGR (SyncField's
     # house convention across OakCameraStream and UVCWebcamStream),
     # so flip the last axis here.

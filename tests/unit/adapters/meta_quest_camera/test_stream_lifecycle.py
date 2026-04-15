@@ -60,6 +60,8 @@ def _status_only_transport() -> httpx.MockTransport:
                 },
                 content=b"",
             )
+        if request.url.path == "/clock/sync":
+            return httpx.Response(200, json={"ok": True})
         return httpx.Response(404)
 
     return httpx.MockTransport(handler)
@@ -163,9 +165,9 @@ class TestRecording:
         assert report.status == "failed"
         assert "no frames" in (report.error or "")
 
-    def test_recording_writes_mp4_and_timestamps_on_frames(self, tmp_path):
-        """Push a handful of JPEG frames into both sinks → both eyes
-        produce valid mp4 + jsonl, status==completed."""
+    def test_recording_writes_single_mp4_on_frames(self, tmp_path):
+        """Push a handful of JPEG frames into the sink → single mp4
+        produced, status==completed, NO sidecar jsonl written."""
         stream = MetaQuestCameraStream(
             id="quest_cam",
             quest_host="test",
@@ -177,19 +179,14 @@ class TestRecording:
         clock = SessionClock(sync_point=SyncPoint.create_now("test_host"))
         stream.start_recording(clock)
 
-        # Reach into the consumers and fire their registered sinks
-        # directly — bypasses the network thread so the test stays
-        # deterministic. The sink is the same callable the consumer
-        # would invoke per real MJPEG frame.
+        # Reach into the consumer and fire its registered sink directly —
+        # bypasses the network thread so the test stays deterministic.
         jpeg = _make_jpeg()
         base_ns = time.monotonic_ns()
         for i in range(5):
             host_ns = base_ns + i * 33_333_333
             quest_ns = host_ns - 1_000_000  # arbitrary delta
-            stream._preview_left._frame_sink(
-                MjpegFrame(jpeg_bytes=jpeg, capture_ns=host_ns, quest_native_ns=quest_ns)
-            )
-            stream._preview_right._frame_sink(
+            stream._preview._frame_sink(
                 MjpegFrame(jpeg_bytes=jpeg, capture_ns=host_ns, quest_native_ns=quest_ns)
             )
 
@@ -198,38 +195,13 @@ class TestRecording:
 
         assert report.status == "completed", report.error
         assert report.frame_count == 5
-        assert (tmp_path / "quest_cam_left.mp4").stat().st_size > 0
-        assert (tmp_path / "quest_cam_right.mp4").stat().st_size > 0
-        ts_left = (tmp_path / "quest_cam_left.timestamps.jsonl").read_text()
-        ts_right = (tmp_path / "quest_cam_right.timestamps.jsonl").read_text()
-        assert ts_left.count("\n") == 5
-        assert ts_right.count("\n") == 5
-        # Each line must carry both timestamps.
-        assert "quest_native_ns" in ts_left
-
-    def test_partial_status_when_only_one_eye_received_frames(self, tmp_path):
-        stream = MetaQuestCameraStream(
-            id="quest_cam",
-            quest_host="test",
-            output_dir=tmp_path,
-            _transport=_status_only_transport(),
-            resolution=(64, 64),
-        )
-        stream.connect()
-        clock = SessionClock(sync_point=SyncPoint.create_now("test_host"))
-        stream.start_recording(clock)
-
-        jpeg = _make_jpeg()
-        # Only the left eye gets frames (right stays at zero).
-        for i in range(3):
-            stream._preview_left._frame_sink(
-                MjpegFrame(jpeg_bytes=jpeg, capture_ns=time.monotonic_ns() + i, quest_native_ns=None)
-            )
-
-        report = stream.stop_recording()
-        stream.disconnect()
-        assert report.status == "partial"
-        assert "single-eye" in (report.error or "") or "right=0" in (report.error or "")
+        # Single MP4, no _left/_right suffix
+        assert (tmp_path / "quest_cam.mp4").stat().st_size > 0
+        assert not (tmp_path / "quest_cam_left.mp4").exists()
+        assert not (tmp_path / "quest_cam_right.mp4").exists()
+        # Recorder no longer writes its own jsonl — orchestrator's
+        # auto-jsonl path handles per-frame timestamps.
+        assert not (tmp_path / "quest_cam.timestamps.jsonl").exists()
 
     def test_double_start_recording_raises(self, tmp_path):
         stream = MetaQuestCameraStream(
@@ -259,18 +231,15 @@ class TestLatestFrame:
         stream = MetaQuestCameraStream(
             id="quest_cam", quest_host="test", output_dir=tmp_path,
         )
-        assert stream.latest_frame_left is None
-        assert stream.latest_frame_right is None
         assert stream.latest_frame is None
 
-    def test_latest_frame_reads_from_preview_consumers(self, tmp_path):
+    def test_latest_frame_reads_from_preview_consumer(self, tmp_path):
         stream = MetaQuestCameraStream(
             id="quest_cam", quest_host="test", output_dir=tmp_path,
             _transport=_status_only_transport(),
         )
         stream.connect()
-        # Empty preview body in the fixture → consumers never produce
+        # Empty preview body in the fixture → consumer never produces
         # a decoded frame, so the slot stays None.
-        assert stream.latest_frame_left is None
-        assert stream.latest_frame_right is None
+        assert stream.latest_frame is None
         stream.disconnect()
