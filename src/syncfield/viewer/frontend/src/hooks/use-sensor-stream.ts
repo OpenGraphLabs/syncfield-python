@@ -1,8 +1,7 @@
 import { useEffect, useRef, useState } from "react";
-import type { SensorEvent } from "@/lib/types";
+import { sensorStore } from "@/lib/sensor-store";
 
 const MAX_POINTS = 300;
-const RECONNECT_DELAY_MS = 2000;
 
 interface UseSensorStreamReturn {
   /** Per-channel rolling buffer of values. */
@@ -13,16 +12,17 @@ interface UseSensorStreamReturn {
    * MetaQuestHandStream). Not buffered — 3-D pose panels render
    * instantaneous state. ``null`` when the stream is scalar-only. */
   pose: Record<string, number[]> | null;
-  /** Whether the SSE connection is alive. */
+  /** Whether the shared SSE connection is alive. */
   isConnected: boolean;
 }
 
 /**
- * SSE hook for real-time sensor channel data.
+ * Subscribe to real-time sensor data for one stream.
  *
- * Connects to `/stream/sensor/{streamId}` and maintains a rolling
- * buffer (max 300 points) per channel. Automatically reconnects on
- * disconnect.
+ * Reads from the shared :module:`sensor-store` rather than opening a
+ * per-hook EventSource, so N tiles share one HTTP connection and stay
+ * under the browser's HTTP/1.1 6-per-origin cap. The returned buffers
+ * are local to this hook — each consumer keeps its own rolling window.
  */
 export function useSensorStream(streamId: string): UseSensorStreamReturn {
   const [channels, setChannels] = useState<Record<string, number[]>>({});
@@ -30,82 +30,40 @@ export function useSensorStream(streamId: string): UseSensorStreamReturn {
   const [pose, setPose] = useState<Record<string, number[]> | null>(null);
   const [isConnected, setIsConnected] = useState(false);
 
-  // Mutable buffers for performance — we only push state on ticks
   const channelBuf = useRef<Record<string, number[]>>({});
   const labelBuf = useRef<number[]>([]);
-  const mountedRef = useRef(true);
 
   useEffect(() => {
-    mountedRef.current = true;
-    let es: EventSource | null = null;
-    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    channelBuf.current = {};
+    labelBuf.current = [];
+    setChannels({});
+    setLabels([]);
+    setPose(null);
 
-    function connect() {
-      if (!mountedRef.current) return;
-
-      es = new EventSource(`/stream/sensor/${streamId}`);
-
-      es.onopen = () => {
-        if (!mountedRef.current) return;
-        setIsConnected(true);
-      };
-
-      es.onmessage = (event) => {
-        if (!mountedRef.current) return;
-        try {
-          const data: SensorEvent = JSON.parse(event.data);
-
-          // Append to label buffer
-          if (data.label !== null) {
-            labelBuf.current.push(data.label);
-            if (labelBuf.current.length > MAX_POINTS) {
-              labelBuf.current = labelBuf.current.slice(-MAX_POINTS);
-            }
-          }
-
-          // Append to each channel buffer
-          for (const [name, value] of Object.entries(data.channels)) {
-            if (!channelBuf.current[name]) {
-              channelBuf.current[name] = [];
-            }
-            channelBuf.current[name].push(value);
-            if (channelBuf.current[name].length > MAX_POINTS) {
-              channelBuf.current[name] = channelBuf.current[name].slice(
-                -MAX_POINTS,
-              );
-            }
-          }
-
-          // Vector-valued channels: ship the entire latest payload
-          // through — not buffered because pose panels want a single
-          // instantaneous snapshot per render.
-          if (data.pose) setPose(data.pose);
-
-          // Push a snapshot to React state
-          setChannels({ ...channelBuf.current });
-          setLabels([...labelBuf.current]);
-        } catch {
-          // Ignore malformed events
+    const unsub = sensorStore.subscribe(streamId, (data) => {
+      if (data.label !== null && data.label !== undefined) {
+        labelBuf.current.push(data.label);
+        if (labelBuf.current.length > MAX_POINTS) {
+          labelBuf.current = labelBuf.current.slice(-MAX_POINTS);
         }
-      };
+      }
+      for (const [name, value] of Object.entries(data.channels)) {
+        if (!channelBuf.current[name]) channelBuf.current[name] = [];
+        channelBuf.current[name].push(value);
+        if (channelBuf.current[name].length > MAX_POINTS) {
+          channelBuf.current[name] = channelBuf.current[name].slice(-MAX_POINTS);
+        }
+      }
+      if (data.pose) setPose(data.pose);
+      setChannels({ ...channelBuf.current });
+      setLabels([...labelBuf.current]);
+    });
 
-      es.onerror = () => {
-        if (!mountedRef.current) return;
-        setIsConnected(false);
-        es?.close();
-        es = null;
-        reconnectTimer = setTimeout(connect, RECONNECT_DELAY_MS);
-      };
-    }
-
-    connect();
+    const unsubStatus = sensorStore.subscribeStatus(setIsConnected);
 
     return () => {
-      mountedRef.current = false;
-      if (reconnectTimer) clearTimeout(reconnectTimer);
-      if (es) es.close();
-      channelBuf.current = {};
-      labelBuf.current = [];
+      unsub();
+      unsubStatus();
     };
   }, [streamId]);
 

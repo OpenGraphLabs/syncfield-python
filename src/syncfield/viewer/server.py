@@ -443,6 +443,22 @@ class ViewerServer:
                 },
             )
 
+        # Multiplexed SSE — fan-out for all sensor streams over one
+        # HTTP connection. Used by the frontend to avoid the browser's
+        # HTTP/1.1 6-per-origin connection cap, which otherwise queues
+        # the 4th+ per-stream EventSource indefinitely.
+        @app.get("/stream/sensors")
+        async def stream_sensors() -> StreamingResponse:
+            return StreamingResponse(
+                self._sse_multiplex_generator(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                },
+            )
+
         # -- REST: one-shot queries -----------------------------------------
 
         @app.get("/api/status")
@@ -2067,6 +2083,56 @@ class ViewerServer:
                 ticks_since_data += 1
                 # Keep-alive comment every ~5 s of dead air so onerror/
                 # reconnect logic in the browser never kicks in spuriously.
+                if ticks_since_data >= 50:
+                    yield ": ka\n\n"
+                    ticks_since_data = 0
+
+            await asyncio.sleep(0.1)  # ~10 Hz
+
+    async def _sse_multiplex_generator(self):
+        """Yield sensor events for every active stream on one connection.
+
+        Mirrors :meth:`_sse_generator` but fans out across all streams
+        in the current snapshot, tagging each event with ``stream_id``
+        so the client can dispatch to the correct tile. One shared
+        connection sidesteps the browser HTTP/1.1 6-per-origin cap,
+        which was leaving per-stream EventSources queued once a session
+        exceeded ~4 sensor streams.
+        """
+        yield ": connected\n\n"
+
+        ticks_since_data = 0
+        while True:
+            sent = False
+            snapshot = self._poller.get_snapshot()
+            if snapshot is not None:
+                for stream_id, stream in snapshot.streams.items():
+                    if not (stream.plot_points or stream.latest_pose):
+                        continue
+                    channels: Dict[str, float] = {}
+                    label: Optional[float] = None
+                    for ch_name, (xs, ys) in stream.plot_points.items():
+                        if ys:
+                            channels[ch_name] = ys[-1]
+                        if xs and label is None:
+                            label = xs[-1]
+
+                    pose = stream.latest_pose if stream.latest_pose else None
+
+                    if channels or pose:
+                        event_data = json.dumps({
+                            "stream_id": stream_id,
+                            "channels": channels,
+                            "pose": pose,
+                            "label": label,
+                        })
+                        yield f"data: {event_data}\n\n"
+                        sent = True
+
+            if sent:
+                ticks_since_data = 0
+            else:
+                ticks_since_data += 1
                 if ticks_since_data >= 50:
                     yield ": ka\n\n"
                     ticks_since_data = 0
