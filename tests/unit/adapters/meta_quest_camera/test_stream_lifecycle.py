@@ -1,12 +1,81 @@
-"""Unit tests for the top-level MetaQuestCameraStream adapter."""
+"""Unit tests for the streaming MetaQuestCameraStream adapter.
+
+The adapter sits on top of three collaborators that have their own
+focused tests (preview, mp4_writer, http_client). These tests cover
+the surface the orchestrator actually drives:
+
+* identity / capabilities
+* connect/disconnect lifecycle (status probe, preview start)
+* start/stop recording without exercising real network I/O — the
+  ``StreamingVideoRecorder`` integration is verified by feeding raw
+  JPEG frames into the consumer's sink directly.
+"""
 
 from __future__ import annotations
 
+import io
+import time
 from pathlib import Path
 
+import httpx
 import pytest
+from PIL import Image
 
 from syncfield.adapters.meta_quest_camera import MetaQuestCameraStream
+from syncfield.adapters.meta_quest_camera.preview import MjpegFrame
+from syncfield.clock import SessionClock, SyncPoint
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _status_only_transport() -> httpx.MockTransport:
+    """Transport that satisfies /status and stalls preview pulls.
+
+    Used for tests that don't care about frame delivery — preview
+    consumers stay blocked reading an empty body so latest_frame
+    stays None and no sink callbacks fire.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/status":
+            return httpx.Response(
+                200,
+                json={
+                    "recording": False,
+                    "session_id": None,
+                    "last_preview_capture_ns": 0,
+                    "left_camera_ready": True,
+                    "right_camera_ready": True,
+                    "storage_free_bytes": 1_000_000_000,
+                },
+            )
+        if request.url.path.startswith("/preview/"):
+            return httpx.Response(
+                200,
+                headers={
+                    "Content-Type": "multipart/x-mixed-replace; boundary=syncfield"
+                },
+                content=b"",
+            )
+        return httpx.Response(404)
+
+    return httpx.MockTransport(handler)
+
+
+def _make_jpeg(width: int = 64, height: int = 64, color=(120, 50, 200)) -> bytes:
+    """Build a minimal valid JPEG so PyAV's MJPEG packetiser is happy."""
+    img = Image.new("RGB", (width, height), color=color)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=80)
+    return buf.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# Identity
+# ---------------------------------------------------------------------------
 
 
 class TestIdentity:
@@ -32,35 +101,9 @@ class TestIdentity:
         assert stream.device_key == ("meta_quest_camera", "192.0.2.10")
 
 
-import httpx
-
-
-def _status_only_transport() -> httpx.MockTransport:
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/status":
-            return httpx.Response(
-                200,
-                json={
-                    "recording": False,
-                    "session_id": None,
-                    "last_preview_capture_ns": 0,
-                    "left_camera_ready": True,
-                    "right_camera_ready": True,
-                    "storage_free_bytes": 1_000_000_000,
-                },
-            )
-        if request.url.path.startswith("/preview/"):
-            # Return a tiny valid MJPEG body (no frames) so the consumer blocks.
-            return httpx.Response(
-                200,
-                headers={
-                    "Content-Type": "multipart/x-mixed-replace; boundary=syncfield"
-                },
-                content=b"",
-            )
-        return httpx.Response(404)
-
-    return httpx.MockTransport(handler)
+# ---------------------------------------------------------------------------
+# Connect / disconnect
+# ---------------------------------------------------------------------------
 
 
 class TestConnectDisconnect:
@@ -69,7 +112,7 @@ class TestConnectDisconnect:
             id="quest_cam",
             quest_host="test",
             output_dir=tmp_path,
-            _transport=_status_only_transport(),  # test-only injection
+            _transport=_status_only_transport(),
         )
         stream.connect()
         assert stream.is_connected is True
@@ -90,156 +133,125 @@ class TestConnectDisconnect:
             stream.connect()
 
 
-import json
-from syncfield.clock import SessionClock, SyncPoint
+# ---------------------------------------------------------------------------
+# Recording — exercises the sink + StreamingVideoRecorder integration
+# ---------------------------------------------------------------------------
 
 
-def _full_quest_transport(left_mp4=b"LEFT_MP4", right_mp4=b"RIGHT_MP4"):
-    state = {"recording": False}
+class TestRecording:
+    def test_start_recording_requires_connect(self, tmp_path):
+        stream = MetaQuestCameraStream(
+            id="quest_cam", quest_host="test", output_dir=tmp_path,
+        )
+        clock = SessionClock(sync_point=SyncPoint.create_now("test_host"))
+        with pytest.raises(RuntimeError):
+            stream.start_recording(clock)
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        path = request.url.path
-        if path == "/status":
-            return httpx.Response(200, json={
-                "recording": state["recording"], "session_id": None,
-                "last_preview_capture_ns": 0,
-                "left_camera_ready": True, "right_camera_ready": True,
-                "storage_free_bytes": 1_000_000_000,
-            })
-        if path.startswith("/preview/"):
-            return httpx.Response(200, headers={
-                "Content-Type": "multipart/x-mixed-replace; boundary=syncfield"
-            }, content=b"")
-        if path == "/recording/start":
-            state["recording"] = True
-            return httpx.Response(200, json={
-                "session_id": "ep_x", "quest_mono_ns_at_start": 0,
-                "delta_ns": 0, "started": True,
-            })
-        if path == "/recording/stop":
-            state["recording"] = False
-            return httpx.Response(200, json={
-                "session_id": "ep_x",
-                "left":  {"frame_count": 2, "bytes": len(left_mp4),  "last_capture_ns": 2},
-                "right": {"frame_count": 2, "bytes": len(right_mp4), "last_capture_ns": 2},
-                "duration_s": 0.1,
-            })
-        if path == "/recording/files/left":
-            return httpx.Response(200, headers={"Content-Length": str(len(left_mp4))}, content=left_mp4)
-        if path == "/recording/files/right":
-            return httpx.Response(200, headers={"Content-Length": str(len(right_mp4))}, content=right_mp4)
-        if path == "/recording/timestamps/left" or path == "/recording/timestamps/right":
-            body = (
-                b'{"frame_number":0,"capture_ns":1}\n'
-                b'{"frame_number":1,"capture_ns":2}\n'
-            )
-            return httpx.Response(200, headers={"Content-Length": str(len(body))}, content=body)
-        if path == "/recording/files" and request.method == "DELETE":
-            return httpx.Response(204)
-        return httpx.Response(404)
-
-    return httpx.MockTransport(handler)
-
-
-class TestRecordingRoundtrip:
-    def test_full_recording_lifecycle(self, tmp_path):
+    def test_start_then_stop_with_no_frames_marks_failed(self, tmp_path):
+        """No frames flowed through the sink → stop returns failed status."""
         stream = MetaQuestCameraStream(
             id="quest_cam",
             quest_host="test",
             output_dir=tmp_path,
-            _transport=_full_quest_transport(),
+            _transport=_status_only_transport(),
         )
         stream.connect()
         clock = SessionClock(sync_point=SyncPoint.create_now("test_host"))
-
         stream.start_recording(clock)
         report = stream.stop_recording()
         stream.disconnect()
+        assert report.status == "failed"
+        assert "no frames" in (report.error or "")
 
-        assert report.status == "completed"
-        assert (tmp_path / "quest_cam_left.mp4").read_bytes() == b"LEFT_MP4"
-        assert (tmp_path / "quest_cam_right.mp4").read_bytes() == b"RIGHT_MP4"
-        assert (tmp_path / "quest_cam_left.timestamps.jsonl").exists()
-        assert (tmp_path / "quest_cam_right.timestamps.jsonl").exists()
-
-
-class TestSizeMismatch:
-    def test_partial_status_when_size_mismatch(self, tmp_path):
-        """When /stop says left.bytes=9999 but actual file is 8 bytes, status=partial."""
-        # left_mp4 body is b"LEFT_MP4" (8 bytes), but /stop will claim bytes=9999
+    def test_recording_writes_mp4_and_timestamps_on_frames(self, tmp_path):
+        """Push a handful of JPEG frames into both sinks → both eyes
+        produce valid mp4 + jsonl, status==completed."""
         stream = MetaQuestCameraStream(
             id="quest_cam",
             quest_host="test",
             output_dir=tmp_path,
-            _transport=_full_quest_transport(left_mp4=b"LEFT_MP4", right_mp4=b"RIGHT_MP4"),
+            _transport=_status_only_transport(),
+            resolution=(64, 64),
         )
+        stream.connect()
+        clock = SessionClock(sync_point=SyncPoint.create_now("test_host"))
+        stream.start_recording(clock)
 
-        # Build a transport that overrides /recording/stop to return wrong byte count
-        def _mismatched_transport():
-            state = {"recording": False}
+        # Reach into the consumers and fire their registered sinks
+        # directly — bypasses the network thread so the test stays
+        # deterministic. The sink is the same callable the consumer
+        # would invoke per real MJPEG frame.
+        jpeg = _make_jpeg()
+        base_ns = time.monotonic_ns()
+        for i in range(5):
+            host_ns = base_ns + i * 33_333_333
+            quest_ns = host_ns - 1_000_000  # arbitrary delta
+            stream._preview_left._frame_sink(
+                MjpegFrame(jpeg_bytes=jpeg, capture_ns=host_ns, quest_native_ns=quest_ns)
+            )
+            stream._preview_right._frame_sink(
+                MjpegFrame(jpeg_bytes=jpeg, capture_ns=host_ns, quest_native_ns=quest_ns)
+            )
 
-            def handler(request: httpx.Request) -> httpx.Response:
-                path = request.url.path
-                if path == "/status":
-                    return httpx.Response(200, json={
-                        "recording": state["recording"], "session_id": None,
-                        "last_preview_capture_ns": 0,
-                        "left_camera_ready": True, "right_camera_ready": True,
-                        "storage_free_bytes": 1_000_000_000,
-                    })
-                if path.startswith("/preview/"):
-                    return httpx.Response(200, headers={
-                        "Content-Type": "multipart/x-mixed-replace; boundary=syncfield"
-                    }, content=b"")
-                if path == "/recording/start":
-                    state["recording"] = True
-                    return httpx.Response(200, json={
-                        "session_id": "ep_x", "quest_mono_ns_at_start": 0,
-                        "delta_ns": 0, "started": True,
-                    })
-                if path == "/recording/stop":
-                    state["recording"] = False
-                    return httpx.Response(200, json={
-                        "session_id": "ep_x",
-                        # 9999 != 8 bytes of b"LEFT_MP4"
-                        "left":  {"frame_count": 2, "bytes": 9999, "last_capture_ns": 2},
-                        "right": {"frame_count": 2, "bytes": len(b"RIGHT_MP4"), "last_capture_ns": 2},
-                        "duration_s": 0.1,
-                    })
-                if path == "/recording/files/left":
-                    body = b"LEFT_MP4"
-                    return httpx.Response(200, headers={"Content-Length": str(len(body))}, content=body)
-                if path == "/recording/files/right":
-                    body = b"RIGHT_MP4"
-                    return httpx.Response(200, headers={"Content-Length": str(len(body))}, content=body)
-                if path == "/recording/timestamps/left" or path == "/recording/timestamps/right":
-                    body = (
-                        b'{"frame_number":0,"capture_ns":1}\n'
-                        b'{"frame_number":1,"capture_ns":2}\n'
-                    )
-                    return httpx.Response(200, headers={"Content-Length": str(len(body))}, content=body)
-                if path == "/recording/files":
-                    # DELETE — best-effort cleanup
-                    return httpx.Response(204)
-                return httpx.Response(404)
+        report = stream.stop_recording()
+        stream.disconnect()
 
-            return httpx.MockTransport(handler)
+        assert report.status == "completed", report.error
+        assert report.frame_count == 5
+        assert (tmp_path / "quest_cam_left.mp4").stat().st_size > 0
+        assert (tmp_path / "quest_cam_right.mp4").stat().st_size > 0
+        ts_left = (tmp_path / "quest_cam_left.timestamps.jsonl").read_text()
+        ts_right = (tmp_path / "quest_cam_right.timestamps.jsonl").read_text()
+        assert ts_left.count("\n") == 5
+        assert ts_right.count("\n") == 5
+        # Each line must carry both timestamps.
+        assert "quest_native_ns" in ts_left
 
-        stream2 = MetaQuestCameraStream(
+    def test_partial_status_when_only_one_eye_received_frames(self, tmp_path):
+        stream = MetaQuestCameraStream(
             id="quest_cam",
             quest_host="test",
-            output_dir=tmp_path / "mismatch",
-            _transport=_mismatched_transport(),
+            output_dir=tmp_path,
+            _transport=_status_only_transport(),
+            resolution=(64, 64),
         )
-        stream2.connect()
+        stream.connect()
         clock = SessionClock(sync_point=SyncPoint.create_now("test_host"))
-        stream2.start_recording(clock)
-        report = stream2.stop_recording()
-        stream2.disconnect()
+        stream.start_recording(clock)
 
+        jpeg = _make_jpeg()
+        # Only the left eye gets frames (right stays at zero).
+        for i in range(3):
+            stream._preview_left._frame_sink(
+                MjpegFrame(jpeg_bytes=jpeg, capture_ns=time.monotonic_ns() + i, quest_native_ns=None)
+            )
+
+        report = stream.stop_recording()
+        stream.disconnect()
         assert report.status == "partial"
-        assert report.error is not None
-        assert "size" in report.error.lower() or "bytes" in report.error.lower()
+        assert "single-eye" in (report.error or "") or "right=0" in (report.error or "")
+
+    def test_double_start_recording_raises(self, tmp_path):
+        stream = MetaQuestCameraStream(
+            id="quest_cam",
+            quest_host="test",
+            output_dir=tmp_path,
+            _transport=_status_only_transport(),
+        )
+        stream.connect()
+        clock = SessionClock(sync_point=SyncPoint.create_now("test_host"))
+        stream.start_recording(clock)
+        try:
+            with pytest.raises(RuntimeError, match="already in progress"):
+                stream.start_recording(clock)
+        finally:
+            stream.stop_recording()
+            stream.disconnect()
+
+
+# ---------------------------------------------------------------------------
+# Viewer-facing properties
+# ---------------------------------------------------------------------------
 
 
 class TestLatestFrame:
@@ -249,6 +261,7 @@ class TestLatestFrame:
         )
         assert stream.latest_frame_left is None
         assert stream.latest_frame_right is None
+        assert stream.latest_frame is None
 
     def test_latest_frame_reads_from_preview_consumers(self, tmp_path):
         stream = MetaQuestCameraStream(
@@ -256,7 +269,8 @@ class TestLatestFrame:
             _transport=_status_only_transport(),
         )
         stream.connect()
-        # Consumers returned empty body in the fixture, so latest_frame stays None.
+        # Empty preview body in the fixture → consumers never produce
+        # a decoded frame, so the slot stays None.
         assert stream.latest_frame_left is None
         assert stream.latest_frame_right is None
         stream.disconnect()

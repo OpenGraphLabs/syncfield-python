@@ -3,15 +3,29 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import BinaryIO, Iterator
+from typing import BinaryIO, Iterator, Optional
 
 
 @dataclass(frozen=True)
 class MjpegFrame:
-    """One JPEG frame pulled from the Quest's MJPEG preview endpoint."""
+    """One JPEG frame pulled from the Quest's MJPEG preview endpoint.
+
+    ``capture_ns`` is the host-projected nanosecond timestamp
+    (``X-Frame-Capture-Ns``) — i.e. already in the Mac monotonic clock
+    domain, courtesy of the ``deltaNs`` offset the Quest sender computes
+    at recording start.
+
+    ``quest_native_ns`` is the Quest's raw monotonic clock at acquisition
+    (``X-Quest-Native-Ns``). Optional for backwards compatibility with
+    older Quest sender builds — older firmwares simply omit the header
+    and the field stays ``None``. Post-processing can use the native
+    timestamp to detect / correct host↔quest clock drift over a long
+    session (the one-shot ``deltaNs`` offset is otherwise frozen).
+    """
 
     jpeg_bytes: bytes
     capture_ns: int
+    quest_native_ns: Optional[int] = None
 
 
 def _readline(stream: BinaryIO) -> bytes:
@@ -59,12 +73,26 @@ def iter_mjpeg_frames(
         except KeyError as exc:
             raise ValueError(f"missing required header: {exc.args[0]}") from exc
 
+        # Optional — present on Quest sender builds that ship the
+        # quest-native timestamp alongside the host-projected one.
+        # Old builds will omit it and post-hoc drift correction
+        # simply isn't available for those recordings.
+        quest_native_raw = headers.get("x-quest-native-ns")
+        try:
+            quest_native_ns = int(quest_native_raw) if quest_native_raw else None
+        except ValueError:
+            quest_native_ns = None
+
         body = stream.read(length)
         if len(body) != length:
             raise EOFError("truncated MJPEG part body")
         # Consume the trailing CRLF.
         stream.readline()
-        yield MjpegFrame(jpeg_bytes=body, capture_ns=capture_ns)
+        yield MjpegFrame(
+            jpeg_bytes=body,
+            capture_ns=capture_ns,
+            quest_native_ns=quest_native_ns,
+        )
 
 
 import logging
@@ -77,6 +105,9 @@ import httpx
 logger = logging.getLogger(__name__)
 
 
+FrameSink = Callable[[MjpegFrame], None]
+
+
 class MjpegPreviewConsumer:
     """Background thread that pulls the Quest's MJPEG preview into ``latest_frame``.
 
@@ -86,6 +117,23 @@ class MjpegPreviewConsumer:
     ``numpy.ndarray`` (BGR) suitable for the viewer; when ``False`` it is
     the raw :class:`MjpegFrame` — useful for tests that don't want to pull
     in OpenCV.
+
+    Frame fan-out
+    -------------
+    Each received frame is delivered to *both* of:
+
+    * ``latest_frame`` slot — decoded BGR array used by the viewer
+      panel. Always populated when ``decode_jpeg=True``.
+    * the optional :class:`FrameSink` registered via
+      :meth:`set_frame_sink` — receives the *raw* :class:`MjpegFrame`
+      so consumers (e.g. the streaming MP4 recorder) get bit-exact
+      JPEG bytes plus the original timestamps without paying for
+      JPEG decode + re-encode.
+
+    The sink may be added or cleared at any time (the recorder turns
+    on at ``start_recording`` and off at ``stop_recording``); the
+    network connection itself stays up across recording cycles so the
+    viewer panel never goes black mid-record.
     """
 
     def __init__(
@@ -107,6 +155,9 @@ class MjpegPreviewConsumer:
         self._latest: Optional[object] = None
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        # Sink is a single-slot mutable hook — replacing or clearing
+        # the sink is atomic at attribute level; we never iterate it.
+        self._frame_sink: Optional[FrameSink] = None
 
     # ------------------------------------------------------------------
 
@@ -129,6 +180,17 @@ class MjpegPreviewConsumer:
         if self._thread is not None:
             self._thread.join(timeout=2.0)
             self._thread = None
+
+    def set_frame_sink(self, sink: Optional[FrameSink]) -> None:
+        """Register (or clear, with ``None``) a per-frame callback.
+
+        Called from the consumer thread once per received frame, before
+        the JPEG is decoded for the viewer slot — so the sink sees the
+        raw bytes and original timestamp/native-ns. Sink exceptions are
+        caught and logged so a misbehaving recorder cannot kill the
+        viewer feed.
+        """
+        self._frame_sink = sink
 
     # ------------------------------------------------------------------
 
@@ -177,6 +239,17 @@ class MjpegPreviewConsumer:
                 # streaming responses and MockTransport (content=) work correctly.
                 buffer = _StreamAdapter(response.iter_bytes(8192), self._stop_event)
                 for frame in iter_mjpeg_frames(buffer, boundary=self._boundary):
+                    # Sink first — it gets the raw JPEG bytes regardless
+                    # of decode_jpeg, which lets the streaming recorder
+                    # operate on bit-exact source frames even while the
+                    # viewer slot holds a decoded BGR array.
+                    sink = self._frame_sink
+                    if sink is not None:
+                        try:
+                            sink(frame)
+                        except Exception as exc:  # noqa: BLE001
+                            logger.warning("frame sink raised: %s", exc)
+
                     decoded: object
                     if self._decode_jpeg:
                         decoded = _decode_jpeg(frame.jpeg_bytes)
