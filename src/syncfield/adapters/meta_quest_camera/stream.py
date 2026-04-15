@@ -267,18 +267,26 @@ class MetaQuestCameraStream(StreamBase):
 
     @property
     def latest_frame(self):
-        """Viewer-compat: return the left eye so the standard video panel
-        has something to render. The viewer's ``StreamSnapshot`` polls
-        ``stream.latest_frame`` for any adapter declaring
-        ``kind="video"``; without this proxy the camera card would sit
-        black even while the MJPEG preview is actively streaming.
+        """Viewer-compat: return a side-by-side ``[left | right]`` composite
+        so the single video panel shows both eyes at once. The viewer's
+        ``StreamSnapshot`` polls ``stream.latest_frame`` for any adapter
+        declaring ``kind="video"``; syncfield's panel model is 1 panel =
+        1 stream_id, so until we split into two adapters we surface the
+        stereo pair as a horizontally-concatenated frame.
 
-        The left eye is authoritative for now — phase 1 records the
-        same primary-camera view on both slots (see spec §9 Q1). Once
-        per-eye acquisition lands we can switch this to a side-by-side
-        composite or expose a user-selectable eye.
+        Falls back to whichever eye is available if the other is still
+        connecting or has dropped — users should see *something* rather
+        than a black card whenever at least one preview is alive.
         """
         left = self.latest_frame_left
+        right = self.latest_frame_right
+        if left is not None and right is not None:
+            import numpy as np
+            if left.shape == right.shape:
+                return np.hstack((left, right))
+            # Shapes can diverge for a frame or two during startup while
+            # the two previews race to produce their first decoded image.
+            # Fall through to the single-eye path instead of raising.
         if left is not None:
             return left
-        return self.latest_frame_right
+        return right

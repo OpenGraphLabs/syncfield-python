@@ -66,6 +66,7 @@ session = sf.SessionOrchestrator(
 session.add(MetaQuestHandStream(
     "quest_tracking",
     mode="hand",  # or "controller" to map Touch Plus pose into wrist slots
+    quest_host=QUEST_IP,  # push our IP via Quest HTTP — no broadcast needed
 ))
 
 # Stereo passthrough camera. We pull MP4 + timestamps over HTTP on
