@@ -18,13 +18,12 @@ from syncfield.adapters.ble_imu_profiles import WIT_WT901BLE_200HZ
 QUEST_IP = "192.168.4.26"
 
 session = sf.SessionOrchestrator(
-    host_id="mac_studio",
+    host_id="mac",
     output_dir=Path(__file__).parent / "output",
 )
-out = session.output_dir
 
 session.add(MetaQuestHandStream("quest_tracking", quest_host=QUEST_IP))
-session.add(MetaQuestCameraStream("quest_cam", quest_host=QUEST_IP, output_dir=out))
+session.add(MetaQuestCameraStream("quest_cam", quest_host=QUEST_IP, output_dir=session.output_dir))
 session.add(BLEImuGenericStream("wrist_left_imu",  profile=WIT_WT901BLE_200HZ, address="5622CCC4-A621-96DC-A7B5-E7650370E8A3"))
 session.add(BLEImuGenericStream("wrist_right_imu", profile=WIT_WT901BLE_200HZ, address="6E22ED0E-72CD-0175-6F29-0BA8D502CBAB"))
 session.add(BLEImuGenericStream("elbow_left_imu",  profile=WIT_WT901BLE_200HZ, address="1CD2DCDE-CE20-905E-7D66-66E20FB01AB6"))
