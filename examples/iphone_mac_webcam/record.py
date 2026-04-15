@@ -3,30 +3,28 @@
     pip install "syncfield[uvc,ble,viewer,camera]"
     python record.py
 
-Workflow (wrist-mount + later dock-and-sync):
-  1. Wear the Go3S on your wrist. Its WiFi is OFF — only BLE is needed.
-  2. Click **Record** in the viewer → all sensors + Go3S start in sync.
-  3. Click **Stop** → recording ends, episode dir now contains an
-     ``aggregation.json`` with the SD file path for the Go3S clip.
-     (No file download yet.)
-  4. Optional: record more episodes the same way.
-  5. When ready to pull videos off the camera:
-     a. Dock the Go3S in the Action Pod (or turn WiFi ON manually via
-        the camera: swipe down → WiFi → ON).
-     b. Make sure the camera's WiFi AP (e.g. "GO 3S 1TEBJJ.OSC") is
-        visible in macOS WiFi menu.
-     c. Click **Sync Go3S** in the viewer. The background queue walks
-        every pending ``aggregation.json`` under the output directory,
-        switches to the camera AP, downloads each file, and restores
-        the original WiFi network.
+Workflow (wrist-mount during recording, USB-C for collection):
+  1. Wear the Go3S on your wrist. Only BLE is used — no WiFi.
+  2. In the viewer, click Connect → Record → ... → Stop.
+  3. After recording, episode dirs hold ``aggregation.json`` with the
+     camera's SD path for each Go3S clip. No video copied yet.
+  4. When ready to pull videos:
+     a. Connect the Go3S to your Mac via USB-C cable.
+     b. On the camera screen, when prompted, choose
+        "USB / Mass Storage". The SD card mounts as a Finder disk
+        (e.g. "Insta360GO3S").
+     c. Switch to the Review tab in the viewer and click
+        Collect Videos. Files for every pending episode are copied
+        from the SD card into their episode folders.
 
-Go3S policy defaults to ``on_demand`` so recording never blocks on WiFi
-availability. Pass ``aggregation_policy="eager"`` if you want stop to
-auto-download (only useful when camera is docked the whole time).
-
-macOS one-time setup (unavoidable — OS-enforced):
-  * Grant Location Services permission to Python / your terminal app when
-    prompted — required for programmatic WiFi switching on macOS 13+.
+Why USB instead of WiFi:
+  Insta360's iOS app can join the camera's WiFi AP via
+  ``NEHotspotConfiguration`` + their proprietary BLE wake command (in
+  ``INSCameraServiceSDK``). macOS has neither — ``networksetup``
+  associations are rejected with -3925 kCWAssociationDeniedErr, and
+  the BLE wake command is not in any public reverse-engineered
+  protocol. USB Mass Storage sidesteps the whole stack: the SD card
+  is just a disk and copying a file is a file system operation.
 """
 
 from pathlib import Path

@@ -130,9 +130,6 @@ function RecordView({
         state={state}
         hasTask={taskState.currentTask !== null}
         onCommand={sendCommand}
-        hasGo3sStream={Object.values(snapshot?.streams ?? {}).some(
-          (s) => s.kind === "video" && s.capabilities?.live_preview === false,
-        )}
       />
       <TaskSelector
         tasks={taskState.tasks}

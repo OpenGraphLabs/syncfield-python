@@ -23,7 +23,6 @@ from syncfield.types import (
 
 from .aggregation.queue import (
     AggregationQueue,
-    Go3SAggregationDownloader,
     make_job_id,
 )
 from .aggregation.types import (
@@ -31,9 +30,8 @@ from .aggregation.types import (
     AggregationJob,
     AggregationState,
 )
+from .aggregation.usb_downloader import USBVolumeDownloader
 from .ble.camera import Go3SBLECamera
-from .wifi.osc_client import OscHttpClient
-from .wifi.switcher import wifi_switcher_for_platform
 
 
 AggregationPolicy = Literal["eager", "on_demand"]
@@ -75,11 +73,12 @@ def _global_aggregation_queue() -> AggregationQueue:
         thread.start()
         ready.wait(timeout=5.0)
 
-        switcher = wifi_switcher_for_platform()
-        downloader = Go3SAggregationDownloader(
-            switcher=switcher,
-            osc_factory=lambda host: OscHttpClient(host=host),
-        )
+        # USB Mass Storage path. WiFi was abandoned because the Go3S WiFi
+        # AP refuses macOS associations with -3925 kCWAssociationDeniedErr
+        # without Insta360's proprietary BLE wake command (which lives in
+        # their iOS / Mac SDK and is not in any public RE'd protocol).
+        # USB is a plain disk copy — no permissions, always works.
+        downloader = USBVolumeDownloader()
         queue = AggregationQueue(downloader=downloader)
         # Start the worker on the dedicated loop and wait for it to be running.
         fut: Future = asyncio.run_coroutine_threadsafe(queue.start(), loop)

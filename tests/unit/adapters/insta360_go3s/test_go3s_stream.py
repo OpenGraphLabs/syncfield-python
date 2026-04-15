@@ -239,14 +239,8 @@ def test_recovery_scan_picks_up_pending_aggregation(tmp_path, monkeypatch):
 
     monkeypatch.setattr(
         _stream_mod,
-        "Go3SAggregationDownloader",
+        "USBVolumeDownloader",
         lambda *args, **kwargs: NoOpDownloader(),
-    )
-    # Stub wifi_switcher_for_platform so init doesn't probe real networks.
-    monkeypatch.setattr(
-        _stream_mod,
-        "wifi_switcher_for_platform",
-        lambda: MagicMock(),
     )
 
     from syncfield.adapters.insta360_go3s.stream import _global_aggregation_queue
