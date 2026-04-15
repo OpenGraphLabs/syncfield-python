@@ -150,6 +150,13 @@ class StreamingVideoRecorder:
                 # jitter are preserved instead of being snapped to a
                 # synthetic 30 fps grid.
                 stream.time_base = Fraction(1, _MP4_TIME_BASE_DEN)
+                # Pin the average frame rate via the codec context —
+                # without this, the MP4 muxer derives r_frame_rate
+                # from the time_base denominator and reports e.g.
+                # 1000000/1 instead of 30/1, which downstream tooling
+                # (sync engine FPS estimator) then reads as a 1 MHz
+                # video and computes nonsense drift values.
+                stream.codec_context.framerate = Fraction(self._fps, 1)
             except Exception:
                 container.close()
                 raise

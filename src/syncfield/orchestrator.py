@@ -2149,6 +2149,12 @@ class SessionOrchestrator:
                         )
                     )
                 else:
+                    # Video streams use the FrameTimestamp schema —
+                    # which intentionally has no `channels` field.
+                    # Adapter-specific scalars (e.g. quest_native_ns
+                    # for Quest cameras) are forwarded as ``extras``
+                    # so they land as top-level keys in the JSONL row
+                    # alongside frame_number / capture_ns / etc.
                     writer.write(
                         FrameTimestamp(
                             frame_number=event.frame_number,
@@ -2156,6 +2162,7 @@ class SessionOrchestrator:
                             clock_source="host_monotonic",
                             clock_domain=clock_domain,
                             uncertainty_ns=event.uncertainty_ns,
+                            extras=dict(event.channels) if event.channels else {},
                         )
                     )
             except Exception as exc:  # pragma: no cover - best-effort

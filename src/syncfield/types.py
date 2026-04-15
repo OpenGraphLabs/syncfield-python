@@ -8,7 +8,7 @@ schema, enabling seamless integration.
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
@@ -83,6 +83,10 @@ class FrameTimestamp:
         clock_source: Origin of the timestamp (always ``"host_monotonic"`` for SDK).
         clock_domain: Host identifier — must match across all streams on the same host.
         uncertainty_ns: Estimated timing uncertainty in nanoseconds.
+        extras: Optional adapter-specific per-frame metadata (e.g.
+            ``{"quest_native_ns": 1234567890}`` for clock-drift correction).
+            Each key is serialised as a top-level field in the JSONL row,
+            so downstream readers can pick it up without schema migration.
     """
 
     frame_number: int
@@ -90,24 +94,33 @@ class FrameTimestamp:
     clock_source: str = "host_monotonic"
     clock_domain: str = "local_host"
     uncertainty_ns: int = 5_000_000  # 5 ms
+    extras: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        out: dict[str, Any] = {
             "frame_number": self.frame_number,
             "capture_ns": self.capture_ns,
             "clock_source": self.clock_source,
             "clock_domain": self.clock_domain,
             "uncertainty_ns": self.uncertainty_ns,
         }
+        if self.extras:
+            out.update(self.extras)
+        return out
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> FrameTimestamp:
+        known = {
+            "frame_number", "capture_ns", "clock_source",
+            "clock_domain", "uncertainty_ns",
+        }
         return cls(
             frame_number=data["frame_number"],
             capture_ns=data["capture_ns"],
             clock_source=data.get("clock_source", "host_monotonic"),
             clock_domain=data.get("clock_domain", "local_host"),
             uncertainty_ns=data.get("uncertainty_ns", 5_000_000),
+            extras={k: v for k, v in data.items() if k not in known},
         )
 
 
