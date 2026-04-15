@@ -286,6 +286,15 @@ class Go3SStream(StreamBase):
             raise
 
         self._cam = cam
+        # Publish to the live-camera registry so the aggregation downloader
+        # can find this open BLE link and pulse the camera over BLE while
+        # macOS associates with its WiFi AP. Without that wake-up the camera
+        # WiFi drops to standby and association fails with -3925 tmpErr.
+        try:
+            from .ble import live_registry
+            live_registry.register(self._ble_address, cam)
+        except Exception:
+            logger.debug("Go3SStream: live_registry register failed", exc_info=True)
 
         # Derive the WiFi AP SSID from the BLE advertised name. Insta360's
         # iOS SDK pattern: SSID = "{ble_name}.OSC" (with the exact spacing of
@@ -586,6 +595,11 @@ class Go3SStream(StreamBase):
         self._cam = None
         if cam is None:
             return
+        try:
+            from .ble import live_registry
+            live_registry.unregister(self._ble_address, cam)
+        except Exception:
+            pass
         try:
             self._run_on_ble_loop(cam.disconnect(), timeout=3.0)
         except Exception:

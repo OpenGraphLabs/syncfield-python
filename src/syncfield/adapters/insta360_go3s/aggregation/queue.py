@@ -327,16 +327,36 @@ class Go3SAggregationDownloader(AggregationDownloader):
 
         prev_ssid = self._switcher.current_ssid()
         _log.info("[aggregation] prev_ssid=%r", prev_ssid)
-        # If the host is already on the camera's AP, skip the switch
-        # entirely. This is the recommended path for production: the
-        # user manually picks the camera SSID from the macOS WiFi menu
-        # (one click, no Location Services permission required), then
-        # we only do probe + download. Auto-switch via networksetup is
-        # unreliable on un-entitled Python processes (Insta360's signed
-        # iOS app does it programmatically; we can't).
         already_on_ap = (
             prev_ssid is not None and prev_ssid.lower() == camera.wifi_ssid.lower()
         )
+
+        # Look up the live BLE camera (held open by the matching
+        # Go3SStream) so we can pulse it during WiFi association. This is
+        # what Insta360's iOS app does — without a recent BLE client the
+        # camera puts WiFi into low-power standby and macOS networksetup
+        # gets -3925 tmpErr on the join.
+        try:
+            from ..ble import live_registry as _ble_live_registry
+            live_cam = _ble_live_registry.get(camera.ble_address)
+        except Exception:
+            live_cam = None
+            _ble_live_registry = None  # type: ignore[assignment]
+
+        keepalive_task: Optional[asyncio.Task] = None
+
+        async def _keepalive_loop() -> None:
+            try:
+                while True:
+                    if live_cam is not None and live_cam.is_connected:
+                        try:
+                            await _ble_live_registry.send_wake(live_cam)
+                        except Exception:
+                            pass
+                    await asyncio.sleep(1.5)
+            except asyncio.CancelledError:
+                return
+
         try:
             if already_on_ap:
                 _log.info(
@@ -345,10 +365,19 @@ class Go3SAggregationDownloader(AggregationDownloader):
                 )
             else:
                 _log.info(
-                    "[aggregation] step 1/4: switching WiFi to %r",
-                    camera.wifi_ssid,
+                    "[aggregation] step 1/4: switching WiFi to %r (BLE wake=%s)",
+                    camera.wifi_ssid, live_cam is not None,
                 )
                 stage("switching_wifi")
+                # Pre-switch wake: pulse BLE so the camera AP is actively
+                # listening before macOS tries to associate.
+                if live_cam is not None and _ble_live_registry is not None:
+                    try:
+                        await _ble_live_registry.send_wake(live_cam)
+                        _log.info("[aggregation] BLE wake sent (pre-switch)")
+                    except Exception as e:
+                        _log.warning("[aggregation] pre-switch wake failed: %s", e)
+                    keepalive_task = asyncio.create_task(_keepalive_loop())
                 # WiFi switching is synchronous (subprocess); run it off
                 # the queue's asyncio loop so we don't block progress
                 # callbacks from other jobs that might arrive concurrently.
@@ -374,6 +403,16 @@ class Go3SAggregationDownloader(AggregationDownloader):
             )
             _log.info("[aggregation] step 4/4: download done (%s)", local_path)
         finally:
+            # Cancel the BLE keep-alive loop first — once the WiFi
+            # association is settled (or definitively failed), the camera
+            # talks via WiFi and we don't need to keep nudging BLE.
+            if keepalive_task is not None:
+                keepalive_task.cancel()
+                try:
+                    await keepalive_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+
             # Only restore WiFi if WE switched it. If the user manually
             # connected to the camera AP before clicking Collect Videos,
             # restoring would yank them off without warning — leave the

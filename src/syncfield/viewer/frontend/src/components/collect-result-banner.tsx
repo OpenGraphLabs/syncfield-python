@@ -42,27 +42,14 @@ export function CollectResultBanner({
             Nothing pending — no aggregation manifests found.
           </span>
         ) : (
-          <div className="flex flex-col gap-1">
-            <span className="font-medium">
-              Queued {enqueuedCount} episode{enqueuedCount === 1 ? "" : "s"} for video collection.
-              {skippedCount > 0 && (
-                <span className="ml-2 text-muted font-normal">
-                  ({skippedCount} skipped)
-                </span>
-              )}
-            </span>
-            <span className="text-[11px] text-muted font-normal">
-              For best results, connect your Mac to the camera's WiFi
-              (e.g.{" "}
-              <code className="rounded bg-foreground/5 px-1">
-                GO 3S xxxxxx.OSC
-              </code>
-              , password{" "}
-              <code className="rounded bg-foreground/5 px-1">88888888</code>)
-              from the macOS WiFi menu first — that lets us skip the
-              auto-switch (which often fails without Location permission).
-            </span>
-          </div>
+          <span className="font-medium">
+            Queued {enqueuedCount} episode{enqueuedCount === 1 ? "" : "s"} for video collection.
+            {skippedCount > 0 && (
+              <span className="ml-2 text-muted font-normal">
+                ({skippedCount} skipped)
+              </span>
+            )}
+          </span>
         )}
         {result.skipped && result.skipped.length > 0 && (
           <span className="text-xs text-muted">
