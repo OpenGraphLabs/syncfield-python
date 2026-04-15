@@ -2250,14 +2250,19 @@ def _read_sensor_jsonl(jsonl_path: Path, max_points: int = 2000) -> dict:
     this still yields >5 ms resolution per visible point which is
     well below what a human notices in the playback scrubber.
 
-    Non-numeric or underscore-prefixed auxiliary channels are dropped
-    so they don't flood the response. The first sample's
-    ``capture_ns`` is used as the zero reference for ``t``.
+    Non-numeric scalar channels and underscore-prefixed auxiliaries are
+    dropped from ``channels``; list-valued channels (e.g. Meta Quest's
+    156-float ``hand_joints``) are surfaced separately under
+    ``vector_channels`` so the Review-mode pose panel can index them at
+    playback time without forcing the line-chart code path to handle
+    list samples. The first sample's ``capture_ns`` is used as the zero
+    reference for ``t``.
     """
     import json as json_mod
 
     capture_ns: list[int] = []
     channel_buffers: dict[str, list[float]] = {}
+    vector_buffers: dict[str, list[list[float]]] = {}
 
     with open(jsonl_path, "r") as handle:
         for line in handle:
@@ -2275,24 +2280,45 @@ def _read_sensor_jsonl(jsonl_path: Path, max_points: int = 2000) -> dict:
 
             capture_ns.append(int(ts))
             for name, value in ch.items():
-                if not isinstance(value, (int, float)):
-                    continue
                 if name.startswith("_") or "timestamp" in name:
                     continue
-                buf = channel_buffers.get(name)
-                if buf is None:
-                    buf = [float("nan")] * (len(capture_ns) - 1)
-                    channel_buffers[name] = buf
-                buf.append(float(value))
+                if isinstance(value, (int, float)):
+                    buf = channel_buffers.get(name)
+                    if buf is None:
+                        buf = [float("nan")] * (len(capture_ns) - 1)
+                        channel_buffers[name] = buf
+                    buf.append(float(value))
+                elif isinstance(value, list) and value and all(
+                    isinstance(v, (int, float)) for v in value
+                ):
+                    vbuf = vector_buffers.get(name)
+                    if vbuf is None:
+                        # Back-fill with zero vectors of the right
+                        # dimension so the per-frame index is aligned
+                        # with capture_ns.
+                        zero = [0.0] * len(value)
+                        vbuf = [list(zero) for _ in range(len(capture_ns) - 1)]
+                        vector_buffers[name] = vbuf
+                    vbuf.append([float(v) for v in value])
             # Pad any channel that didn't appear on this row so all
             # buffers stay the same length as capture_ns.
             for name, buf in channel_buffers.items():
                 if len(buf) < len(capture_ns):
                     buf.append(float("nan"))
+            for name, vbuf in vector_buffers.items():
+                if len(vbuf) < len(capture_ns):
+                    dim = len(vbuf[-1]) if vbuf else 0
+                    vbuf.append([0.0] * dim)
 
     total = len(capture_ns)
     if total == 0:
-        return {"t": [], "channels": {}, "count": 0, "duration_s": 0.0}
+        return {
+            "t": [],
+            "channels": {},
+            "vector_channels": {},
+            "count": 0,
+            "duration_s": 0.0,
+        }
 
     t0 = capture_ns[0]
     # Stride-decimate if oversized — keep roughly evenly-spaced points
@@ -2307,11 +2333,16 @@ def _read_sensor_jsonl(jsonl_path: Path, max_points: int = 2000) -> dict:
         name: [round(buf[i], 6) for i in keep]
         for name, buf in channel_buffers.items()
     }
+    vector_channels_out = {
+        name: [vbuf[i] for i in keep]
+        for name, vbuf in vector_buffers.items()
+    }
     duration_s = round((capture_ns[-1] - t0) / 1e9, 6)
 
     return {
         "t": t_seconds,
         "channels": channels_out,
+        "vector_channels": vector_channels_out,
         "count": total,
         "duration_s": duration_s,
     }

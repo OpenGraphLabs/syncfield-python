@@ -3,8 +3,11 @@ import { useEffect, useState } from "react";
 export interface SensorReplayData {
   /** Sample timestamps in seconds, relative to the first sample. */
   t: number[];
-  /** Per-channel value arrays aligned to ``t``. */
+  /** Per-channel scalar value arrays aligned to ``t``. */
   channels: Record<string, number[]>;
+  /** Per-channel vector samples aligned to ``t`` (e.g. Quest's
+   *  156-float ``hand_joints``). Optional for older payloads. */
+  vector_channels?: Record<string, number[][]>;
   /** Total number of samples in the source file (before decimation). */
   count: number;
   /** Duration in seconds from first to last sample. */

@@ -160,9 +160,14 @@ function EpisodeDetailInner({
             carries ``shrink-0`` so it's *never* the thing that gets
             clipped when the viewport is short — the user must always
             be able to reach the play/scrub controls without scrolling. */}
-        <div className="flex min-h-0 flex-1 flex-col bg-black/95">
+        <div className="flex min-h-0 flex-1 flex-col bg-background-subtle">
           {primaryStream && (
-            <div className="flex min-h-0 flex-[2] p-2">
+            // Primary stream: 60 % of the vertical budget (was 67 %).
+            // Trims the headline panel just enough that the secondary
+            // grid below has room to render IMU cubes / pose at a
+            // legible size — primary still dominates, but the layout
+            // reads as balanced rather than dwarfed-secondaries.
+            <div className="flex min-h-0 flex-[3] p-2">
               {kindOf(primaryStream) === "video" ? (
                 <ReviewVideoPlayer
                   episodeId={episodeId}
@@ -183,7 +188,9 @@ function EpisodeDetailInner({
           )}
 
           {secondaryStreams.length > 0 && (
-            <div className="grid min-h-0 flex-1 auto-rows-fr gap-2 p-2 grid-cols-[repeat(auto-fit,minmax(220px,1fr))]">
+            // Secondary grid: 40 % of vertical (was 33 %), wider
+            // minmax so each card renders at a useful size.
+            <div className="grid min-h-0 flex-[2] auto-rows-fr gap-2 p-2 grid-cols-[repeat(auto-fit,minmax(260px,1fr))]">
               {secondaryStreams.map((sid) => {
                 const kind = kindOf(sid);
                 const streamResult = syncReport?.streams[sid];

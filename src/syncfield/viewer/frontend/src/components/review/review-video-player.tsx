@@ -74,7 +74,7 @@ export function ReviewVideoPlayer({
   return (
     <div
       className={cn(
-        "relative flex-1 overflow-hidden rounded-lg bg-black",
+        "relative flex-1 overflow-hidden rounded-lg border bg-background",
         isClickable && "cursor-pointer ring-transparent transition-all hover:ring-2 hover:ring-primary/40",
       )}
       onClick={isClickable ? onClick : undefined}
