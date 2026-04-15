@@ -91,12 +91,28 @@ export interface SyncJobStatus {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/** Derive a human-readable grade from a stream's sync confidence. */
+/** Derive a human-readable grade from a stream's sync confidence.
+ *
+ * Special case: an intra-host sensor that the sync engine couldn't
+ * cross-correlate (audio / video features) but for which it reported
+ * an exact zero offset is still functionally aligned via the host
+ * monotonic clock. The engine flags those at confidence 0.5 with a
+ * "clock_domain mismatch" warning, which the UI used to render as
+ * a yellow "Fair" — misleading because the streams ARE aligned to
+ * within the timestamp uncertainty. Promote that case to "good" so
+ * the badge tracks actual alignment quality, not the conservatism
+ * of the cross-correlation fallback.
+ */
 export function syncGrade(stream: SyncStreamResult): SyncGrade {
   if (stream.role === "primary") return "primary";
   const c = stream.confidence ?? 0;
+  const offset = Math.abs(stream.offset_ms ?? 0);
   if (c >= 0.8) return "excellent";
   if (c >= 0.6) return "good";
+  // Aligned-by-timestamp fallback: zero offset + ≥0.4 confidence
+  // means the engine deferred to host-clock alignment without a
+  // measurable cross-correlation peak. That's "good", not "fair".
+  if (c >= 0.4 && offset < 1.0) return "good";
   if (c >= 0.4) return "fair";
   return "poor";
 }
