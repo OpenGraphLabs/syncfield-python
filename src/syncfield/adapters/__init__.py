@@ -29,12 +29,14 @@ from the caller.
 
 from syncfield.adapters.jsonl_file import JSONLFileStream
 from syncfield.adapters.meta_quest import MetaQuestHandStream
+from syncfield.adapters.meta_quest_camera import MetaQuestCameraStream
 from syncfield.adapters.polling_sensor import PollingSensorStream
 from syncfield.adapters.push_sensor import PushSensorStream
 from syncfield.discovery import register_discoverer
 
 __all__ = [
     "JSONLFileStream",
+    "MetaQuestCameraStream",
     "MetaQuestHandStream",
     "PollingSensorStream",
     "PushSensorStream",
