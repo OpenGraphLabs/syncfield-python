@@ -33,25 +33,22 @@ function hasOrientationChannels(names: string[]): boolean {
 export function SensorPanel({ streamId }: SensorPanelProps) {
   const { channels, isConnected } = useSensorStream(streamId);
   const channelNames = Object.keys(channels);
+  const hasData = channelNames.length > 0;
 
-  if (!isConnected) {
-    return (
-      <div className="flex aspect-video items-center justify-center text-xs text-muted">
-        Connecting…
-      </div>
-    );
+  // If channel data has arrived, render it regardless of isConnected.
+  // (Some EventSource implementations or middleware can deliver
+  // messages without firing onopen reliably; the data itself is the
+  // ground truth that the stream is alive.)
+  if (hasData) {
+    if (hasOrientationChannels(channelNames)) {
+      return <PosePanel channels={channels} />;
+    }
+    return <SensorChart streamId={streamId} />;
   }
 
-  if (channelNames.length === 0) {
-    return (
-      <div className="flex aspect-video items-center justify-center text-xs text-muted">
-        Waiting for data…
-      </div>
-    );
-  }
-
-  if (hasOrientationChannels(channelNames)) {
-    return <PosePanel channels={channels} />;
-  }
-  return <SensorChart streamId={streamId} />;
+  return (
+    <div className="flex aspect-video items-center justify-center text-xs text-muted">
+      {isConnected ? "Waiting for data…" : "Connecting…"}
+    </div>
+  );
 }

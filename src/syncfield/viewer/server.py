@@ -1730,17 +1730,39 @@ class ViewerServer:
 
     def _setup_static(self) -> None:
         if STATIC_DIR.exists() and (STATIC_DIR / "index.html").exists():
-            # Serve the SPA — catch-all returns index.html for client-side routing
+            # Serve the SPA — catch-all returns index.html for client-side routing.
+            #
+            # Cache strategy (standard Vite hashed-asset pattern):
+            #   * index.html → no-store, must revalidate every request.
+            #     Without this, browsers apply heuristic caching to the
+            #     SPA shell — a stale index.html keeps pointing at last
+            #     deploy's hashed bundle even after we ship a new one,
+            #     so users see fixed bugs come back.
+            #   * /assets/index-<hash>.{js,css} → 1 year immutable.
+            #     The filename changes per build, so cache forever is safe.
+            #   * Everything else → no-store (small static files).
             @self.app.get("/{full_path:path}")
             async def spa_fallback(full_path: str) -> HTMLResponse:
-                # Try to serve the exact file first
                 file_path = STATIC_DIR / full_path
                 if full_path and file_path.exists() and file_path.is_file():
                     content = file_path.read_bytes()
                     media_type = _guess_media_type(full_path)
-                    return HTMLResponse(content=content, media_type=media_type)
-                # Fallback to index.html for SPA routing
-                return HTMLResponse(content=(STATIC_DIR / "index.html").read_text())
+                    if full_path.startswith("assets/") and (
+                        full_path.endswith(".js") or full_path.endswith(".css")
+                    ):
+                        cache_header = "public, max-age=31536000, immutable"
+                    else:
+                        cache_header = "no-store"
+                    return HTMLResponse(
+                        content=content,
+                        media_type=media_type,
+                        headers={"Cache-Control": cache_header},
+                    )
+                # Fallback to index.html for SPA routing — never cache.
+                return HTMLResponse(
+                    content=(STATIC_DIR / "index.html").read_text(),
+                    headers={"Cache-Control": "no-store"},
+                )
 
     # ------------------------------------------------------------------
     # WebSocket broadcast loop
