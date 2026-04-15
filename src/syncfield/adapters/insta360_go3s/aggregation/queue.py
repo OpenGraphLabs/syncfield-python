@@ -327,17 +327,36 @@ class Go3SAggregationDownloader(AggregationDownloader):
 
         prev_ssid = self._switcher.current_ssid()
         _log.info("[aggregation] prev_ssid=%r", prev_ssid)
+        # If the host is already on the camera's AP, skip the switch
+        # entirely. This is the recommended path for production: the
+        # user manually picks the camera SSID from the macOS WiFi menu
+        # (one click, no Location Services permission required), then
+        # we only do probe + download. Auto-switch via networksetup is
+        # unreliable on un-entitled Python processes (Insta360's signed
+        # iOS app does it programmatically; we can't).
+        already_on_ap = (
+            prev_ssid is not None and prev_ssid.lower() == camera.wifi_ssid.lower()
+        )
         try:
-            _log.info("[aggregation] step 1/4: switching WiFi to %r", camera.wifi_ssid)
-            stage("switching_wifi")
-            # WiFi switching is synchronous (subprocess); run it off the
-            # queue's asyncio loop so we don't block progress callbacks
-            # from other jobs that might arrive concurrently.
-            await asyncio.to_thread(
-                self._switcher.connect,
-                camera.wifi_ssid,
-                camera.wifi_password,
-            )
+            if already_on_ap:
+                _log.info(
+                    "[aggregation] already on camera AP %r — skipping WiFi switch",
+                    camera.wifi_ssid,
+                )
+            else:
+                _log.info(
+                    "[aggregation] step 1/4: switching WiFi to %r",
+                    camera.wifi_ssid,
+                )
+                stage("switching_wifi")
+                # WiFi switching is synchronous (subprocess); run it off
+                # the queue's asyncio loop so we don't block progress
+                # callbacks from other jobs that might arrive concurrently.
+                await asyncio.to_thread(
+                    self._switcher.connect,
+                    camera.wifi_ssid,
+                    camera.wifi_password,
+                )
             _log.info("[aggregation] step 2/4: probing camera at %s", self._ap_host)
             stage("probing")
             osc = await self._wait_for_ap()  # returns the probed client
@@ -355,15 +374,26 @@ class Go3SAggregationDownloader(AggregationDownloader):
             )
             _log.info("[aggregation] step 4/4: download done (%s)", local_path)
         finally:
-            try:
-                _log.info("[aggregation] restoring WiFi to %r", prev_ssid)
-                stage("restoring_wifi")
-                await asyncio.to_thread(self._switcher.restore, prev_ssid)
-            except Exception:
-                _log.warning(
-                    "Go3SAggregationDownloader: failed to restore WiFi to %s",
-                    prev_ssid,
-                    exc_info=True,
+            # Only restore WiFi if WE switched it. If the user manually
+            # connected to the camera AP before clicking Collect Videos,
+            # restoring would yank them off without warning — leave the
+            # restoration to the user (they can click any network in the
+            # macOS WiFi menu, just like they did to join the camera).
+            if not already_on_ap:
+                try:
+                    _log.info("[aggregation] restoring WiFi to %r", prev_ssid)
+                    stage("restoring_wifi")
+                    await asyncio.to_thread(self._switcher.restore, prev_ssid)
+                except Exception:
+                    _log.warning(
+                        "Go3SAggregationDownloader: failed to restore WiFi to %s",
+                        prev_ssid,
+                        exc_info=True,
+                    )
+            else:
+                _log.info(
+                    "[aggregation] user-controlled WiFi (was on camera AP "
+                    "before run) — skipping restore"
                 )
 
     async def _wait_for_ap(self) -> Any:
