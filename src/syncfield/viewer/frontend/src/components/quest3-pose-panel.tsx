@@ -327,7 +327,7 @@ export function Quest3PosePanel({ pose: poseData }: Quest3PosePanelProps) {
 
   return (
     <div className="aspect-video" style={{ background: COLORS.bg }}>
-      <Canvas camera={{ position: [0.28, 0.22, 0.32], fov: 55 }}>
+      <Canvas camera={{ position: [0.23, 0.19, 0.27], fov: 55 }}>
         <color attach="background" args={[COLORS.bg]} />
         <ambientLight intensity={1.0} />
         <directionalLight position={[3, 4, 2]} intensity={1.0} color="#fffdf8" />
