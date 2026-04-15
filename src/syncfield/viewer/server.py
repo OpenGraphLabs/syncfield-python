@@ -1990,8 +1990,23 @@ class ViewerServer:
     # ------------------------------------------------------------------
 
     async def _sse_generator(self, stream_id: str):
-        """Yield sensor data as Server-Sent Events."""
+        """Yield sensor data as Server-Sent Events.
+
+        Emits an SSE comment (``:<text>\\n\\n``) immediately so the browser's
+        EventSource fires onopen as soon as headers arrive. Without this,
+        the response body stays empty until the first real data point and
+        the panel sits on "Connecting…" indefinitely — especially for BLE
+        sensors in the ~100 ms window before the first sample propagates
+        into the poller buffer. Subsequent comments every ~5 s keep the
+        connection alive through proxies that close idle streams.
+        """
+        # Header flush — tells the browser the stream is live and unblocks
+        # EventSource.onopen. Comment lines are ignored by the SSE parser.
+        yield ": connected\n\n"
+
+        ticks_since_data = 0
         while True:
+            sent = False
             snapshot = self._poller.get_snapshot()
             if snapshot is not None:
                 stream = snapshot.streams.get(stream_id)
@@ -2010,6 +2025,18 @@ class ViewerServer:
                             "label": label,
                         })
                         yield f"data: {event_data}\n\n"
+                        sent = True
+
+            if sent:
+                ticks_since_data = 0
+            else:
+                ticks_since_data += 1
+                # Keep-alive comment every ~5 s of dead air so onerror/
+                # reconnect logic in the browser never kicks in spuriously.
+                if ticks_since_data >= 50:
+                    yield ": ka\n\n"
+                    ticks_since_data = 0
+
             await asyncio.sleep(0.1)  # ~10 Hz
 
 
