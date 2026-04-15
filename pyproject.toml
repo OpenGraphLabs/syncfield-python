@@ -53,10 +53,15 @@ multihost = [
     "uvicorn[standard]>=0.24.0",
     "httpx>=0.25.0",
 ]
-# Insta360 Go3S adapter: BLE trigger via bleak + WiFi/OSC HTTP download via aiohttp.
+# Camera adapters that talk to off-host cameras:
+#   * Insta360 Go3S — BLE trigger via bleak + WiFi/OSC HTTP via aiohttp.
+#   * MetaQuestCameraStream — stereo passthrough over HTTP via httpx to
+#     the SyncField Quest Sender companion app; pulls the on-device
+#     recorded MP4 + timestamps JSONL after stop_recording().
 camera = [
     "bleak>=0.21",
     "aiohttp>=3.9",
+    "httpx>=0.25.0",
 ]
 all = [
     "sounddevice>=0.4.6",
