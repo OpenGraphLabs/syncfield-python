@@ -275,8 +275,11 @@ function SceneContent({ pose }: { pose: ParsedPoseData }) {
   );
   // Scale down aggressively so content stays inside the 0.84-m workspace box.
   const fitScale = Math.min(0.8, Math.max(0.2, 0.18 / maxRadius));
-  const headAxisLength = Math.max(0.03, 0.06 * fitScale);
-  const markerScale = Math.max(0.6, Math.min(1.2, fitScale * 1.5));
+  // Bumped from 0.06 → 0.10 (head axis arms) and 1.5 → 2.4 (joint marker
+  // multiplier) so head + hand skeletons are legible at the closer
+  // default camera distance — previously they shrank to a tiny dot.
+  const headAxisLength = Math.max(0.05, 0.10 * fitScale);
+  const markerScale = Math.max(1.0, Math.min(2.0, fitScale * 2.4));
 
   const transformed = (p: Vec3): Vec3 => vectorScale(vectorSubtract(p, pose.sceneCenter), fitScale);
   const leftJoints = pose.leftJoints.map(transformed);
@@ -324,7 +327,7 @@ export function Quest3PosePanel({ pose: poseData }: Quest3PosePanelProps) {
 
   return (
     <div className="aspect-video" style={{ background: COLORS.bg }}>
-      <Canvas camera={{ position: [0.5, 0.35, 0.5], fov: 50 }}>
+      <Canvas camera={{ position: [0.28, 0.22, 0.32], fov: 55 }}>
         <color attach="background" args={[COLORS.bg]} />
         <ambientLight intensity={1.0} />
         <directionalLight position={[3, 4, 2]} intensity={1.0} color="#fffdf8" />
@@ -335,7 +338,7 @@ export function Quest3PosePanel({ pose: poseData }: Quest3PosePanelProps) {
         <Workspace />
         <SceneContent pose={parsed} />
 
-        <OrbitControls enablePan={false} target={[0, 0.1, 0]} minDistance={0.2} maxDistance={2} />
+        <OrbitControls enablePan={false} target={[0, 0.1, 0]} minDistance={0.15} maxDistance={1.2} />
       </Canvas>
     </div>
   );
