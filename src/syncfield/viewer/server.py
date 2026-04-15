@@ -1730,17 +1730,39 @@ class ViewerServer:
 
     def _setup_static(self) -> None:
         if STATIC_DIR.exists() and (STATIC_DIR / "index.html").exists():
-            # Serve the SPA — catch-all returns index.html for client-side routing
+            # Serve the SPA — catch-all returns index.html for client-side routing.
+            #
+            # Cache strategy (standard Vite hashed-asset pattern):
+            #   * index.html → no-store, must revalidate every request.
+            #     Without this, browsers apply heuristic caching to the
+            #     SPA shell — a stale index.html keeps pointing at last
+            #     deploy's hashed bundle even after we ship a new one,
+            #     so users see fixed bugs come back.
+            #   * /assets/index-<hash>.{js,css} → 1 year immutable.
+            #     The filename changes per build, so cache forever is safe.
+            #   * Everything else → no-store (small static files).
             @self.app.get("/{full_path:path}")
             async def spa_fallback(full_path: str) -> HTMLResponse:
-                # Try to serve the exact file first
                 file_path = STATIC_DIR / full_path
                 if full_path and file_path.exists() and file_path.is_file():
                     content = file_path.read_bytes()
                     media_type = _guess_media_type(full_path)
-                    return HTMLResponse(content=content, media_type=media_type)
-                # Fallback to index.html for SPA routing
-                return HTMLResponse(content=(STATIC_DIR / "index.html").read_text())
+                    if full_path.startswith("assets/") and (
+                        full_path.endswith(".js") or full_path.endswith(".css")
+                    ):
+                        cache_header = "public, max-age=31536000, immutable"
+                    else:
+                        cache_header = "no-store"
+                    return HTMLResponse(
+                        content=content,
+                        media_type=media_type,
+                        headers={"Cache-Control": cache_header},
+                    )
+                # Fallback to index.html for SPA routing — never cache.
+                return HTMLResponse(
+                    content=(STATIC_DIR / "index.html").read_text(),
+                    headers={"Cache-Control": "no-store"},
+                )
 
     # ------------------------------------------------------------------
     # WebSocket broadcast loop
@@ -1994,13 +2016,28 @@ class ViewerServer:
 
         Two payload shapes ride the same event:
 
-        * ``channels`` — scalar latest values (rolling chart)
+        * ``channels`` — scalar latest values (rolling chart).
         * ``pose``    — list-valued latest samples (e.g. 156-float
                         ``hand_joints`` from MetaQuestHandStream).
                         Kept optional so existing sensor-chart callers
                         that only consume scalars stay backward-compatible.
+
+        Emits an SSE comment (``:<text>\\n\\n``) immediately so the
+        browser's EventSource fires onopen as soon as headers arrive.
+        Without this the response body stays empty until the first real
+        data point and the panel sits on "Connecting…" indefinitely —
+        especially for BLE sensors in the ~100 ms window before the
+        first sample propagates into the poller buffer. Subsequent
+        comments every ~5 s keep the connection alive through proxies
+        that close idle streams.
         """
+        # Header flush — tells the browser the stream is live and unblocks
+        # EventSource.onopen. Comment lines are ignored by the SSE parser.
+        yield ": connected\n\n"
+
+        ticks_since_data = 0
         while True:
+            sent = False
             snapshot = self._poller.get_snapshot()
             if snapshot is not None:
                 stream = snapshot.streams.get(stream_id)
@@ -2022,6 +2059,18 @@ class ViewerServer:
                             "label": label,
                         })
                         yield f"data: {event_data}\n\n"
+                        sent = True
+
+            if sent:
+                ticks_since_data = 0
+            else:
+                ticks_since_data += 1
+                # Keep-alive comment every ~5 s of dead air so onerror/
+                # reconnect logic in the browser never kicks in spuriously.
+                if ticks_since_data >= 50:
+                    yield ": ka\n\n"
+                    ticks_since_data = 0
+
             await asyncio.sleep(0.1)  # ~10 Hz
 
 

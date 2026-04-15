@@ -11,7 +11,7 @@ interface SensorPanelProps {
  * Dispatcher across the three sensor render paths:
  *
  *  - :component:`Quest3PosePanel` — MetaQuestHandStream samples
- *    (detected by the ``hand_joints`` list channel).
+ *    (detected by the ``hand_joints`` list channel in ``pose``).
  *  - :component:`PosePanel` — roll/pitch/yaw IMUs (e.g. WitMotion).
  *  - :component:`SensorChart` — fallback multi-channel line chart.
  *
@@ -20,6 +20,11 @@ interface SensorPanelProps {
  * :hook:`useSensorStream` once, look at both the scalar channel names
  * and the pose payload to pick a panel, and that panel opens its own
  * short subscription for rendering.
+ *
+ * The render decision keys off *data arrival*, not ``isConnected``.
+ * Some EventSource implementations / middleware deliver messages
+ * without firing ``onopen`` reliably; the data itself is ground
+ * truth that the stream is alive.
  */
 
 function hasOrientationChannels(names: string[]): boolean {
@@ -37,29 +42,23 @@ function hasQuest3Pose(pose: Record<string, number[]> | null): boolean {
 export function SensorPanel({ streamId }: SensorPanelProps) {
   const { channels, pose, isConnected } = useSensorStream(streamId);
   const channelNames = Object.keys(channels);
+  const hasScalar = channelNames.length > 0;
+  const hasPose = hasQuest3Pose(pose);
+  const hasData = hasScalar || hasPose;
 
-  if (!isConnected) {
-    return (
-      <div className="flex aspect-video items-center justify-center text-xs text-muted">
-        Connecting…
-      </div>
-    );
+  if (hasData) {
+    if (hasPose) {
+      return <Quest3PosePanel pose={pose} />;
+    }
+    if (hasOrientationChannels(channelNames)) {
+      return <PosePanel channels={channels} />;
+    }
+    return <SensorChart streamId={streamId} />;
   }
 
-  if (hasQuest3Pose(pose)) {
-    return <Quest3PosePanel pose={pose} />;
-  }
-
-  if (channelNames.length === 0) {
-    return (
-      <div className="flex aspect-video items-center justify-center text-xs text-muted">
-        Waiting for data…
-      </div>
-    );
-  }
-
-  if (hasOrientationChannels(channelNames)) {
-    return <PosePanel channels={channels} />;
-  }
-  return <SensorChart streamId={streamId} />;
+  return (
+    <div className="flex aspect-video items-center justify-center text-xs text-muted">
+      {isConnected ? "Waiting for data…" : "Connecting…"}
+    </div>
+  );
 }
