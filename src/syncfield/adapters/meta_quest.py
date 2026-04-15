@@ -137,6 +137,12 @@ class MetaQuestHandStream(StreamBase):
     _discovery_kind = "sensor"
     _discovery_adapter_type = "meta_quest"
 
+    # Quest companion app HTTP control port (same CameraHttpServer that
+    # serves /status, /preview, /recording/*). We piggy-back on it to
+    # push the Mac's IP directly to the tracker, skipping UDP broadcast
+    # discovery entirely (which some APs silently drop).
+    DEFAULT_QUEST_HTTP_PORT = 14045
+
     def __init__(
         self,
         id: str,
@@ -144,6 +150,8 @@ class MetaQuestHandStream(StreamBase):
         host: str = "0.0.0.0",
         port: int = DEFAULT_PORT,
         mode: str = "hand",
+        quest_host: Optional[str] = None,
+        quest_http_port: int = 14045,
     ) -> None:
         super().__init__(
             id=id,
@@ -158,6 +166,8 @@ class MetaQuestHandStream(StreamBase):
         self._host = host
         self._port = port
         self._mode = mode.lower() if mode in ("hand", "controller") else "hand"
+        self._quest_host = quest_host
+        self._quest_http_port = quest_http_port
 
         self._socket: Optional[socket.socket] = None
         self._receive_thread: Optional[threading.Thread] = None
@@ -212,6 +222,20 @@ class MetaQuestHandStream(StreamBase):
             self.id, self._host, self._port, self._mode,
         )
 
+        # Direct-push of our IP to the Quest companion app — bypasses
+        # UDP broadcast discovery, which some APs silently drop. Only
+        # runs when the caller passed quest_host (i.e. they know where
+        # the headset is); otherwise we fall back to the responder path.
+        if self._quest_host:
+            try:
+                self._push_target_to_quest()
+            except Exception as exc:
+                logger.warning(
+                    "[%s] Could not push target IP to Quest at %s:%d: %s "
+                    "(falling back to broadcast discovery)",
+                    self.id, self._quest_host, self._quest_http_port, exc,
+                )
+
         # Spin up the discovery responder so the Quest companion app can
         # auto-resolve our IP. Without this the user has to type the
         # Mac's IP into the Quest HUD every time the network changes.
@@ -261,6 +285,34 @@ class MetaQuestHandStream(StreamBase):
     # ------------------------------------------------------------------
     # Discovery responder (UDP :14044)
     # ------------------------------------------------------------------
+
+    def _push_target_to_quest(self) -> None:
+        """POST our local IP to the Quest's CameraHttpServer.
+
+        The Quest's UDPTrackingSender will then unicast tracking packets
+        directly to us — no UDP broadcast required. This is the reliable
+        path when the Wi-Fi AP drops broadcasts (client isolation,
+        IPv6-only, etc.).
+
+        Uses urllib so we don't pull httpx into the base sensor adapter
+        just for one request — the camera adapter has its own httpx
+        dependency, but MetaQuestHandStream stays import-light.
+        """
+        import urllib.request
+
+        local_ip = self._resolve_local_ip_for(self._quest_host)
+        payload = json.dumps({"ip": local_ip, "port": self._port}).encode("utf-8")
+        url = f"http://{self._quest_host}:{self._quest_http_port}/tracker/target"
+        req = urllib.request.Request(
+            url, data=payload, method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=2.0) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+            logger.info(
+                "[%s] Pushed target %s:%d to Quest %s — %s",
+                self.id, local_ip, self._port, self._quest_host, body.strip(),
+            )
 
     def _start_discovery_responder(self) -> None:
         """Respond to Quest companion-app discovery broadcasts.

@@ -132,16 +132,40 @@ class MjpegPreviewConsumer:
 
     # ------------------------------------------------------------------
 
+    # Exponential backoff for repeat failures. Quest's HTTP server
+    # disappearing for a minute (app restart, idle screen-off) would
+    # otherwise spam ~60 WARN lines at 1 s cadence.
+    _RECONNECT_INITIAL_S = 1.0
+    _RECONNECT_MAX_S = 8.0
+
     def _run(self) -> None:
+        delay_s = self._RECONNECT_INITIAL_S
+        consecutive_failures = 0
         while not self._stop_event.is_set():
             try:
                 self._consume_once()
+                # _consume_once returned without raising — either the
+                # stream ended cleanly or the stop_event fired. Reset
+                # the backoff so the next genuine failure logs loudly.
+                delay_s = self._RECONNECT_INITIAL_S
+                consecutive_failures = 0
             except Exception as exc:  # pragma: no cover - exercised by reconnect test
-                logger.warning("MJPEG consumer error: %s", exc)
-                if self._on_health is not None:
+                consecutive_failures += 1
+                # First failure per reconnect cycle is a real warning;
+                # subsequent retries against the same outage get demoted
+                # to INFO so debug sessions aren't buried under spam.
+                if consecutive_failures == 1:
+                    logger.warning("MJPEG consumer error: %s", exc)
+                else:
+                    logger.info(
+                        "MJPEG consumer error (retry %d, next in %.1fs): %s",
+                        consecutive_failures, delay_s, exc,
+                    )
+                if self._on_health is not None and consecutive_failures == 1:
                     self._on_health("drop", f"mjpeg error: {exc}")
-                if self._stop_event.wait(1.0):
+                if self._stop_event.wait(delay_s):
                     return
+                delay_s = min(delay_s * 2.0, self._RECONNECT_MAX_S)
 
     def _consume_once(self) -> None:
         client = httpx.Client(transport=self._transport, timeout=None)
@@ -218,6 +242,10 @@ def _decode_jpeg(data: bytes):
     from PIL import Image
 
     img = Image.open(io.BytesIO(data)).convert("RGB")
+    # Quest's passthrough camera frames arrive Y-flipped (OpenGL
+    # texture-origin convention): without this transpose the viewer
+    # shows the scene upside-down. Flip before the numpy handoff.
+    img = img.transpose(Image.FLIP_TOP_BOTTOM)
     # The viewer server re-encodes frames assuming BGR (SyncField's
     # house convention across OakCameraStream and UVCWebcamStream),
     # so flip the last axis here.
