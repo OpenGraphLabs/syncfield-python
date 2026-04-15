@@ -1,3 +1,4 @@
+/// <reference types="@react-three/fiber" />
 /**
  * Quest3PosePanel — 3-D hand skeleton + head rig renderer for the
  * MetaQuestHandStream data.
