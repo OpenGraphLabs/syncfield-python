@@ -43,7 +43,6 @@ inside a hand-tracking session (the Meta system menu can be awkward
 to reach with recording gloves / straps on).
 """
 
-import os
 import sys
 from pathlib import Path
 
@@ -58,29 +57,19 @@ from syncfield.adapters.ble_imu_profiles import WIT_WT901BLE_200HZ
 from syncfield.adapters.meta_quest import discover_quest_ip
 
 
-# Resolve the Quest's IP. Priority:
-#   1. ``QUEST_IP`` env var — explicit override for unusual networks
-#      (multi-Quest setups, manual IP, debugging).
-#   2. UDP discovery — listens for the Quest sender's broadcast probe
-#      on :14044 (the same channel auto-discovery uses to find a
-#      recorder), captures the source IP. Quest must be running.
-#
-# Camera HTTP is pull-based (Mac → Quest), so we need an explicit
-# address for it; the tracking UDP path is push-based and works
-# without one. Hard-coding worked but broke any time the AP handed
-# the Quest a new lease.
-QUEST_IP = os.environ.get("QUEST_IP")
-if not QUEST_IP:
-    print("[record] Discovering Quest on local network…", flush=True)
-    QUEST_IP = discover_quest_ip(timeout_s=8.0)
-if not QUEST_IP:
+# Quest's IPv4 — auto-discovered from the SyncField Quest Sender's
+# broadcast probes. Override with ``QUEST_IP=<addr>`` env var if you
+# need to pin a specific headset on a multi-Quest network.
+print("[record] Discovering Quest on local network…", flush=True)
+quest_ip = discover_quest_ip(timeout_s=8.0)
+if not quest_ip:
     sys.exit(
         "[record] Could not find a Quest on this network.\n"
         "  • Make sure the SyncField Quest Sender app is running and the\n"
         "    Quest is on the same WiFi subnet as this Mac.\n"
         "  • Or set QUEST_IP=<addr> to skip discovery."
     )
-print(f"[record] Quest IP = {QUEST_IP}", flush=True)
+print(f"[record] Quest IP = {quest_ip}", flush=True)
 
 session = sf.SessionOrchestrator(
     host_id="mac_studio",
@@ -93,7 +82,7 @@ session = sf.SessionOrchestrator(
 session.add(MetaQuestHandStream(
     "quest_tracking",
     mode="hand",  # or "controller" to map Touch Plus pose into wrist slots
-    quest_host=QUEST_IP,  # push our IP via Quest HTTP — no broadcast needed
+    quest_host=quest_ip,  # push our IP via Quest HTTP — no broadcast needed
 ))
 
 # Stereo passthrough camera. We pull MP4 + timestamps over HTTP on
@@ -101,7 +90,7 @@ session.add(MetaQuestHandStream(
 # the Mac initiates the request.
 session.add(MetaQuestCameraStream(
     "quest_cam",
-    quest_host=QUEST_IP,
+    quest_host=quest_ip,
     output_dir=session.output_dir,
     fps=30,
     resolution=(1280, 960),  # Quest 3 PCA native (4:3) — 16:9 makes Convert silently fail

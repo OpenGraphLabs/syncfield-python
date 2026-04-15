@@ -78,26 +78,32 @@ DISCOVERY_RESPONSE_TYPE = "syncfield_recorder"
 
 
 def discover_quest_ip(timeout_s: float = 8.0) -> Optional[str]:
-    """Wait for a Quest companion-app broadcast and return its IP.
+    """Resolve the Quest's IPv4 — env var first, then UDP discovery.
 
-    The Quest sender broadcasts :data:`DISCOVERY_PROBE` to UDP
-    :data:`DEFAULT_DISCOVERY_PORT` every ~2 s while it's looking for a
-    recorder. We open a one-shot listener on that port, capture the
-    source address of the first valid probe, close the socket, and
-    return the IP — so callers can populate ``quest_host`` for
-    :class:`MetaQuestCameraStream` (and :class:`MetaQuestHandStream`)
-    without hard-coding the headset's address.
+    Resolution order:
 
-    The socket is bound with ``SO_REUSEADDR`` and released before
-    returning so :class:`MetaQuestHandStream`'s permanent discovery
-    responder can take over the port immediately afterward without a
-    bind conflict.
+    1. ``QUEST_IP`` environment variable — explicit override for
+       unusual networks (multi-Quest setups, manual IP pinning,
+       debugging). Returned verbatim with no validation.
+    2. UDP :data:`DEFAULT_DISCOVERY_PORT` listener — captures the
+       source address of the first :data:`DISCOVERY_PROBE` packet
+       the Quest companion app broadcasts (it sends one every ~2 s
+       while looking for a recorder). The socket is bound with
+       ``SO_REUSEADDR`` and released before returning so
+       :class:`MetaQuestHandStream`'s permanent discovery responder
+       can take over the port immediately afterward without a bind
+       conflict.
 
-    Returns ``None`` on timeout — caller should fall back to an
-    explicit address (env var, config file) and surface a clear error.
-    The ``timeout_s`` default is generous enough (~4 probe intervals)
-    to survive typical AP packet loss.
+    Returns ``None`` on timeout. ``timeout_s`` defaults to ~4 probe
+    intervals, generous enough to survive typical AP packet loss.
     """
+    import os
+
+    env_ip = os.environ.get("QUEST_IP")
+    if env_ip:
+        logger.info("discover_quest_ip: using QUEST_IP env override = %s", env_ip)
+        return env_ip
+
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -106,8 +112,8 @@ def discover_quest_ip(timeout_s: float = 8.0) -> Optional[str]:
         except OSError as exc:
             logger.warning(
                 "discover_quest_ip: cannot bind UDP :%d (%s) — "
-                "another process may already own it; falling back to "
-                "explicit quest_host.",
+                "another process may already own it; set QUEST_IP env "
+                "var to skip discovery.",
                 DEFAULT_DISCOVERY_PORT, exc,
             )
             return None
