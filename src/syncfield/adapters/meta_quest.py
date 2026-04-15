@@ -541,20 +541,26 @@ class MetaQuestHandStream(StreamBase):
         # Build channels from packet
         channels = self._parse_channels(packet)
 
+        # Always emit so the viewer's live panel shows tracking data the
+        # moment the headset is connected — without this the user has to
+        # press Record before they can confirm the sensor is even alive.
+        # Recording state still gates first/last_at (those describe the
+        # recorded segment, not the live preview) and the FinalizationReport
+        # frame count.
+        frame_number = self._frame_count
+        self._frame_count += 1
         if self._recording:
             if self._first_at is None:
                 self._first_at = capture_ns
             self._last_at = capture_ns
-            frame_number = self._frame_count
-            self._frame_count += 1
-            self._emit_sample(SampleEvent(
-                stream_id=self.id,
-                frame_number=frame_number,
-                capture_ns=capture_ns,
-                channels=channels,
-                uncertainty_ns=self.UNCERTAINTY_NS,
-                clock_domain=self.CLOCK_DOMAIN,
-            ))
+        self._emit_sample(SampleEvent(
+            stream_id=self.id,
+            frame_number=frame_number,
+            capture_ns=capture_ns,
+            channels=channels,
+            uncertainty_ns=self.UNCERTAINTY_NS,
+            clock_domain=self.CLOCK_DOMAIN,
+        ))
 
     def _update_connection_state_on_packet(self, at_ns: int) -> None:
         """Emit HEARTBEAT on first packet, RECONNECT after a drop."""
