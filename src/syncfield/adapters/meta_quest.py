@@ -176,6 +176,13 @@ class MetaQuestHandStream(StreamBase):
         # "lost"     = had packets, none for > CONNECTION_TIMEOUT_S (DROP emitted)
         self._connection_state: str = "waiting"
 
+        # Start the discovery responder eagerly so the Quest can
+        # auto-resolve our IP as soon as the adapter is instantiated —
+        # before the user clicks "Connect" in the viewer. Without this
+        # the Quest keeps sending to its stale default IP until the
+        # 4-phase lifecycle's connect() fires.
+        self._start_discovery_responder()
+
     # ------------------------------------------------------------------
     # 4-phase lifecycle
     # ------------------------------------------------------------------
@@ -269,6 +276,8 @@ class MetaQuestHandStream(StreamBase):
         responder already owns the port. Single-Quest setups — the
         common case — just work.
         """
+        if self._discovery_thread is not None and self._discovery_thread.is_alive():
+            return
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
