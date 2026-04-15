@@ -38,6 +38,7 @@ import logging
 import socket
 import threading
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from syncfield.clock import SessionClock
@@ -77,25 +78,63 @@ DISCOVERY_PROBE = b"SYNCFIELD_DISCOVER_RECORDER_V1"
 DISCOVERY_RESPONSE_TYPE = "syncfield_recorder"
 
 
+_QUEST_HTTP_PORT = 14045
+_QUEST_IP_CACHE_PATH = Path.home() / ".cache" / "syncfield" / "quest_ip"
+
+
+def _probe_quest_alive(ip: str, timeout_s: float = 1.5) -> bool:
+    """Cheap reachability check — does the Quest companion HTTP server
+    answer at ``http://{ip}:14045/status``? Used to validate a cached
+    or env-supplied address before committing to it.
+    """
+    import urllib.error
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(
+            f"http://{ip}:{_QUEST_HTTP_PORT}/status", timeout=timeout_s,
+        ) as resp:
+            return resp.status == 200
+    except (urllib.error.URLError, OSError, TimeoutError):
+        return False
+
+
+def _read_cached_quest_ip() -> Optional[str]:
+    try:
+        return _QUEST_IP_CACHE_PATH.read_text().strip() or None
+    except OSError:
+        return None
+
+
+def _write_cached_quest_ip(ip: str) -> None:
+    try:
+        _QUEST_IP_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _QUEST_IP_CACHE_PATH.write_text(ip)
+    except OSError:
+        pass  # cache is best-effort; stale entries get overwritten next time
+
+
 def discover_quest_ip(timeout_s: float = 8.0) -> Optional[str]:
-    """Resolve the Quest's IPv4 — env var first, then UDP discovery.
+    """Resolve the Quest's IPv4 with cache + broadcast fallback.
 
     Resolution order:
 
-    1. ``QUEST_IP`` environment variable — explicit override for
-       unusual networks (multi-Quest setups, manual IP pinning,
-       debugging). Returned verbatim with no validation.
-    2. UDP :data:`DEFAULT_DISCOVERY_PORT` listener — captures the
-       source address of the first :data:`DISCOVERY_PROBE` packet
-       the Quest companion app broadcasts (it sends one every ~2 s
-       while looking for a recorder). The socket is bound with
-       ``SO_REUSEADDR`` and released before returning so
-       :class:`MetaQuestHandStream`'s permanent discovery responder
-       can take over the port immediately afterward without a bind
-       conflict.
+    1. ``QUEST_IP`` env var — verbatim, no validation. Use this to pin
+       a specific headset (multi-Quest setups, manual override, CI).
+    2. Cached IP from ``~/.cache/syncfield/quest_ip`` — last address
+       that worked. Validated by a 1.5 s ``/status`` probe so a stale
+       cache after a DHCP lease change just falls through.
+    3. UDP :data:`DEFAULT_DISCOVERY_PORT` broadcast listener — picks
+       up the Quest companion app's :data:`DISCOVERY_PROBE` (sent
+       every ~2 s). Required when the cache is missing or stale.
+       Fails on networks that drop limited broadcasts (some APs with
+       client isolation enabled) — the cache exists precisely so
+       you only have to survive this once.
 
-    Returns ``None`` on timeout. ``timeout_s`` defaults to ~4 probe
-    intervals, generous enough to survive typical AP packet loss.
+    On success the result is written back to the cache so the next
+    run resolves in <2 s without touching the network. Returns
+    ``None`` if everything fails; caller should print an actionable
+    error pointing at the env-var override.
     """
     import os
 
@@ -104,6 +143,16 @@ def discover_quest_ip(timeout_s: float = 8.0) -> Optional[str]:
         logger.info("discover_quest_ip: using QUEST_IP env override = %s", env_ip)
         return env_ip
 
+    cached = _read_cached_quest_ip()
+    if cached and _probe_quest_alive(cached):
+        logger.info("discover_quest_ip: cached IP %s is alive", cached)
+        return cached
+    if cached:
+        logger.info(
+            "discover_quest_ip: cached IP %s did not answer; falling back to broadcast",
+            cached,
+        )
+
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -111,9 +160,8 @@ def discover_quest_ip(timeout_s: float = 8.0) -> Optional[str]:
             sock.bind(("0.0.0.0", DEFAULT_DISCOVERY_PORT))
         except OSError as exc:
             logger.warning(
-                "discover_quest_ip: cannot bind UDP :%d (%s) — "
-                "another process may already own it; set QUEST_IP env "
-                "var to skip discovery.",
+                "discover_quest_ip: cannot bind UDP :%d (%s) — set "
+                "QUEST_IP env var to skip discovery.",
                 DEFAULT_DISCOVERY_PORT, exc,
             )
             return None
@@ -128,10 +176,12 @@ def discover_quest_ip(timeout_s: float = 8.0) -> Optional[str]:
                 return None
             if data.strip() == DISCOVERY_PROBE:
                 logger.info("discover_quest_ip: found Quest at %s", addr[0])
+                _write_cached_quest_ip(addr[0])
                 return addr[0]
         logger.warning(
             "discover_quest_ip: no probe received in %.1fs — Quest app "
-            "may not be running, or AP is dropping broadcasts.",
+            "may not be running, or AP is dropping broadcasts. Set "
+            "QUEST_IP env var to skip discovery.",
             timeout_s,
         )
         return None
