@@ -8,8 +8,9 @@ Workflow:
   2. Open the SyncField Quest Sender app on the Quest (sideloaded from
      ``opengraph-studio/unity/SyncFieldQuest3Sender``). Confirm the HUD
      shows ``● SENDING <hz>`` in green.
-  3. Confirm the Quest and this Mac are on the same WiFi subnet, then
-     copy the Quest's IP address from the HUD into ``QUEST_IP`` below.
+  3. Confirm the Quest and this Mac are on the same WiFi subnet — the
+     script auto-discovers the Quest IP from its broadcast probes
+     (override with ``QUEST_IP`` env var if you need a specific one).
   4. Click **Record** in the viewer → every stream starts in sync.
   5. Click **Stop** → the Mac pulls the recorded stereo MP4 + per-eye
      timestamps JSONL off the Quest over HTTP (takes a few seconds).
@@ -42,6 +43,8 @@ inside a hand-tracking session (the Meta system menu can be awkward
 to reach with recording gloves / straps on).
 """
 
+import os
+import sys
 from pathlib import Path
 
 import syncfield as sf
@@ -52,13 +55,32 @@ from syncfield.adapters import (
     MetaQuestHandStream,
 )
 from syncfield.adapters.ble_imu_profiles import WIT_WT901BLE_200HZ
+from syncfield.adapters.meta_quest import discover_quest_ip
 
-# Quest 3 IPv4 — copy from the Quest sender app's HUD ("Host" line) or
-# check Settings → Wi-Fi → <network> → Details → IP address. Must be on
-# the same subnet as this Mac. Camera file pull uses HTTP :14045; there
-# is no auto-discovery yet (tracking UDP does auto-discover, but the
-# camera HTTP endpoint needs an explicit host).
-QUEST_IP = "192.168.4.26"
+
+# Resolve the Quest's IP. Priority:
+#   1. ``QUEST_IP`` env var — explicit override for unusual networks
+#      (multi-Quest setups, manual IP, debugging).
+#   2. UDP discovery — listens for the Quest sender's broadcast probe
+#      on :14044 (the same channel auto-discovery uses to find a
+#      recorder), captures the source IP. Quest must be running.
+#
+# Camera HTTP is pull-based (Mac → Quest), so we need an explicit
+# address for it; the tracking UDP path is push-based and works
+# without one. Hard-coding worked but broke any time the AP handed
+# the Quest a new lease.
+QUEST_IP = os.environ.get("QUEST_IP")
+if not QUEST_IP:
+    print("[record] Discovering Quest on local network…", flush=True)
+    QUEST_IP = discover_quest_ip(timeout_s=8.0)
+if not QUEST_IP:
+    sys.exit(
+        "[record] Could not find a Quest on this network.\n"
+        "  • Make sure the SyncField Quest Sender app is running and the\n"
+        "    Quest is on the same WiFi subnet as this Mac.\n"
+        "  • Or set QUEST_IP=<addr> to skip discovery."
+    )
+print(f"[record] Quest IP = {QUEST_IP}", flush=True)
 
 session = sf.SessionOrchestrator(
     host_id="mac_studio",

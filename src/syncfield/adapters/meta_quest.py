@@ -76,6 +76,65 @@ DEFAULT_DISCOVERY_PORT = 14044
 DISCOVERY_PROBE = b"SYNCFIELD_DISCOVER_RECORDER_V1"
 DISCOVERY_RESPONSE_TYPE = "syncfield_recorder"
 
+
+def discover_quest_ip(timeout_s: float = 8.0) -> Optional[str]:
+    """Wait for a Quest companion-app broadcast and return its IP.
+
+    The Quest sender broadcasts :data:`DISCOVERY_PROBE` to UDP
+    :data:`DEFAULT_DISCOVERY_PORT` every ~2 s while it's looking for a
+    recorder. We open a one-shot listener on that port, capture the
+    source address of the first valid probe, close the socket, and
+    return the IP — so callers can populate ``quest_host`` for
+    :class:`MetaQuestCameraStream` (and :class:`MetaQuestHandStream`)
+    without hard-coding the headset's address.
+
+    The socket is bound with ``SO_REUSEADDR`` and released before
+    returning so :class:`MetaQuestHandStream`'s permanent discovery
+    responder can take over the port immediately afterward without a
+    bind conflict.
+
+    Returns ``None`` on timeout — caller should fall back to an
+    explicit address (env var, config file) and surface a clear error.
+    The ``timeout_s`` default is generous enough (~4 probe intervals)
+    to survive typical AP packet loss.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind(("0.0.0.0", DEFAULT_DISCOVERY_PORT))
+        except OSError as exc:
+            logger.warning(
+                "discover_quest_ip: cannot bind UDP :%d (%s) — "
+                "another process may already own it; falling back to "
+                "explicit quest_host.",
+                DEFAULT_DISCOVERY_PORT, exc,
+            )
+            return None
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            sock.settimeout(min(1.0, max(0.05, deadline - time.monotonic())))
+            try:
+                data, addr = sock.recvfrom(512)
+            except (TimeoutError, socket.timeout):
+                continue
+            except OSError:
+                return None
+            if data.strip() == DISCOVERY_PROBE:
+                logger.info("discover_quest_ip: found Quest at %s", addr[0])
+                return addr[0]
+        logger.warning(
+            "discover_quest_ip: no probe received in %.1fs — Quest app "
+            "may not be running, or AP is dropping broadcasts.",
+            timeout_s,
+        )
+        return None
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+
 # OpenXR standard joint names (26 per hand)
 JOINT_NAMES = [
     "Palm", "Wrist",
