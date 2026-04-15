@@ -204,13 +204,21 @@ class _StreamAdapter:
 
 
 def _decode_jpeg(data: bytes):
-    """Decode JPEG bytes to a BGR ``numpy.ndarray`` via OpenCV.
+    """Decode JPEG bytes to a BGR ``numpy.ndarray``.
 
-    Imported lazily so the adapter module stays importable on hosts that
-    don't have OpenCV installed (tests pass ``decode_jpeg=False``).
+    Uses Pillow (already required by ``syncfield[viewer]``) so the
+    adapter can run from a stock ``syncfield[viewer,camera]`` install
+    without pulling in OpenCV. Imported lazily so the module stays
+    importable on hosts that skip the viewer extra (tests pass
+    ``decode_jpeg=False``).
     """
-    import cv2
-    import numpy as np
+    import io
 
-    buf = np.frombuffer(data, dtype=np.uint8)
-    return cv2.imdecode(buf, cv2.IMREAD_COLOR)
+    import numpy as np
+    from PIL import Image
+
+    img = Image.open(io.BytesIO(data)).convert("RGB")
+    # The viewer server re-encodes frames assuming BGR (SyncField's
+    # house convention across OakCameraStream and UVCWebcamStream),
+    # so flip the last axis here.
+    return np.asarray(img)[:, :, ::-1]
