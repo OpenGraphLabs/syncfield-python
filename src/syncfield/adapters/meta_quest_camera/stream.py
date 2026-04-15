@@ -379,24 +379,20 @@ class MetaQuestCameraStream(StreamBase):
 
     @property
     def latest_frame(self):
-        """Side-by-side ``[left | right]`` composite for the viewer panel.
+        """Single-eye preview for the viewer panel.
 
-        The viewer's video panel polls a single ``latest_frame`` per
-        stream, so we surface the stereo pair as a horizontally
-        concatenated array. Falls back to whichever eye is fresh when
-        the other is still warming up — better to render half a frame
-        than a black card.
+        Quest 3's ARFoundation only exposes the "primary" passthrough
+        camera, so /preview/left and /preview/right currently carry
+        identical pixels. Showing a side-by-side composite would waste
+        space + bandwidth without conveying any extra information.
+        Surface the left eye alone; we fall back to right if left
+        hasn't produced its first decoded frame yet.
+
+        True per-eye stereo would need either a Camera2 NDK wrapper or
+        a full XR backend swap to OVR plugin (see PR #75 retrospective).
+        Until then, one stream is the honest representation.
         """
         left = self.latest_frame_left
-        right = self.latest_frame_right
-        if left is not None and right is not None:
-            import numpy as np
-            if left.shape == right.shape:
-                return np.hstack((left, right))
-            # Shapes can disagree for a frame or two during startup
-            # while the two previews race to produce their first
-            # decoded image. Fall through to the single-eye path
-            # rather than raising.
         if left is not None:
             return left
-        return right
+        return self.latest_frame_right
