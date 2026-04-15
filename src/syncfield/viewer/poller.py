@@ -180,6 +180,7 @@ class SessionPoller:
                 self._stats[stream_id] = buffer
 
             plot_points = buffer.snapshot_plot() if stream.kind != "video" else {}
+            latest_pose = buffer.snapshot_pose() if stream.kind != "video" else {}
             effective_hz = buffer.snapshot_fps(now_ns)
             latest_frame = self._safe_latest_frame(stream)
 
@@ -205,6 +206,7 @@ class SessionPoller:
                 effective_hz=effective_hz,
                 latest_frame=latest_frame,
                 plot_points=plot_points,
+                latest_pose=latest_pose,
                 health_count=len(buffer._health),
                 live_preview=getattr(stream.capabilities, "live_preview", True),
             )

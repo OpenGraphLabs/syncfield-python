@@ -1990,12 +1990,21 @@ class ViewerServer:
     # ------------------------------------------------------------------
 
     async def _sse_generator(self, stream_id: str):
-        """Yield sensor data as Server-Sent Events."""
+        """Yield sensor data as Server-Sent Events.
+
+        Two payload shapes ride the same event:
+
+        * ``channels`` — scalar latest values (rolling chart)
+        * ``pose``    — list-valued latest samples (e.g. 156-float
+                        ``hand_joints`` from MetaQuestHandStream).
+                        Kept optional so existing sensor-chart callers
+                        that only consume scalars stay backward-compatible.
+        """
         while True:
             snapshot = self._poller.get_snapshot()
             if snapshot is not None:
                 stream = snapshot.streams.get(stream_id)
-                if stream is not None and stream.plot_points:
+                if stream is not None and (stream.plot_points or stream.latest_pose):
                     channels: Dict[str, float] = {}
                     label: Optional[float] = None
                     for ch_name, (xs, ys) in stream.plot_points.items():
@@ -2004,9 +2013,12 @@ class ViewerServer:
                         if xs and label is None:
                             label = xs[-1]
 
-                    if channels:
+                    pose = stream.latest_pose if stream.latest_pose else None
+
+                    if channels or pose:
                         event_data = json.dumps({
                             "channels": channels,
+                            "pose": pose,
                             "label": label,
                         })
                         yield f"data: {event_data}\n\n"
