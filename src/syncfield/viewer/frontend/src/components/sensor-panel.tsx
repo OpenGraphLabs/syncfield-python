@@ -1,5 +1,6 @@
 import { useSensorStream } from "@/hooks/use-sensor-stream";
 import { PosePanel } from "./pose-panel";
+import { Quest3PosePanel } from "./quest3-pose-panel";
 import { SensorChart } from "./sensor-chart";
 
 interface SensorPanelProps {
@@ -7,19 +8,23 @@ interface SensorPanelProps {
 }
 
 /**
- * Dispatcher between :component:`PosePanel` and :component:`SensorChart`.
+ * Dispatcher across the three sensor render paths:
  *
- * The viewer's SSE sensor endpoint is already rate-limited server-side
- * to ~10 Hz, so a single shared subscription is both the simplest and
- * most efficient design — no separate "probe" connection needed. This
- * component opens :hook:`useSensorStream` once, decides which panel to
- * render from the first event's channel names, and the chosen panel
- * opens its own short subscription for rendering.
+ *  - :component:`Quest3PosePanel` — MetaQuestHandStream samples
+ *    (detected by the ``hand_joints`` list channel in ``pose``).
+ *  - :component:`PosePanel` — roll/pitch/yaw IMUs (e.g. WitMotion).
+ *  - :component:`SensorChart` — fallback multi-channel line chart.
  *
- * Orientation-capable sensors (those that emit ``roll``, ``pitch``,
- * and ``yaw`` channels — e.g. WitMotion WT901BLE) get the 3D cube
- * view; everything else falls back to the generic multi-channel line
- * chart so existing adapters keep working unchanged.
+ * The viewer's SSE sensor endpoint is rate-limited server-side to
+ * ~10 Hz, so one shared subscription per stream is enough. We open
+ * :hook:`useSensorStream` once, look at both the scalar channel names
+ * and the pose payload to pick a panel, and that panel opens its own
+ * short subscription for rendering.
+ *
+ * The render decision keys off *data arrival*, not ``isConnected``.
+ * Some EventSource implementations / middleware deliver messages
+ * without firing ``onopen`` reliably; the data itself is ground
+ * truth that the stream is alive.
  */
 
 function hasOrientationChannels(names: string[]): boolean {
@@ -30,16 +35,21 @@ function hasOrientationChannels(names: string[]): boolean {
   );
 }
 
-export function SensorPanel({ streamId }: SensorPanelProps) {
-  const { channels, isConnected } = useSensorStream(streamId);
-  const channelNames = Object.keys(channels);
-  const hasData = channelNames.length > 0;
+function hasQuest3Pose(pose: Record<string, number[]> | null): boolean {
+  return Boolean(pose && Array.isArray(pose.hand_joints) && pose.hand_joints.length > 0);
+}
 
-  // If channel data has arrived, render it regardless of isConnected.
-  // (Some EventSource implementations or middleware can deliver
-  // messages without firing onopen reliably; the data itself is the
-  // ground truth that the stream is alive.)
+export function SensorPanel({ streamId }: SensorPanelProps) {
+  const { channels, pose, isConnected } = useSensorStream(streamId);
+  const channelNames = Object.keys(channels);
+  const hasScalar = channelNames.length > 0;
+  const hasPose = hasQuest3Pose(pose);
+  const hasData = hasScalar || hasPose;
+
   if (hasData) {
+    if (hasPose) {
+      return <Quest3PosePanel pose={pose} />;
+    }
     if (hasOrientationChannels(channelNames)) {
       return <PosePanel channels={channels} />;
     }

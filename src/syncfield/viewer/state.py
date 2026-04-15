@@ -66,6 +66,13 @@ class StreamSnapshot:
         plot_points: For sensor streams, a dict of ``channel_name ->
             (x_list, y_list)`` rolling buffers of numeric values. Empty for
             video streams.
+        latest_pose: The most recent *non-scalar* channel values in flat
+            form (e.g. ``"hand_joints" -> [156 floats]``, ``"head_pose"
+            -> [7 floats]`` from :class:`MetaQuestHandStream`). Unlike
+            ``plot_points`` which tracks rolling scalar histories, this
+            exposes the latest vector/list sample so panels that render
+            a single-frame pose (3-D hand skeleton, quaternion axes…)
+            have data to draw. Empty for streams that emit only scalars.
         health_count: Number of health events this stream has buffered so
             far. Useful for showing a red dot on degraded streams.
     """
@@ -79,6 +86,7 @@ class StreamSnapshot:
     effective_hz: float
     latest_frame: Any  # numpy array or None — kept as Any so numpy is optional
     plot_points: Dict[str, Tuple[List[float], List[float]]]
+    latest_pose: Dict[str, List[float]]
     health_count: int
     live_preview: bool = True
 
@@ -164,6 +172,13 @@ class StreamStatsBuffer:
     _plot_timestamps: Deque[float] = field(default_factory=lambda: deque(maxlen=300))
     _plot_channels: Dict[str, Deque[float]] = field(default_factory=dict)
 
+    # Latest list/vector-valued channels (e.g. 156-float hand_joints
+    # from MetaQuestHandStream). We only retain the most recent value
+    # because the receiver — a 3-D pose panel — wants instantaneous
+    # state, not a history, and the payload (~500 floats per pose) is
+    # too large to buffer thousands of frames of.
+    _latest_pose: Dict[str, List[float]] = field(default_factory=dict)
+
     # Health events produced by this stream (capped)
     _health: Deque[HealthEntry] = field(default_factory=lambda: deque(maxlen=20))
 
@@ -192,6 +207,23 @@ class StreamStatsBuffer:
                 if isinstance(value, (int, float))
                 and not _is_auxiliary_channel(name)
             }
+
+            # List/tuple-valued channels (e.g. MetaQuestHandStream's
+            # hand_joints: 156 floats per sample) — retain only the
+            # latest value. 3-D pose panels want an instantaneous
+            # snapshot; keeping a rolling history would explode memory
+            # (~500 floats × 300 samples × 1 adapter = 150k floats).
+            for name, value in channels.items():
+                if _is_auxiliary_channel(name):
+                    continue
+                if isinstance(value, (list, tuple)):
+                    # Cast to a plain list of floats so the SSE JSON
+                    # serializer never sees numpy scalars or similar.
+                    try:
+                        self._latest_pose[name] = [float(v) for v in value]
+                    except (TypeError, ValueError):
+                        # Best-effort: skip non-numeric list payloads.
+                        continue
 
             # Pad any missing channel to align lengths, then append numeric values.
             current_len = len(self._plot_timestamps)
@@ -249,6 +281,14 @@ class StreamStatsBuffer:
                 y = y[-len(x):]
             out[name] = (x, y)
         return out
+
+    def snapshot_pose(self) -> Dict[str, List[float]]:
+        """Return the most-recent list-valued channel samples.
+
+        Returns a plain dict so the viewer render thread can serialise
+        it straight to JSON without touching the poller's state.
+        """
+        return {name: list(values) for name, values in self._latest_pose.items()}
 
     def snapshot_health(self) -> List[HealthEntry]:
         return list(self._health)

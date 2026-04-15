@@ -2014,13 +2014,22 @@ class ViewerServer:
     async def _sse_generator(self, stream_id: str):
         """Yield sensor data as Server-Sent Events.
 
-        Emits an SSE comment (``:<text>\\n\\n``) immediately so the browser's
-        EventSource fires onopen as soon as headers arrive. Without this,
-        the response body stays empty until the first real data point and
-        the panel sits on "Connecting…" indefinitely — especially for BLE
-        sensors in the ~100 ms window before the first sample propagates
-        into the poller buffer. Subsequent comments every ~5 s keep the
-        connection alive through proxies that close idle streams.
+        Two payload shapes ride the same event:
+
+        * ``channels`` — scalar latest values (rolling chart).
+        * ``pose``    — list-valued latest samples (e.g. 156-float
+                        ``hand_joints`` from MetaQuestHandStream).
+                        Kept optional so existing sensor-chart callers
+                        that only consume scalars stay backward-compatible.
+
+        Emits an SSE comment (``:<text>\\n\\n``) immediately so the
+        browser's EventSource fires onopen as soon as headers arrive.
+        Without this the response body stays empty until the first real
+        data point and the panel sits on "Connecting…" indefinitely —
+        especially for BLE sensors in the ~100 ms window before the
+        first sample propagates into the poller buffer. Subsequent
+        comments every ~5 s keep the connection alive through proxies
+        that close idle streams.
         """
         # Header flush — tells the browser the stream is live and unblocks
         # EventSource.onopen. Comment lines are ignored by the SSE parser.
@@ -2032,7 +2041,7 @@ class ViewerServer:
             snapshot = self._poller.get_snapshot()
             if snapshot is not None:
                 stream = snapshot.streams.get(stream_id)
-                if stream is not None and stream.plot_points:
+                if stream is not None and (stream.plot_points or stream.latest_pose):
                     channels: Dict[str, float] = {}
                     label: Optional[float] = None
                     for ch_name, (xs, ys) in stream.plot_points.items():
@@ -2041,9 +2050,12 @@ class ViewerServer:
                         if xs and label is None:
                             label = xs[-1]
 
-                    if channels:
+                    pose = stream.latest_pose if stream.latest_pose else None
+
+                    if channels or pose:
                         event_data = json.dumps({
                             "channels": channels,
+                            "pose": pose,
                             "label": label,
                         })
                         yield f"data: {event_data}\n\n"

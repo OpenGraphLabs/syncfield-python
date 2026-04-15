@@ -9,6 +9,10 @@ interface UseSensorStreamReturn {
   channels: Record<string, number[]>;
   /** Rolling buffer of x-axis labels (timestamps). */
   labels: number[];
+  /** Latest vector-valued channels (e.g. ``hand_joints`` from
+   * MetaQuestHandStream). Not buffered — 3-D pose panels render
+   * instantaneous state. ``null`` when the stream is scalar-only. */
+  pose: Record<string, number[]> | null;
   /** Whether the SSE connection is alive. */
   isConnected: boolean;
 }
@@ -23,6 +27,7 @@ interface UseSensorStreamReturn {
 export function useSensorStream(streamId: string): UseSensorStreamReturn {
   const [channels, setChannels] = useState<Record<string, number[]>>({});
   const [labels, setLabels] = useState<number[]>([]);
+  const [pose, setPose] = useState<Record<string, number[]> | null>(null);
   const [isConnected, setIsConnected] = useState(false);
 
   // Mutable buffers for performance — we only push state on ticks
@@ -71,6 +76,11 @@ export function useSensorStream(streamId: string): UseSensorStreamReturn {
             }
           }
 
+          // Vector-valued channels: ship the entire latest payload
+          // through — not buffered because pose panels want a single
+          // instantaneous snapshot per render.
+          if (data.pose) setPose(data.pose);
+
           // Push a snapshot to React state
           setChannels({ ...channelBuf.current });
           setLabels([...labelBuf.current]);
@@ -99,5 +109,5 @@ export function useSensorStream(streamId: string): UseSensorStreamReturn {
     };
   }, [streamId]);
 
-  return { channels, labels, isConnected };
+  return { channels, labels, pose, isConnected };
 }

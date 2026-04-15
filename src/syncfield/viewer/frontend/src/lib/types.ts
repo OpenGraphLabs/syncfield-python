@@ -158,7 +158,18 @@ export interface DiscoveredDevice {
 
 export interface SensorEvent {
   channels: Record<string, number>;
+  // List / vector-valued channels (e.g. MetaQuestHandStream's
+  // ``hand_joints``: 156 floats). Present when the adapter emits
+  // non-scalar samples. ``null`` when the stream is scalar-only.
+  pose: Record<string, number[]> | null;
   label: number | null;
+}
+
+export interface Quest3Frame {
+  hand_joints?: number[];      // 156 floats (26 × 3 × 2 hands)
+  joint_rotations?: number[];  // 208 floats (26 × 4 × 2 hands)
+  head_pose?: number[];        // 7 floats (pos3 + quat4 xyzw)
+  mode?: "hands" | "controller";
 }
 
 // ---------------------------------------------------------------------------
