@@ -100,12 +100,36 @@ try:
 except ImportError:
     pass
 
-try:
-    from syncfield.adapters.oak_camera import OakCameraStream  # noqa: F401
-    __all__.append("OakCameraStream")
-    _safe_register(OakCameraStream)
-except ImportError:
-    pass
+# OakCameraStream is deferred to truly-lazy import via PEP-562 __getattr__
+# below. Depthai installs process-wide signal handlers at import time that
+# intercept SIGSEGV/SIGABRT from *any* library — if bleak or subprocess
+# then triggers a native crash, depthai's handler recurses infinitely
+# (you'll see frames 0..31 of backward::SignalHandling::sig_handler in
+# the crash dump). Eager-importing depthai when the user doesn't use an
+# OAK camera means their BLE-only session can be taken down by an
+# unrelated third-party crash. Lazy-loading contains the damage:
+# depthai only loads when someone actually references OakCameraStream.
+_OAK_LOADED = False
+
+
+def __getattr__(name: str):
+    global _OAK_LOADED
+    if name == "OakCameraStream":
+        try:
+            from syncfield.adapters.oak_camera import OakCameraStream
+        except ImportError as e:
+            raise AttributeError(
+                f"OakCameraStream requires the 'oak' optional dependency "
+                f"(depthai + av). Install with `uv add 'syncfield[oak]'`. "
+                f"Underlying error: {e}"
+            ) from e
+        if not _OAK_LOADED:
+            _safe_register(OakCameraStream)
+            if "OakCameraStream" not in __all__:
+                __all__.append("OakCameraStream")
+            _OAK_LOADED = True
+        return OakCameraStream
+    raise AttributeError(name)
 
 try:
     from syncfield.adapters.insta360_go3s import Go3SStream  # noqa: F401
