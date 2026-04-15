@@ -264,3 +264,21 @@ class MetaQuestCameraStream(StreamBase):
         if self._preview_right is None:
             return None
         return self._preview_right.latest_frame
+
+    @property
+    def latest_frame(self):
+        """Viewer-compat: return the left eye so the standard video panel
+        has something to render. The viewer's ``StreamSnapshot`` polls
+        ``stream.latest_frame`` for any adapter declaring
+        ``kind="video"``; without this proxy the camera card would sit
+        black even while the MJPEG preview is actively streaming.
+
+        The left eye is authoritative for now — phase 1 records the
+        same primary-camera view on both slots (see spec §9 Q1). Once
+        per-eye acquisition lands we can switch this to a side-by-side
+        composite or expose a user-selectable eye.
+        """
+        left = self.latest_frame_left
+        if left is not None:
+            return left
+        return self.latest_frame_right

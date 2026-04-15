@@ -66,6 +66,15 @@ JOINTS_DIM = NUM_JOINTS * NUM_COORDS * NUM_HANDS      # 156
 ROTATIONS_DIM = NUM_JOINTS * NUM_QUAT * NUM_HANDS      # 208
 HEAD_POSE_DIM = 7     # pos(3) + quat(4)
 DEFAULT_PORT = 14043
+DEFAULT_DISCOVERY_PORT = 14044
+
+# Discovery protocol spoken by the Unity companion app
+# (opengraph-studio/unity/SyncFieldQuest3Sender/Assets/Scripts/
+#  UDPTrackingSender.cs). The Quest broadcasts the probe string on
+# UDP :14044 every ~2 s; whoever responds with a well-formed
+# RecorderDiscoveryResponse becomes the Quest's tracking target.
+DISCOVERY_PROBE = b"SYNCFIELD_DISCOVER_RECORDER_V1"
+DISCOVERY_RESPONSE_TYPE = "syncfield_recorder"
 
 # OpenXR standard joint names (26 per hand)
 JOINT_NAMES = [
@@ -152,6 +161,9 @@ class MetaQuestHandStream(StreamBase):
 
         self._socket: Optional[socket.socket] = None
         self._receive_thread: Optional[threading.Thread] = None
+        self._discovery_socket: Optional[socket.socket] = None
+        self._discovery_thread: Optional[threading.Thread] = None
+        self._discovery_port = DEFAULT_DISCOVERY_PORT
         self._stop_event = threading.Event()
         self._recording = False
         self._frame_count = 0
@@ -193,6 +205,11 @@ class MetaQuestHandStream(StreamBase):
             self.id, self._host, self._port, self._mode,
         )
 
+        # Spin up the discovery responder so the Quest companion app can
+        # auto-resolve our IP. Without this the user has to type the
+        # Mac's IP into the Quest HUD every time the network changes.
+        self._start_discovery_responder()
+
     def start_recording(self, session_clock: SessionClock) -> None:
         self._recording = True
         self._frame_count = 0
@@ -218,12 +235,132 @@ class MetaQuestHandStream(StreamBase):
         if self._receive_thread is not None:
             self._receive_thread.join(timeout=2.0)
             self._receive_thread = None
+        if self._discovery_thread is not None:
+            self._discovery_thread.join(timeout=2.0)
+            self._discovery_thread = None
+        if self._discovery_socket is not None:
+            try:
+                self._discovery_socket.close()
+            except Exception:
+                pass
+            self._discovery_socket = None
         if self._socket is not None:
             try:
                 self._socket.close()
             except Exception:
                 pass
             self._socket = None
+
+    # ------------------------------------------------------------------
+    # Discovery responder (UDP :14044)
+    # ------------------------------------------------------------------
+
+    def _start_discovery_responder(self) -> None:
+        """Respond to Quest companion-app discovery broadcasts.
+
+        The Quest sender broadcasts :data:`DISCOVERY_PROBE` every ~2 s
+        on :data:`DEFAULT_DISCOVERY_PORT` until a recorder replies.
+        We listen on that port and reply with a JSON payload naming
+        ourselves as the tracker target — Quest then locks onto our
+        IP automatically and starts sending on :data:`DEFAULT_PORT`.
+
+        Multiple ``MetaQuestHandStream`` instances in one process would
+        fight over :14044, so we silently skip the bind if another
+        responder already owns the port. Single-Quest setups — the
+        common case — just work.
+        """
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind(("0.0.0.0", self._discovery_port))
+            sock.settimeout(1.0)
+        except OSError as exc:
+            logger.info(
+                "[%s] Discovery responder disabled (port %d busy: %s). "
+                "If your Quest can't auto-find this Mac, set the receiver "
+                "IP manually in the Quest app HUD.",
+                self.id, self._discovery_port, exc,
+            )
+            return
+
+        self._discovery_socket = sock
+        self._discovery_thread = threading.Thread(
+            target=self._discovery_loop,
+            name=f"quest3-discovery-{self.id}",
+            daemon=True,
+        )
+        self._discovery_thread.start()
+        logger.info(
+            "[%s] Quest 3 discovery responder listening on :%d",
+            self.id, self._discovery_port,
+        )
+
+    def _discovery_loop(self) -> None:
+        while not self._stop_event.is_set():
+            sock = self._discovery_socket
+            if sock is None:
+                break
+            try:
+                data, addr = sock.recvfrom(512)
+            except TimeoutError:
+                continue
+            except Exception:
+                if self._stop_event.is_set():
+                    return
+                continue
+            if data.strip() != DISCOVERY_PROBE:
+                continue
+            response = self._build_discovery_response(addr[0])
+            try:
+                sock.sendto(response, addr)
+                logger.info(
+                    "[%s] Answered Quest discovery probe from %s",
+                    self.id, addr[0],
+                )
+            except Exception as exc:
+                logger.warning("[%s] Discovery reply failed: %s", self.id, exc)
+
+    def _build_discovery_response(self, quest_ip: str) -> bytes:
+        """Build the JSON response shape the Unity app's
+        ``RecorderDiscoveryResponse`` parser expects.
+
+        We source our own IP by opening a UDP socket toward the Quest
+        and reading the resulting local endpoint — that's the address
+        we'd send out of, which is the address the Quest should target.
+        """
+        recorder_ip = self._resolve_local_ip_for(quest_ip)
+        payload = {
+            "type": DISCOVERY_RESPONSE_TYPE,
+            "recorder_ip": recorder_ip,
+            "tracker_port": self._port,
+            "api_port": 0,
+            "hostname": socket.gethostname(),
+            "label": "SyncField (Python)",
+            "active_config": "",
+            "ts_ms": int(time.time() * 1000),
+        }
+        return json.dumps(payload).encode("utf-8")
+
+    @staticmethod
+    def _resolve_local_ip_for(remote_ip: str) -> str:
+        """Return the local IPv4 the OS would use to reach ``remote_ip``.
+
+        Creating a UDP socket and calling ``connect()`` doesn't send any
+        packets; it just makes the kernel pick the right outbound
+        interface. Reading ``getsockname`` after that gives the IP the
+        Quest should target.
+        """
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect((remote_ip, 1))
+            return s.getsockname()[0]
+        except Exception:
+            return "127.0.0.1"
+        finally:
+            try:
+                s.close()
+            except Exception:
+                pass
 
     # Legacy one-shot compatibility
     def prepare(self) -> None:
