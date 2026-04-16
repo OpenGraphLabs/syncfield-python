@@ -81,6 +81,71 @@ DISCOVERY_RESPONSE_TYPE = "syncfield_recorder"
 _QUEST_HTTP_PORT = 14045
 _QUEST_IP_CACHE_PATH = Path.home() / ".cache" / "syncfield" / "quest_ip"
 
+# mDNS service type the Quest companion app advertises. Matches the
+# registerService() call in opengraph-studio's QuestMdnsAdvertiser.cs.
+_MDNS_SERVICE_TYPE = "_syncfield-quest._tcp.local."
+
+
+def _mdns_discover(timeout_s: float) -> Optional[str]:
+    """Browse local mDNS for a Quest sender and return its IP.
+
+    Relies on the Unity app's :file:`QuestMdnsAdvertiser.cs` component
+    registering an ``_syncfield-quest._tcp`` service via Android
+    ``NsdManager``. mDNS multicast crosses most home / office networks
+    that filter UDP broadcasts (the protocol Apple uses for AirPlay /
+    AirPrint) so this is the robust path — broadcast listen stays as
+    a fallback for networks with multicast disabled too.
+
+    Returns ``None`` when ``zeroconf`` isn't installed, no service
+    appears within the timeout, or the resolver hands back an address
+    that doesn't look like an IPv4.
+    """
+    try:
+        from zeroconf import ServiceBrowser, ServiceListener, Zeroconf
+    except ImportError:
+        logger.info(
+            "discover_quest_ip: zeroconf not installed — skipping mDNS. "
+            "Install with `pip install syncfield[camera]` for mDNS support."
+        )
+        return None
+
+    import threading as _threading
+
+    found_event = _threading.Event()
+    found_ip: Dict[str, Optional[str]] = {"ip": None}
+
+    class _Listener(ServiceListener):
+        def add_service(self, zc, type_, name):  # noqa: D401
+            info = zc.get_service_info(type_, name, timeout=1500)
+            if info is None or not info.addresses:
+                return
+            # addresses is a list of packed IPv4/IPv6; take the first
+            # routable IPv4 we see.
+            for raw in info.addresses:
+                if len(raw) == 4:
+                    ip = socket.inet_ntoa(raw)
+                    logger.info("discover_quest_ip: mDNS found Quest at %s", ip)
+                    found_ip["ip"] = ip
+                    found_event.set()
+                    return
+
+        def update_service(self, zc, type_, name): pass
+        def remove_service(self, zc, type_, name): pass
+
+    zc = Zeroconf()
+    try:
+        ServiceBrowser(zc, _MDNS_SERVICE_TYPE, _Listener())
+        found_event.wait(timeout=timeout_s)
+        return found_ip["ip"]
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("discover_quest_ip: mDNS error: %s", exc)
+        return None
+    finally:
+        try:
+            zc.close()
+        except Exception:
+            pass
+
 
 def _probe_quest_alive(ip: str, timeout_s: float = 1.5) -> bool:
     """Cheap reachability check — does the Quest companion HTTP server
@@ -115,26 +180,27 @@ def _write_cached_quest_ip(ip: str) -> None:
 
 
 def discover_quest_ip(timeout_s: float = 8.0) -> Optional[str]:
-    """Resolve the Quest's IPv4 with cache + broadcast fallback.
+    """Resolve the Quest's IPv4 via mDNS with layered fallbacks.
 
-    Resolution order:
+    Resolution order — first non-``None`` result wins:
 
-    1. ``QUEST_IP`` env var — verbatim, no validation. Use this to pin
-       a specific headset (multi-Quest setups, manual override, CI).
-    2. Cached IP from ``~/.cache/syncfield/quest_ip`` — last address
-       that worked. Validated by a 1.5 s ``/status`` probe so a stale
-       cache after a DHCP lease change just falls through.
-    3. UDP :data:`DEFAULT_DISCOVERY_PORT` broadcast listener — picks
-       up the Quest companion app's :data:`DISCOVERY_PROBE` (sent
-       every ~2 s). Required when the cache is missing or stale.
-       Fails on networks that drop limited broadcasts (some APs with
-       client isolation enabled) — the cache exists precisely so
-       you only have to survive this once.
+    1. ``QUEST_IP`` env var — verbatim override for multi-Quest setups
+       / CI / the rare network that filters both mDNS AND broadcast.
+    2. **mDNS browse for ``_syncfield-quest._tcp``** (default ~3 s of
+       the budget). The Quest companion app advertises this service
+       on start via Android ``NsdManager``. Works on any network that
+       passes multicast DNS (most home / office WiFi — same protocol
+       AirPlay, AirPrint, Chromecast rely on).
+    3. Cached IP from ``~/.cache/syncfield/quest_ip``, validated by a
+       1.5 s ``/status`` probe. Stale caches after a DHCP lease
+       change fall through naturally.
+    4. UDP ``:14044`` broadcast listener — picks up the Quest's own
+       ``SYNCFIELD_DISCOVER_RECORDER_V1`` probe. Last resort for
+       networks that block mDNS but pass UDP broadcast.
 
-    On success the result is written back to the cache so the next
-    run resolves in <2 s without touching the network. Returns
-    ``None`` if everything fails; caller should print an actionable
-    error pointing at the env-var override.
+    On success the result is cached so subsequent runs re-resolve in
+    <2 s. Returns ``None`` when every path fails; caller should print
+    an actionable error pointing at the env-var override.
     """
     import os
 
@@ -143,15 +209,28 @@ def discover_quest_ip(timeout_s: float = 8.0) -> Optional[str]:
         logger.info("discover_quest_ip: using QUEST_IP env override = %s", env_ip)
         return env_ip
 
+    # Cache first: on a stable network the Quest usually keeps the
+    # same DHCP lease and an HTTP probe (~1.5 s worst case) is cheap.
+    # mDNS, by contrast, takes ~5 s of wall-clock on macOS because
+    # zeroconf shares port 5353 with mDNSResponder and needs a warm-up.
     cached = _read_cached_quest_ip()
     if cached and _probe_quest_alive(cached):
         logger.info("discover_quest_ip: cached IP %s is alive", cached)
         return cached
     if cached:
         logger.info(
-            "discover_quest_ip: cached IP %s did not answer; falling back to broadcast",
+            "discover_quest_ip: cached IP %s did not answer; falling back to mDNS",
             cached,
         )
+
+    # Fresh network / DHCP renewal / first run: ask mDNS. The Quest
+    # app advertises ``_syncfield-quest._tcp`` via Android NsdManager
+    # so any subnet that passes multicast DNS returns the answer
+    # within ~5 s.
+    mdns_ip = _mdns_discover(6.0)
+    if mdns_ip:
+        _write_cached_quest_ip(mdns_ip)
+        return mdns_ip
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
