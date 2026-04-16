@@ -2369,6 +2369,7 @@ camera = [
     { name = "bleak", version = "1.1.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.10'" },
     { name = "bleak", version = "3.0.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.10'" },
     { name = "httpx" },
+    { name = "zeroconf" },
 ]
 multihost = [
     { name = "fastapi", version = "0.128.8", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.10'" },
@@ -2439,6 +2440,7 @@ requires-dist = [
     { name = "uvicorn", extras = ["standard"], marker = "extra == 'multihost'", specifier = ">=0.24.0" },
     { name = "uvicorn", extras = ["standard"], marker = "extra == 'viewer'", specifier = ">=0.24.0" },
     { name = "zeroconf", marker = "extra == 'all'", specifier = ">=0.130" },
+    { name = "zeroconf", marker = "extra == 'camera'", specifier = ">=0.130" },
     { name = "zeroconf", marker = "extra == 'multihost'", specifier = ">=0.130" },
 ]
 provides-extras = ["audio", "uvc", "ble", "oak", "viewer", "multihost", "camera", "all"]
