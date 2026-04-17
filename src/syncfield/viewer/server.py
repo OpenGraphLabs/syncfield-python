@@ -1905,11 +1905,22 @@ class ViewerServer:
                 self.broadcast_countdown(n), loop,
             )
 
-        await asyncio.to_thread(
-            self._session.start,
-            countdown_s=countdown_s,
-            on_countdown_tick=_on_tick,
-        )
+        try:
+            await asyncio.to_thread(
+                self._session.start,
+                countdown_s=countdown_s,
+                on_countdown_tick=_on_tick,
+            )
+        except Exception as exc:
+            # Surface start failures to the browser so the Record button
+            # doesn't silently appear to do nothing. The WebSocket
+            # top-level handler swallows exceptions with a debug log.
+            logger.exception("session.start() failed")
+            await self._broadcast_message({
+                "type": "record_error",
+                "error": f"{type(exc).__name__}: {exc}",
+            })
+            raise
 
     async def _stop_and_report(self) -> None:
         """Stop recording, validate output, and broadcast the result.
@@ -1934,8 +1945,14 @@ class ViewerServer:
             })
             return
 
-        # Validate output files on disk
-        output_dir = self._session.output_dir
+        # After stop(), session.output_dir has rotated to the *next*
+        # episode path. The files we just wrote live under
+        # last_episode_dir — fall back to output_dir for SDK callers on
+        # an older orchestrator that didn't expose the property.
+        output_dir = (
+            getattr(self._session, "last_episode_dir", None)
+            or self._session.output_dir
+        )
         stream_results: Dict[str, Any] = {}
         all_ok = True
 
