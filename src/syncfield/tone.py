@@ -467,9 +467,10 @@ def create_default_player(sample_rate: int = 44100) -> ChirpPlayer:
         import sounddevice  # noqa: F401
     except (ImportError, OSError) as exc:
         logger.warning(
-            "sounddevice unavailable (%s). The countdown ticks and start/"
-            "stop chirps will be SILENT. Install the audio extra to hear "
-            "them: pip install 'syncfield[audio]'",
+            "sounddevice failed to load (%s). The 3/2/1 countdown and "
+            "start/stop chirps will be SILENT. sounddevice ships with "
+            "syncfield by default; on Linux you may need the system "
+            "PortAudio package: `apt install libportaudio2`.",
             exc,
         )
         return SilentChirpPlayer()

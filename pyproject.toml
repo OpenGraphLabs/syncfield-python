@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "syncfield"
-version = "0.3.16"
+version = "0.3.17"
 description = "Multi-modal capture orchestration framework with precision sync for Physical AI data collection"
 readme = "README.md"
 license = "Apache-2.0"
@@ -23,26 +23,22 @@ classifiers = [
     "Topic :: Scientific/Engineering",
 ]
 
-# Default install ships the canonical first-run stack: a UVC webcam adapter
-# and the browser viewer. Together they cover the iPhone+Mac quickstart
-# end-to-end with no extras to remember. Heavier / platform-specific
-# adapters (BLE, OAK, off-host cameras, audio anchor, multi-host control
-# plane) stay opt-in via `[project.optional-dependencies]` below.
+# Default install ships the canonical first-run stack: a UVC webcam adapter,
+# the browser viewer, and the sounddevice-backed chirp / countdown player
+# (so the 3/2/1 ticks and start/stop chirps are audible out of the box).
+# Heavier / platform-specific adapters (BLE, OAK, off-host cameras,
+# multi-host control plane) stay opt-in via the optional-dependencies
+# block below.
 dependencies = [
     "av>=12.0.0",
     "numpy>=1.21",
     "fastapi>=0.104.0",
     "uvicorn[standard]>=0.24.0",
     "Pillow>=10.0.0",
+    "sounddevice>=0.4.6",
 ]
 
 [project.optional-dependencies]
-# sounddevice.play() internally requires numpy even when the caller hands it
-# Python lists, so numpy is part of the audio extra.
-audio = [
-    "sounddevice>=0.4.6",
-    "numpy>=1.21",
-]
 ble = ["bleak>=0.21"]
 # OakCameraStream uses depthai v3 for the pipeline and PyAV for the MP4
 # writer (also via _video_encoder, hence numpy). Install `syncfield[oak]`
@@ -69,15 +65,9 @@ camera = [
     "zeroconf>=0.130",
 ]
 all = [
-    "sounddevice>=0.4.6",
-    "numpy>=1.21",
-    "av>=12.0.0",
-    "Pillow>=10.0.0",
     "bleak>=0.21",
     "aiohttp>=3.9",
     "depthai>=3.0.0",
-    "fastapi>=0.104.0",
-    "uvicorn[standard]>=0.24.0",
     "zeroconf>=0.130",
     "httpx>=0.25.0",
 ]

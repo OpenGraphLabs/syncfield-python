@@ -14,7 +14,7 @@ Or from PyPI:
 pip install syncfield
 ```
 
-The default install covers UVC cameras and the viewer. Extras (`ble`, `camera`, `oak`, `audio`, `multihost`) are listed per-example below.
+The default install covers UVC cameras, the viewer, and the chirp/countdown audio player. Extras (`ble`, `camera`, `oak`, `multihost`) are listed per-example below.
 
 ## Catalog
 
@@ -27,8 +27,8 @@ The default install covers UVC cameras and the viewer. Extras (`ble`, `camera`, 
 | Insta360 Go3S | `uv run python examples/insta360_go3s/record.py` | Go3S | `camera` |
 | Polling sensor | `uv run python examples/generic_sensor_demo/polling_serial.py` | Serial sensor | — |
 | Async push sensor | `uv run python examples/generic_sensor_demo/push_async.py` | None (fake) | — |
-| Multi-host leader | `uv run python examples/multihost_lab/leader.py` | Mac + iPhone | `multihost`, `audio` |
-| Multi-host follower | `uv run python examples/multihost_lab/follower.py` | Mac + iPhone | `multihost`, `audio` |
+| Multi-host leader | `uv run python examples/multihost_lab/leader.py` | Mac + iPhone | `multihost` |
+| Multi-host follower | `uv run python examples/multihost_lab/follower.py` | Mac + iPhone | `multihost` |
 
 ## Multi-host
 

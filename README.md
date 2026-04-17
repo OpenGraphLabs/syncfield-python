@@ -14,11 +14,10 @@ The default install ships `UVCWebcamStream` and the browser viewer. Optional ada
 
 | Need | Install |
 |---|---|
-| USB / Continuity cameras + viewer | `pip install syncfield` |
+| USB / Continuity cameras + viewer + audio chirps | `pip install syncfield` |
 | BLE IMU sensors | `pip install "syncfield[ble]"` |
 | Off-host cameras (Quest, Insta360 Go3S) | `pip install "syncfield[camera]"` |
 | OAK-D depth cameras | `pip install "syncfield[oak]"` |
-| Host microphone (cross-host audio anchor) | `pip install "syncfield[audio]"` |
 | Multi-host leader/follower over mDNS | `pip install "syncfield[multihost]"` |
 | Everything | `pip install "syncfield[all]"` |
 
@@ -78,7 +77,7 @@ Shipped adapters: `UVCWebcamStream`, `BLEImuGenericStream`, `OakCameraStream`, `
 ## Multi-host
 
 ```bash
-pip install "syncfield[multihost,audio]"
+pip install "syncfield[multihost]"
 ```
 
 ```bash
