@@ -79,9 +79,14 @@ class TestConnect:
     def test_connect_with_valid_device(self, tmp_path: Path):
         stream = HostAudioStream("mic", output_dir=tmp_path)
         mock_info = {"name": "Test Mic", "max_input_channels": 2}
-        with patch("sounddevice.query_devices", return_value=mock_info):
+        # Mock both query_devices (for channel validation) and InputStream
+        # (so no real PortAudio device is opened in CI).
+        with patch("sounddevice.query_devices", return_value=mock_info), \
+             patch("sounddevice.InputStream") as mock_input_stream:
+            mock_input_stream.return_value = MagicMock()
             stream.connect()
             assert stream._connected is True
+            mock_input_stream.assert_called_once()
 
     def test_connect_no_input_channels(self, tmp_path: Path):
         stream = HostAudioStream("mic", output_dir=tmp_path)

@@ -13,6 +13,19 @@ from syncfield.tone import SyncToneConfig
 from syncfield.types import StreamCapabilities
 
 
+@pytest.fixture(autouse=True)
+def _disable_audio_auto_inject():
+    """Override conftest.py — this module *tests* auto-audio injection.
+
+    The package-level conftest patches both ``_maybe_preregister_host_audio``
+    and ``_maybe_inject_host_audio`` away so other unit tests can assert
+    exact stream counts without a live mic interfering. Tests in this
+    file need the real injection path to run; per-test patches handle
+    everything else (mic discovery, sounddevice mocking).
+    """
+    yield
+
+
 def _session(tmp_path: Path, **kwargs) -> SessionOrchestrator:
     return SessionOrchestrator(
         host_id=kwargs.pop("host_id", "rig_01"),

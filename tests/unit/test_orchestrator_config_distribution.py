@@ -452,6 +452,11 @@ class TestLeaderBootstrapsBrowser:
             output_dir=tmp_path,
             role=sf.LeaderRole(session_id="amber-tiger-042", control_plane_port=0),
         )
+        # Since refactor 64dd0fd the orchestrator brings up a browser at
+        # __init__ time. The conftest replaces it with _InertBrowser, so
+        # the "_browser is None" bootstrap branch we want to exercise
+        # here is skipped. Drop the inert browser to force the fallback.
+        session._browser = None
 
         started = []
         closed = []
@@ -574,6 +579,11 @@ class TestFollowerAdvertising:
             output_dir=tmp_path,
             role=sf.FollowerRole(session_id="amber-tiger-042", control_plane_port=0),
         )
+        # Pre-shared followers create an init-time advertiser as part of
+        # mDNS bring-up (refactor 64dd0fd). Clear the counter so the rest
+        # of the test only measures advertisers created by the explicit
+        # _maybe_start_advertising() call below.
+        created_advertisers.clear()
         follower.add(FakeStream("cam"))
         mic = FakeStream("mic"); mic.kind = "audio"
         follower.add(mic)
@@ -648,7 +658,10 @@ class TestStaticPeers:
              "resolved_address": "127.0.0.1", "status": "preparing"},
         ])
 
-        # No browser attached — would fail without the short-circuit.
+        # Drop the conftest-installed inert browser so the assertion below
+        # genuinely proves the discovery path doesn't touch any browser.
+        # (Since refactor 64dd0fd a browser is wired up at __init__.)
+        session._browser = None
         assert session._browser is None
 
         peers = session._discover_followers_in_preparing()

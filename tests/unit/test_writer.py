@@ -3,6 +3,7 @@
 import json
 from pathlib import Path
 
+import syncfield as sf
 from syncfield.types import (
     ChirpSpec,
     FrameTimestamp,
@@ -63,7 +64,7 @@ def test_write_sync_point(tmp_path: Path):
     assert path == tmp_path / "sync_point.json"
 
     data = json.loads(path.read_text())
-    assert data["sdk_version"] == "0.2.0"
+    assert data["sdk_version"] == sf.__version__
     assert data["host_id"] == "test"
     assert data["monotonic_ns"] == 111
     assert data["wall_clock_ns"] == 222
@@ -133,7 +134,7 @@ def test_write_manifest(tmp_path: Path):
     assert path == tmp_path / "manifest.json"
 
     data = json.loads(path.read_text())
-    assert data["sdk_version"] == "0.2.0"
+    assert data["sdk_version"] == sf.__version__
     assert data["host_id"] == "test_host"
     assert "streams" in data
     assert data["streams"]["cam_left"]["type"] == "video"
