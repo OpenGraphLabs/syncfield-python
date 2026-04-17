@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "syncfield"
-version = "0.3.13"
+version = "0.3.14"
 description = "Multi-modal capture orchestration framework with precision sync for Physical AI data collection"
 readme = "README.md"
 license = "Apache-2.0"
@@ -23,6 +23,19 @@ classifiers = [
     "Topic :: Scientific/Engineering",
 ]
 
+# Default install ships the canonical first-run stack: a UVC webcam adapter
+# and the browser viewer. Together they cover the iPhone+Mac quickstart
+# end-to-end with no extras to remember. Heavier / platform-specific
+# adapters (BLE, OAK, off-host cameras, audio anchor, multi-host control
+# plane) stay opt-in via `[project.optional-dependencies]` below.
+dependencies = [
+    "av>=12.0.0",
+    "numpy>=1.21",
+    "fastapi>=0.104.0",
+    "uvicorn[standard]>=0.24.0",
+    "Pillow>=10.0.0",
+]
+
 [project.optional-dependencies]
 # sounddevice.play() internally requires numpy even when the caller hands it
 # Python lists, so numpy is part of the audio extra.
@@ -30,20 +43,11 @@ audio = [
     "sounddevice>=0.4.6",
     "numpy>=1.21",
 ]
-uvc = ["av>=12.0.0"]
 ble = ["bleak>=0.21"]
 # OakCameraStream uses depthai v3 for the pipeline and PyAV for the MP4
-# writer. Install `syncfield[oak]` for the full OAK capture path.
-oak = ["depthai>=3.0.0", "av>=12.0.0"]
-# The web viewer uses FastAPI + uvicorn and opens a browser tab.
-# PyAV handles MJPEG encoding of video frames; Pillow is used for still
-# image conversions.
-viewer = [
-    "fastapi>=0.104.0",
-    "uvicorn[standard]>=0.24.0",
-    "av>=12.0.0",
-    "Pillow>=10.0.0",
-]
+# writer (also via _video_encoder, hence numpy). Install `syncfield[oak]`
+# for the full OAK capture path.
+oak = ["depthai>=3.0.0", "av>=12.0.0", "numpy>=1.21"]
 # mDNS-based multi-host session rendezvous (syncfield.multihost). Required
 # only when you want a leader/follower session discovered automatically
 # on the local network — single-host sessions do not need this.

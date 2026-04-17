@@ -1,141 +1,175 @@
 """Reference :class:`~syncfield.stream.Stream` adapters shipped with syncfield.
 
-Adapters with no external dependencies are always re-exported here.
-Adapters gated behind optional extras are re-exported **lazily** — if the
-corresponding extra is not installed, importing ``syncfield.adapters`` still
-succeeds but that specific class is simply absent from the module.
+The default ``pip install syncfield`` ships a fully-functional single-host
+recording stack: ``UVCWebcamStream`` for USB / Continuity cameras and the
+browser-based viewer. Heavier or platform-specific adapters live behind an
+optional extra:
 
-=========================  =====================================  =============================
+=========================  =====================================  ==================================
 Adapter                    Requires                               Install
-=========================  =====================================  =============================
+=========================  =====================================  ==================================
 ``JSONLFileStream``        —                                      ``syncfield``
-``UVCWebcamStream``        ``av``                                 ``syncfield[uvc]``
+``MetaQuestHandStream``    —                                      ``syncfield``
+``PollingSensorStream``    —                                      ``syncfield``
+``PushSensorStream``       —                                      ``syncfield``
+``UVCWebcamStream``        ``av`` + ``numpy``                     ``syncfield``  *(default)*
+``HostAudioStream``        ``sounddevice`` + ``numpy``            ``syncfield[audio]``
 ``BLEImuGenericStream``    ``bleak``                              ``syncfield[ble]``
 ``OgloTactileStream``      ``bleak``                              ``syncfield[ble]``
-``OakCameraStream``        ``depthai`` + ``av``                   ``syncfield[oak]``
-``Go3SStream``             ``bleak`` + ``aiohttp``                ``syncfield[camera]``
-=========================  =====================================  =============================
+``MetaQuestCameraStream``  ``httpx``                              ``syncfield[camera]``
+``Go3SStream``             ``bleak`` + ``aiohttp`` + ``httpx``    ``syncfield[camera]``
+``OakCameraStream``        ``depthai`` + ``av`` + ``numpy``       ``syncfield[oak]``
+=========================  =====================================  ==================================
 
-Users who need a specific optional adapter can always import it directly
-(e.g. ``from syncfield.adapters.uvc_webcam import UVCWebcamStream``) — that
-path raises a clear :class:`ImportError` with an install hint when the
-dependency is missing.
+Optional adapters are imported eagerly when their extra is installed so
+:func:`syncfield.discovery.scan` enumerates them automatically. When the
+extra is missing, referencing the adapter raises :class:`AttributeError`
+(surfaced by ``from syncfield.adapters import …`` as :class:`ImportError`)
+with the exact ``pip install`` line — never a silent disappearance.
 
-Adapters that implement a ``discover()`` classmethod are **automatically
-registered with the discovery registry** here at import time, so
-``syncfield.discovery.scan()`` walks them without any explicit plumbing
-from the caller.
+``OakCameraStream`` is a deliberate exception: even when the ``oak`` extra
+is installed it is *not* eagerly imported, because depthai installs
+process-wide ``SIGSEGV`` / ``SIGABRT`` handlers at import time. Those
+handlers recurse infinitely when an unrelated native library (bleak, av…)
+crashes, so a BLE-only session would otherwise be killed by an unrelated
+failure. Lazy loading keeps the depthai blast radius confined to sessions
+that actually use it.
 """
+
+from __future__ import annotations
+
+import logging
+from importlib import import_module
 
 from syncfield.adapters.jsonl_file import JSONLFileStream
 from syncfield.adapters.meta_quest import MetaQuestHandStream
-from syncfield.adapters.meta_quest_camera import MetaQuestCameraStream
 from syncfield.adapters.polling_sensor import PollingSensorStream
 from syncfield.adapters.push_sensor import PushSensorStream
+from syncfield.adapters.uvc_webcam import UVCWebcamStream
 from syncfield.discovery import register_discoverer
 
-__all__ = [
-    "JSONLFileStream",
-    "MetaQuestCameraStream",
-    "MetaQuestHandStream",
-    "PollingSensorStream",
-    "PushSensorStream",
-]
-
-# HostAudioStream requires the 'audio' extra (sounddevice + numpy).
-try:
-    from syncfield.adapters.host_audio import HostAudioStream  # noqa: F401
-    __all__.append("HostAudioStream")
-except ImportError:
-    pass
+logger = logging.getLogger(__name__)
 
 
 def _safe_register(cls) -> None:
-    """Register an adapter with the discovery registry, swallowing errors.
+    """Register an adapter with the discovery registry, ignoring TypeErrors.
 
-    Keeping this defensive means a bad ``_discovery_kind`` / ``discover()``
-    on one adapter never breaks the whole :mod:`syncfield.adapters` import.
+    Adapters that lack ``discover()`` / ``_discovery_kind`` are silently
+    skipped — not every stream type needs to be auto-discoverable.
     """
     try:
         register_discoverer(cls)
     except TypeError:
-        # Adapter is missing the discover() classmethod or the
-        # _discovery_kind attribute. Log-friendly fail: don't raise,
-        # just don't register.
         pass
 
 
+_safe_register(UVCWebcamStream)
+
+
+__all__ = [
+    "JSONLFileStream",
+    "MetaQuestHandStream",
+    "PollingSensorStream",
+    "PushSensorStream",
+    "UVCWebcamStream",
+]
+
+
 # ---------------------------------------------------------------------------
-# Optional re-exports — never fatal if the corresponding extra is missing.
-# Each adapter that imports cleanly is also registered with the discovery
-# registry so ``syncfield.discovery.scan()`` enumerates it automatically.
+# Optional adapters.
+#
+# Each entry: (module path, qualname, extra name, dependency hint).
+# When the extra is installed → eager import + register.
+# When it is missing → record in ``_MISSING_HINTS`` so ``__getattr__`` can
+# raise an AttributeError with a precise install instruction on first
+# access (instead of the silent "name vanished" behaviour of the older
+# ``try: …; except ImportError: pass`` pattern).
 # ---------------------------------------------------------------------------
+_OPTIONAL: tuple[tuple[str, str, str, str], ...] = (
+    ("syncfield.adapters.host_audio",        "HostAudioStream",       "audio",  "sounddevice + numpy"),
+    ("syncfield.adapters.ble_imu",           "BLEImuGenericStream",   "ble",    "bleak"),
+    ("syncfield.adapters.ble_imu",           "BLEImuProfile",         "ble",    "bleak"),
+    ("syncfield.adapters.ble_imu",           "ChannelSpec",           "ble",    "bleak"),
+    ("syncfield.adapters.ble_imu",           "ConfigWrite",           "ble",    "bleak"),
+    ("syncfield.adapters.oglo_tactile",      "OgloTactileStream",     "ble",    "bleak"),
+    ("syncfield.adapters.meta_quest_camera", "MetaQuestCameraStream", "camera", "httpx"),
+    ("syncfield.adapters.insta360_go3s",     "Go3SStream",            "camera", "bleak + aiohttp + httpx"),
+)
 
-try:
-    from syncfield.adapters.uvc_webcam import UVCWebcamStream  # noqa: F401
-    __all__.append("UVCWebcamStream")
-    _safe_register(UVCWebcamStream)
-except ImportError:
-    pass
+_MISSING_HINTS: dict[str, tuple[str, str, str]] = {}
 
-try:
-    from syncfield.adapters.ble_imu import (  # noqa: F401
-        BLEImuGenericStream,
-        BLEImuProfile,
-        ChannelSpec,
-        ConfigWrite,
-    )
-    __all__ += [
-        "BLEImuGenericStream",
-        "BLEImuProfile",
-        "ChannelSpec",
-        "ConfigWrite",
-    ]
-    _safe_register(BLEImuGenericStream)
-except ImportError:
-    pass
+for _module_path, _qualname, _extra, _hint in _OPTIONAL:
+    try:
+        _module = import_module(_module_path)
+        _obj = getattr(_module, _qualname)
+    except ImportError as _e:
+        _MISSING_HINTS[_qualname] = (_extra, _hint, str(_e))
+        logger.debug(
+            "%s unavailable (install syncfield[%s]): %s",
+            _qualname, _extra, _e,
+        )
+        continue
+    globals()[_qualname] = _obj
+    if _qualname not in __all__:
+        __all__.append(_qualname)
+    if hasattr(_obj, "_discovery_kind"):
+        _safe_register(_obj)
 
-try:
-    from syncfield.adapters.oglo_tactile import OgloTactileStream  # noqa: F401
-    __all__.append("OgloTactileStream")
-    _safe_register(OgloTactileStream)
-except ImportError:
-    pass
 
-# OakCameraStream is deferred to truly-lazy import via PEP-562 __getattr__
-# below. Depthai installs process-wide signal handlers at import time that
-# intercept SIGSEGV/SIGABRT from *any* library — if bleak or subprocess
-# then triggers a native crash, depthai's handler recurses infinitely
-# (you'll see frames 0..31 of backward::SignalHandling::sig_handler in
-# the crash dump). Eager-importing depthai when the user doesn't use an
-# OAK camera means their BLE-only session can be taken down by an
-# unrelated third-party crash. Lazy-loading contains the damage:
-# depthai only loads when someone actually references OakCameraStream.
+# ---------------------------------------------------------------------------
+# OakCameraStream is *always* deferred via __getattr__, even when the
+# 'oak' extra is installed. Depthai installs process-wide SIGSEGV/SIGABRT
+# handlers at import time and those handlers recurse infinitely when any
+# unrelated native library crashes — quarantining the import to the
+# moment the user actually references OakCameraStream means a pure-BLE
+# session never carries the depthai blast radius.
+# ---------------------------------------------------------------------------
 _OAK_LOADED = False
 
 
+def _missing_extra_error(name: str, extra: str, deps: str, err: str) -> ImportError:
+    """Build an ImportError that survives ``from syncfield.adapters import X``.
+
+    We deliberately raise :class:`ImportError` (not :class:`AttributeError`)
+    from :func:`__getattr__` because CPython's ``from A import B`` machinery
+    catches AttributeError, drops its message, and re-raises a generic
+    ``cannot import name 'B' from 'A'`` — losing the install hint. An
+    ImportError is propagated verbatim, so the user sees the actionable
+    message regardless of import form.
+    """
+    return ImportError(
+        f"{name} requires the {extra!r} optional dependency ({deps}). "
+        f"Install with `pip install 'syncfield[{extra}]'`. "
+        f"Underlying error: {err}",
+        name=name,
+    )
+
+
 def __getattr__(name: str):
+    """PEP 562 hook — resolve OakCameraStream lazily and surface install hints."""
     global _OAK_LOADED
     if name == "OakCameraStream":
         try:
             from syncfield.adapters.oak_camera import OakCameraStream
         except ImportError as e:
-            raise AttributeError(
-                f"OakCameraStream requires the 'oak' optional dependency "
-                f"(depthai + av). Install with `uv add 'syncfield[oak]'`. "
-                f"Underlying error: {e}"
+            raise _missing_extra_error(
+                "OakCameraStream", "oak", "depthai + av + numpy", str(e)
             ) from e
         if not _OAK_LOADED:
             _safe_register(OakCameraStream)
             if "OakCameraStream" not in __all__:
                 __all__.append("OakCameraStream")
             _OAK_LOADED = True
+        globals()["OakCameraStream"] = OakCameraStream
         return OakCameraStream
+
+    hint = _MISSING_HINTS.get(name)
+    if hint is not None:
+        extra, deps, err = hint
+        raise _missing_extra_error(name, extra, deps, err)
     raise AttributeError(name)
 
-try:
-    from syncfield.adapters.insta360_go3s import Go3SStream  # noqa: F401
-    __all__.append("Go3SStream")
-    _safe_register(Go3SStream)
-except ImportError:
-    pass
+
+def __dir__() -> list[str]:
+    """Surface lazy / missing-extra adapters to dir() and tab completion."""
+    return sorted(set(__all__) | set(_MISSING_HINTS.keys()) | {"OakCameraStream"})

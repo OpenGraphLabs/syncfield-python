@@ -366,6 +366,12 @@ class SessionOrchestrator:
         # Flipped to True when the episode dir has been created on disk.
         self._episode_dir_created = False
 
+        # Snapshot of the most recently completed episode path. Populated
+        # by ``_prepare_next_episode()`` so callers can locate the files
+        # they just wrote, even after ``output_dir`` has rotated to the
+        # next episode. ``None`` until at least one recording has finished.
+        self._last_episode_dir: Optional[Path] = None
+
         # Current task label — set by the viewer before recording.
         self._task: Optional[str] = None
 
@@ -1364,7 +1370,26 @@ class SessionOrchestrator:
 
     @property
     def output_dir(self) -> Path:
+        """Episode directory for the *next* recording.
+
+        Starts as a fresh ``ep_*`` path at ``__init__`` time. After each
+        ``stop()`` / ``cancel()`` it rotates to a brand new path so the
+        next ``start()`` writes to a clean directory. To find the files
+        a just-finished recording wrote, use :attr:`last_episode_dir`.
+        """
         return self._output_dir
+
+    @property
+    def last_episode_dir(self) -> Optional[Path]:
+        """Episode directory of the most recently completed recording.
+
+        ``None`` until at least one ``start()`` → ``stop()`` cycle has
+        finished. After that, this points at the episode folder the
+        just-completed recording wrote into — use this (not
+        :attr:`output_dir`) to locate ``sync_point.json``, ``manifest.json``
+        and per-stream files once control returns from ``stop()``.
+        """
+        return self._last_episode_dir
 
     @property
     def task(self) -> Optional[str]:
@@ -2339,7 +2364,14 @@ class SessionOrchestrator:
         Called after ``stop()`` and ``cancel()`` so the next ``start()``
         writes to a new directory. Every stream adapter that holds a
         reference to the output path is updated to the new location.
+
+        The outgoing path is snapshotted into ``self._last_episode_dir``
+        so callers can still locate the files they just finished writing
+        — ``session.output_dir`` always points at the *next* episode
+        once ``stop()`` returns.
         """
+        if self._episode_dir_created:
+            self._last_episode_dir = self._output_dir
         self._output_dir = self._compute_initial_output_dir()
         self._episode_dir_created = False
 
@@ -2990,6 +3022,16 @@ class SessionOrchestrator:
         """
         if not isinstance(self._role, FollowerRole):
             raise RuntimeError("wait_for_leader_stopped() requires FollowerRole")
+
+        # Constructing the session brings the browser up immediately (since
+        # refactor 64dd0fd the mDNS surface is online at __init__). The
+        # meaningful precondition for this call is therefore that a
+        # recording is underway — the sync clock is set as part of start().
+        if self._session_clock is None:
+            raise RuntimeError(
+                "wait_for_leader_stopped() requires an active recording; "
+                "call start() first"
+            )
 
         # Static leader mode: poll /health instead of using the browser.
         if self._static_leader is not None:
