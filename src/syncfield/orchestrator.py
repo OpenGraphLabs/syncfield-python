@@ -689,14 +689,18 @@ class SessionOrchestrator:
         also aggregated into the same exception with a synthesized
         reason so a single unreachable follower can't silently proceed.
         """
+        # Guard BEFORE importing the multi-host-only deps. Single-host
+        # rigs don't install the `camera` / `multihost` extras, so
+        # pulling httpx / zeroconf-backed browser modules up front used
+        # to crash start() on every Record click.
+        config = self._build_session_config()
+        if config is None:
+            return  # single-host or follower — nothing to distribute
+
         import httpx
         import time as _time
         from syncfield.multihost.browser import SessionBrowser
         from syncfield.multihost.errors import ClusterConfigMismatch
-
-        config = self._build_session_config()
-        if config is None:
-            return  # single-host or follower — nothing to distribute
 
         # The leader's long-lived browser was started in
         # :meth:`_bring_multihost_online`; by the time start() runs,
@@ -1113,17 +1117,21 @@ class SessionOrchestrator:
         SDK, or control plane failed to bind), or if there's no
         observed leader at all (single-host path / pre-attach state).
         """
-        import httpx
-        from syncfield.multihost.session_config import (
-            SessionConfig,
-            validate_config_against_local_capabilities,
-        )
-
+        # Guard BEFORE importing httpx — single-host rigs don't install
+        # the `camera` / `multihost` extras, so importing httpx at the
+        # top of the function used to crash `session.start()` on every
+        # Record click (see tests/unit/test_orchestrator.py regression).
         if self._observed_leader is None:
             return
         port = self._observed_leader.control_plane_port
         if port is None:
             return
+
+        import httpx
+        from syncfield.multihost.session_config import (
+            SessionConfig,
+            validate_config_against_local_capabilities,
+        )
 
         url = f"{self._follower_base_url(self._observed_leader)}/session/config"
         headers = {"Authorization": f"Bearer {self.session_id}"}
