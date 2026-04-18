@@ -186,3 +186,41 @@ def compute_jitter_percentiles(
     p95_idx = min(len(sorted_iv) - 1, int(len(sorted_iv) * 0.95))
     p99_idx = min(len(sorted_iv) - 1, int(len(sorted_iv) * 0.99))
     return sorted_iv[p95_idx], sorted_iv[p99_idx]
+
+
+def remux_h264_to_mp4(
+    h264_path: str | Path,
+    mp4_path: str | Path,
+    *,
+    fps: float,
+) -> None:
+    """Remux a raw H.264 Annex-B bitstream into an MP4 container.
+
+    Copy-mode only — no re-encoding. The on-device encoder already
+    produced well-formed compressed packets; all this does is wrap them
+    in an MP4 ISO-BMFF container so standard players (and ffprobe) can
+    decode the file. Runtime is dominated by disk I/O and is effectively
+    instant for typical benchmark clips.
+
+    Args:
+        h264_path: Path to the raw ``.h264`` file (Annex-B with SPS/PPS
+            inline; DepthAI's ``VideoEncoder`` emits exactly this).
+        mp4_path: Destination MP4 path. Overwritten if it exists.
+        fps: Nominal frame rate. Used as the demuxer hint so PyAV can
+            synthesise DTS/PTS even when the raw bitstream lacks them.
+    """
+    options = {"framerate": str(int(round(fps)))}
+    input_container = av.open(str(h264_path), format="h264", options=options)
+    output_container = av.open(str(mp4_path), mode="w")
+    try:
+        in_stream = input_container.streams.video[0]
+        out_stream = output_container.add_stream(template=in_stream)
+        for packet in input_container.demux(in_stream):
+            # PyAV yields a trailing "flush" packet with dts=None; skip it.
+            if packet.dts is None:
+                continue
+            packet.stream = out_stream
+            output_container.mux(packet)
+    finally:
+        input_container.close()
+        output_container.close()

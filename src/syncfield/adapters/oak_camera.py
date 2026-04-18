@@ -60,15 +60,37 @@ except ImportError as exc:  # pragma: no cover - exercised via sys.modules patch
         "Install with `pip install syncfield[oak]`."
     ) from exc
 
-from syncfield.adapters._video_encoder import VideoEncoder, compute_jitter_percentiles
+from syncfield.adapters._video_encoder import (
+    VideoEncoder,
+    compute_jitter_percentiles,
+    remux_h264_to_mp4,
+)
 
 from syncfield.clock import SessionClock
 from syncfield.stream import StreamBase
 from syncfield.types import (
     FinalizationReport,
+    HealthEvent,
+    HealthEventKind,
     SampleEvent,
     StreamCapabilities,
 )
+
+
+#: Supported RGB output encodings.
+#:
+#: * ``"h264"`` — on-device H.264 hardware encoder (default). Full-res
+#:   frames travel over XLink as compressed bitstream, cutting USB
+#:   bandwidth ~20-50x versus raw and eliminating the host-side PyAV
+#:   encode on the capture thread. A separate low-res BGR branch feeds
+#:   the viewer preview so ``latest_frame`` still updates in real time.
+#: * ``"raw"`` — uncompressed BGR888p streamed over XLink and re-
+#:   encoded host-side via PyAV. Retained as a fallback for environments
+#:   where the on-device encoder is unavailable or when a caller wants
+#:   direct access to BGR frames in the capture loop.
+OAK_ENCODING_H264 = "h264"
+OAK_ENCODING_RAW = "raw"
+_OAK_ENCODINGS = (OAK_ENCODING_H264, OAK_ENCODING_RAW)
 
 
 class OakCameraStream(StreamBase):
@@ -89,11 +111,28 @@ class OakCameraStream(StreamBase):
         id: Stream id (also used as the output file name: ``{id}.mp4``).
         output_dir: Directory for the MP4 (and optional depth) file.
         rgb_resolution: Desired RGB resolution as ``(width, height)``.
+            Defaults to 720p — enough for most Physical AI benchmark
+            and imitation-learning workloads while keeping the XLink
+            budget small when two OAK boards share a USB bus. Pass
+            ``(1920, 1080)`` to opt into 1080p.
         rgb_fps: Desired RGB frame rate.
         depth_enabled: If True, also capture raw depth to ``{id}.depth.bin``.
         depth_resolution: Depth resolution as ``(width, height)``. Must be a
             resolution supported by the device (e.g. ``(640, 400)``).
         depth_fps: Depth frame rate.
+        encoding: ``"h264"`` (default) routes frames through the OAK's
+            on-device H.264 hardware encoder so only compressed
+            packets traverse XLink. ``"raw"`` falls back to the
+            uncompressed BGR888p pipeline re-encoded host-side by
+            PyAV — retained for debugging and environments without
+            the on-device encoder.
+        h264_bitrate_kbps: Target CBR bitrate for h264 mode. ``0``
+            (default) lets DepthAI pick based on resolution + fps.
+        h264_keyframe_interval: Insert an IDR keyframe every N frames.
+            ``None`` (default) picks one keyframe per second (= fps).
+        preview_resolution: Low-res BGR size used to feed the viewer
+            preview in h264 mode. Does not affect the recorded MP4.
+        preview_fps: Frame rate of the low-res preview branch.
     """
 
     # Class-level hints for the discovery registry (see
@@ -108,12 +147,23 @@ class OakCameraStream(StreamBase):
         id: str,
         output_dir: Path | str,
         device_id: Optional[str] = None,
-        rgb_resolution: Tuple[int, int] = (1920, 1080),
+        rgb_resolution: Tuple[int, int] = (1280, 720),
         rgb_fps: int = 30,
         depth_enabled: bool = False,
         depth_resolution: Tuple[int, int] = (640, 400),
         depth_fps: int = 30,
+        encoding: str = OAK_ENCODING_H264,
+        h264_bitrate_kbps: int = 0,
+        h264_keyframe_interval: Optional[int] = None,
+        preview_resolution: Tuple[int, int] = (320, 180),
+        preview_fps: float = 10.0,
     ) -> None:
+        if encoding not in _OAK_ENCODINGS:
+            raise ValueError(
+                f"OakCameraStream.encoding must be one of {_OAK_ENCODINGS!r}, "
+                f"got {encoding!r}"
+            )
+
         super().__init__(
             id=id,
             kind="video",
@@ -132,15 +182,38 @@ class OakCameraStream(StreamBase):
         self._depth_resolution = depth_resolution
         self._depth_fps = depth_fps
 
-        # Pipeline + queue handles (populated in prepare()).
+        self._encoding = encoding
+        self._h264_bitrate_kbps = int(h264_bitrate_kbps)
+        # Default to one keyframe per second (== rgb_fps). Users that record
+        # long clips and care about seek granularity can lower this.
+        self._h264_keyframe_interval = (
+            int(h264_keyframe_interval)
+            if h264_keyframe_interval is not None
+            else int(rgb_fps)
+        )
+        self._preview_resolution = preview_resolution
+        self._preview_fps = float(preview_fps)
+
+        # Pipeline + queue handles (populated in connect()).
         self._pipeline: Any = None
+        # In h264 mode ``_q_rgb`` yields encoded packets from the
+        # on-device VideoEncoder; in raw mode it yields full-res BGR
+        # frames directly from the camera. The capture loop dispatches
+        # on ``self._encoding`` to pick the right handler.
         self._q_rgb: Any = None
+        self._q_preview: Any = None
         self._q_depth: Any = None
 
         # Recording state.
         self._mp4_path = self._output_dir / f"{id}.mp4"
+        # Raw intermediate bitstream used only in h264 mode. Written to
+        # disk during the recording window and remuxed into ``_mp4_path``
+        # at ``stop_recording`` time. Removed on successful remux; kept
+        # in place on failure so the footage is recoverable.
+        self._h264_path = self._output_dir / f"{id}.h264"
         self._depth_path = self._output_dir / f"{id}.depth.bin"
         self._video_writer: Optional[VideoEncoder] = None
+        self._h264_file: Any = None
         self._depth_file: Any = None
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
@@ -293,9 +366,13 @@ class OakCameraStream(StreamBase):
         """Open output files and flip the recording flag.
 
         The capture thread is already running from :meth:`connect`, so
-        this is a :class:`VideoEncoder` construction plus a boolean
-        flip — fast enough to run atomically across every stream in
-        the orchestrator's start phase.
+        this is a writer construction plus a boolean flip — fast enough
+        to run atomically across every stream in the orchestrator's
+        start phase.
+
+        In h264 mode the "writer" is just a raw file handle for the
+        compressed bitstream; the MP4 container is synthesised at
+        :meth:`stop_recording` time via :func:`remux_h264_to_mp4`.
 
         If the caller skipped :meth:`connect` (legacy 0.1 ``start()``
         path), the pipeline is started here first so the writer always
@@ -314,13 +391,24 @@ class OakCameraStream(StreamBase):
         self._prev_capture_ns = None
         self._intervals_ns = []
 
-        width, height = self._rgb_resolution
-        self._video_writer = VideoEncoder.open(
-            self._mp4_path,
-            width=width,
-            height=height,
-            fps=float(self._rgb_fps),
-        )
+        if self._encoding == OAK_ENCODING_H264:
+            # Drop any stale bitstream from a crashed prior session so
+            # the capture loop never writes on top of foreign bytes.
+            if self._h264_path.exists():
+                try:
+                    self._h264_path.unlink()
+                except OSError:
+                    pass
+            self._h264_file = open(self._h264_path, "wb")
+        else:
+            width, height = self._rgb_resolution
+            self._video_writer = VideoEncoder.open(
+                self._mp4_path,
+                width=width,
+                height=height,
+                fps=float(self._rgb_fps),
+            )
+
         if self._depth_enabled:
             self._depth_file = open(self._depth_path, "wb")
 
@@ -334,16 +422,26 @@ class OakCameraStream(StreamBase):
         The pipeline stays live so the viewer preview keeps rendering
         and the operator can start a fresh recording on the same
         session without re-opening hardware.
+
+        In h264 mode the raw ``.h264`` bitstream is remuxed into the
+        target ``.mp4`` here (copy-mode, near-instant). If the remux
+        fails the raw file is left in place so the footage is
+        recoverable and a health event is emitted so the operator can
+        see it in the session report.
         """
         self._recording = False
         self._release_writers()
+
+        mp4_available = self._finalize_mp4()
 
         jitter_p95, jitter_p99 = compute_jitter_percentiles(self._intervals_ns)
         return FinalizationReport(
             stream_id=self.id,
             status="completed",
             frame_count=self._frame_count,
-            file_path=self._mp4_path if self._frame_count > 0 else None,
+            file_path=(
+                self._mp4_path if self._frame_count > 0 and mp4_available else None
+            ),
             first_sample_at_ns=self._first_at,
             last_sample_at_ns=self._last_at,
             health_events=list(self._collected_health),
@@ -351,6 +449,49 @@ class OakCameraStream(StreamBase):
             jitter_p95_ns=jitter_p95,
             jitter_p99_ns=jitter_p99,
         )
+
+    def _finalize_mp4(self) -> bool:
+        """Produce ``_mp4_path`` from the captured bitstream.
+
+        * raw mode — the PyAV ``VideoEncoder`` already wrote the MP4
+          during the recording window; nothing to do.
+        * h264 mode — remux ``_h264_path`` into ``_mp4_path`` in copy
+          mode.
+
+        Returns ``True`` if an MP4 file is available on disk after
+        this call, ``False`` if the remux failed. A failure is
+        surfaced as a health event so it shows up in the session
+        report without aborting the whole finalization.
+        """
+        if self._encoding != OAK_ENCODING_H264:
+            return True
+        if self._frame_count <= 0 or not self._h264_path.exists():
+            return False
+        try:
+            remux_h264_to_mp4(
+                self._h264_path,
+                self._mp4_path,
+                fps=float(self._rgb_fps),
+            )
+        except Exception as exc:  # noqa: BLE001 - PyAV surfaces diverse errors
+            self._emit_health(
+                HealthEvent(
+                    stream_id=self.id,
+                    kind=HealthEventKind.ERROR,
+                    at_ns=time.monotonic_ns(),
+                    detail=(
+                        f"h264 → mp4 remux failed: {exc!r}; "
+                        f"raw bitstream kept at {self._h264_path}"
+                    ),
+                )
+            )
+            return False
+        # Remux succeeded — clean up the intermediate bitstream.
+        try:
+            self._h264_path.unlink()
+        except OSError:
+            pass
+        return True
 
     def disconnect(self) -> None:
         """Stop the capture thread and release the DepthAI pipeline.
@@ -394,21 +535,35 @@ class OakCameraStream(StreamBase):
     def _build_pipeline(self) -> Any:
         """Build a DepthAI v3 pipeline with the requested outputs.
 
-        Always creates an RGB ``Camera`` node. If ``depth_enabled`` is
-        True, also creates a ``StereoDepth`` node wired to the on-board
-        mono cameras.
+        Always creates an RGB ``Camera`` node. The shape of the RGB
+        subgraph depends on :attr:`_encoding`:
+
+        * ``"h264"`` — full-res NV12 output fans into a ``VideoEncoder``
+          that emits compressed H.264 over XLink. A parallel low-res
+          BGR branch feeds the viewer preview without paying the
+          full-res bandwidth cost.
+        * ``"raw"`` — legacy single-branch BGR888p stream straight out
+          of the camera. The capture loop re-encodes host-side via
+          PyAV.
+
+        If ``depth_enabled`` is True, also creates a ``StereoDepth``
+        node wired to the on-board mono cameras.
         """
         pipeline = dai.Pipeline()
 
         # --- RGB camera --------------------------------------------------
         cam = pipeline.create(dai.node.Camera)
         cam.build()
-        rgb_out = cam.requestOutput(
-            self._rgb_resolution,
-            dai.ImgFrame.Type.BGR888p,
-            fps=float(self._rgb_fps),
-        )
-        self._q_rgb = rgb_out.createOutputQueue()
+
+        if self._encoding == OAK_ENCODING_H264:
+            self._build_h264_branch(pipeline, cam)
+        else:
+            rgb_out = cam.requestOutput(
+                self._rgb_resolution,
+                dai.ImgFrame.Type.BGR888p,
+                fps=float(self._rgb_fps),
+            )
+            self._q_rgb = rgb_out.createOutputQueue()
 
         # --- Optional stereo depth --------------------------------------
         if self._depth_enabled:
@@ -422,6 +577,44 @@ class OakCameraStream(StreamBase):
             self._q_depth = stereo.depth.createOutputQueue()
 
         return pipeline
+
+    def _build_h264_branch(self, pipeline: Any, cam: Any) -> None:
+        """Wire Camera → VideoEncoder (full-res, compressed) plus a
+        low-res BGR preview branch used only for ``latest_frame``.
+
+        Must be called exactly once from :meth:`_build_pipeline` when
+        ``encoding == "h264"``. Populates ``self._q_rgb`` with the
+        encoded-bitstream queue and ``self._q_preview`` with the live
+        preview queue.
+        """
+        # Full-resolution NV12 feed for the hardware encoder. NV12 is
+        # the encoder's native pixel layout; requesting BGR here would
+        # force an on-device CSC and lose the bandwidth win.
+        encoder_in = cam.requestOutput(
+            self._rgb_resolution,
+            dai.ImgFrame.Type.NV12,
+            fps=float(self._rgb_fps),
+        )
+        encoder = pipeline.create(dai.node.VideoEncoder)
+        encoder.build(
+            input=encoder_in,
+            frameRate=float(self._rgb_fps),
+            profile=dai.VideoEncoderProperties.Profile.H264_MAIN,
+            keyframeFrequency=self._h264_keyframe_interval,
+        )
+        if self._h264_bitrate_kbps > 0:
+            encoder.setBitrateKbps(self._h264_bitrate_kbps)
+        self._q_rgb = encoder.out.createOutputQueue()
+
+        # Low-res BGR feed for the viewer. At 320x180×10fps this costs
+        # ~1.7 MB/s per camera — negligible compared to the old
+        # 1080p×30fps BGR firehose that saturated USB.
+        preview_out = cam.requestOutput(
+            self._preview_resolution,
+            dai.ImgFrame.Type.BGR888p,
+            fps=self._preview_fps,
+        )
+        self._q_preview = preview_out.createOutputQueue()
 
     # ------------------------------------------------------------------
     # Capture loop
@@ -438,12 +631,12 @@ class OakCameraStream(StreamBase):
           ``SampleEvent``. The capture runs continuously from the
           moment :meth:`connect` spawned this thread.
         * **Recording** (``_recording == True``) — same preview
-          publish, plus write to the ``VideoEncoder``, advance
-          ``_frame_count``, drain a depth tick, and emit
-          ``SampleEvent``. The capture timestamp is sampled
-          *immediately* after ``queue.get()`` so the jitter between
-          the physical frame and the recorded monotonic time stays
-          as small as possible.
+          publish, plus write to the on-disk bitstream (h264 mode) or
+          MP4 via PyAV (raw mode), advance ``_frame_count``, drain a
+          depth tick, and emit ``SampleEvent``. The capture timestamp
+          is sampled *immediately* after ``queue.get()`` so the jitter
+          between the physical frame and the recorded monotonic time
+          stays as small as possible.
 
         The loop exits when ``_stop_event`` fires (from
         :meth:`disconnect`).
@@ -451,39 +644,99 @@ class OakCameraStream(StreamBase):
         while not self._stop_event.is_set():
             rgb_msg = self._safe_get_rgb()
             capture_ns = time.monotonic_ns()
+
+            # In h264 mode the viewer preview rides a separate low-res
+            # BGR branch — poll it opportunistically so ``latest_frame``
+            # keeps updating even if the main encoded queue is quiet.
+            if self._encoding == OAK_ENCODING_H264:
+                self._drain_preview_tick()
+
             if rgb_msg is None:
                 continue
+
             # Recording-window-only jitter collection (see UVC adapter for rationale).
             if self._recording:
                 if self._prev_capture_ns is not None:
                     self._intervals_ns.append(capture_ns - self._prev_capture_ns)
                 self._prev_capture_ns = capture_ns
 
-            frame = rgb_msg.getCvFrame()
+            if self._encoding == OAK_ENCODING_H264:
+                self._handle_encoded_packet(rgb_msg, capture_ns)
+            else:
+                self._handle_raw_frame(rgb_msg, capture_ns)
 
-            # Always publish the latest frame for live preview — the
-            # viewer reads this in both CONNECTED and RECORDING states.
-            with self._frame_lock:
-                self._latest_frame = frame
+            if self._recording and self._depth_enabled:
+                self._drain_depth_tick()
 
-            if self._recording:
-                if self._first_at is None:
-                    self._first_at = capture_ns
-                self._last_at = capture_ns
-                self._frame_count += 1
+    def _handle_encoded_packet(self, msg: Any, capture_ns: int) -> None:
+        """h264 mode — write the on-device encoded packet to the raw
+        ``.h264`` file and emit a :class:`SampleEvent`.
 
-                if self._video_writer is not None:
-                    self._video_writer.write(frame)
-                self._emit_sample(
-                    SampleEvent(
-                        stream_id=self.id,
-                        frame_number=self._frame_count - 1,
-                        capture_ns=capture_ns,
-                    )
-                )
+        The packet payload is Annex-B H.264 with SPS/PPS inline, so the
+        raw file is directly decodable and can be remuxed into an MP4
+        at ``stop_recording`` time with no re-encoding.
+        """
+        if not self._recording:
+            return
+        if self._first_at is None:
+            self._first_at = capture_ns
+        self._last_at = capture_ns
+        self._frame_count += 1
+        if self._h264_file is not None:
+            # ``getData()`` returns a depthai ``VectorUChar``; ``bytes(...)``
+            # gives us a plain buffer the OS write path prefers.
+            self._h264_file.write(bytes(msg.getData()))
+        self._emit_sample(
+            SampleEvent(
+                stream_id=self.id,
+                frame_number=self._frame_count - 1,
+                capture_ns=capture_ns,
+            )
+        )
 
-                if self._depth_enabled:
-                    self._drain_depth_tick()
+    def _handle_raw_frame(self, msg: Any, capture_ns: int) -> None:
+        """raw mode — publish the BGR frame for preview and host-encode
+        via PyAV.
+        """
+        frame = msg.getCvFrame()
+        with self._frame_lock:
+            self._latest_frame = frame
+
+        if not self._recording:
+            return
+        if self._first_at is None:
+            self._first_at = capture_ns
+        self._last_at = capture_ns
+        self._frame_count += 1
+        if self._video_writer is not None:
+            self._video_writer.write(frame)
+        self._emit_sample(
+            SampleEvent(
+                stream_id=self.id,
+                frame_number=self._frame_count - 1,
+                capture_ns=capture_ns,
+            )
+        )
+
+    def _drain_preview_tick(self) -> None:
+        """h264 mode only — non-blocking pull from the low-res BGR
+        preview queue. Publishes the most recent frame to
+        :attr:`latest_frame` for the viewer.
+        """
+        if self._q_preview is None:
+            return
+        try:
+            msg = self._q_preview.tryGet()
+        except Exception:
+            return
+        if msg is None:
+            return
+        try:
+            frame = msg.getCvFrame()
+        except Exception:
+            return
+        with self._frame_lock:
+            self._latest_frame = frame
 
     def _safe_get_rgb(self) -> Any:
         """Pull one RGB frame from the queue, swallowing timeouts."""
@@ -519,6 +772,13 @@ class OakCameraStream(StreamBase):
             except Exception:
                 pass
             self._video_writer = None
+        if self._h264_file is not None:
+            try:
+                self._h264_file.flush()
+                self._h264_file.close()
+            except Exception:
+                pass
+            self._h264_file = None
         if self._depth_file is not None:
             try:
                 self._depth_file.flush()
@@ -535,6 +795,7 @@ class OakCameraStream(StreamBase):
                 pass
             self._pipeline = None
         self._q_rgb = None
+        self._q_preview = None
         self._q_depth = None
 
     # ------------------------------------------------------------------

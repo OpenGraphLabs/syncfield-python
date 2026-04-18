@@ -44,6 +44,16 @@ def _build_fake_av(
     input_container = MagicMock(name="InputContainer")
     input_container.decode = MagicMock(return_value=_paced_frames())
 
+    # The OAK h264 → mp4 remux path uses ``.streams.video[0]`` + a
+    # generator-returning ``.demux(stream)``. Stub both so tests can
+    # drive the remux call through without crashing; no real packet
+    # payload is produced — the remux's copy-mode loop simply sees
+    # zero packets and the output ends up empty. Integration tests on
+    # real OAK hardware exercise the content-producing path.
+    input_stream = MagicMock(name="InputVideoStream")
+    input_container.streams.video = [input_stream]
+    input_container.demux = MagicMock(return_value=iter(()))
+
     output_stream = MagicMock(name="VideoStream")
     packet = MagicMock(name="Packet")
     output_stream.encode = MagicMock(

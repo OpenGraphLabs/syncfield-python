@@ -25,12 +25,23 @@ def _build_fake_depthai() -> MagicMock:
     Camera node with requestOutput() → OutputQueue.get() → ImgFrame-like
     object exposing .getCvFrame() and .getTimestamp().
 
-    The fake queue returns an unlimited stream of frames — in the new
-    4-phase lifecycle the capture loop runs across both the preview
-    (``connect()``) and recording (``start_recording()``) phases, so a
-    fixed budget would get consumed before any recording happens.
-    Tests that want to exercise "queue drains" swap in a narrower
-    side_effect manually.
+    Covers both OAK encoding modes:
+
+    * ``"raw"`` legacy path — Camera → BGR frames direct into the
+      capture loop. The main ``rgb_queue`` yields ``_FakeFrame`` objects
+      whose ``.getCvFrame()`` returns a real 1080p zero BGR array.
+    * ``"h264"`` default path — Camera → VideoEncoder → encoded packets
+      that expose ``.getData()`` returning a short fake Annex-B buffer,
+      plus a parallel low-res BGR preview queue. ``pipeline.create`` is
+      given a side_effect so the VideoEncoder node is a distinct mock
+      and exposes a distinct ``.out.createOutputQueue`` wired to the
+      encoded-packet queue.
+
+    The fake queues return unlimited streams — in the 4-phase lifecycle
+    the capture loop runs across both preview (``connect()``) and
+    recording (``start_recording()``), so a fixed budget would get
+    consumed before any recording happens. Tests that want to exercise
+    "queue drains" swap in a narrower side_effect manually.
     """
     fake = MagicMock()
 
@@ -44,41 +55,100 @@ def _build_fake_depthai() -> MagicMock:
         def getCvFrame(self) -> np.ndarray:
             return self._cv_frame
 
-    # --- Fake output queue: unlimited stream of frames ------------------
-    def make_queue() -> MagicMock:
+    class _FakeEncodedPacket:
+        """Mimics a dai ``EncodedFrame`` with a short fake Annex-B payload.
+
+        The exact bytes don't matter for unit tests — the adapter only
+        writes them to a raw file and (in real hardware runs) lets PyAV
+        demux them. The on-device test relies on real bitstreams.
+        """
+
+        _FAKE_NAL = b"\x00\x00\x00\x01\x67\x42\x00\x00"  # SPS start marker
+
+        def getData(self) -> bytes:
+            return self._FAKE_NAL
+
+    # --- Fake output queues: unlimited streams --------------------------
+    def make_queue(payload_factory) -> MagicMock:
         q = MagicMock()
-
-        def fake_get(timeout: float = 0.1) -> _FakeFrame:
-            return _FakeFrame()
-
-        q.get.side_effect = fake_get
+        q.get.side_effect = lambda timeout=0.1: payload_factory()
         q.tryGet.return_value = None
         return q
 
-    rgb_queue = make_queue()
+    rgb_queue = make_queue(_FakeFrame)  # raw mode main queue
+    encoded_queue = make_queue(_FakeEncodedPacket)  # h264 main queue
+    preview_queue = make_queue(_FakeFrame)  # h264 preview queue
+    preview_queue.tryGet.side_effect = lambda: _FakeFrame()
 
     # --- Fake Camera node -----------------------------------------------
     camera_node = MagicMock()
-    camera_node.requestOutput.return_value.createOutputQueue.return_value = rgb_queue
+    # Each requestOutput() call returns the same Node.Output mock whose
+    # createOutputQueue() returns ``rgb_queue`` in raw mode and
+    # ``preview_queue`` in h264 mode (since the encoder path uses the
+    # encoder's own ``.out`` for its queue, this queue serves the
+    # viewer preview branch). The adapter calls createOutputQueue once
+    # per branch; MagicMock returns the same value on repeat calls.
+    camera_output = MagicMock(name="CameraOutput")
+    camera_node.requestOutput.return_value = camera_output
+    # Raw mode's queue; h264 preview mode reuses the same factory
+    # because the adapter only reads via ``getCvFrame`` / ``tryGet``.
+    camera_output.createOutputQueue.return_value = rgb_queue
 
-    # --- Fake pipeline: pipeline.create(dai.node.Camera) returns camera -
+    # --- Fake VideoEncoder node -----------------------------------------
+    encoder_node = MagicMock(name="VideoEncoder")
+    encoder_node.out.createOutputQueue.return_value = encoded_queue
+
+    # --- Fake StereoDepth node ------------------------------------------
+    stereo_node = MagicMock(name="StereoDepth")
+
+    # --- Fake pipeline dispatch on node class ---------------------------
     pipeline = MagicMock()
-    pipeline.create.return_value = camera_node
+
+    def _pipeline_create(node_cls):  # noqa: ANN001 - MagicMock signature
+        if node_cls is fake.node.VideoEncoder:
+            # Reroute the Camera→encoder link target: if the adapter
+            # later calls createOutputQueue on ``camera_output`` while
+            # building the h264 branch, reroute it to ``preview_queue``
+            # so the preview branch gets a distinct queue from the
+            # encoded one. First call was already for the encoder
+            # input; subsequent calls are for the preview branch.
+            camera_output.createOutputQueue.return_value = preview_queue
+            return encoder_node
+        if node_cls is fake.node.StereoDepth:
+            return stereo_node
+        return camera_node
+
+    pipeline.create.side_effect = _pipeline_create
     pipeline.getDefaultDevice.return_value.getUsbSpeed.return_value = MagicMock(
         name="SUPER", value=3
     )
 
     fake.Pipeline.return_value = pipeline
 
-    # dai.node namespace
+    # dai.node namespace — sentinels used in pipeline.create() dispatch.
+    # Using small concrete types keeps ``is`` comparisons stable across
+    # repeated attribute access. StereoDepth needs a nested ``PresetMode``
+    # attribute because the adapter reads ``PresetMode.HIGH_DETAIL`` when
+    # wiring the depth branch.
     fake.node = MagicMock()
-    fake.node.Camera = object  # sentinel class passed to pipeline.create
+    fake.node.Camera = type("Camera", (), {})
+    fake.node.VideoEncoder = type("VideoEncoder", (), {})
+
+    class _FakeStereoDepth:
+        class PresetMode:
+            HIGH_DETAIL = object()
+
+    fake.node.StereoDepth = _FakeStereoDepth
 
     # dai.Device.getAllAvailableDevices()
     fake.Device.getAllAvailableDevices.return_value = [MagicMock()]
 
-    # dai.ImgFrame.Type.BGR888p sentinel
+    # dai.ImgFrame.Type sentinels
     fake.ImgFrame.Type.BGR888p = "BGR888p"
+    fake.ImgFrame.Type.NV12 = "NV12"
+
+    # dai.VideoEncoderProperties.Profile sentinels
+    fake.VideoEncoderProperties.Profile.H264_MAIN = "H264_MAIN"
 
     # dai.UsbSpeed.SUPER sentinel (for USB-speed warning branch)
     fake.UsbSpeed.SUPER = MagicMock(value=3)
@@ -230,11 +300,16 @@ class TestDepthOption:
     def test_depth_disabled_by_default(
         self, mock_depthai, mock_av_generous, tmp_path
     ):
-        """Default config builds only the RGB camera node."""
+        """With depth disabled no StereoDepth node is added.
+
+        Pinned to ``encoding="raw"`` to keep the call-count assertion
+        focused on the depth branch — h264 mode adds a VideoEncoder
+        node that would otherwise confuse the count.
+        """
         fake = mock_depthai
         from syncfield.adapters.oak_camera import OakCameraStream
 
-        stream = OakCameraStream("oak", output_dir=tmp_path)
+        stream = OakCameraStream("oak", output_dir=tmp_path, encoding="raw")
         stream.prepare()
         stream.connect()
         try:
@@ -242,6 +317,95 @@ class TestDepthOption:
             assert pipeline.create.call_count == 1  # RGB only
         finally:
             stream.disconnect()
+
+
+class TestEncoding:
+    """Exercise the ``encoding`` parameter — h264 (default) vs raw."""
+
+    def test_h264_default_builds_video_encoder_branch(
+        self, mock_depthai, mock_av_generous, tmp_path
+    ):
+        """Default encoding wires a VideoEncoder node + preview branch.
+
+        Both nodes are created via ``pipeline.create``, so we check
+        that both class sentinels were passed through. The camera
+        itself is also one create call, bringing the total to three
+        when depth is enabled and two when not.
+        """
+        fake = mock_depthai
+        from syncfield.adapters.oak_camera import OakCameraStream
+
+        stream = OakCameraStream("oak", output_dir=tmp_path)
+        assert stream._encoding == "h264"
+
+        stream.connect()
+        try:
+            pipeline = fake.Pipeline.return_value
+            created_types = [
+                call.args[0] for call in pipeline.create.call_args_list
+            ]
+            assert fake.node.Camera in created_types
+            assert fake.node.VideoEncoder in created_types
+        finally:
+            stream.disconnect()
+
+    def test_h264_recording_produces_mp4_via_remux(
+        self, mock_depthai, mock_av_generous, tmp_path
+    ):
+        """Full lifecycle in h264 mode yields a FinalizationReport with
+        ``file_path`` set to the target MP4.
+
+        The raw ``.h264`` intermediate file is created during the
+        recording window; after :meth:`stop_recording` runs the remux
+        it should be gone. The mocked ``av`` pipeline completes the
+        remux with an empty packet stream, which is enough to verify
+        the control-flow works end-to-end.
+        """
+        from syncfield.adapters.oak_camera import OakCameraStream
+
+        stream = OakCameraStream("oak", output_dir=tmp_path)
+        stream.connect()
+        stream.start_recording(_clock())
+
+        h264_path = tmp_path / "oak.h264"
+        # Capture thread should open the intermediate bitstream file
+        # almost immediately after start_recording flips the flag.
+        # Give it a beat to produce a few samples.
+        time.sleep(0.15)
+
+        report = stream.stop_recording()
+        stream.disconnect()
+
+        assert report.status == "completed"
+        assert report.file_path == tmp_path / "oak.mp4"
+        # Remux succeeded under the mock, so the intermediate file
+        # should have been cleaned up.
+        assert not h264_path.exists()
+
+    def test_raw_mode_opt_in_keeps_legacy_pipeline(
+        self, mock_depthai, mock_av_generous, tmp_path
+    ):
+        """Explicit ``encoding="raw"`` should skip the VideoEncoder."""
+        fake = mock_depthai
+        from syncfield.adapters.oak_camera import OakCameraStream
+
+        stream = OakCameraStream("oak", output_dir=tmp_path, encoding="raw")
+        stream.connect()
+        try:
+            pipeline = fake.Pipeline.return_value
+            created_types = [
+                call.args[0] for call in pipeline.create.call_args_list
+            ]
+            assert fake.node.Camera in created_types
+            assert fake.node.VideoEncoder not in created_types
+        finally:
+            stream.disconnect()
+
+    def test_invalid_encoding_raises(self, mock_depthai, mock_av_generous, tmp_path):
+        from syncfield.adapters.oak_camera import OakCameraStream
+
+        with pytest.raises(ValueError, match="encoding"):
+            OakCameraStream("oak", output_dir=tmp_path, encoding="vp9")
 
 
 class TestImportGuard:
