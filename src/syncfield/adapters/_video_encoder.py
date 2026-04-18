@@ -197,29 +197,62 @@ def remux_h264_to_mp4(
     """Remux a raw H.264 Annex-B bitstream into an MP4 container.
 
     Copy-mode only — no re-encoding. The on-device encoder already
-    produced well-formed compressed packets; all this does is wrap them
-    in an MP4 ISO-BMFF container so standard players (and ffprobe) can
-    decode the file. Runtime is dominated by disk I/O and is effectively
-    instant for typical benchmark clips.
+    produced well-formed compressed packets; all this does is wrap
+    them in an MP4 ISO-BMFF container so standard players (and
+    ffprobe) can decode the file. Runtime is dominated by disk I/O
+    and is effectively instant for typical benchmark clips.
+
+    Timestamps: raw Annex-B streams carry no PTS/DTS — the demuxer
+    surfaces every packet with ``dts=None``. We synthesise a uniform
+    1/fps cadence at a millisecond-granularity timebase so the MP4
+    muxer has monotonic timestamps to work with. This matches what
+    ``ffmpeg -framerate N -i in.h264 -c copy out.mp4`` does at the
+    CLI level.
 
     Args:
         h264_path: Path to the raw ``.h264`` file (Annex-B with SPS/PPS
             inline; DepthAI's ``VideoEncoder`` emits exactly this).
         mp4_path: Destination MP4 path. Overwritten if it exists.
-        fps: Nominal frame rate. Used as the demuxer hint so PyAV can
-            synthesise DTS/PTS even when the raw bitstream lacks them.
+        fps: Nominal frame rate. Controls both the demuxer's framerate
+            hint and the synthesised PTS cadence.
     """
-    options = {"framerate": str(int(round(fps)))}
+    from fractions import Fraction
+
+    fps_rounded = int(round(fps))
+    # Millisecond-granularity timebase — fine enough that sub-frame
+    # jitter (captured separately in ``timestamps.jsonl``) is not
+    # rounded away, coarse enough that synthesised pts values stay in
+    # int64 territory for arbitrarily long sessions.
+    time_base = Fraction(1, fps_rounded * 1000)
+    frame_duration = 1000  # in ``time_base`` units → 1/fps seconds
+
+    options = {"framerate": str(fps_rounded)}
     input_container = av.open(str(h264_path), format="h264", options=options)
     output_container = av.open(str(mp4_path), mode="w")
     try:
         in_stream = input_container.streams.video[0]
-        out_stream = output_container.add_stream(template=in_stream)
+        # PyAV >=14 exposes a dedicated template copy API; the legacy
+        # ``add_stream(template=...)`` form that worked through PyAV 13
+        # was removed. The ``hasattr`` check keeps us compatible with
+        # the ``av>=12`` floor declared in pyproject.toml.
+        if hasattr(output_container, "add_stream_from_template"):
+            out_stream = output_container.add_stream_from_template(template=in_stream)
+        else:
+            out_stream = output_container.add_stream(template=in_stream)
+
+        pts = 0
         for packet in input_container.demux(in_stream):
-            # PyAV yields a trailing "flush" packet with dts=None; skip it.
-            if packet.dts is None:
+            # PyAV emits a final zero-size "flush" packet at EOF that
+            # must not be muxed. Real packets from Annex-B have
+            # ``dts=None`` but ``size>0`` — filtering on size avoids
+            # the raw/container demuxer asymmetry.
+            if packet.size == 0:
                 continue
             packet.stream = out_stream
+            packet.pts = pts
+            packet.dts = pts
+            packet.time_base = time_base
+            pts += frame_duration
             output_container.mux(packet)
     finally:
         input_container.close()
