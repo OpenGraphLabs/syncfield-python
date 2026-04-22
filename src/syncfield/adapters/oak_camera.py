@@ -172,6 +172,7 @@ class OakCameraStream(StreamBase):
                 supports_precise_timestamps=True,
                 is_removable=True,
                 produces_file=True,
+                target_hz=float(rgb_fps),
             ),
         )
         self._output_dir = Path(output_dir)
@@ -332,6 +333,8 @@ class OakCameraStream(StreamBase):
                 attached devices after :attr:`_ENUMERATE_RETRIES`
                 probe attempts.
         """
+        self._install_depthai_bridge()
+
         if self._thread is not None and self._thread.is_alive():
             return
 
@@ -493,6 +496,33 @@ class OakCameraStream(StreamBase):
             pass
         return True
 
+    def _install_depthai_bridge(self) -> None:
+        """Install a logging.Handler that converts depthai native log records into HealthEvents.
+
+        Idempotent. Registered on depthai's module logger so every internal
+        warning/error that depthai emits during this stream's lifetime is
+        routed to the IncidentTracker via :meth:`_emit_health`.
+        """
+        import logging as _logging
+        from syncfield.health.detectors.depthai_bridge import DepthAILoggerBridge
+
+        if getattr(self, "_depthai_bridge", None) is not None:
+            return
+        self._depthai_bridge = DepthAILoggerBridge(
+            stream_id=self.id,
+            sink=lambda _sid, ev: self._emit_health(ev),
+        )
+        _logging.getLogger("depthai").addHandler(self._depthai_bridge)
+
+    def _uninstall_depthai_bridge(self) -> None:
+        """Remove the depthai logging handler. Idempotent."""
+        import logging as _logging
+        bridge = getattr(self, "_depthai_bridge", None)
+        if bridge is None:
+            return
+        _logging.getLogger("depthai").removeHandler(bridge)
+        self._depthai_bridge = None
+
     def disconnect(self) -> None:
         """Stop the capture thread and release the DepthAI pipeline.
 
@@ -505,6 +535,7 @@ class OakCameraStream(StreamBase):
             self._thread.join(timeout=3.0)
             self._thread = None
         self._release_pipeline()
+        self._uninstall_depthai_bridge()
 
     # ------------------------------------------------------------------
     # Legacy one-shot lifecycle
