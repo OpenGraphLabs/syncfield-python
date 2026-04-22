@@ -110,3 +110,59 @@ def test_incidents_jsonl_written(tmp_path: Path):
     fingerprints = [json.loads(l)["fingerprint"] for l in lines]
     assert any(fp == "cam:stream-stall" for fp in fingerprints), \
         f"stall fingerprint missing — found: {set(fingerprints)}"
+
+
+@pytest.mark.slow
+def test_incidents_jsonl_written_with_poller_wired(tmp_path: Path):
+    """Regression: SessionPoller must not clobber SessionOrchestrator's persist listener."""
+    from syncfield.viewer.poller import SessionPoller
+
+    sess = SessionOrchestrator(host_id="test", output_dir=tmp_path)
+    stream = FakeStream("cam", target_hz=30.0)
+    sess.add(stream)
+
+    # Spin up a poller as the viewer would.
+    poller = SessionPoller(sess)
+
+    sess.connect()
+    sess.start(countdown_s=0)
+    stream.pause_samples()
+    time.sleep(2.5)
+    sess.stop()
+    sess.disconnect()
+
+    out = list(tmp_path.rglob("incidents.jsonl"))
+    assert out, "no incidents.jsonl written — poller likely clobbered persist listener"
+    lines = out[0].read_text().strip().splitlines()
+    assert any('"fingerprint": "cam:stream-stall"' in l or '"fingerprint":"cam:stream-stall"' in l for l in lines)
+
+
+@pytest.mark.slow
+def test_orchestrator_feeds_writer_stats_to_backpressure_detector(tmp_path: Path):
+    from syncfield.health.detector import DetectorBase
+    from syncfield.health.severity import Severity
+
+    class WriterStatsSpy(DetectorBase):
+        name = "writer-stats-spy"
+        default_severity = Severity.INFO
+
+        def __init__(self):
+            self.calls = 0
+
+        def observe_writer_stats(self, stream_id, stats):
+            self.calls += 1
+
+    sess = SessionOrchestrator(host_id="test", output_dir=tmp_path)
+    spy = WriterStatsSpy()
+    sess.health.register(spy)
+    stream = FakeStream("cam", target_hz=30.0)
+    sess.add(stream)
+
+    sess.connect()
+    sess.start(countdown_s=0)
+    time.sleep(0.6)
+    sess.stop()
+    sess.disconnect()
+
+    # At 10 Hz throttle + 600ms → ~5-6 calls expected.
+    assert spy.calls >= 2, f"writer stats not emitted (got {spy.calls})"

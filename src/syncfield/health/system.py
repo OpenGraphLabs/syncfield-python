@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Callable, Iterable, Iterator, Optional
+from typing import Callable, Dict, Iterable, Iterator, Optional
 
 from syncfield.health.detector import Detector
 from syncfield.health.detectors.adapter_passthrough import AdapterEventPassthrough
@@ -31,16 +31,23 @@ class HealthSystem:
         self._tracker = IncidentTracker(passthrough_close_ns=passthrough_close_ns)
         self._worker: Optional[HealthWorker] = None
         self._tick_hz = tick_hz
-
-        self.on_incident_opened: Optional[Callable[[Incident], None]] = None
-        self.on_incident_updated: Optional[Callable[[Incident], None]] = None
-        self.on_incident_closed: Optional[Callable[[Incident], None]] = None
-
-        self._tracker.on_opened = lambda inc: self._fire("on_incident_opened", inc)
-        self._tracker.on_updated = lambda inc: self._fire("on_incident_updated", inc)
-        self._tracker.on_closed = lambda inc: self._fire("on_incident_closed", inc)
+        self._target_hz_by_stream: Dict[str, Optional[float]] = {}
 
         self._install_default_detectors()
+
+    # --- incident callbacks ----------------------------------------------
+
+    def on_incident_opened(self, cb: Callable[[Incident], None]) -> None:
+        """Register a callback fired when a new incident opens."""
+        self._tracker.add_on_opened(cb)
+
+    def on_incident_updated(self, cb: Callable[[Incident], None]) -> None:
+        """Register a callback fired when an open incident receives a new event."""
+        self._tracker.add_on_updated(cb)
+
+    def on_incident_closed(self, cb: Callable[[Incident], None]) -> None:
+        """Register a callback fired when an incident is resolved."""
+        self._tracker.add_on_closed(cb)
 
     # --- registry --------------------------------------------------------
 
@@ -111,15 +118,15 @@ class HealthSystem:
 
     # --- helpers ---------------------------------------------------------
 
+    def register_stream(self, stream_id: str, target_hz: Optional[float]) -> None:
+        """Declare the expected target_hz for a stream. Detectors consult this."""
+        self._target_hz_by_stream[stream_id] = target_hz
+
     def _install_default_detectors(self) -> None:
+        target_getter = lambda sid: self._target_hz_by_stream.get(sid)
         self.register(AdapterEventPassthrough())
         self.register(StreamStallDetector())
-        self.register(FpsDropDetector())
-        self.register(JitterDetector())
+        self.register(FpsDropDetector(target_getter=target_getter))
+        self.register(JitterDetector(target_getter=target_getter))
         self.register(StartupFailureDetector())
         self.register(BackpressureDetector())
-
-    def _fire(self, attr: str, inc: Incident) -> None:
-        cb = getattr(self, attr, None)
-        if cb is not None:
-            cb(inc)

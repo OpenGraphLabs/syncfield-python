@@ -50,8 +50,8 @@ def test_health_system_installs_default_detectors():
 def test_health_system_callbacks_fire_on_open_and_close():
     hs = HealthSystem(passthrough_close_ns=1)  # close instantly for the test
     opened, closed = [], []
-    hs.on_incident_opened = opened.append
-    hs.on_incident_closed = closed.append
+    hs.on_incident_opened(opened.append)
+    hs.on_incident_closed(closed.append)
 
     hs.start()
     try:
@@ -96,3 +96,15 @@ def test_health_system_register_after_start_warns():
             assert any("after HealthSystem.start()" in str(w.message) for w in caught)
     finally:
         hs.stop()
+
+
+def test_register_stream_propagates_target_hz_to_detectors():
+    hs = HealthSystem()
+    hs.register_stream("cam", 30.0)
+
+    fps = next(d for d in hs.iter_detectors() if d.name == "fps-drop")
+    jitter = next(d for d in hs.iter_detectors() if d.name == "jitter")
+
+    assert fps._target_getter("cam") == 30.0
+    assert jitter._target_getter("cam") == 30.0
+    assert fps._target_getter("unknown") is None

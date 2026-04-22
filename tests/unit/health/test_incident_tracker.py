@@ -37,7 +37,7 @@ def test_tracker_opens_incident_on_first_matching_event():
     tr = IncidentTracker()
     tr.bind_detector(AlwaysCloseAfter(close_after_ns=1000))
     opened: List[Incident] = []
-    tr.on_opened = opened.append
+    tr.add_on_opened(opened.append)
 
     tr.ingest(_ev(100))
 
@@ -65,7 +65,7 @@ def test_tracker_closes_incident_when_detector_close_condition_fires():
     tr = IncidentTracker()
     tr.bind_detector(AlwaysCloseAfter(close_after_ns=500))
     closed: List[Incident] = []
-    tr.on_closed = closed.append
+    tr.add_on_closed(closed.append)
 
     tr.ingest(_ev(100))
     tr.tick(now_ns=200)          # 100 ns since last event, not yet
@@ -109,7 +109,7 @@ def test_tracker_flush_callbacks_fire_on_update_too():
     tr = IncidentTracker()
     tr.bind_detector(AlwaysCloseAfter(close_after_ns=1_000_000_000))
     updates: List[Incident] = []
-    tr.on_updated = updates.append
+    tr.add_on_updated(updates.append)
 
     tr.ingest(_ev(100))      # opens
     tr.ingest(_ev(200))      # updates

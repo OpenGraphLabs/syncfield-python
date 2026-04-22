@@ -22,9 +22,18 @@ class IncidentTracker:
         self._detectors_by_name: Dict[str, Detector] = {}
         self._passthrough_close_ns = passthrough_close_ns
 
-        self.on_opened: Optional[Callback] = None
-        self.on_updated: Optional[Callback] = None
-        self.on_closed: Optional[Callback] = None
+        self._on_opened: List[Callback] = []
+        self._on_updated: List[Callback] = []
+        self._on_closed: List[Callback] = []
+
+    def add_on_opened(self, cb: Callback) -> None:
+        self._on_opened.append(cb)
+
+    def add_on_updated(self, cb: Callback) -> None:
+        self._on_updated.append(cb)
+
+    def add_on_closed(self, cb: Callback) -> None:
+        self._on_closed.append(cb)
 
     # --- detector wiring -------------------------------------------------
 
@@ -43,10 +52,10 @@ class IncidentTracker:
         if open_inc is None:
             inc = Incident.opened_from(event, title=_title_from(event))
             self._by_fingerprint[event.fingerprint] = inc
-            self._fire(self.on_opened, inc)
+            self._fire(self._on_opened, inc)
             return
         open_inc.record_event(event)
-        self._fire(self.on_updated, open_inc)
+        self._fire(self._on_updated, open_inc)
 
     # --- tick — evaluate close conditions --------------------------------
 
@@ -65,7 +74,7 @@ class IncidentTracker:
             inc = self._by_fingerprint.pop(fp)
             inc.close(at_ns=now_ns)
             self._resolved.append(inc)
-            self._fire(self.on_closed, inc)
+            self._fire(self._on_closed, inc)
 
     def close_all(self, *, at_ns: int) -> None:
         """Used at session stop to resolve any still-open incidents."""
@@ -73,7 +82,7 @@ class IncidentTracker:
             inc = self._by_fingerprint.pop(fp)
             inc.close(at_ns=at_ns)
             self._resolved.append(inc)
-            self._fire(self.on_closed, inc)
+            self._fire(self._on_closed, inc)
 
     # --- read-only views -------------------------------------------------
 
@@ -93,9 +102,13 @@ class IncidentTracker:
         return self._detectors_by_name.get(parts[1])
 
     @staticmethod
-    def _fire(cb: Optional[Callback], inc: Incident) -> None:
-        if cb is not None:
-            cb(inc)
+    def _fire(callbacks: List[Callback], inc: Incident) -> None:
+        for cb in callbacks:
+            try:
+                cb(inc)
+            except Exception:
+                # A listener failure must not break the tracker.
+                pass
 
 
 def _title_from(event: HealthEvent) -> str:

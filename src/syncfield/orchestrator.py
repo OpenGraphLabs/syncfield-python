@@ -396,9 +396,12 @@ class SessionOrchestrator:
         # started/stopped alongside each recording cycle.
         from syncfield.health import HealthSystem
         self.health = HealthSystem()
-        self.health.on_incident_opened = self._persist_incident
-        self.health.on_incident_updated = self._persist_incident
-        self.health.on_incident_closed = self._persist_incident
+        self.health.on_incident_opened(self._persist_incident)
+        self.health.on_incident_updated(self._persist_incident)
+        self.health.on_incident_closed(self._persist_incident)
+
+        # Throttle tracker for writer stats emission — keyed by stream_id.
+        self._last_writer_stats_emit_at: Dict[str, int] = {}
 
         # Multi-host: start control plane + advertiser (or follower browser)
         # at construction time so cluster discovery is independent of device
@@ -1510,7 +1513,11 @@ class SessionOrchestrator:
 
         self._streams[stream.id] = stream
         stream.on_health(self._on_stream_health)
-        stream.on_sample(lambda s, _sid=stream.id: self.health.observe_sample(_sid, s))
+        stream.on_sample(lambda s, _sid=stream.id: (
+            self.health.observe_sample(_sid, s),
+            self._emit_writer_stats(_sid),
+        ))
+        self.health.register_stream(stream.id, stream.capabilities.target_hz)
 
         # After the first non-audio stream is registered, check whether
         # to pre-register a host audio stream so it appears in the
@@ -2394,6 +2401,23 @@ class SessionOrchestrator:
         if self._log_writer is not None:
             self._log_writer.log_health(event)
         self.health.observe_health(event.stream_id, event)
+
+    def _emit_writer_stats(self, stream_id: str) -> None:
+        """Emit WriterStats to the health system at most ~10 Hz per stream."""
+        import time as _t
+        from syncfield.health.types import WriterStats
+        now = _t.monotonic_ns()
+        last = self._last_writer_stats_emit_at.get(stream_id, 0)
+        if now - last < 100_000_000:   # 100 ms throttle
+            return
+        self._last_writer_stats_emit_at[stream_id] = now
+        self.health.observe_writer_stats(
+            stream_id,
+            WriterStats(
+                stream_id=stream_id, at_ns=now,
+                queue_depth=0, queue_capacity=1, dropped=0,
+            ),
+        )
 
     def _persist_incident(self, incident) -> None:
         """Forward incidents to the session log writer + attach crash dumps.

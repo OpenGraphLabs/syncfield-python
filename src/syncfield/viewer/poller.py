@@ -72,9 +72,9 @@ class SessionPoller:
         self._open_by_id: dict[str, Incident] = {}
         self._resolved: deque[Incident] = deque(maxlen=20)
 
-        session.health.on_incident_opened = self._ingest_incident
-        session.health.on_incident_updated = self._ingest_incident
-        session.health.on_incident_closed = self._ingest_incident
+        session.health.on_incident_opened(self._ingest_incident)
+        session.health.on_incident_updated(self._ingest_incident)
+        session.health.on_incident_closed(self._ingest_incident)
 
     # ------------------------------------------------------------------
     # Public API
