@@ -47,8 +47,6 @@ class FpsDropDetector(DetectorBase):
         self._fire_active: Dict[str, bool] = {}
         # Same thing for recovery tracking.
         self._recovery_began_at: Dict[str, Optional[int]] = {}
-        # Track the most recent observation, for incremental dip tracking
-        self._last_observed_state: Dict[str, bool] = {}  # True if in drop, False if not
 
     # --- observers -------------------------------------------------------
 
@@ -74,12 +72,9 @@ class FpsDropDetector(DetectorBase):
             if observed < target * self._drop_ratio:
                 began = self._dip_began_at.get(stream_id)
                 if began is None:
-                    # Find when the drop started by looking at the buffer
-                    dip_start = self._find_dip_start(buf, target, now_ns)
-                    self._dip_began_at[stream_id] = dip_start
-                    began = dip_start
-                elapsed = now_ns - began
-                if elapsed >= self._sustain_ns and not self._fire_active.get(stream_id, False):
+                    self._dip_began_at[stream_id] = now_ns
+                    began = now_ns
+                if (now_ns - began) >= self._sustain_ns and not self._fire_active.get(stream_id, False):
                     self._fire_active[stream_id] = True
                     out.append(HealthEvent(
                         stream_id=stream_id,
@@ -114,46 +109,6 @@ class FpsDropDetector(DetectorBase):
         return (now_ns - began) >= self._recovery_ns
 
     # --- helpers ---------------------------------------------------------
-
-    def _find_dip_start(self, buf: Deque[int], target: float, now_ns: int) -> int:
-        """Find the earliest time when FPS dropped below threshold."""
-        if not buf:
-            return now_ns
-        # Binary search to find when we first dropped below target
-        threshold = target * self._drop_ratio
-        left, right = 0, len(buf) - 1
-        result = buf[-1] if buf else now_ns
-
-        while left <= right:
-            mid = (left + right) // 2
-            # Check FPS from buf[mid] onwards
-            mid_time = buf[mid]
-            fps_from_mid = self._observed_fps_from(buf, mid_time, now_ns)
-
-            if fps_from_mid < threshold:
-                result = mid_time
-                right = mid - 1
-            else:
-                left = mid + 1
-
-        return result
-
-    def _observed_fps_from(self, buf: Deque[int], start_time: int, now_ns: int) -> Optional[float]:
-        """Calculate FPS from a specific start time to now."""
-        if not buf:
-            return None
-        count = sum(1 for t in buf if t >= start_time and t <= now_ns)
-        if count == 0:
-            return 0.0
-        elapsed_ns = now_ns - start_time
-        if elapsed_ns < _WINDOW_NS:
-            # Less than 1 second, use actual window
-            return count / (elapsed_ns / 1e9) if elapsed_ns > 0 else 0.0
-        else:
-            # More than 1 second, use 1-second rolling window from now
-            cutoff = now_ns - _WINDOW_NS
-            count = sum(1 for t in buf if t >= cutoff)
-            return count / (_WINDOW_NS / 1e9)
 
     def _effective_target(self, stream_id: str, now_ns: int) -> Optional[float]:
         declared = self._target_getter(stream_id)
