@@ -21,6 +21,8 @@ export interface StreamSnapshot {
   produces_file: boolean;
   /** Stream capabilities declared by the adapter. May be absent on older servers. */
   capabilities?: StreamCapabilities;
+  connection_state: ConnectionState;
+  connection_error: string | null;
 }
 
 export interface ChirpInfo {
@@ -30,6 +32,13 @@ export interface ChirpInfo {
 }
 
 export type Severity = "info" | "warning" | "error" | "critical";
+
+export type ConnectionState =
+  | "idle"
+  | "connecting"
+  | "connected"
+  | "failed"
+  | "disconnected";
 
 export interface IncidentArtifact {
   kind: string;
