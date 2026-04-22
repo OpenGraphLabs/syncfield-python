@@ -132,7 +132,7 @@ class HealthWorker:
         for msg in _drain_queue(self._healths):
             for d in self._detectors:
                 d.observe_health(msg.stream_id, msg.event)
-            self._tracker.ingest(msg.event)
+            self._safe_ingest(msg.event)
         for msg in _drain_queue(self._states):
             for d in self._detectors:
                 d.observe_state(msg.old, msg.new)
@@ -144,7 +144,18 @@ class HealthWorker:
         now = time.monotonic_ns()
         for d in self._detectors:
             for event in d.tick(now):
-                self._tracker.ingest(event)
+                self._safe_ingest(event)
+
+    def _safe_ingest(self, event: HealthEvent) -> None:
+        """Ingest but never let a malformed event crash the worker thread."""
+        try:
+            self._tracker.ingest(event)
+        except Exception as exc:   # noqa: BLE001 — telemetry must not crash
+            import logging
+            logging.getLogger(__name__).warning(
+                "IncidentTracker.ingest dropped event: %s (fingerprint=%r, source=%r)",
+                exc, event.fingerprint, event.source,
+            )
 
 
 def _drain_queue(q: "queue.SimpleQueue") -> list:
