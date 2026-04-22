@@ -196,6 +196,7 @@ class StreamCapabilities:
     supports_precise_timestamps: bool = False
     is_removable: bool = False
     produces_file: bool = False
+    target_hz: float | None = None
     live_preview: bool = True
 
     def to_dict(self) -> dict[str, Any]:
@@ -204,6 +205,7 @@ class StreamCapabilities:
             "supports_precise_timestamps": self.supports_precise_timestamps,
             "is_removable": self.is_removable,
             "produces_file": self.produces_file,
+            "target_hz": self.target_hz,
             "live_preview": self.live_preview,
         }
 
@@ -336,6 +338,7 @@ class FinalizationReport:
     error: str | None
     jitter_p95_ns: int | None = None
     jitter_p99_ns: int | None = None
+    incidents: list = field(default_factory=list)
 
 
 @dataclass(frozen=True)

@@ -183,6 +183,7 @@ class TestStreamCapabilities:
             "supports_precise_timestamps": False,
             "is_removable": True,
             "produces_file": True,
+            "target_hz": None,
             "live_preview": True,
         }
 
