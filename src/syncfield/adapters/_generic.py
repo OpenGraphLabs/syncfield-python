@@ -58,12 +58,17 @@ class _SensorWriteCore:
             self._last_at_ns = None
 
 
-def _default_sensor_capabilities(*, precise: bool) -> StreamCapabilities:
+def _default_sensor_capabilities(
+    *,
+    precise: bool,
+    target_hz: Optional[float] = None,
+) -> StreamCapabilities:
     return StreamCapabilities(
         provides_audio_track=False,
         supports_precise_timestamps=precise,
         is_removable=False,
         produces_file=False,  # orchestrator handles JSONL persistence
+        target_hz=target_hz,
     )
 
 
@@ -71,7 +76,8 @@ def _resolve_capabilities(
     user: Optional[StreamCapabilities],
     *,
     precise: bool,
+    target_hz: Optional[float] = None,
 ) -> StreamCapabilities:
     if user is not None:
         return user
-    return _default_sensor_capabilities(precise=precise)
+    return _default_sensor_capabilities(precise=precise, target_hz=target_hz)

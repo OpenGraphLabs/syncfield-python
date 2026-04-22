@@ -91,6 +91,7 @@ class UVCWebcamStream(StreamBase):
                 supports_precise_timestamps=True,
                 is_removable=True,
                 produces_file=True,
+                target_hz=(float(fps) if fps is not None else None),
             ),
         )
         self._device_index = device_index

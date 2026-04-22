@@ -116,6 +116,7 @@ class MetaQuestCameraStream(StreamBase):
                 supports_precise_timestamps=True,
                 is_removable=True,
                 produces_file=True,
+                target_hz=float(fps),
             ),
         )
         self._quest_host = quest_host
