@@ -88,6 +88,8 @@ class StreamSnapshot:
     plot_points: Dict[str, Tuple[List[float], List[float]]]
     latest_pose: Dict[str, List[float]]
     live_preview: bool = True
+    connection_state: str = "idle"
+    connection_error: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
