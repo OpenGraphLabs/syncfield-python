@@ -69,3 +69,30 @@ def test_health_system_callbacks_fire_on_open_and_close():
         hs.stop()
     assert opened, "incident was not opened"
     assert closed, "incident was not closed"
+
+
+def test_health_system_double_start_is_idempotent():
+    hs = HealthSystem()
+    hs.start()
+    first_worker = hs._worker
+    hs.start()   # should not spin up a new thread
+    second_worker = hs._worker
+    try:
+        assert first_worker is second_worker, "start() should be idempotent"
+    finally:
+        hs.stop()
+
+
+def test_health_system_register_after_start_warns():
+    import warnings
+
+    hs = HealthSystem()
+    hs.start()
+    try:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            hs.register(Custom())
+            assert any(issubclass(w.category, RuntimeWarning) for w in caught)
+            assert any("after HealthSystem.start()" in str(w.message) for w in caught)
+    finally:
+        hs.stop()

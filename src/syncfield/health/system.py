@@ -45,8 +45,17 @@ class HealthSystem:
     # --- registry --------------------------------------------------------
 
     def register(self, detector: Detector) -> None:
+        import warnings
         self._registry.register(detector)
         self._tracker.bind_detector(detector)
+        if self._worker is not None:
+            warnings.warn(
+                f"Detector '{detector.name}' registered after HealthSystem.start(); "
+                "it will be bound for close-condition routing but will NOT be ticked "
+                "until the system is stopped and restarted.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
     def unregister(self, name: str) -> None:
         self._registry.unregister(name)
@@ -75,6 +84,8 @@ class HealthSystem:
     # --- lifecycle -------------------------------------------------------
 
     def start(self) -> None:
+        if self._worker is not None:
+            return  # already running — idempotent
         self._worker = HealthWorker(
             tracker=self._tracker,
             detectors=list(self._registry),
