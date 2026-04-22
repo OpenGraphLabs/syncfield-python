@@ -135,7 +135,7 @@ class IncidentSnapshot:
     event_count: int
     detail: str | None
     ago_s: float
-    artifacts: List[dict]
+    artifacts: List[dict[str, Any]]
 
     @property
     def is_open(self) -> bool:

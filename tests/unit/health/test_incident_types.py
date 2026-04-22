@@ -83,3 +83,16 @@ def test_incident_snapshot_shape():
     assert snap.severity == "error"
     assert snap.is_open is True
     assert snap.ago_s >= 0
+
+
+def test_incident_snapshot_uses_closed_at_as_anchor_when_closed():
+    inc = Incident.opened_from(_ev(1_000_000_000), title="t")
+    inc.record_event(_ev(1_100_000_000))   # last_event_at_ns = 1.1s
+    inc.close(at_ns=1_500_000_000)          # closed 500ms later
+
+    # now_ns is 2s after close
+    snap = IncidentSnapshot.from_incident(inc, now_ns=3_500_000_000)
+    assert snap.is_open is False
+    assert snap.closed_at_ns == 1_500_000_000
+    # ago_s is measured from closed_at_ns, not last_event_at_ns.
+    assert abs(snap.ago_s - 2.0) < 0.01
