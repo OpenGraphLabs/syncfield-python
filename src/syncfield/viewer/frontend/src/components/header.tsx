@@ -61,6 +61,13 @@ export function Header({
   const elapsed = snapshot?.elapsed_s ?? 0;
   const isRecording = state === "recording";
 
+  const streams = Object.values(snapshot?.streams ?? {});
+  const total = streams.length;
+  const connected = streams.filter((s) => s.connection_state === "connected").length;
+  const showCount = total > 0 && connected < total;
+  const stateLabel = friendlyState(state);
+  const displayedLabel = showCount ? `${stateLabel} (${connected}/${total})` : stateLabel;
+
   return (
     <header
       className={cn(
@@ -98,10 +105,14 @@ export function Header({
             <span
               className={cn(
                 "text-xs font-medium",
-                isRecording ? "text-recording" : "text-muted",
+                showCount
+                  ? "rounded px-1.5 py-0.5 bg-yellow-500/15 text-yellow-300 border border-yellow-500/40"
+                  : isRecording
+                    ? "text-recording"
+                    : "text-muted",
               )}
             >
-              {friendlyState(state)}
+              {displayedLabel}
             </span>
           </div>
 
