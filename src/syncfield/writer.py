@@ -116,21 +116,31 @@ class SessionLogWriter:
     crash mid-recording and the core service can reconstruct partial
     sessions from the file.
 
-    Output file: ``session_log.jsonl``
+    Output files:
+    - ``session_log.jsonl`` — state transitions and health events
+    - ``incidents.jsonl`` — incident lifecycle events
     """
 
     def __init__(self, output_dir: Path) -> None:
         self._path = output_dir / "session_log.jsonl"
+        self._incidents_path = output_dir / "incidents.jsonl"
         self._handle: IO[str] | None = None
+        self._incidents_handle: IO[str] | None = None
 
     @property
     def path(self) -> Path:
         return self._path
 
+    @property
+    def incidents_path(self) -> Path:
+        return self._incidents_path
+
     def open(self) -> None:
-        """Open the log file for writing. Idempotent on an already-open writer."""
+        """Open the log files for writing. Idempotent on an already-open writer."""
         if self._handle is None:
             self._handle = open(self._path, "w")
+        if self._incidents_handle is None:
+            self._incidents_handle = open(self._incidents_path, "w")
 
     def log_event(self, event: dict[str, Any]) -> None:
         """Serialize *event* as a single JSON line and flush.
@@ -155,10 +165,24 @@ class SessionLogWriter:
             }
         )
 
+    def log_incident(self, incident: Any) -> None:
+        """Serialize an :class:`Incident` as a single JSON line and flush.
+
+        Raises:
+            RuntimeError: If the writer has not been opened.
+        """
+        if self._incidents_handle is None:
+            raise RuntimeError("SessionLogWriter is not open")
+        self._incidents_handle.write(json.dumps(incident.to_dict(), separators=(",", ":")) + "\n")
+        self._incidents_handle.flush()
+
     def close(self) -> None:
         if self._handle is not None:
             self._handle.close()
             self._handle = None
+        if self._incidents_handle is not None:
+            self._incidents_handle.close()
+            self._incidents_handle = None
 
 
 def write_sync_point(
