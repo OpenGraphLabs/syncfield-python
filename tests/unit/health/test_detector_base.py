@@ -44,3 +44,9 @@ def test_grandchild_subclass_must_redeclare_if_needed():
     # subclassing DetectorBase again (which must itself declare attrs).
     # The more important invariant is covered by the existing
     # test_detector_base_requires_name_and_severity.
+
+
+def test_detector_base_observe_connection_state_default_is_noop():
+    d = NoopDetector()
+    # Does not raise; returns None.
+    assert d.observe_connection_state("cam", "connected", 100) is None
