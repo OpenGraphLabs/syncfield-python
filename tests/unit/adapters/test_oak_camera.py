@@ -416,3 +416,58 @@ class TestImportGuard:
         monkeypatch.delattr(_pkg, "oak_camera", raising=False)
         with pytest.raises(ImportError, match=r"syncfield\[oak\]"):
             importlib.import_module("syncfield.adapters.oak_camera")
+
+
+class TestDeviceShutterHostNs:
+    """``_device_shutter_host_ns`` projects the DepthAI on-device shutter
+    instant onto the host monotonic clock, as integer nanoseconds.
+
+    It is called on every frame before the message reaches any handler,
+    so the contract is: never raise, return ``None`` on any form of
+    missing / malformed timestamp, and use integer arithmetic to avoid
+    float rounding at the ~10¹⁸ ns magnitudes reached after long uptimes.
+    """
+
+    def _load_helper(self, mock_depthai):  # noqa: ARG002 - fixture runs for side effects
+        from syncfield.adapters.oak_camera import _device_shutter_host_ns
+        return _device_shutter_host_ns
+
+    def test_converts_timedelta_to_nanoseconds(self, mock_depthai):
+        from datetime import timedelta
+
+        helper = self._load_helper(mock_depthai)
+        msg = MagicMock()
+        # 5 s, 500 μs — a realistic pipeline-warmup-era value.
+        msg.getTimestamp.return_value = timedelta(seconds=5, microseconds=500)
+
+        assert helper(msg) == 5_000_500_000
+
+    def test_preserves_nanosecond_precision_for_large_values(self, mock_depthai):
+        """Integer math survives datetime's microsecond resolution AND the
+        ~10¹⁸ ns range reached after multi-day uptime."""
+        from datetime import timedelta
+
+        helper = self._load_helper(mock_depthai)
+        msg = MagicMock()
+        msg.getTimestamp.return_value = timedelta(days=1, seconds=2, microseconds=3)
+
+        # (86400 + 2) * 10⁹  +  3 * 10³
+        expected = (86_400 + 2) * 1_000_000_000 + 3 * 1_000
+        assert helper(msg) == expected
+
+    def test_none_message_returns_none(self, mock_depthai):
+        assert self._load_helper(mock_depthai)(None) is None
+
+    def test_get_timestamp_raising_returns_none(self, mock_depthai):
+        helper = self._load_helper(mock_depthai)
+        msg = MagicMock()
+        msg.getTimestamp.side_effect = RuntimeError("not ready yet")
+
+        assert helper(msg) is None
+
+    def test_get_timestamp_returning_none_returns_none(self, mock_depthai):
+        helper = self._load_helper(mock_depthai)
+        msg = MagicMock()
+        msg.getTimestamp.return_value = None
+
+        assert helper(msg) is None

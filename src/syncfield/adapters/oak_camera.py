@@ -77,6 +77,36 @@ from syncfield.types import (
 )
 
 
+def _device_shutter_host_ns(msg: Any) -> Optional[int]:
+    """Return the frame's shutter-close time, projected onto the host's
+    monotonic clock, as integer nanoseconds — or ``None`` if unavailable.
+
+    DepthAI periodically cross-correlates its on-chip Myriad-X clock with
+    the host's ``time.monotonic_ns()``, so ``msg.getTimestamp()`` returns
+    a ``datetime.timedelta`` whose value is the frame's **shutter instant
+    already translated into the host clock domain** — upstream of the
+    ISP / encoder / XLink pipeline depth that otherwise biases the
+    arrival-time ``capture_ns`` we stamp in the capture loop.
+
+    Adapters expose this alongside ``capture_ns`` (never in place of it)
+    so a downstream aligner can opportunistically anchor on the true
+    shutter instant for devices that provide one, and fall back to the
+    arrival timestamp for those that don't — preserving SyncField's
+    hardware-agnostic contract.
+    """
+    if msg is None:
+        return None
+    try:
+        td = msg.getTimestamp()
+    except Exception:
+        return None
+    if td is None:
+        return None
+    # Integer arithmetic — avoid float rounding at ns scale for the
+    # ~10¹⁸ ns magnitudes reached after long uptimes.
+    return ((td.days * 86_400 + td.seconds) * 1_000_000 + td.microseconds) * 1_000
+
+
 #: Supported RGB output encodings.
 #:
 #: * ``"h264"`` — on-device H.264 hardware encoder (default). Full-res
@@ -685,6 +715,14 @@ class OakCameraStream(StreamBase):
             if rgb_msg is None:
                 continue
 
+            # DepthAI projects the on-device shutter moment into host
+            # monotonic time — pull it here, *before* any handler touches
+            # the message, so downstream sync consumers can anchor on the
+            # true shutter instant instead of the pipeline-depth-biased
+            # arrival stamp. Surfaced via ``SampleEvent.channels`` so the
+            # orchestrator lands it in the jsonl ``extras``.
+            device_shutter_host_ns = _device_shutter_host_ns(rgb_msg)
+
             # Recording-window-only jitter collection (see UVC adapter for rationale).
             if self._recording:
                 if self._prev_capture_ns is not None:
@@ -692,14 +730,19 @@ class OakCameraStream(StreamBase):
                 self._prev_capture_ns = capture_ns
 
             if self._encoding == OAK_ENCODING_H264:
-                self._handle_encoded_packet(rgb_msg, capture_ns)
+                self._handle_encoded_packet(rgb_msg, capture_ns, device_shutter_host_ns)
             else:
-                self._handle_raw_frame(rgb_msg, capture_ns)
+                self._handle_raw_frame(rgb_msg, capture_ns, device_shutter_host_ns)
 
             if self._recording and self._depth_enabled:
                 self._drain_depth_tick()
 
-    def _handle_encoded_packet(self, msg: Any, capture_ns: int) -> None:
+    def _handle_encoded_packet(
+        self,
+        msg: Any,
+        capture_ns: int,
+        device_shutter_host_ns: Optional[int],
+    ) -> None:
         """h264 mode — write the on-device encoded packet to the raw
         ``.h264`` file and emit a :class:`SampleEvent`.
 
@@ -717,15 +760,26 @@ class OakCameraStream(StreamBase):
             # ``getData()`` returns a depthai ``VectorUChar``; ``bytes(...)``
             # gives us a plain buffer the OS write path prefers.
             self._h264_file.write(bytes(msg.getData()))
+        channels = (
+            {"device_shutter_host_ns": device_shutter_host_ns}
+            if device_shutter_host_ns is not None
+            else None
+        )
         self._emit_sample(
             SampleEvent(
                 stream_id=self.id,
                 frame_number=self._frame_count - 1,
                 capture_ns=capture_ns,
+                channels=channels,
             )
         )
 
-    def _handle_raw_frame(self, msg: Any, capture_ns: int) -> None:
+    def _handle_raw_frame(
+        self,
+        msg: Any,
+        capture_ns: int,
+        device_shutter_host_ns: Optional[int],
+    ) -> None:
         """raw mode — publish the BGR frame for preview and host-encode
         via PyAV.
         """
@@ -741,11 +795,17 @@ class OakCameraStream(StreamBase):
         self._frame_count += 1
         if self._video_writer is not None:
             self._video_writer.write(frame)
+        channels = (
+            {"device_shutter_host_ns": device_shutter_host_ns}
+            if device_shutter_host_ns is not None
+            else None
+        )
         self._emit_sample(
             SampleEvent(
                 stream_id=self.id,
                 frame_number=self._frame_count - 1,
                 capture_ns=capture_ns,
+                channels=channels,
             )
         )
 

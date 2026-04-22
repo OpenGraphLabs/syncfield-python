@@ -68,6 +68,42 @@ def test_frame_timestamp_from_dict_defaults():
     assert ts.uncertainty_ns == 5_000_000
 
 
+def test_frame_timestamp_extras_land_at_top_level():
+    """Adapter-specific scalars pushed through ``extras`` (e.g. the OAK
+    adapter's ``device_shutter_host_ns``, the Quest camera's
+    ``quest_native_ns``) must appear as **top-level** JSONL fields so
+    downstream readers can pick them up without schema migration."""
+    ts = FrameTimestamp(
+        frame_number=7,
+        capture_ns=1_000_000_000,
+        clock_domain="rig_01",
+        extras={"device_shutter_host_ns": 999_500_000},
+    )
+    d = ts.to_dict()
+    assert d["device_shutter_host_ns"] == 999_500_000
+    # Base schema fields still present and unaltered.
+    assert d["frame_number"] == 7
+    assert d["capture_ns"] == 1_000_000_000
+    assert d["clock_source"] == "host_monotonic"
+
+
+def test_frame_timestamp_extras_round_trip():
+    """from_dict keeps unknown top-level fields in ``extras`` so a
+    recorder-emitted jsonl row round-trips without losing adapter
+    metadata (``device_shutter_host_ns`` is the current driver)."""
+    raw = {
+        "frame_number": 3,
+        "capture_ns": 500,
+        "clock_source": "host_monotonic",
+        "clock_domain": "rig_01",
+        "uncertainty_ns": 5_000_000,
+        "device_shutter_host_ns": 450,
+    }
+    ts = FrameTimestamp.from_dict(raw)
+    assert ts.extras == {"device_shutter_host_ns": 450}
+    assert ts.to_dict() == raw
+
+
 # --- SensorSample tests ---
 
 
