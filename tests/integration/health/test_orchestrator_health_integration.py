@@ -1,4 +1,6 @@
 """Integration: real SessionOrchestrator + FakeStream → incidents flow end-to-end."""
+from __future__ import annotations
+
 import json
 import threading
 import time
