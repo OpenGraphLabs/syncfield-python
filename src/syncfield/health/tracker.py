@@ -34,6 +34,11 @@ class IncidentTracker:
     # --- event ingestion -------------------------------------------------
 
     def ingest(self, event: HealthEvent) -> None:
+        if not event.fingerprint:
+            raise ValueError(
+                "HealthEvent.fingerprint is required before reaching the IncidentTracker; "
+                "the platform fills it in for adapter events, detectors set their own."
+            )
         open_inc = self._by_fingerprint.get(event.fingerprint)
         if open_inc is None:
             inc = Incident.opened_from(event, title=_title_from(event))

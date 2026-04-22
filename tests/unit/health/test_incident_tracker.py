@@ -1,5 +1,7 @@
 from typing import List
 
+import pytest
+
 from syncfield.health.detector import DetectorBase
 from syncfield.health.severity import Severity
 from syncfield.health.tracker import IncidentTracker
@@ -113,3 +115,14 @@ def test_tracker_flush_callbacks_fire_on_update_too():
     tr.ingest(_ev(200))      # updates
     tr.ingest(_ev(300))      # updates
     assert len(updates) == 2
+
+
+def test_tracker_rejects_empty_fingerprint():
+    tr = IncidentTracker()
+    with pytest.raises(ValueError, match="fingerprint"):
+        tr.ingest(HealthEvent(
+            stream_id="cam",
+            kind=HealthEventKind.ERROR,
+            at_ns=1,
+            # fingerprint defaults to ""
+        ))
