@@ -126,3 +126,28 @@ def test_worker_stop_is_idempotent():
     w.start()
     w.stop()
     w.stop()  # does not raise
+
+
+def test_worker_drains_connection_state_queue_and_fans_out():
+    class Spy(DetectorBase):
+        name = "conn-spy"
+        default_severity = Severity.INFO
+
+        def __init__(self):
+            self.calls = []
+
+        def observe_connection_state(self, stream_id, new_state, at_ns):
+            self.calls.append((stream_id, new_state, at_ns))
+
+    tr = IncidentTracker()
+    spy = Spy()
+    w = HealthWorker(tracker=tr, detectors=[spy], tick_hz=100)
+    w.start()
+    try:
+        w.push_connection_state("cam", "connecting", 1)
+        w.push_connection_state("cam", "connected", 2)
+        assert _wait_until(lambda: len(spy.calls) == 2)
+    finally:
+        w.stop()
+
+    assert spy.calls == [("cam", "connecting", 1), ("cam", "connected", 2)]

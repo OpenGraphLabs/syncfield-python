@@ -45,6 +45,13 @@ class _WriterStatsMsg:
     stats: WriterStats
 
 
+@dataclass(frozen=True)
+class _ConnectionStateMsg:
+    stream_id: str
+    new_state: str
+    at_ns: int
+
+
 class HealthWorker:
     def __init__(
         self,
@@ -65,6 +72,7 @@ class HealthWorker:
         self._healths: "queue.SimpleQueue[_HealthMsg]" = queue.SimpleQueue()
         self._states: "queue.SimpleQueue[_StateMsg]" = queue.SimpleQueue()
         self._writer_stats: "queue.SimpleQueue[_WriterStatsMsg]" = queue.SimpleQueue()
+        self._connection_states: "queue.SimpleQueue[_ConnectionStateMsg]" = queue.SimpleQueue()
 
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -82,6 +90,9 @@ class HealthWorker:
 
     def push_writer_stats(self, stream_id: str, stats: WriterStats) -> None:
         self._writer_stats.put(_WriterStatsMsg(stream_id, stats))
+
+    def push_connection_state(self, stream_id: str, new_state: str, at_ns: int) -> None:
+        self._connection_states.put(_ConnectionStateMsg(stream_id, new_state, at_ns))
 
     # --- lifecycle -------------------------------------------------------
 
@@ -139,6 +150,9 @@ class HealthWorker:
         for msg in _drain_queue(self._writer_stats):
             for d in self._detectors:
                 d.observe_writer_stats(msg.stream_id, msg.stats)
+        for msg in _drain_queue(self._connection_states):
+            for d in self._detectors:
+                d.observe_connection_state(msg.stream_id, msg.new_state, msg.at_ns)
 
     def _fire_detector_ticks(self) -> None:
         now = time.monotonic_ns()
