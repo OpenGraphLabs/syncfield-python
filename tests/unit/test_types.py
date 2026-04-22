@@ -220,6 +220,10 @@ class TestHealthEvent:
             "kind": "drop",
             "at_ns": 42,
             "detail": "buffer overflow",
+            "severity": "info",
+            "source": "unknown",
+            "fingerprint": "",
+            "data": {},
         }
 
 
@@ -288,3 +292,38 @@ class TestSessionReport:
         )
         assert report.host_id == "rig_01"
         assert report.finalizations == []
+
+
+from syncfield.health.severity import Severity
+
+
+def test_health_event_has_enrichment_fields_with_defaults():
+    ev = HealthEvent(
+        stream_id="cam",
+        kind=HealthEventKind.ERROR,
+        at_ns=1_000,
+        detail="boom",
+    )
+    # new fields default to safe values when caller does not set them.
+    assert ev.severity == Severity.INFO
+    assert ev.source == "unknown"
+    assert ev.fingerprint == ""
+    assert ev.data == {}
+
+
+def test_health_event_to_dict_includes_new_fields():
+    ev = HealthEvent(
+        stream_id="cam",
+        kind=HealthEventKind.ERROR,
+        at_ns=1_000,
+        detail="boom",
+        severity=Severity.ERROR,
+        source="adapter:oak",
+        fingerprint="cam:adapter:xlink-error",
+        data={"stream": "__x_0_1"},
+    )
+    d = ev.to_dict()
+    assert d["severity"] == "error"
+    assert d["source"] == "adapter:oak"
+    assert d["fingerprint"] == "cam:adapter:xlink-error"
+    assert d["data"] == {"stream": "__x_0_1"}
