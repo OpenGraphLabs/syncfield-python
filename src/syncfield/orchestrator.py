@@ -392,6 +392,14 @@ class SessionOrchestrator:
         self._sample_writers: Dict[str, SampleWriter] = {}
         self._sample_handler_active: Dict[str, List[bool]] = {}
 
+        # Health telemetry — constructed once per orchestrator instance,
+        # started/stopped alongside each recording cycle.
+        from syncfield.health import HealthSystem
+        self.health = HealthSystem()
+        self.health.on_incident_opened = self._persist_incident
+        self.health.on_incident_updated = self._persist_incident
+        self.health.on_incident_closed = self._persist_incident
+
         # Multi-host: start control plane + advertiser (or follower browser)
         # at construction time so cluster discovery is independent of device
         # lifecycle. Failures here raise out of __init__ (the constructor is
@@ -1502,6 +1510,7 @@ class SessionOrchestrator:
 
         self._streams[stream.id] = stream
         stream.on_health(self._on_stream_health)
+        stream.on_sample(lambda s, _sid=stream.id: self.health.observe_sample(_sid, s))
 
         # After the first non-audio stream is registered, check whether
         # to pre-register a host audio stream so it appears in the
@@ -1632,6 +1641,10 @@ class SessionOrchestrator:
             # This enables multi-host cross-correlation sync without the
             # user having to add an audio stream manually.
             self._maybe_inject_host_audio()
+
+            # Start the health worker so samples flowing from stream.connect()
+            # onward are observed. Idempotent — safe to call again in start().
+            self.health.start()
 
             self._transition(SessionState.CONNECTED)
 
@@ -1848,6 +1861,7 @@ class SessionOrchestrator:
             # the recorded audio track, so we wait until every stream
             # has enabled file writing before playing it.
             self._maybe_play_start_chirp()
+            self.health.start()
             self._transition(SessionState.RECORDING)
 
             # Distribute the leader's SessionConfig to every preparing
@@ -1917,6 +1931,20 @@ class SessionOrchestrator:
             self._maybe_play_stop_chirp_and_wait()
 
             finalizations = self._finalize_streams()
+
+            # Stop the health worker and close any still-open incidents.
+            # Must run AFTER finalize_streams (so stall detectors see the
+            # stream stop) but BEFORE closing _log_writer (so
+            # _persist_incident can still flush to incidents.jsonl).
+            self.health.stop()
+            all_incidents = list(self.health.open_incidents()) + list(
+                self.health.resolved_incidents()
+            )
+            by_stream: Dict[str, list] = {}
+            for inc in all_incidents:
+                by_stream.setdefault(inc.stream_id, []).append(inc)
+            for report in finalizations:
+                report.incidents = by_stream.get(report.stream_id, [])
 
             # Leader: flip advert status to stopped BEFORE closing the
             # advertiser so every follower on the network observes the
@@ -2077,6 +2105,9 @@ class SessionOrchestrator:
             # Multi-host infrastructure (advertiser, browser, control plane)
             # stays up across disconnect(). It was brought up at __init__
             # and is only torn down by shutdown() or the atexit handler.
+
+            # Stop health worker — no-op if already stopped by stop().
+            self.health.stop(close_open_incidents=False)
 
             self._transition(SessionState.IDLE)
             if self._log_writer is not None:
@@ -2328,6 +2359,7 @@ class SessionOrchestrator:
         """
         old = self._state
         self._state = new_state
+        self.health.observe_state(old, new_state)
         if self._log_writer is not None:
             self._log_writer.log_event(
                 {
@@ -2361,6 +2393,30 @@ class SessionOrchestrator:
         """
         if self._log_writer is not None:
             self._log_writer.log_health(event)
+        self.health.observe_health(event.stream_id, event)
+
+    def _persist_incident(self, incident) -> None:
+        """Forward incidents to the session log writer + attach crash dumps.
+
+        Called from the HealthWorker thread — must not raise or the worker dies.
+        """
+        # Attach crash_dump artifacts for device-crash incidents (idempotent).
+        if incident.fingerprint.endswith(":device-crash"):
+            path = (
+                incident.first_event.data.get("crash_dump_path")
+                if incident.first_event.data
+                else None
+            )
+            if path and not any(a.kind == "crash_dump" for a in incident.artifacts):
+                from syncfield.health.types import IncidentArtifact
+                incident.attach(IncidentArtifact(kind="crash_dump", path=str(path)))
+
+        if self._log_writer is not None:
+            try:
+                self._log_writer.log_incident(incident)
+            except Exception:
+                # Never let telemetry persistence crash the recording.
+                pass
 
     # ------------------------------------------------------------------
     # Episode lifecycle
