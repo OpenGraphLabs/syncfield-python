@@ -278,7 +278,7 @@ class HealthEvent:
             "severity": self.severity.value,
             "source": self.source,
             "fingerprint": self.fingerprint,
-            "data": self.data,
+            "data": dict(self.data),
         }
 
 
