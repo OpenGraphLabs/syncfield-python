@@ -48,3 +48,18 @@ def test_closes_after_phase_success_signal():
         data={"phase": "connect", "outcome": "success"},
     ))
     assert d.close_condition(inc, now_ns=400) is True
+
+
+def test_success_clears_pending_so_no_stale_fire():
+    d = StartupFailureDetector()
+    # Error first, then success.
+    d.observe_health("cam", _ev_for("connect"))
+    d.observe_health("cam", HealthEvent(
+        stream_id="cam", kind=HealthEventKind.HEARTBEAT, at_ns=50, detail="connected",
+        severity=Severity.INFO, source="orchestrator",
+        fingerprint="cam:adapter:startup-success",
+        data={"phase": "connect", "outcome": "success"},
+    ))
+
+    # Next tick should emit nothing — success arrived before any tick fired.
+    assert list(d.tick(now_ns=200)) == []

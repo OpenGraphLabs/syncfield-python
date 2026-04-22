@@ -36,6 +36,9 @@ class StartupFailureDetector(DetectorBase):
             self._recovered.discard(stream_id)
         elif outcome == "success":
             self._recovered.add(stream_id)
+            # Clear any stale pending failure so the next tick doesn't emit it
+            # as a spurious post-recovery event.
+            self._pending_failures.pop(stream_id, None)
 
     def tick(self, now_ns: int) -> Iterator[HealthEvent]:
         out: List[HealthEvent] = []
