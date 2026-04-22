@@ -1326,7 +1326,7 @@ class SessionOrchestrator:
         # 1. Stop each stream that's currently recording. Must happen
         #    BEFORE closing writers so any in-flight samples are
         #    flushed before the file handles go away.
-        recording_streams = list(self._streams.values())
+        recording_streams = list(self._connected_streams)
         _rollback_stop_recording(recording_streams)
 
         # 2. Close sample writers — matches the happy stop() flow so
@@ -1866,7 +1866,7 @@ class SessionOrchestrator:
 
             recording: List[Stream] = []
             try:
-                for stream in self._streams.values():
+                for stream in self._connected_streams:
                     stream.start_recording(self._session_clock)
                     recording.append(stream)
             except Exception as exc:
@@ -2166,7 +2166,7 @@ class SessionOrchestrator:
         before moving on to the next.
         """
         finalizations: List[FinalizationReport] = []
-        for stream in self._streams.values():
+        for stream in self._connected_streams:
             try:
                 report = stream.stop_recording()
             except Exception as exc:
@@ -2213,7 +2213,7 @@ class SessionOrchestrator:
         capture thread become no-ops instead of writing to a closed
         writer.
         """
-        for stream in self._streams.values():
+        for stream in self._connected_streams:
             writer: SampleWriter
             if stream.kind == "sensor":
                 writer = SensorWriter(stream.id, self._output_dir)

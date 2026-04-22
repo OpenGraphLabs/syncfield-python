@@ -299,6 +299,11 @@ class TestStartHappyPath:
 
 class TestStartRollback:
     def test_failure_during_start_rolls_back_prior_streams(self, tmp_path):
+        """Under partial-connect semantics a stream with fail_on_start=True
+        fails at connect() time — it is never added to _connected_streams and
+        is therefore skipped during start_recording().  The two healthy streams
+        both connect and start successfully, so start() no longer raises.
+        """
         session = _session(tmp_path)
         good1 = FakeStream("a")
         bad = FakeStream("b", fail_on_start=True)
@@ -307,20 +312,21 @@ class TestStartRollback:
         session.add(bad)
         session.add(good2)
 
-        with pytest.raises(RuntimeError, match="fake failure in start"):
-            session.start()
+        # start() must NOT raise — partial-connect isolated the failure
+        session.start()
 
-        # good1 was started → must be rolled back (stop called)
+        # good1 and good2 connected and started
         assert good1.start_calls == 1
-        assert good1.stop_calls == 1
-        # bad raised during start → stop should NOT be called on it
-        assert bad.start_calls == 1
+        assert good2.start_calls == 1
+        # bad failed during connect() — start_recording was never called on it
+        assert bad.start_calls == 0
         assert bad.stop_calls == 0
-        # good2 never reached start
-        assert good2.start_calls == 0
-        assert good2.stop_calls == 0
 
-        assert session.state is SessionState.IDLE
+        assert session.state is SessionState.RECORDING
+
+        session.stop()
+        # Auto-connect path lands in STOPPED (not IDLE) after stop()
+        assert session.state is SessionState.STOPPED
 
     def test_failure_during_prepare_isolated_to_failing_stream(self, tmp_path):
         """A prepare() failure in the connect phase is now isolated to the
@@ -1361,9 +1367,18 @@ class TestSessionLog:
         session.stop()
 
     def test_rollback_is_logged(self, tmp_path):
+        """A stream that connects successfully but raises during start_recording()
+        must cause a rollback log entry.  Under partial-connect semantics
+        fail_on_start=True causes connect() to fail (not start_recording()), so
+        we use a custom subclass that overrides start_recording() directly.
+        """
+        class FailOnStartRecording(FakeStream):
+            def start_recording(self, session_clock):
+                raise RuntimeError("fake failure in start_recording")
+
         session = _session(tmp_path)
         session.add(FakeStream("a"))
-        session.add(FakeStream("b", fail_on_start=True))
+        session.add(FailOnStartRecording("b"))
         # Capture the episode dir before start() — rollback happens inside
         # start() and _prepare_next_episode() rotates output_dir in that path.
         episode_dir = session.output_dir

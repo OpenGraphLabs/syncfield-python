@@ -78,3 +78,38 @@ def test_startup_failure_event_reaches_health_system(tmp_path: Path):
     assert ev.data.get("phase") == "connect"
     assert ev.data.get("outcome") == "error"
     assert ev.data.get("error")
+
+
+def test_failed_stream_is_skipped_during_recording(tmp_path: Path):
+    from syncfield.testing import FakeStream
+
+    class CountingFakeStream(FakeStream):
+        def __init__(self, stream_id, fail_on_start=False):
+            super().__init__(stream_id, fail_on_start=fail_on_start)
+            self.start_recording_calls = 0
+            self.stop_recording_calls = 0
+
+        def start_recording(self, session_clock):
+            self.start_recording_calls += 1
+            return super().start_recording(session_clock)
+
+        def stop_recording(self):
+            self.stop_recording_calls += 1
+            return super().stop_recording()
+
+    sess = SessionOrchestrator(host_id="h", output_dir=tmp_path)
+    good = CountingFakeStream("good")
+    bad = CountingFakeStream("bad", fail_on_start=True)
+    sess.add(good)
+    sess.add(bad)
+
+    sess.connect()
+    sess.start(countdown_s=0)
+    sess.stop()
+
+    assert good.start_recording_calls > 0
+    assert good.stop_recording_calls > 0
+    # The failed stream's hardware was never opened, so start/stop_recording
+    # must not have been called on it.
+    assert bad.start_recording_calls == 0
+    assert bad.stop_recording_calls == 0
