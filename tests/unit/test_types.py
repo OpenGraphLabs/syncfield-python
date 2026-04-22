@@ -1,6 +1,11 @@
 """Tests for syncfield.types."""
 
+import pytest
+from dataclasses import FrozenInstanceError
+from pathlib import Path
+
 from syncfield.types import FrameTimestamp, SensorSample, SyncPoint
+from syncfield.health.severity import Severity
 
 
 def test_sync_point_create_now():
@@ -134,10 +139,6 @@ def test_sensor_sample_nested_round_trip():
     assert restored.channels["gestures"]["pinch"] == 0.95
 
 
-import pytest
-from dataclasses import FrozenInstanceError
-from pathlib import Path
-
 from syncfield.types import (
     ChirpSpec,
     FinalizationReport,
@@ -182,6 +183,7 @@ class TestStreamCapabilities:
             "supports_precise_timestamps": False,
             "is_removable": True,
             "produces_file": True,
+            "target_hz": None,
             "live_preview": True,
         }
 
@@ -220,7 +222,41 @@ class TestHealthEvent:
             "kind": "drop",
             "at_ns": 42,
             "detail": "buffer overflow",
+            "severity": "info",
+            "source": "unknown",
+            "fingerprint": "",
+            "data": {},
         }
+
+    def test_health_event_has_enrichment_fields_with_defaults(self):
+        ev = HealthEvent(
+            stream_id="cam",
+            kind=HealthEventKind.ERROR,
+            at_ns=1_000,
+            detail="boom",
+        )
+        # new fields default to safe values when caller does not set them.
+        assert ev.severity == Severity.INFO
+        assert ev.source == "unknown"
+        assert ev.fingerprint == ""
+        assert ev.data == {}
+
+    def test_health_event_to_dict_includes_new_fields(self):
+        ev = HealthEvent(
+            stream_id="cam",
+            kind=HealthEventKind.ERROR,
+            at_ns=1_000,
+            detail="boom",
+            severity=Severity.ERROR,
+            source="adapter:oak",
+            fingerprint="cam:adapter:xlink-error",
+            data={"stream": "__x_0_1"},
+        )
+        d = ev.to_dict()
+        assert d["severity"] == "error"
+        assert d["source"] == "adapter:oak"
+        assert d["fingerprint"] == "cam:adapter:xlink-error"
+        assert d["data"] == {"stream": "__x_0_1"}
 
 
 class TestSampleEvent:
@@ -288,3 +324,4 @@ class TestSessionReport:
         )
         assert report.host_id == "rig_01"
         assert report.finalizations == []
+

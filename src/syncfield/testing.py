@@ -20,6 +20,18 @@ from syncfield.types import (
 )
 
 
+def _severity_for(kind: HealthEventKind):
+    from syncfield.health.severity import Severity
+    mapping = {
+        HealthEventKind.HEARTBEAT: Severity.INFO,
+        HealthEventKind.RECONNECT: Severity.INFO,
+        HealthEventKind.DROP: Severity.WARNING,
+        HealthEventKind.WARNING: Severity.WARNING,
+        HealthEventKind.ERROR: Severity.ERROR,
+    }
+    return mapping.get(kind, Severity.WARNING)
+
+
 class FakeStream(StreamBase):
     """Programmable in-memory :class:`~syncfield.stream.Stream` used by tests.
 
@@ -73,6 +85,10 @@ class FakeStream(StreamBase):
         if self._fail_on_prepare:
             raise RuntimeError("fake failure in prepare")
 
+    def connect(self) -> None:
+        if self._fail_on_start:
+            raise RuntimeError("fake failure in connect")
+
     def start(self, session_clock: SessionClock) -> None:
         self.start_calls += 1
         if self._fail_on_start:
@@ -110,4 +126,12 @@ class FakeStream(StreamBase):
         detail: Optional[str] = None,
     ) -> None:
         """Emit a synthetic health event through the callback path."""
-        self._emit_health(HealthEvent(self.id, kind, at_ns, detail))
+        self._emit_health(HealthEvent(
+            stream_id=self.id,
+            kind=kind,
+            at_ns=at_ns,
+            detail=detail,
+            severity=_severity_for(kind),
+            source="adapter:test",
+            fingerprint=f"{self.id}:adapter:{kind.value}",
+        ))

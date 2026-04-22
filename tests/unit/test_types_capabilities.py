@@ -16,3 +16,16 @@ def test_to_dict_includes_live_preview():
     d = caps.to_dict()
     assert d["live_preview"] is False
     assert d["produces_file"] is False
+
+
+def test_target_hz_defaults_to_none():
+    from syncfield.types import StreamCapabilities
+    caps = StreamCapabilities()
+    assert caps.target_hz is None
+
+
+def test_target_hz_round_trips_to_dict():
+    from syncfield.types import StreamCapabilities
+    caps = StreamCapabilities(target_hz=30.0)
+    d = caps.to_dict()
+    assert d["target_hz"] == 30.0

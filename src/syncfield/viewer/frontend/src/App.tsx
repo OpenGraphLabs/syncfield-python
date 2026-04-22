@@ -7,7 +7,7 @@ import { Header } from "@/components/header";
 import { ControlPanel } from "@/components/control-panel";
 import { SessionClock } from "@/components/session-clock";
 import { StreamCard } from "@/components/stream-card";
-import { HealthTable } from "@/components/health-table";
+import { IncidentPanel } from "@/components/incident-panel";
 import { CountdownOverlay } from "@/components/countdown-overlay";
 import { DiscoveryModal } from "@/components/discovery-modal";
 import { ClusterPanel } from "@/components/cluster-panel";
@@ -169,6 +169,7 @@ function RecordView({
                   stream={stream}
                   canRemove={canRemove}
                   onRemove={handleRemoveStream}
+                  activeIncidents={snapshot?.active_incidents ?? []}
                   sessionState={state}
                   aggregation={snapshot?.aggregation}
                   onRetryAggregation={(jobId) =>
@@ -194,12 +195,12 @@ function RecordView({
           <div className="hidden w-72 shrink-0 overflow-y-auto border-l lg:block">
             {cluster.available && <ClusterPanel cluster={cluster} />}
             {streamList.length > 0 && (
-              <>
-                <div className="px-3 py-2.5">
-                  <h3 className="text-xs font-medium text-muted">Health Events</h3>
-                </div>
-                <HealthTable entries={snapshot?.health_log ?? []} />
-              </>
+              <div className="px-3 py-2.5">
+                <IncidentPanel
+                  active={snapshot?.active_incidents ?? []}
+                  resolved={snapshot?.resolved_incidents ?? []}
+                />
+              </div>
             )}
           </div>
         )}

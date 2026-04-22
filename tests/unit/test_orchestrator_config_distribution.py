@@ -1,4 +1,5 @@
 """Leader-side config distribution: build, discover, distribute."""
+from __future__ import annotations
 
 from unittest.mock import MagicMock
 
@@ -271,6 +272,9 @@ class TestRollbackAfterDistributeFailure:
         mic = FakeStream("mic", kind="audio")
         session.add(cam)
         session.add(mic)
+        # Simulate streams that connected successfully — rollback only
+        # operates on _connected_streams, not the full _streams registry.
+        session._connected_streams = [cam, mic]
         session._state = SessionState.RECORDING
 
         session._rollback_after_distribute_failure()

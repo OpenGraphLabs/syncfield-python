@@ -16,6 +16,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Set up Node (for viewer frontend)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Build viewer frontend
+        working-directory: src/syncfield/viewer/frontend
+        run: |
+          # Same lockfile-regeneration dance as publish.yml: optional
+          # platform-specific deps (e.g. rollup's @rollup/rollup-linux-*)
+          # aren't re-resolved when a macOS-generated lockfile runs on
+          # Ubuntu. Regenerating from package.json on CI works.
+          rm -f package-lock.json
+          npm install --no-audit --no-fund
+          npm run build
+
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
         with:
@@ -24,7 +40,21 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[dev]" || pip install -e . && pip install pytest
+          # [all] brings in every optional adapter dep (bleak, aiohttp,
+          # depthai, zeroconf, httpx) so tests that import adapters at
+          # collection time don't ImportError.
+          pip install -e ".[all]"
+          # `dev` lives in PEP 735 [dependency-groups], not
+          # [project.optional-dependencies], so .[dev] wouldn't resolve.
+          # Install pytest + its plugins explicitly — keep this list in
+          # sync with [dependency-groups].dev in pyproject.toml.
+          pip install \
+            "pytest>=8.4.2" \
+            "pytest-aiohttp>=1.1.0" \
+            "pytest-asyncio>=1.2.0" \
+            "pytest-mock>=3.12.0" \
+            "pytest-timeout>=2.4.0" \
+            "pytest-xdist>=3.6.0"
 
       - name: Run tests
         run: pytest -v

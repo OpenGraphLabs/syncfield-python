@@ -1,4 +1,4 @@
-import type { AggregationSnapshotWS, StreamSnapshot } from "@/lib/types";
+import type { AggregationSnapshotWS, IncidentSnapshot, Severity, StreamSnapshot } from "@/lib/types";
 import { formatCount, formatHz } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import { AudioLevelChart } from "./audio-level-chart";
@@ -8,17 +8,48 @@ import {
   StandaloneRecorderPanel,
   type StandaloneRecorderStream,
 } from "./standalone-recorder-panel";
+import {
+  ConnectingOverlay,
+  WaitingForDataOverlay,
+  FailedOverlay,
+} from "./stream-overlays";
 
 interface StreamCardProps {
   stream: StreamSnapshot;
   canRemove: boolean;
   onRemove: (streamId: string) => void;
+  /** Active incidents from the session snapshot — used to derive per-stream severity badge. */
+  activeIncidents?: IncidentSnapshot[];
   /** Session state string — forwarded to StandaloneRecorderPanel for recording detection. */
   sessionState?: string;
   /** Top-level aggregation snapshot from the WS payload — used by StandaloneRecorderPanel. */
   aggregation?: AggregationSnapshotWS;
   /** Callback to send an aggregation retry command for a given job ID. */
   onRetryAggregation?: (jobId: string) => void;
+}
+
+// ---------------------------------------------------------------------------
+// Per-stream incident helpers
+// ---------------------------------------------------------------------------
+
+const SEVERITY_ORDER: Severity[] = ["info", "warning", "error", "critical"];
+const BADGE_COLOR: Record<Severity, string> = {
+  info: "bg-slate-500",
+  warning: "bg-yellow-500",
+  error: "bg-orange-500",
+  critical: "bg-red-500",
+};
+
+function streamIncidentStats(streamId: string, active: IncidentSnapshot[]) {
+  const mine = active.filter((i) => i.stream_id === streamId);
+  const count = mine.length;
+  let highest: Severity | null = null;
+  for (const i of mine) {
+    if (highest === null || SEVERITY_ORDER.indexOf(i.severity) > SEVERITY_ORDER.indexOf(highest)) {
+      highest = i.severity;
+    }
+  }
+  return { count, highest };
 }
 
 /**
@@ -35,10 +66,12 @@ export function StreamCard({
   stream,
   canRemove,
   onRemove,
+  activeIncidents = [],
   sessionState,
   aggregation,
   onRetryAggregation,
 }: StreamCardProps) {
+  const { count: incidentCount, highest: incidentSeverity } = streamIncidentStats(stream.id, activeIncidents);
   // Dispatch to StandaloneRecorderPanel for video streams without live preview
   // (e.g. Insta360 Go3S which downloads files via BLE/Wi-Fi after recording).
   const isStandalone =
@@ -66,6 +99,13 @@ export function StreamCard({
           <span className="truncate font-mono text-sm font-medium">
             {stream.id}
           </span>
+          {incidentCount > 0 && incidentSeverity && (
+            <span
+              className={`inline-flex items-center justify-center rounded-full text-xs text-white w-5 h-5 ${BADGE_COLOR[incidentSeverity]}`}
+            >
+              {incidentCount}
+            </span>
+          )}
           <div className="flex-1" />
           {canRemove && (
             <button
@@ -110,14 +150,6 @@ export function StreamCard({
           <span className="font-mono">{formatCount(stream.frame_count)}</span>
           <span className="h-3 w-px bg-border" />
           <span className="font-mono">{formatHz(stream.effective_hz)}</span>
-          {stream.problem_count > 0 && (
-            <>
-              <span className="h-3 w-px bg-border" />
-              <span className="text-destructive">
-                {stream.problem_count} issue{stream.problem_count > 1 ? "s" : ""}
-              </span>
-            </>
-          )}
         </div>
       </div>
     );
@@ -136,6 +168,13 @@ export function StreamCard({
         <span className="truncate font-mono text-sm font-medium">
           {stream.id}
         </span>
+        {incidentCount > 0 && incidentSeverity && (
+          <span
+            className={`inline-flex items-center justify-center rounded-full text-xs text-white w-5 h-5 ${BADGE_COLOR[incidentSeverity]}`}
+          >
+            {incidentCount}
+          </span>
+        )}
         <div className="flex-1" />
         {canRemove && (
           <button
@@ -162,19 +201,9 @@ export function StreamCard({
         {stream.produces_file && <Tag>file</Tag>}
       </div>
 
-      {/* Body — varies by stream kind */}
+      {/* Body — varies by connection state, then stream kind */}
       <div className="flex-1 border-t">
-        {stream.kind === "video" ? (
-          <VideoPreview streamId={stream.id} />
-        ) : stream.kind === "audio" ? (
-          <AudioLevelChart streamId={stream.id} />
-        ) : stream.kind === "sensor" ? (
-          <SensorPanel streamId={stream.id} />
-        ) : (
-          <div className="flex h-full min-h-[180px] items-center justify-center text-xs text-muted">
-            No preview
-          </div>
-        )}
+        <StreamCardBody stream={stream} />
       </div>
 
       {/* Footer stats */}
@@ -182,15 +211,36 @@ export function StreamCard({
         <span className="font-mono">{formatCount(stream.frame_count)}</span>
         <span className="h-3 w-px bg-border" />
         <span className="font-mono">{formatHz(stream.effective_hz)}</span>
-        {stream.problem_count > 0 && (
-          <>
-            <span className="h-3 w-px bg-border" />
-            <span className="text-destructive">
-              {stream.problem_count} issue{stream.problem_count > 1 ? "s" : ""}
-            </span>
-          </>
-        )}
       </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// StreamCardBody — branches on connection_state before kind-based rendering
+// ---------------------------------------------------------------------------
+
+function StreamCardBody({ stream }: { stream: StreamSnapshot }) {
+  if (stream.connection_state === "connecting") {
+    return <ConnectingOverlay />;
+  }
+  if (stream.connection_state === "failed") {
+    return <FailedOverlay error={stream.connection_error ?? "Unknown error"} />;
+  }
+  if (
+    stream.connection_state === "connected" &&
+    stream.kind === "video" &&
+    stream.frame_count === 0
+  ) {
+    return <WaitingForDataOverlay />;
+  }
+  // Healthy / idle / disconnected — fall through to kind-based rendering.
+  if (stream.kind === "video") return <VideoPreview streamId={stream.id} />;
+  if (stream.kind === "audio") return <AudioLevelChart streamId={stream.id} />;
+  if (stream.kind === "sensor") return <SensorPanel streamId={stream.id} />;
+  return (
+    <div className="flex h-full min-h-[180px] items-center justify-center text-xs text-muted">
+      No preview
     </div>
   );
 }

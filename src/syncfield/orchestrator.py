@@ -80,6 +80,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Union
 
 from syncfield.clock import SessionClock
+from syncfield.health.severity import Severity
 from syncfield.multihost.advertiser import SessionAdvertiser
 from syncfield.multihost.browser import SessionBrowser
 from syncfield.multihost.types import SessionAnnouncement
@@ -359,6 +360,13 @@ class SessionOrchestrator:
         # opened a device.
         self._connected_streams: List[Stream] = []
 
+        # Per-stream connection state for partial-connect semantics.
+        # Keys are stream ids; values are one of:
+        #   "idle" | "connecting" | "connected" | "failed" | "disconnected".
+        self._stream_states: dict[str, str] = {}
+        # Populated only when a stream's connect() raised.
+        self._stream_errors: dict[str, str] = {}
+
         # Auto-injected host audio stream (if any). Tracked so it can
         # be removed on disconnect.
         self._auto_audio_stream: Optional[Stream] = None
@@ -391,6 +399,17 @@ class SessionOrchestrator:
         # ``write()`` against a closed writer.
         self._sample_writers: Dict[str, SampleWriter] = {}
         self._sample_handler_active: Dict[str, List[bool]] = {}
+
+        # Health telemetry — constructed once per orchestrator instance,
+        # started/stopped alongside each recording cycle.
+        from syncfield.health import HealthSystem
+        self.health = HealthSystem()
+        self.health.on_incident_opened(self._persist_incident)
+        self.health.on_incident_updated(self._persist_incident)
+        self.health.on_incident_closed(self._persist_incident)
+
+        # Throttle tracker for writer stats emission — keyed by stream_id.
+        self._last_writer_stats_emit_at: Dict[str, int] = {}
 
         # Multi-host: start control plane + advertiser (or follower browser)
         # at construction time so cluster discovery is independent of device
@@ -1307,7 +1326,7 @@ class SessionOrchestrator:
         # 1. Stop each stream that's currently recording. Must happen
         #    BEFORE closing writers so any in-flight samples are
         #    flushed before the file handles go away.
-        recording_streams = list(self._streams.values())
+        recording_streams = list(self._connected_streams)
         _rollback_stop_recording(recording_streams)
 
         # 2. Close sample writers — matches the happy stop() flow so
@@ -1502,12 +1521,19 @@ class SessionOrchestrator:
 
         self._streams[stream.id] = stream
         stream.on_health(self._on_stream_health)
+        stream.on_sample(lambda s, _sid=stream.id: (
+            self.health.observe_sample(_sid, s),
+            self._emit_writer_stats(_sid),
+        ))
+        self.health.register_stream(stream.id, stream.capabilities.target_hz)
 
         # After the first non-audio stream is registered, check whether
         # to pre-register a host audio stream so it appears in the
         # viewer immediately (before Connect/Record is pressed).
         if self._auto_audio_stream is None and not stream.capabilities.provides_audio_track:
             self._maybe_preregister_host_audio()
+
+        self._set_stream_state(stream.id, "idle")
 
     def remove(self, stream_id: str) -> None:
         """Unregister a previously added stream.
@@ -1603,28 +1629,54 @@ class SessionOrchestrator:
 
             self._transition(SessionState.CONNECTING)
 
+            # Start the health worker early so events emitted during the
+            # connect loop (including per-stream failure events) reach
+            # registered detectors. Idempotent — safe to call again below.
+            self.health.start()
+
             connected: List[Stream] = []
-            try:
-                for stream in self._streams.values():
+            for stream in self._streams.values():
+                self._set_stream_state(stream.id, "connecting")
+                try:
                     stream.prepare()
                     stream.connect()
-                    connected.append(stream)
-                    # Emit a health event so the viewer's Health Events
-                    # panel confirms each device connected successfully.
+                except Exception as exc:
+                    self._stream_errors[stream.id] = str(exc)
+                    self._set_stream_state(stream.id, "failed")
                     stream._emit_health(HealthEvent(
                         stream_id=stream.id,
-                        kind=HealthEventKind.HEARTBEAT,
+                        kind=HealthEventKind.ERROR,
                         at_ns=time.monotonic_ns(),
-                        detail="connected",
+                        detail=str(exc),
+                        severity=Severity.ERROR,
+                        source="orchestrator",
+                        fingerprint=f"{stream.id}:startup-failure",
+                        data={"phase": "connect", "outcome": "error", "error": str(exc)},
                     ))
-            except Exception as exc:
-                self._log_rollback(exc, len(connected))
-                _rollback_disconnect_streams(connected)
+                    continue
+                connected.append(stream)
+                self._stream_errors.pop(stream.id, None)
+                self._set_stream_state(stream.id, "connected")
+                stream._emit_health(HealthEvent(
+                    stream_id=stream.id,
+                    kind=HealthEventKind.HEARTBEAT,
+                    at_ns=time.monotonic_ns(),
+                    detail="connected",
+                    severity=Severity.INFO,
+                    source="orchestrator",
+                    fingerprint=f"{stream.id}:startup-success",
+                    data={"phase": "connect", "outcome": "success"},
+                ))
+
+            if not connected:
                 self._transition(SessionState.IDLE)
                 if self._log_writer is not None:
                     self._log_writer.close()
                     self._log_writer = None
-                raise
+                raise RuntimeError(
+                    "connect() failed: no streams connected — every adapter raised. "
+                    "Inspect per-stream errors via session._stream_errors."
+                )
 
             self._connected_streams = connected
 
@@ -1632,6 +1684,10 @@ class SessionOrchestrator:
             # This enables multi-host cross-correlation sync without the
             # user having to add an audio stream manually.
             self._maybe_inject_host_audio()
+
+            # Start the health worker so samples flowing from stream.connect()
+            # onward are observed. Idempotent — safe to call again in start().
+            self.health.start()
 
             self._transition(SessionState.CONNECTED)
 
@@ -1810,7 +1866,7 @@ class SessionOrchestrator:
 
             recording: List[Stream] = []
             try:
-                for stream in self._streams.values():
+                for stream in self._connected_streams:
                     stream.start_recording(self._session_clock)
                     recording.append(stream)
             except Exception as exc:
@@ -1848,6 +1904,7 @@ class SessionOrchestrator:
             # the recorded audio track, so we wait until every stream
             # has enabled file writing before playing it.
             self._maybe_play_start_chirp()
+            self.health.start()
             self._transition(SessionState.RECORDING)
 
             # Distribute the leader's SessionConfig to every preparing
@@ -1917,6 +1974,20 @@ class SessionOrchestrator:
             self._maybe_play_stop_chirp_and_wait()
 
             finalizations = self._finalize_streams()
+
+            # Stop the health worker and close any still-open incidents.
+            # Must run AFTER finalize_streams (so stall detectors see the
+            # stream stop) but BEFORE closing _log_writer (so
+            # _persist_incident can still flush to incidents.jsonl).
+            self.health.stop()
+            all_incidents = list(self.health.open_incidents()) + list(
+                self.health.resolved_incidents()
+            )
+            by_stream: Dict[str, list] = {}
+            for inc in all_incidents:
+                by_stream.setdefault(inc.stream_id, []).append(inc)
+            for report in finalizations:
+                report.incidents = by_stream.get(report.stream_id, [])
 
             # Leader: flip advert status to stopped BEFORE closing the
             # advertiser so every follower on the network observes the
@@ -2071,12 +2142,23 @@ class SessionOrchestrator:
             _rollback_disconnect_streams(self._connected_streams)
             self._connected_streams = []
 
+            # Flip every tracked stream's state to 'disconnected' so the
+            # viewer reflects a clean slate — this includes streams that
+            # were 'failed' (they never opened hardware, but their UI tile
+            # should no longer display a red error overlay after teardown).
+            for stream_id in list(self._stream_states.keys()):
+                self._set_stream_state(stream_id, "disconnected")
+            self._stream_errors.clear()
+
             # Keep auto-injected audio stream registered (visible in viewer)
             # but disconnected. It will be reconnected on next connect().
 
             # Multi-host infrastructure (advertiser, browser, control plane)
             # stays up across disconnect(). It was brought up at __init__
             # and is only torn down by shutdown() or the atexit handler.
+
+            # Stop health worker — no-op if already stopped by stop().
+            self.health.stop(close_open_incidents=False)
 
             self._transition(SessionState.IDLE)
             if self._log_writer is not None:
@@ -2092,7 +2174,7 @@ class SessionOrchestrator:
         before moving on to the next.
         """
         finalizations: List[FinalizationReport] = []
-        for stream in self._streams.values():
+        for stream in self._connected_streams:
             try:
                 report = stream.stop_recording()
             except Exception as exc:
@@ -2139,7 +2221,7 @@ class SessionOrchestrator:
         capture thread become no-ops instead of writing to a closed
         writer.
         """
-        for stream in self._streams.values():
+        for stream in self._connected_streams:
             writer: SampleWriter
             if stream.kind == "sensor":
                 writer = SensorWriter(stream.id, self._output_dir)
@@ -2328,6 +2410,7 @@ class SessionOrchestrator:
         """
         old = self._state
         self._state = new_state
+        self.health.observe_state(old, new_state)
         if self._log_writer is not None:
             self._log_writer.log_event(
                 {
@@ -2361,6 +2444,57 @@ class SessionOrchestrator:
         """
         if self._log_writer is not None:
             self._log_writer.log_health(event)
+        self.health.observe_health(event.stream_id, event)
+
+    def _emit_writer_stats(self, stream_id: str) -> None:
+        """Emit WriterStats to the health system at most ~10 Hz per stream."""
+        import time as _t
+        from syncfield.health.types import WriterStats
+        now = _t.monotonic_ns()
+        last = self._last_writer_stats_emit_at.get(stream_id, 0)
+        if now - last < 100_000_000:   # 100 ms throttle
+            return
+        self._last_writer_stats_emit_at[stream_id] = now
+        self.health.observe_writer_stats(
+            stream_id,
+            WriterStats(
+                stream_id=stream_id, at_ns=now,
+                queue_depth=0, queue_capacity=1, dropped=0,
+            ),
+        )
+
+    def _persist_incident(self, incident) -> None:
+        """Forward incidents to the session log writer + attach crash dumps.
+
+        Called from the HealthWorker thread — must not raise or the worker dies.
+        """
+        # Attach crash_dump artifacts for device-crash incidents (idempotent).
+        if incident.fingerprint.endswith(":device-crash"):
+            path = (
+                incident.first_event.data.get("crash_dump_path")
+                if incident.first_event.data
+                else None
+            )
+            if path and not any(a.kind == "crash_dump" for a in incident.artifacts):
+                from syncfield.health.types import IncidentArtifact
+                incident.attach(IncidentArtifact(kind="crash_dump", path=str(path)))
+
+        if self._log_writer is not None:
+            try:
+                self._log_writer.log_incident(incident)
+            except Exception:
+                # Never let telemetry persistence crash the recording.
+                pass
+
+    def _set_stream_state(self, stream_id: str, new_state: str) -> None:
+        """Update per-stream connection state and forward to HealthSystem.
+
+        The health worker may not be running yet (e.g. this is called
+        from add() when the session is IDLE) — observe_connection_state
+        is a no-op in that case.
+        """
+        self._stream_states[stream_id] = new_state
+        self.health.observe_connection_state(stream_id, new_state, time.monotonic_ns())
 
     # ------------------------------------------------------------------
     # Episode lifecycle

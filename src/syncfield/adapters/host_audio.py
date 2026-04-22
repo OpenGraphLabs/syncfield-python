@@ -119,6 +119,7 @@ class HostAudioStream(StreamBase):
                 supports_precise_timestamps=True,
                 is_removable=True,
                 produces_file=True,
+                target_hz=1.0 / METRICS_INTERVAL_S,
             ),
         )
         self._output_dir = Path(output_dir)

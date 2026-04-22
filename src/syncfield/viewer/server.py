@@ -37,7 +37,7 @@ from starlette.responses import FileResponse, StreamingResponse
 
 from syncfield.orchestrator import SessionOrchestrator
 from syncfield.viewer.poller import SessionPoller
-from syncfield.viewer.state import AggregationSnapshot, HealthEntry, SessionSnapshot, StreamSnapshot
+from syncfield.viewer.state import AggregationSnapshot, SessionSnapshot, StreamSnapshot
 
 logger = logging.getLogger(__name__)
 
@@ -70,14 +70,6 @@ def snapshot_to_dict(snapshot: SessionSnapshot) -> Dict[str, Any]:
     now_ns = time.monotonic_ns()
 
     streams: Dict[str, Any] = {}
-    # Count non-heartbeat events per stream (heartbeats are informational)
-    problem_count_by_stream: Dict[str, int] = {}
-    for h in snapshot.health_log:
-        if h.kind != "heartbeat":
-            problem_count_by_stream[h.stream_id] = (
-                problem_count_by_stream.get(h.stream_id, 0) + 1
-            )
-
     for sid, s in snapshot.streams.items():
         last_sample_ms_ago: Optional[float] = None
         if s.last_sample_at_ns is not None:
@@ -91,8 +83,8 @@ def snapshot_to_dict(snapshot: SessionSnapshot) -> Dict[str, Any]:
             "last_sample_ms_ago": last_sample_ms_ago,
             "provides_audio_track": s.provides_audio_track,
             "produces_file": s.produces_file,
-            "health_count": s.health_count,
-            "problem_count": problem_count_by_stream.get(sid, 0),
+            "connection_state": s.connection_state,
+            "connection_error": s.connection_error,
             "capabilities": {
                 "live_preview": getattr(s, "live_preview", True),
                 "provides_audio_track": s.provides_audio_track,
@@ -102,16 +94,21 @@ def snapshot_to_dict(snapshot: SessionSnapshot) -> Dict[str, Any]:
             },
         }
 
-    health_log: List[Dict[str, Any]] = []
-    for h in snapshot.health_log:
-        # Convert monotonic ns to "seconds ago" for display
-        ago_s = round((now_ns - h.at_ns) / 1e9, 1) if h.at_ns else 0
-        health_log.append({
-            "stream_id": h.stream_id,
-            "kind": h.kind,
-            "ago_s": ago_s,
-            "detail": h.detail,
-        })
+    def _serialize_incident(inc) -> Dict[str, Any]:
+        return {
+            "id": inc.id,
+            "stream_id": inc.stream_id,
+            "fingerprint": inc.fingerprint,
+            "title": inc.title,
+            "severity": inc.severity,
+            "source": inc.source,
+            "opened_at_ns": inc.opened_at_ns,
+            "closed_at_ns": inc.closed_at_ns,
+            "event_count": inc.event_count,
+            "detail": inc.detail,
+            "ago_s": round(inc.ago_s, 1),
+            "artifacts": inc.artifacts,
+        }
 
     return {
         "type": "snapshot",
@@ -124,7 +121,8 @@ def snapshot_to_dict(snapshot: SessionSnapshot) -> Dict[str, Any]:
             "stop_ns": snapshot.chirp_stop_ns,
         },
         "streams": streams,
-        "health_log": health_log,
+        "active_incidents": [_serialize_incident(i) for i in snapshot.active_incidents],
+        "resolved_incidents": [_serialize_incident(i) for i in snapshot.resolved_incidents],
         "output_dir": snapshot.output_dir,
         "aggregation": _serialize_aggregation(getattr(snapshot, "aggregation", None)),
     }

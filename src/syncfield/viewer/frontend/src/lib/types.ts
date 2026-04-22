@@ -19,11 +19,10 @@ export interface StreamSnapshot {
   last_sample_ms_ago: number | null;
   provides_audio_track: boolean;
   produces_file: boolean;
-  health_count: number;
-  /** Count of non-heartbeat events (warnings/errors/drops). */
-  problem_count: number;
   /** Stream capabilities declared by the adapter. May be absent on older servers. */
   capabilities?: StreamCapabilities;
+  connection_state: ConnectionState;
+  connection_error: string | null;
 }
 
 export interface ChirpInfo {
@@ -32,11 +31,34 @@ export interface ChirpInfo {
   stop_ns: number | null;
 }
 
-export interface HealthEntry {
-  stream_id: string;
+export type Severity = "info" | "warning" | "error" | "critical";
+
+export type ConnectionState =
+  | "idle"
+  | "connecting"
+  | "connected"
+  | "failed"
+  | "disconnected";
+
+export interface IncidentArtifact {
   kind: string;
-  ago_s: number;
+  path: string;
   detail: string | null;
+}
+
+export interface IncidentSnapshot {
+  id: string;
+  stream_id: string;
+  fingerprint: string;
+  title: string;
+  severity: Severity;
+  source: string;
+  opened_at_ns: number;
+  closed_at_ns: number | null;
+  event_count: number;
+  detail: string | null;
+  ago_s: number;
+  artifacts: IncidentArtifact[];
 }
 
 // ---------------------------------------------------------------------------
@@ -74,7 +96,8 @@ export interface SessionSnapshot {
   elapsed_s: number;
   chirp: ChirpInfo;
   streams: Record<string, StreamSnapshot>;
-  health_log: HealthEntry[];
+  active_incidents: IncidentSnapshot[];
+  resolved_incidents: IncidentSnapshot[];
   output_dir: string;
   /** Aggregation state for Go3S streams; present when a Go3S adapter is active. */
   aggregation?: AggregationSnapshotWS;

@@ -14,6 +14,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Literal, Union
 
+from syncfield.health.severity import Severity
+
 # Sensor channel value type.
 # Leaf values are always numeric (float | int).
 # Structure can be nested dicts or lists.
@@ -194,6 +196,7 @@ class StreamCapabilities:
     supports_precise_timestamps: bool = False
     is_removable: bool = False
     produces_file: bool = False
+    target_hz: float | None = None
     live_preview: bool = True
 
     def to_dict(self) -> dict[str, Any]:
@@ -202,6 +205,7 @@ class StreamCapabilities:
             "supports_precise_timestamps": self.supports_precise_timestamps,
             "is_removable": self.is_removable,
             "produces_file": self.produces_file,
+            "target_hz": self.target_hz,
             "live_preview": self.live_preview,
         }
 
@@ -249,19 +253,23 @@ class HealthEventKind(Enum):
 
 @dataclass(frozen=True)
 class HealthEvent:
-    """A stream reports a health observation to the orchestrator.
+    """A stream reports a health observation.
 
-    Attributes:
-        stream_id: Stream that emitted the event.
-        kind: Category of the event.
-        at_ns: ``time.monotonic_ns()`` when the event was observed.
-        detail: Optional free-form description.
+    ``severity`` / ``source`` / ``fingerprint`` / ``data`` enable the
+    incident-tracking layer in :mod:`syncfield.health` to group many raw
+    events into a single Sentry-style Incident. Adapters that don't care
+    can leave them at their safe defaults; the platform will fill them
+    in before the event reaches the IncidentTracker.
     """
 
     stream_id: str
     kind: HealthEventKind
     at_ns: int
     detail: str | None = None
+    severity: Severity = Severity.INFO
+    source: str = "unknown"
+    fingerprint: str = ""
+    data: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -269,6 +277,10 @@ class HealthEvent:
             "kind": self.kind.value,
             "at_ns": self.at_ns,
             "detail": self.detail,
+            "severity": self.severity.value,
+            "source": self.source,
+            "fingerprint": self.fingerprint,
+            "data": dict(self.data),
         }
 
 
@@ -326,6 +338,7 @@ class FinalizationReport:
     error: str | None
     jitter_p95_ns: int | None = None
     jitter_p99_ns: int | None = None
+    incidents: list = field(default_factory=list)
 
 
 @dataclass(frozen=True)

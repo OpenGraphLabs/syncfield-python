@@ -41,7 +41,9 @@ class PollingSensorStream(StreamBase):
         super().__init__(
             id=id,
             kind="sensor",
-            capabilities=_resolve_capabilities(capabilities, precise=True),
+            capabilities=_resolve_capabilities(
+                capabilities, precise=True, target_hz=float(hz)
+            ),
         )
         self._validate_arity(read, expects_handle=open is not None)
         self._read = read

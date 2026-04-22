@@ -271,3 +271,37 @@ class TestManifestSessionConfig:
         import json
         manifest = json.loads(path.read_text())
         assert "session_config" not in manifest
+
+
+def test_log_incident_appends_to_incidents_jsonl(tmp_path):
+    from syncfield.health.severity import Severity
+    from syncfield.health.types import Incident
+
+    def _ev(at_ns: int) -> HealthEvent:
+        return HealthEvent(
+            stream_id="cam", kind=HealthEventKind.ERROR, at_ns=at_ns, detail="x",
+            severity=Severity.ERROR, source="detector:stream-stall",
+            fingerprint="cam:stream-stall",
+        )
+
+    w = SessionLogWriter(tmp_path)
+    w.open()
+    try:
+        inc = Incident.opened_from(_ev(100), title="stall")
+        w.log_incident(inc)
+        inc.record_event(_ev(200))
+        w.log_incident(inc)
+        inc.close(at_ns=300)
+        w.log_incident(inc)
+    finally:
+        w.close()
+
+    path = tmp_path / "incidents.jsonl"
+    assert path.exists()
+    lines = path.read_text().strip().splitlines()
+    assert len(lines) == 3
+    first = json.loads(lines[0])
+    assert first["id"] == inc.id
+    assert first["event_count"] == 1
+    last = json.loads(lines[-1])
+    assert last["closed_at_ns"] == 300
