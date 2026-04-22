@@ -359,6 +359,13 @@ class SessionOrchestrator:
         # opened a device.
         self._connected_streams: List[Stream] = []
 
+        # Per-stream connection state for partial-connect semantics.
+        # Keys are stream ids; values are one of:
+        #   "idle" | "connecting" | "connected" | "failed" | "disconnected".
+        self._stream_states: dict[str, str] = {}
+        # Populated only when a stream's connect() raised.
+        self._stream_errors: dict[str, str] = {}
+
         # Auto-injected host audio stream (if any). Tracked so it can
         # be removed on disconnect.
         self._auto_audio_stream: Optional[Stream] = None
@@ -1525,6 +1532,8 @@ class SessionOrchestrator:
         if self._auto_audio_stream is None and not stream.capabilities.provides_audio_track:
             self._maybe_preregister_host_audio()
 
+        self._set_stream_state(stream.id, "idle")
+
     def remove(self, stream_id: str) -> None:
         """Unregister a previously added stream.
 
@@ -2441,6 +2450,16 @@ class SessionOrchestrator:
             except Exception:
                 # Never let telemetry persistence crash the recording.
                 pass
+
+    def _set_stream_state(self, stream_id: str, new_state: str) -> None:
+        """Update per-stream connection state and forward to HealthSystem.
+
+        The health worker may not be running yet (e.g. this is called
+        from add() when the session is IDLE) — observe_connection_state
+        is a no-op in that case.
+        """
+        self._stream_states[stream_id] = new_state
+        self.health.observe_connection_state(stream_id, new_state, time.monotonic_ns())
 
     # ------------------------------------------------------------------
     # Episode lifecycle
