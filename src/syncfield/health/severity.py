@@ -21,6 +21,9 @@ class Severity(str, Enum):
         return _RANK[self]
 
 
+# `(str, Enum)` inherits alphabetical string comparison, which would order
+# critical < error < info < warning — wrong for severity. `_RANK` pins the
+# intended order explicitly and gives `.rank` O(1) lookup.
 _RANK = {
     Severity.INFO: 0,
     Severity.WARNING: 1,

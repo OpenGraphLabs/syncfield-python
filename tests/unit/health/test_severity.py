@@ -1,3 +1,5 @@
+import pytest
+
 from syncfield.health.severity import Severity, max_severity
 
 
@@ -19,9 +21,9 @@ def test_max_severity_picks_highest():
     assert max_severity(Severity.INFO, Severity.WARNING) == Severity.WARNING
     assert max_severity(Severity.ERROR, Severity.WARNING) == Severity.ERROR
     assert max_severity(Severity.CRITICAL, Severity.INFO, Severity.ERROR) == Severity.CRITICAL
+    assert max_severity(Severity.ERROR) == Severity.ERROR
 
 
 def test_max_severity_requires_at_least_one():
-    import pytest
     with pytest.raises(ValueError):
         max_severity()
