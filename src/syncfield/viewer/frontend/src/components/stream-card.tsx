@@ -8,6 +8,11 @@ import {
   StandaloneRecorderPanel,
   type StandaloneRecorderStream,
 } from "./standalone-recorder-panel";
+import {
+  ConnectingOverlay,
+  WaitingForDataOverlay,
+  FailedOverlay,
+} from "./stream-overlays";
 
 interface StreamCardProps {
   stream: StreamSnapshot;
@@ -196,19 +201,9 @@ export function StreamCard({
         {stream.produces_file && <Tag>file</Tag>}
       </div>
 
-      {/* Body — varies by stream kind */}
+      {/* Body — varies by connection state, then stream kind */}
       <div className="flex-1 border-t">
-        {stream.kind === "video" ? (
-          <VideoPreview streamId={stream.id} />
-        ) : stream.kind === "audio" ? (
-          <AudioLevelChart streamId={stream.id} />
-        ) : stream.kind === "sensor" ? (
-          <SensorPanel streamId={stream.id} />
-        ) : (
-          <div className="flex h-full min-h-[180px] items-center justify-center text-xs text-muted">
-            No preview
-          </div>
-        )}
+        <StreamCardBody stream={stream} />
       </div>
 
       {/* Footer stats */}
@@ -217,6 +212,35 @@ export function StreamCard({
         <span className="h-3 w-px bg-border" />
         <span className="font-mono">{formatHz(stream.effective_hz)}</span>
       </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// StreamCardBody — branches on connection_state before kind-based rendering
+// ---------------------------------------------------------------------------
+
+function StreamCardBody({ stream }: { stream: StreamSnapshot }) {
+  if (stream.connection_state === "connecting") {
+    return <ConnectingOverlay />;
+  }
+  if (stream.connection_state === "failed") {
+    return <FailedOverlay error={stream.connection_error ?? "Unknown error"} />;
+  }
+  if (
+    stream.connection_state === "connected" &&
+    stream.kind === "video" &&
+    stream.frame_count === 0
+  ) {
+    return <WaitingForDataOverlay />;
+  }
+  // Healthy / idle / disconnected — fall through to kind-based rendering.
+  if (stream.kind === "video") return <VideoPreview streamId={stream.id} />;
+  if (stream.kind === "audio") return <AudioLevelChart streamId={stream.id} />;
+  if (stream.kind === "sensor") return <SensorPanel streamId={stream.id} />;
+  return (
+    <div className="flex h-full min-h-[180px] items-center justify-center text-xs text-muted">
+      No preview
     </div>
   );
 }
