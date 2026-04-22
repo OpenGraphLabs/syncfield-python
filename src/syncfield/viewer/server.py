@@ -83,6 +83,8 @@ def snapshot_to_dict(snapshot: SessionSnapshot) -> Dict[str, Any]:
             "last_sample_ms_ago": last_sample_ms_ago,
             "provides_audio_track": s.provides_audio_track,
             "produces_file": s.produces_file,
+            "connection_state": s.connection_state,
+            "connection_error": s.connection_error,
             "capabilities": {
                 "live_preview": getattr(s, "live_preview", True),
                 "provides_audio_track": s.provides_audio_track,
