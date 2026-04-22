@@ -3,6 +3,7 @@ import { formatElapsed } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import { Logo } from "./logo";
 import { NavLinks, type ViewMode } from "./segment-control";
+import { Spinner } from "./spinner";
 
 interface HeaderProps {
   snapshot: SessionSnapshot | null;
@@ -15,15 +16,26 @@ interface HeaderProps {
   clusterPeerCount?: number | null;
 }
 
-/** Dot color by session state. */
+/** Dot color by session state. Transitional states pulse so the chip
+ *  reads as "in progress" at a glance. */
 const STATE_DOT: Record<string, string> = {
   recording: "bg-recording animate-pulse-recording",
-  countdown: "bg-warning",
-  preparing: "bg-warning",
-  connecting: "bg-warning",
-  disconnecting: "bg-warning",
-  stopping: "bg-warning",
+  countdown: "bg-warning animate-pulse",
+  preparing: "bg-warning animate-pulse",
+  connecting: "bg-warning animate-pulse",
+  disconnecting: "bg-warning animate-pulse",
+  stopping: "bg-warning animate-pulse",
 };
+
+/** States during which the chip should show a small spinner alongside
+ *  the dot — covers any user-initiated, server-acknowledged transition. */
+const TRANSITIONAL_STATES = new Set<string>([
+  "connecting",
+  "disconnecting",
+  "preparing",
+  "countdown",
+  "stopping",
+]);
 
 /** User-friendly labels — idle-like states show "Ready". */
 function friendlyState(state: string): string {
@@ -104,14 +116,24 @@ export function Header({
             />
             <span
               className={cn(
-                "text-xs font-medium",
+                "inline-flex items-center gap-1 text-xs font-medium",
                 showCount
-                  ? "rounded px-1.5 py-0.5 bg-yellow-500/15 text-yellow-300 border border-yellow-500/40"
-                  : isRecording
-                    ? "text-recording"
-                    : "text-muted",
+                  ? "rounded-md border border-warning/40 bg-warning/15 px-1.5 py-0.5 text-foreground"
+                  : TRANSITIONAL_STATES.has(state)
+                    ? "rounded-md border border-warning/40 bg-warning/15 px-1.5 py-0.5 text-foreground"
+                    : isRecording
+                      ? "text-recording"
+                      : "text-foreground",
               )}
+              title={
+                showCount
+                  ? `${connected} of ${total} streams connected`
+                  : undefined
+              }
             >
+              {TRANSITIONAL_STATES.has(state) && (
+                <Spinner className="h-3 w-3 text-muted" />
+              )}
               {displayedLabel}
             </span>
           </div>

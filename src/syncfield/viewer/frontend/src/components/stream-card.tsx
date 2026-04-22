@@ -8,11 +8,8 @@ import {
   StandaloneRecorderPanel,
   type StandaloneRecorderStream,
 } from "./standalone-recorder-panel";
-import {
-  ConnectingOverlay,
-  WaitingForDataOverlay,
-  FailedOverlay,
-} from "./stream-overlays";
+import { ConnectingOverlay, FailedOverlay } from "./stream-overlays";
+import { Spinner } from "./spinner";
 
 interface StreamCardProps {
   stream: StreamSnapshot;
@@ -34,11 +31,32 @@ interface StreamCardProps {
 
 const SEVERITY_ORDER: Severity[] = ["info", "warning", "error", "critical"];
 const BADGE_COLOR: Record<Severity, string> = {
-  info: "bg-slate-500",
-  warning: "bg-yellow-500",
-  error: "bg-orange-500",
-  critical: "bg-red-500",
+  info: "bg-muted text-white",
+  warning: "bg-warning text-foreground",
+  error: "bg-destructive text-white",
+  critical: "bg-destructive text-white",
 };
+const SEVERITY_LABEL: Record<Severity, string> = {
+  info: "info",
+  warning: "warning",
+  error: "error",
+  critical: "critical",
+};
+
+function IncidentBadge({ count, severity }: { count: number; severity: Severity }) {
+  return (
+    <span
+      title={`${count} active ${SEVERITY_LABEL[severity]} ${count === 1 ? "issue" : "issues"} — see Active Issues panel`}
+      aria-label={`${count} ${SEVERITY_LABEL[severity]} ${count === 1 ? "issue" : "issues"}`}
+      className={cn(
+        "inline-flex h-4 min-w-4 items-center justify-center rounded-full px-1 text-[10px] font-semibold leading-none tabular-nums",
+        BADGE_COLOR[severity],
+      )}
+    >
+      {count}
+    </span>
+  );
+}
 
 function streamIncidentStats(streamId: string, active: IncidentSnapshot[]) {
   const mine = active.filter((i) => i.stream_id === streamId);
@@ -133,7 +151,7 @@ export function StreamCard({
         </div>
 
         {/* Body */}
-        <div className="flex-1 border-t">
+        <div className="relative flex-1 border-t">
           <StandaloneRecorderPanel
             stream={standaloneStream}
             aggregation={activeJob}
@@ -143,6 +161,7 @@ export function StreamCard({
                 : undefined
             }
           />
+          {sessionState === "disconnecting" && <DisconnectingOverlay />}
         </div>
 
         {/* Footer stats */}
@@ -169,11 +188,7 @@ export function StreamCard({
           {stream.id}
         </span>
         {incidentCount > 0 && incidentSeverity && (
-          <span
-            className={`inline-flex items-center justify-center rounded-full text-xs text-white w-5 h-5 ${BADGE_COLOR[incidentSeverity]}`}
-          >
-            {incidentCount}
-          </span>
+          <IncidentBadge count={incidentCount} severity={incidentSeverity} />
         )}
         <div className="flex-1" />
         {canRemove && (
@@ -202,8 +217,9 @@ export function StreamCard({
       </div>
 
       {/* Body — varies by connection state, then stream kind */}
-      <div className="flex-1 border-t">
+      <div className="relative flex-1 border-t">
         <StreamCardBody stream={stream} />
+        {sessionState === "disconnecting" && <DisconnectingOverlay />}
       </div>
 
       {/* Footer stats */}
@@ -227,14 +243,9 @@ function StreamCardBody({ stream }: { stream: StreamSnapshot }) {
   if (stream.connection_state === "failed") {
     return <FailedOverlay error={stream.connection_error ?? "Unknown error"} />;
   }
-  if (
-    stream.connection_state === "connected" &&
-    stream.kind === "video" &&
-    stream.frame_count === 0
-  ) {
-    return <WaitingForDataOverlay />;
-  }
-  // Healthy / idle / disconnected — fall through to kind-based rendering.
+  // Connected / idle / disconnected — live preview is driven by the
+  // adapter's `latest_frame`, which is populated on connect (not on
+  // record start), so video/audio/sensor can render immediately.
   if (stream.kind === "video") return <VideoPreview streamId={stream.id} />;
   if (stream.kind === "audio") return <AudioLevelChart streamId={stream.id} />;
   if (stream.kind === "sensor") return <SensorPanel streamId={stream.id} />;
@@ -281,5 +292,22 @@ function Tag({ children }: { children: React.ReactNode }) {
     <span className="rounded-md bg-foreground/5 px-2 py-0.5 text-[11px] font-medium text-muted">
       {children}
     </span>
+  );
+}
+
+/**
+ * Faint dim + spinner overlaid on the card body while the session is
+ * tearing down — gives every stream card immediate visual feedback the
+ * Disconnect action was received, without waiting for each adapter's
+ * connection_state to actually flip.
+ */
+function DisconnectingOverlay() {
+  return (
+    <div className="pointer-events-none absolute inset-0 flex items-center justify-center bg-background/55 backdrop-blur-[1px]">
+      <div className="flex items-center gap-2 rounded-md border bg-card/95 px-2.5 py-1.5 text-xs text-foreground shadow-sm">
+        <Spinner className="h-3 w-3 text-muted" />
+        Disconnecting…
+      </div>
+    </div>
   );
 }
