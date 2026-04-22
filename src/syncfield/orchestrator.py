@@ -2142,6 +2142,14 @@ class SessionOrchestrator:
             _rollback_disconnect_streams(self._connected_streams)
             self._connected_streams = []
 
+            # Flip every tracked stream's state to 'disconnected' so the
+            # viewer reflects a clean slate — this includes streams that
+            # were 'failed' (they never opened hardware, but their UI tile
+            # should no longer display a red error overlay after teardown).
+            for stream_id in list(self._stream_states.keys()):
+                self._set_stream_state(stream_id, "disconnected")
+            self._stream_errors.clear()
+
             # Keep auto-injected audio stream registered (visible in viewer)
             # but disconnected. It will be reconnected on next connect().
 

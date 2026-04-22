@@ -113,3 +113,31 @@ def test_failed_stream_is_skipped_during_recording(tmp_path: Path):
     # must not have been called on it.
     assert bad.start_recording_calls == 0
     assert bad.stop_recording_calls == 0
+
+
+def test_disconnect_does_not_call_stream_disconnect_on_failed(tmp_path: Path):
+    from syncfield.testing import FakeStream
+
+    class CountingFakeStream(FakeStream):
+        def __init__(self, stream_id, fail_on_start=False):
+            super().__init__(stream_id, fail_on_start=fail_on_start)
+            self.disconnect_calls = 0
+
+        def disconnect(self):
+            self.disconnect_calls += 1
+            super().disconnect()
+
+    sess = SessionOrchestrator(host_id="h", output_dir=tmp_path)
+    good = CountingFakeStream("good")
+    bad = CountingFakeStream("bad", fail_on_start=True)
+    sess.add(good)
+    sess.add(bad)
+
+    sess.connect()
+    sess.disconnect()
+
+    assert good.disconnect_calls == 1
+    assert bad.disconnect_calls == 0
+    assert sess._stream_states["good"] == "disconnected"
+    assert sess._stream_states["bad"] == "disconnected"
+    assert sess._stream_errors == {}
