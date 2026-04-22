@@ -43,6 +43,7 @@ def test_health_system_installs_default_detectors():
         "jitter",
         "startup-failure",
         "backpressure",
+        "no-data",
     ):
         assert expected in names, f"missing default detector: {expected}"
 

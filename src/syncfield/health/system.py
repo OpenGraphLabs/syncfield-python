@@ -9,6 +9,7 @@ from syncfield.health.detectors.adapter_passthrough import AdapterEventPassthrou
 from syncfield.health.detectors.backpressure import BackpressureDetector
 from syncfield.health.detectors.fps_drop import FpsDropDetector
 from syncfield.health.detectors.jitter import JitterDetector
+from syncfield.health.detectors.no_data import NoDataDetector
 from syncfield.health.detectors.startup_failure import StartupFailureDetector
 from syncfield.health.detectors.stream_stall import StreamStallDetector
 from syncfield.health.registry import DetectorRegistry
@@ -134,3 +135,4 @@ class HealthSystem:
         self.register(JitterDetector(target_getter=target_getter))
         self.register(StartupFailureDetector())
         self.register(BackpressureDetector())
+        self.register(NoDataDetector())
