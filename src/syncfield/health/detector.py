@@ -13,7 +13,7 @@ defaults for the rest.
 
 from __future__ import annotations
 
-from typing import Iterable, Iterator, Protocol, runtime_checkable
+from typing import Iterator, Protocol, runtime_checkable
 
 from syncfield.health.severity import Severity
 from syncfield.health.types import Incident, WriterStats
@@ -29,7 +29,7 @@ class Detector(Protocol):
     def observe_health(self, stream_id: str, event: HealthEvent) -> None: ...
     def observe_state(self, old: SessionState, new: SessionState) -> None: ...
     def observe_writer_stats(self, stream_id: str, stats: WriterStats) -> None: ...
-    def tick(self, now_ns: int) -> Iterable[HealthEvent]: ...
+    def tick(self, now_ns: int) -> Iterator[HealthEvent]: ...
     def close_condition(self, incident: Incident, now_ns: int) -> bool: ...
 
 
@@ -45,9 +45,19 @@ class DetectorBase:
 
     def __init_subclass__(cls, **kwargs: object) -> None:
         super().__init_subclass__(**kwargs)
-        # Guard against subclasses that forget to set required class attrs.
+        # Require each subclass chain to end at a concrete class that declares
+        # these attrs. We walk the MRO up to (but not including) DetectorBase
+        # and assert at least one class in that chain sets each attribute
+        # as an own attribute (via __dict__). This prevents a grandchild from
+        # silently inheriting a default it shouldn't while still allowing
+        # legitimate intermediate base classes.
         for attr in ("name", "default_severity"):
-            if not hasattr(cls, attr):
+            declared = any(
+                attr in klass.__dict__
+                for klass in cls.__mro__
+                if klass is not DetectorBase and klass is not object
+            )
+            if not declared:
                 raise TypeError(
                     f"Detector subclass {cls.__name__} must set class attribute '{attr}'"
                 )

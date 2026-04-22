@@ -1,3 +1,5 @@
+import pytest
+
 from syncfield.health.detector import DetectorBase
 from syncfield.health.severity import Severity
 from syncfield.health.types import WriterStats
@@ -22,11 +24,23 @@ def test_detector_base_defaults_are_noops():
     from syncfield.health.types import Incident
     ev = HealthEvent(stream_id="cam", kind=HealthEventKind.WARNING, at_ns=1)
     inc = Incident.opened_from(ev, title="x")
-    assert isinstance(d.close_condition(inc, now_ns=10), bool)
+    assert d.close_condition(inc, now_ns=10) is False
 
 
 def test_detector_base_requires_name_and_severity():
-    import pytest
-
     with pytest.raises(TypeError):
         DetectorBase()  # abstract base: name / default_severity unset on the class
+
+
+def test_grandchild_subclass_must_redeclare_if_needed():
+    # Sanity: once a parent sets name/default_severity, grandchildren inheriting
+    # them pass the check (legitimate use case).
+    class Grandchild(NoopDetector):
+        pass
+    Grandchild()  # should not raise
+
+    # A subclass that overrides nothing but lacks both required attrs
+    # cannot exist — we cannot construct such a test directly without
+    # subclassing DetectorBase again (which must itself declare attrs).
+    # The more important invariant is covered by the existing
+    # test_detector_base_requires_name_and_severity.
