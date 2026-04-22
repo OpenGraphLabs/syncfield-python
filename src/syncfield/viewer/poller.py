@@ -212,6 +212,8 @@ class SessionPoller:
                 plot_points=plot_points,
                 latest_pose=latest_pose,
                 live_preview=getattr(stream.capabilities, "live_preview", True),
+                connection_state=session._stream_states.get(stream_id, "idle"),  # type: ignore[attr-defined]
+                connection_error=session._stream_errors.get(stream_id),  # type: ignore[attr-defined]
             )
 
         # Snapshot incidents — take a consistent copy under the incidents lock.

@@ -103,3 +103,23 @@ class TestSnapshotBuilding:
             assert snap.host_id == "test_rig"
         finally:
             poller.stop()
+
+    def test_poller_snapshot_includes_connection_state(self, tmp_path):
+        """Verify that StreamSnapshot carries connection_state and connection_error
+        from the orchestrator's per-stream tracking."""
+        session = sf.SessionOrchestrator(
+            host_id="h",
+            output_dir=tmp_path,
+            sync_tone=sf.SyncToneConfig.silent(),
+        )
+        session.add(FakeStream("good"))
+        session.add(FakeStream("bad", fail_on_start=True))
+
+        poller = SessionPoller(session)
+        session.connect()
+
+        snap = poller._build_snapshot()
+        assert snap.streams["good"].connection_state == "connected"
+        assert snap.streams["good"].connection_error is None
+        assert snap.streams["bad"].connection_state == "failed"
+        assert snap.streams["bad"].connection_error is not None
