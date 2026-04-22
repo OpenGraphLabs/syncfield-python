@@ -80,6 +80,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Union
 
 from syncfield.clock import SessionClock
+from syncfield.health.severity import Severity
 from syncfield.multihost.advertiser import SessionAdvertiser
 from syncfield.multihost.browser import SessionBrowser
 from syncfield.multihost.types import SessionAnnouncement
@@ -1628,28 +1629,54 @@ class SessionOrchestrator:
 
             self._transition(SessionState.CONNECTING)
 
+            # Start the health worker early so events emitted during the
+            # connect loop (including per-stream failure events) reach
+            # registered detectors. Idempotent — safe to call again below.
+            self.health.start()
+
             connected: List[Stream] = []
-            try:
-                for stream in self._streams.values():
+            for stream in self._streams.values():
+                self._set_stream_state(stream.id, "connecting")
+                try:
                     stream.prepare()
                     stream.connect()
-                    connected.append(stream)
-                    # Emit a health event so the viewer's Health Events
-                    # panel confirms each device connected successfully.
+                except Exception as exc:
+                    self._stream_errors[stream.id] = str(exc)
+                    self._set_stream_state(stream.id, "failed")
                     stream._emit_health(HealthEvent(
                         stream_id=stream.id,
-                        kind=HealthEventKind.HEARTBEAT,
+                        kind=HealthEventKind.ERROR,
                         at_ns=time.monotonic_ns(),
-                        detail="connected",
+                        detail=str(exc),
+                        severity=Severity.ERROR,
+                        source="orchestrator",
+                        fingerprint=f"{stream.id}:startup-failure",
+                        data={"phase": "connect", "outcome": "error", "error": str(exc)},
                     ))
-            except Exception as exc:
-                self._log_rollback(exc, len(connected))
-                _rollback_disconnect_streams(connected)
+                    continue
+                connected.append(stream)
+                self._stream_errors.pop(stream.id, None)
+                self._set_stream_state(stream.id, "connected")
+                stream._emit_health(HealthEvent(
+                    stream_id=stream.id,
+                    kind=HealthEventKind.HEARTBEAT,
+                    at_ns=time.monotonic_ns(),
+                    detail="connected",
+                    severity=Severity.INFO,
+                    source="orchestrator",
+                    fingerprint=f"{stream.id}:startup-success",
+                    data={"phase": "connect", "outcome": "success"},
+                ))
+
+            if not connected:
                 self._transition(SessionState.IDLE)
                 if self._log_writer is not None:
                     self._log_writer.close()
                     self._log_writer = None
-                raise
+                raise RuntimeError(
+                    "connect() failed: no streams connected — every adapter raised. "
+                    "Inspect per-stream errors via session._stream_errors."
+                )
 
             self._connected_streams = connected
 

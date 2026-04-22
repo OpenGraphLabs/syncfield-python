@@ -85,6 +85,10 @@ class FakeStream(StreamBase):
         if self._fail_on_prepare:
             raise RuntimeError("fake failure in prepare")
 
+    def connect(self) -> None:
+        if self._fail_on_start:
+            raise RuntimeError("fake failure in connect")
+
     def start(self, session_clock: SessionClock) -> None:
         self.start_calls += 1
         if self._fail_on_start:
