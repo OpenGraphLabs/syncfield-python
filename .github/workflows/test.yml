@@ -16,6 +16,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Set up Node (for viewer frontend)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Build viewer frontend
+        working-directory: src/syncfield/viewer/frontend
+        run: |
+          # Same lockfile-regeneration dance as publish.yml: optional
+          # platform-specific deps (e.g. rollup's @rollup/rollup-linux-*)
+          # aren't re-resolved when a macOS-generated lockfile runs on
+          # Ubuntu. Regenerating from package.json on CI works.
+          rm -f package-lock.json
+          npm install --no-audit --no-fund
+          npm run build
+
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
         with:
