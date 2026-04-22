@@ -322,16 +322,17 @@ class TestStartRollback:
 
         assert session.state is SessionState.IDLE
 
-    def test_failure_during_prepare_stops_earlier_streams(self, tmp_path):
-        """A failure in ``prepare()`` happens during the connect phase,
-        which runs all preparations before any stream starts recording.
-        The rollback therefore calls ``disconnect()`` on streams that
-        connected — and ``start()`` is never reached on any of them.
+    def test_failure_during_prepare_isolated_to_failing_stream(self, tmp_path):
+        """A prepare() failure in the connect phase is now isolated to the
+        failing stream — partial-connect semantics.
 
-        This differs from the 0.1 behaviour where ``prepare()`` and
-        ``start()`` interleaved per stream; the 0.2 orchestrator splits
-        the two phases so all devices connect before any begin writing,
-        matching the egonaut lab recorder's 2-phase model.
+        The failing stream is marked ``"failed"`` with an entry in
+        ``_stream_errors``. Streams that connected successfully proceed to
+        recording, and ``start()`` does not raise.
+
+        The old all-or-nothing rollback behaviour (every stream rolled back
+        to IDLE when any stream failed) was replaced in the partial-connect
+        refactor so a single bad camera no longer blocks the entire session.
         """
         session = _session(tmp_path)
         good = FakeStream("a")
@@ -339,17 +340,21 @@ class TestStartRollback:
         session.add(good)
         session.add(bad)
 
-        with pytest.raises(RuntimeError, match="fake failure in prepare"):
-            session.start()
+        # start() must NOT raise — the session recovers with one fewer stream
+        session.start()
 
-        # prepare() ran on both in the connect phase
+        # Both streams entered the connect phase
         assert good.prepare_calls == 1
         assert bad.prepare_calls == 1
-        # start_recording() was never invoked because the connect phase failed
-        assert good.start_calls == 0
-        assert bad.start_calls == 0
-        # Rollback returned the auto-connected session to IDLE
-        assert session.state is SessionState.IDLE
+        # The failing stream is isolated: marked failed, error recorded
+        assert session._stream_states["b"] == "failed"
+        assert "b" in session._stream_errors
+        assert session._stream_errors["b"]
+        # The healthy stream connected and was started
+        assert session._stream_states["a"] == "connected"
+        assert good.start_calls > 0
+        # The session is recording with the surviving stream
+        assert session.state is SessionState.RECORDING
 
 
 class TestFourPhaseLifecycle:
