@@ -88,6 +88,10 @@ class HealthSystem:
         if self._worker is not None:
             self._worker.push_writer_stats(stream_id, stats)
 
+    def observe_connection_state(self, stream_id: str, new_state: str, at_ns: int) -> None:
+        if self._worker is not None:
+            self._worker.push_connection_state(stream_id, new_state, at_ns)
+
     # --- lifecycle -------------------------------------------------------
 
     def start(self) -> None:

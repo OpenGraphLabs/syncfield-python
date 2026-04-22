@@ -108,3 +108,31 @@ def test_register_stream_propagates_target_hz_to_detectors():
     assert fps._target_getter("cam") == 30.0
     assert jitter._target_getter("cam") == 30.0
     assert fps._target_getter("unknown") is None
+
+
+def test_health_system_observe_connection_state_routes_to_worker():
+    import time as _time
+    class Spy(DetectorBase):
+        name = "conn-spy"
+        default_severity = Severity.INFO
+
+        def __init__(self):
+            self.calls = []
+
+        def observe_connection_state(self, stream_id, new_state, at_ns):
+            self.calls.append((stream_id, new_state, at_ns))
+
+    hs = HealthSystem()
+    spy = Spy()
+    hs.register(spy)
+
+    hs.start()
+    try:
+        hs.observe_connection_state("cam", "connecting", 10)
+        hs.observe_connection_state("cam", "connected", 20)
+        deadline = _time.monotonic() + 2.0
+        while _time.monotonic() < deadline and len(spy.calls) < 2:
+            _time.sleep(0.02)
+    finally:
+        hs.stop()
+    assert spy.calls == [("cam", "connecting", 10), ("cam", "connected", 20)]
