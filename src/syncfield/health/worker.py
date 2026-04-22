@@ -12,8 +12,8 @@ from __future__ import annotations
 import queue
 import threading
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Iterable, List
 
 from syncfield.health.detector import Detector
 from syncfield.health.tracker import IncidentTracker
@@ -54,9 +54,13 @@ class HealthWorker:
         tick_hz: float = 20.0,
     ) -> None:
         self._tracker = tracker
-        self._detectors: List[Detector] = list(detectors)
+        self._detectors: list[Detector] = list(detectors)
         self._tick_interval = 1.0 / tick_hz
 
+        # SimpleQueue is unbounded. Producer rate is bounded in practice by
+        # hardware frame rate (tens of Hz) and the worker drains at tick_hz
+        # (default 20 Hz) plus post-stop. No back-pressure is needed for the
+        # intended load; if that changes, swap to queue.Queue with maxsize.
         self._samples: "queue.SimpleQueue[_SampleMsg]" = queue.SimpleQueue()
         self._healths: "queue.SimpleQueue[_HealthMsg]" = queue.SimpleQueue()
         self._states: "queue.SimpleQueue[_StateMsg]" = queue.SimpleQueue()
@@ -106,15 +110,19 @@ class HealthWorker:
             self._tracker.tick(now_ns=time.monotonic_ns())
 
             next_deadline += self._tick_interval
-            sleep_for = next_deadline - time.monotonic()
+            now = time.monotonic()
+            sleep_for = next_deadline - now
             if sleep_for > 0:
-                # Use Event.wait so stop() can interrupt immediately.
+                # Event.wait lets stop() cut short the sleep.
                 self._stop.wait(timeout=sleep_for)
             else:
-                # Running behind; reset the schedule anchor.
-                next_deadline = time.monotonic()
+                # Running behind; reset anchor to the clock reading we just took.
+                next_deadline = now
 
-        # Drain any straggling messages after stop so tests see a consistent state.
+        # Drain any stragglers so post-stop state is consistent. We deliberately
+        # do NOT call tracker.tick() here — incidents still open at stop time
+        # are resolved by SessionOrchestrator via IncidentTracker.close_all(),
+        # not by one last opportunistic close_condition pass.
         self._drain_once()
 
     def _drain_once(self) -> None:
@@ -139,7 +147,7 @@ class HealthWorker:
                 self._tracker.ingest(event)
 
 
-def _drain_queue(q: "queue.SimpleQueue") -> List:
+def _drain_queue(q: "queue.SimpleQueue") -> list:
     out = []
     while True:
         try:
