@@ -23,6 +23,8 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Deque, Dict, List, Optional, Tuple
 
+from syncfield.health.types import IncidentSnapshot
+
 
 # ---------------------------------------------------------------------------
 # Aggregation snapshot
@@ -73,8 +75,6 @@ class StreamSnapshot:
             exposes the latest vector/list sample so panels that render
             a single-frame pose (3-D hand skeleton, quaternion axes…)
             have data to draw. Empty for streams that emit only scalars.
-        health_count: Number of health events this stream has buffered so
-            far. Useful for showing a red dot on degraded streams.
     """
 
     id: str
@@ -87,27 +87,7 @@ class StreamSnapshot:
     latest_frame: Any  # numpy array or None — kept as Any so numpy is optional
     plot_points: Dict[str, Tuple[List[float], List[float]]]
     latest_pose: Dict[str, List[float]]
-    health_count: int
     live_preview: bool = True
-
-
-# ---------------------------------------------------------------------------
-# Health event
-# ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class HealthEntry:
-    """A single health event surfaced by any stream.
-
-    Simpler than :class:`~syncfield.types.HealthEvent` because the viewer
-    only needs strings for display and a monotonic ordering key.
-    """
-
-    stream_id: str
-    kind: str   # "heartbeat" | "drop" | "reconnect" | "warning" | "error"
-    at_ns: int
-    detail: Optional[str]
 
 
 # ---------------------------------------------------------------------------
@@ -131,7 +111,8 @@ class SessionSnapshot:
         chirp_enabled: Whether :class:`SyncToneConfig` had chirp enabled.
         elapsed_s: Wall-clock seconds since ``start()``, or 0 if idle.
         streams: Ordered map ``stream_id -> StreamSnapshot``.
-        health_log: Most recent health events across all streams (newest last).
+        active_incidents: Currently open incidents across all streams.
+        resolved_incidents: Recently closed incidents (newest last, capped at 20).
     """
 
     host_id: str
@@ -144,7 +125,8 @@ class SessionSnapshot:
     chirp_enabled: bool
     elapsed_s: float
     streams: Dict[str, StreamSnapshot]
-    health_log: List[HealthEntry]
+    active_incidents: List[IncidentSnapshot] = field(default_factory=list)
+    resolved_incidents: List[IncidentSnapshot] = field(default_factory=list)
     aggregation: Optional[AggregationSnapshot] = None
 
 
@@ -163,7 +145,6 @@ class StreamStatsBuffer:
     """
 
     max_plot_samples: int = 300
-    max_health: int = 20
 
     # Rolling fps window (monotonic ns)
     _fps_window: Deque[int] = field(default_factory=lambda: deque(maxlen=30))
@@ -178,9 +159,6 @@ class StreamStatsBuffer:
     # state, not a history, and the payload (~500 floats per pose) is
     # too large to buffer thousands of frames of.
     _latest_pose: Dict[str, List[float]] = field(default_factory=dict)
-
-    # Health events produced by this stream (capped)
-    _health: Deque[HealthEntry] = field(default_factory=lambda: deque(maxlen=20))
 
     def observe_sample(self, capture_ns: int, channels: Optional[Dict[str, Any]]) -> None:
         """Record one sample. Called from the stream's callback thread.
@@ -244,9 +222,6 @@ class StreamStatsBuffer:
                 if name not in plottable:
                     buf.append(float("nan"))
 
-    def observe_health(self, event: HealthEntry) -> None:
-        self._health.append(event)
-
     def snapshot_fps(self, now_ns: int) -> float:
         """Effective Hz over the last second of samples.
 
@@ -289,9 +264,6 @@ class StreamStatsBuffer:
         it straight to JSON without touching the poller's state.
         """
         return {name: list(values) for name, values in self._latest_pose.items()}
-
-    def snapshot_health(self) -> List[HealthEntry]:
-        return list(self._health)
 
 
 # ---------------------------------------------------------------------------

@@ -11,7 +11,7 @@ import math
 
 import pytest
 
-from syncfield.viewer.state import HealthEntry, StreamStatsBuffer
+from syncfield.viewer.state import StreamStatsBuffer
 
 
 class TestStreamStatsBufferSamples:
@@ -95,29 +95,6 @@ class TestStreamStatsBufferSamples:
         assert math.isnan(gx_ys[1])
 
 
-class TestStreamStatsBufferHealth:
-    def test_empty(self):
-        assert StreamStatsBuffer().snapshot_health() == []
-
-    def test_records_in_order(self):
-        buf = StreamStatsBuffer()
-        a = HealthEntry(stream_id="s", kind="warning", at_ns=10, detail="a")
-        b = HealthEntry(stream_id="s", kind="error", at_ns=20, detail="b")
-        buf.observe_health(a)
-        buf.observe_health(b)
-        events = buf.snapshot_health()
-        assert events == [a, b]
-
-    def test_capped(self):
-        buf = StreamStatsBuffer(max_health=3)
-        # Override the internal deque size — real constructor caps at 20,
-        # but we test the cap principle with whatever the dataclass set up.
-        # The deque default is maxlen=20; this test verifies behaviour at
-        # whatever cap the buffer ended up with.
-        for i in range(30):
-            buf.observe_health(
-                HealthEntry(stream_id="s", kind="heartbeat", at_ns=i, detail=None)
-            )
-        events = buf.snapshot_health()
-        assert len(events) <= 20  # matches default max_health
-        assert events[-1].at_ns == 29  # newest kept
+# Health tracking has been moved from StreamStatsBuffer to HealthSystem/IncidentTracker.
+# The per-stream HealthEntry buffer and observe_health/snapshot_health methods were
+# removed in Task 20. Health-related viewer tests now live in test_snapshot_incidents.py.

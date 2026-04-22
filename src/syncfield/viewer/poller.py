@@ -16,16 +16,17 @@ otherwise miss ~90% of samples on a 100 Hz IMU.
 from __future__ import annotations
 
 import threading
-import time
+import time as _time
+from collections import deque
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, Optional
 
+from syncfield.health.types import Incident, IncidentSnapshot
 from syncfield.orchestrator import SessionOrchestrator
 from syncfield.stream import Stream
-from syncfield.types import HealthEvent, SampleEvent, SessionState
+from syncfield.types import SampleEvent, SessionState
 
 from syncfield.viewer.state import (
-    HealthEntry,
     SessionSnapshot,
     StreamSnapshot,
     StreamStatsBuffer,
@@ -66,6 +67,15 @@ class SessionPoller:
         self._recording_started_at: Optional[float] = None
         self._last_observed_state: SessionState = SessionState.IDLE
 
+        # Incident tracking — fed by HealthSystem callbacks.
+        self._incidents_lock = threading.Lock()
+        self._open_by_id: dict[str, Incident] = {}
+        self._resolved: deque[Incident] = deque(maxlen=20)
+
+        session.health.on_incident_opened = self._ingest_incident
+        session.health.on_incident_updated = self._ingest_incident
+        session.health.on_incident_closed = self._ingest_incident
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -96,7 +106,7 @@ class SessionPoller:
     # ------------------------------------------------------------------
 
     def _register_callbacks(self) -> None:
-        """Attach on_sample / on_health to each registered stream.
+        """Attach on_sample to each registered stream.
 
         Re-entrant: callbacks for streams we've already registered for are
         skipped by tracking which stream ids already have a buffer.
@@ -107,7 +117,6 @@ class SessionPoller:
             buffer = StreamStatsBuffer()
             self._stats[stream_id] = buffer
             stream.on_sample(self._make_sample_callback(stream_id, buffer))
-            stream.on_health(self._make_health_callback(stream_id, buffer))
 
     @staticmethod
     def _make_sample_callback(stream_id: str, buffer: StreamStatsBuffer):
@@ -116,19 +125,14 @@ class SessionPoller:
 
         return _on_sample
 
-    @staticmethod
-    def _make_health_callback(stream_id: str, buffer: StreamStatsBuffer):
-        def _on_health(event: HealthEvent) -> None:
-            buffer.observe_health(
-                HealthEntry(
-                    stream_id=stream_id,
-                    kind=event.kind.value,
-                    at_ns=event.at_ns,
-                    detail=event.detail,
-                )
-            )
-
-        return _on_health
+    def _ingest_incident(self, incident: Incident) -> None:
+        """Called from the HealthSystem worker thread whenever an incident changes."""
+        with self._incidents_lock:
+            if incident.is_open:
+                self._open_by_id[incident.id] = incident
+            else:
+                self._open_by_id.pop(incident.id, None)
+                self._resolved.append(incident)
 
     # ------------------------------------------------------------------
     # Poll loop
@@ -157,7 +161,7 @@ class SessionPoller:
 
         # Track the recording start time so we can compute elapsed seconds.
         current_state: SessionState = session.state
-        now = time.time()
+        now = _time.time()
         if (
             current_state is SessionState.RECORDING
             and self._last_observed_state is not SessionState.RECORDING
@@ -171,7 +175,7 @@ class SessionPoller:
         if self._recording_started_at is not None:
             elapsed_s = max(0.0, now - self._recording_started_at)
 
-        now_ns = time.monotonic_ns()
+        now_ns = _time.monotonic_ns()
         streams_snapshot: Dict[str, StreamSnapshot] = {}
         for stream_id, stream in session._streams.items():  # type: ignore[attr-defined]
             buffer = self._stats.get(stream_id)
@@ -207,12 +211,20 @@ class SessionPoller:
                 latest_frame=latest_frame,
                 plot_points=plot_points,
                 latest_pose=latest_pose,
-                health_count=len(buffer._health),
                 live_preview=getattr(stream.capabilities, "live_preview", True),
             )
 
-        # Merge health events into a session-wide, time-sorted log.
-        health_log = self._collect_health_log()
+        # Snapshot incidents — take a consistent copy under the incidents lock.
+        with self._incidents_lock:
+            now_ns = _time.monotonic_ns()
+            active = [
+                IncidentSnapshot.from_incident(i, now_ns=now_ns)
+                for i in self._open_by_id.values()
+            ]
+            resolved = [
+                IncidentSnapshot.from_incident(i, now_ns=now_ns)
+                for i in self._resolved
+            ]
 
         # Session-level sync point + chirp fields.
         sync_point = getattr(session, "_sync_point", None)
@@ -233,7 +245,8 @@ class SessionPoller:
             chirp_enabled=chirp_enabled,
             elapsed_s=elapsed_s,
             streams=streams_snapshot,
-            health_log=health_log,
+            active_incidents=active,
+            resolved_incidents=resolved,
         )
 
     @staticmethod
@@ -241,12 +254,3 @@ class SessionPoller:
         """Read ``stream.latest_frame`` if the adapter exposes it."""
         frame = getattr(stream, "latest_frame", None)
         return frame
-
-    def _collect_health_log(self) -> List[HealthEntry]:
-        """Merge per-stream health deques into a time-sorted global log."""
-        merged: List[HealthEntry] = []
-        for buffer in self._stats.values():
-            merged.extend(buffer.snapshot_health())
-        merged.sort(key=lambda e: e.at_ns)
-        # Cap to the most recent N so a long session doesn't blow up the table.
-        return merged[-50:]

@@ -11,7 +11,6 @@ import time
 
 import syncfield as sf
 from syncfield.testing import FakeStream
-from syncfield.types import HealthEventKind
 from syncfield.viewer.poller import SessionPoller
 
 
@@ -79,24 +78,17 @@ class TestSnapshotBuilding:
         finally:
             session.stop()
 
-    def test_push_health_surfaces_in_health_log(self, tmp_path):
+    def test_snapshot_has_incident_lists(self, tmp_path):
+        """Verify that SessionSnapshot carries active_incidents / resolved_incidents
+        (replacing the retired health_log / health_count fields from Task 20)."""
         session = _make_session(tmp_path)
         poller = SessionPoller(session, interval_s=0.01)
-        poller._register_callbacks()
-
-        session.start()
-        try:
-            imu = session._streams["imu"]  # type: ignore[attr-defined]
-            imu.push_health(HealthEventKind.WARNING, at_ns=123, detail="burst")
-            snap = poller._build_snapshot()
-            assert len(snap.health_log) >= 1
-            assert any(
-                ev.kind == "warning" and ev.detail == "burst"
-                for ev in snap.health_log
-            )
-            assert snap.streams["imu"].health_count >= 1
-        finally:
-            session.stop()
+        snap = poller._build_snapshot()
+        # No incidents yet — both lists should be present and empty.
+        assert hasattr(snap, "active_incidents")
+        assert hasattr(snap, "resolved_incidents")
+        assert snap.active_incidents == []
+        assert snap.resolved_incidents == []
 
     def test_start_stop_and_get_snapshot_thread(self, tmp_path):
         """End-to-end smoke test of the polling thread."""

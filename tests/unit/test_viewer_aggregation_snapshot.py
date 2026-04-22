@@ -9,9 +9,18 @@ from syncfield.adapters.insta360_go3s.aggregation.types import (
 from syncfield.viewer.server import snapshot_to_dict
 
 
-def test_snapshot_includes_aggregation_section_empty_by_default():
+def _make_snapshot_mock(**kwargs):
     snapshot = MagicMock()
-    snapshot.aggregation = None
+    snapshot.streams = {}
+    snapshot.active_incidents = []
+    snapshot.resolved_incidents = []
+    for k, v in kwargs.items():
+        setattr(snapshot, k, v)
+    return snapshot
+
+
+def test_snapshot_includes_aggregation_section_empty_by_default():
+    snapshot = _make_snapshot_mock(aggregation=None)
     d = snapshot_to_dict(snapshot)
     assert "aggregation" in d
     assert d["aggregation"]["active_job"] is None
@@ -30,11 +39,11 @@ def test_snapshot_serializes_active_job():
         current_bytes=5_000_000,
         current_total_bytes=10_000_000,
     )
-    snapshot = MagicMock()
-    snapshot.aggregation = MagicMock()
-    snapshot.aggregation.active_job = progress
-    snapshot.aggregation.queue_length = 1
-    snapshot.aggregation.recent_jobs = [progress]
+    agg_mock = MagicMock()
+    agg_mock.active_job = progress
+    agg_mock.queue_length = 1
+    agg_mock.recent_jobs = [progress]
+    snapshot = _make_snapshot_mock(aggregation=agg_mock)
     d = snapshot_to_dict(snapshot)
     assert d["aggregation"]["active_job"]["state"] == "running"
     assert d["aggregation"]["active_job"]["current_bytes"] == 5_000_000
