@@ -471,3 +471,87 @@ class TestDeviceShutterHostNs:
         msg.getTimestamp.return_value = None
 
         assert helper(msg) is None
+
+
+class TestRecordingAnchor:
+    """Per-recording-window intra-host sync anchor capture.
+
+    OAK cameras expose a real on-device shutter timestamp, so the
+    anchor's ``first_frame_device_ns`` is expected to be populated
+    (non-``None``) on the very first frame that arrives after
+    ``start_recording()``.
+    """
+
+    def test_anchor_captured_from_first_frame(
+        self, mock_depthai, mock_av_generous, tmp_path, monkeypatch
+    ):
+        """After arming the clock and pushing frames through the fake
+        pipeline, ``stop_recording`` returns a :class:`FinalizationReport`
+        whose ``recording_anchor`` captures the armed host ns, the host
+        arrival ns of the first recorded frame, and the device-clock
+        timestamp of that frame."""
+        from syncfield.adapters import oak_camera
+        from syncfield.adapters.oak_camera import OakCameraStream
+
+        # Force a known, non-None device timestamp on every frame so the
+        # assertion on ``first_frame_device_ns`` is unambiguous. The
+        # fake ``_FakeFrame`` / ``_FakeEncodedPacket`` payloads used by
+        # the shared fixture don't define ``getTimestamp``, so the real
+        # helper would return ``None``.
+        known_device_ns = 42_000_000_000
+        monkeypatch.setattr(
+            oak_camera, "_device_timestamp_ns", lambda msg: known_device_ns
+        )
+
+        armed_ns = 1_234_567_890
+        clock = SessionClock(
+            sync_point=SyncPoint.create_now("h"),
+            recording_armed_ns=armed_ns,
+        )
+
+        stream = OakCameraStream("oak", output_dir=tmp_path)
+        stream.prepare()
+        stream.connect()
+        stream.start_recording(clock)
+        # Let the capture thread drain at least one frame out of the
+        # unlimited fake queue.
+        time.sleep(0.15)
+        report = stream.stop_recording()
+        stream.disconnect()
+
+        assert report.recording_anchor is not None
+        assert report.recording_anchor.armed_host_ns == armed_ns
+        assert report.recording_anchor.first_frame_host_ns >= armed_ns
+        assert report.recording_anchor.first_frame_device_ns == known_device_ns
+
+    def test_no_anchor_when_no_frames_arrive(
+        self, mock_depthai, mock_av_generous, tmp_path
+    ):
+        """If ``start_recording`` is called but zero frames arrive before
+        ``stop_recording``, the report's ``recording_anchor`` stays
+        ``None``."""
+        from syncfield.adapters.oak_camera import OakCameraStream
+
+        armed_ns = 9_876_543_210
+        clock = SessionClock(
+            sync_point=SyncPoint.create_now("h"),
+            recording_armed_ns=armed_ns,
+        )
+
+        stream = OakCameraStream("oak", output_dir=tmp_path)
+        stream.prepare()
+        stream.connect()
+        # Starve the capture loop so the recording window sees no frames.
+        # ``_safe_get_rgb`` swallows exceptions and returns ``None``, so
+        # raising from ``get`` keeps the loop spinning without producing
+        # a frame. Set BEFORE ``start_recording`` and give the capture
+        # thread a beat to settle on the new side_effect so no in-flight
+        # frame slips past the ``_recording`` flag flip.
+        stream._q_rgb.get.side_effect = RuntimeError("starved")
+        time.sleep(0.05)
+        stream.start_recording(clock)
+        time.sleep(0.1)
+        report = stream.stop_recording()
+        stream.disconnect()
+
+        assert report.recording_anchor is None

@@ -418,6 +418,7 @@ class OakCameraStream(StreamBase):
         path), the pipeline is started here first so the writer always
         has a feeder.
         """
+        self._begin_recording_window(session_clock)
         if self._thread is None or not self._thread.is_alive():
             self.connect()
         self._output_dir.mkdir(parents=True, exist_ok=True)
@@ -488,6 +489,7 @@ class OakCameraStream(StreamBase):
             error=None,
             jitter_p95_ns=jitter_p95,
             jitter_p99_ns=jitter_p99,
+            recording_anchor=self._recording_anchor(),
         )
 
     def _finalize_mp4(self) -> bool:
@@ -732,6 +734,7 @@ class OakCameraStream(StreamBase):
 
             # Recording-window-only jitter collection (see UVC adapter for rationale).
             if self._recording:
+                self._observe_first_frame(capture_ns, device_ts_ns)
                 if self._prev_capture_ns is not None:
                     self._intervals_ns.append(capture_ns - self._prev_capture_ns)
                 self._prev_capture_ns = capture_ns
