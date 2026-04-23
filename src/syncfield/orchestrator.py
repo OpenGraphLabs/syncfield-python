@@ -1930,6 +1930,17 @@ class SessionOrchestrator:
             # close path in ``_finalize_streams`` can flush them.
             self._open_sample_writers()
 
+            # Capture a single shared armed_host_ns immediately before
+            # fanning start_recording out — all streams receive the
+            # same value via SessionClock.recording_armed_ns, which
+            # they can use as an intra-host sync anchor in their
+            # capture loop (see StreamBase._begin_recording_window).
+            import dataclasses as _dc
+            armed_ns = time.monotonic_ns()
+            self._session_clock = _dc.replace(
+                self._session_clock, recording_armed_ns=armed_ns
+            )
+
             recording: List[Stream] = []
             try:
                 for stream in self._connected_streams:
@@ -2445,6 +2456,16 @@ class SessionOrchestrator:
                     entry["path"] = str(final.file_path)
                 if final.error is not None:
                     entry["error"] = final.error
+                # Intra-host sync anchor: common ``armed_host_ns`` plus
+                # this stream's first-frame timestamps. ``None`` for
+                # empty recordings or adapters that haven't opted in;
+                # downstream sync tooling reads ``first_frame_latency_ns``
+                # to bias-correct per-adapter pipeline latency.
+                entry["recording_anchor"] = (
+                    final.recording_anchor.to_dict()
+                    if final.recording_anchor is not None
+                    else None
+                )
             streams_dict[stream.id] = entry
 
         write_manifest(
