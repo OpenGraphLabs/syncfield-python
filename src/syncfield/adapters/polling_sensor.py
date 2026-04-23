@@ -126,6 +126,8 @@ class PollingSensorStream(StreamBase):
         ))
 
         if self._writing:
+            # Polling sensors have no device clock — pass None for device_ns.
+            self._observe_first_frame(capture_ns, None)
             self._write_core.record_sample(capture_ns)
 
         elapsed = time.monotonic() - loop_start
@@ -153,6 +155,7 @@ class PollingSensorStream(StreamBase):
         self._thread.start()
 
     def start_recording(self, session_clock: SessionClock) -> None:
+        self._begin_recording_window(session_clock)
         self._write_core.reset_recording_stats()
         self._writing = True
 
@@ -170,6 +173,7 @@ class PollingSensorStream(StreamBase):
             last_sample_at_ns=last_ns,
             health_events=list(self._collected_health),
             error=None,
+            recording_anchor=self._recording_anchor(),
         )
 
     def disconnect(self) -> None:
