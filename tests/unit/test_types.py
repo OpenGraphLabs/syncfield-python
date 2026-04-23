@@ -408,3 +408,24 @@ class TestSessionReport:
         assert report.host_id == "rig_01"
         assert report.finalizations == []
 
+
+def test_finalization_report_with_anchor():
+    anchor = RecordingAnchor(
+        armed_host_ns=100, first_frame_host_ns=150, first_frame_device_ns=42
+    )
+    report = FinalizationReport(
+        stream_id="s1", status="completed", frame_count=10,
+        file_path=None, first_sample_at_ns=150, last_sample_at_ns=450,
+        health_events=[], error=None, recording_anchor=anchor,
+    )
+    assert report.recording_anchor is anchor
+
+
+def test_finalization_report_anchor_defaults_to_none():
+    report = FinalizationReport(
+        stream_id="s2", status="completed", frame_count=0,
+        file_path=None, first_sample_at_ns=None, last_sample_at_ns=None,
+        health_events=[], error=None,
+    )
+    assert report.recording_anchor is None
+

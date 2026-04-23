@@ -374,6 +374,10 @@ class FinalizationReport:
         jitter_p99_ns: 99th-percentile inter-frame interval (ns) during
             the recording window. None if fewer than 20 samples were
             collected.
+        recording_anchor: Intra-host sync anchor captured at the start
+            of the recording window (common ``armed_host_ns`` plus this
+            stream's first-frame timestamps). ``None`` for empty
+            recordings or adapters that haven't opted in.
     """
 
     stream_id: str
@@ -387,6 +391,7 @@ class FinalizationReport:
     jitter_p95_ns: int | None = None
     jitter_p99_ns: int | None = None
     incidents: list = field(default_factory=list)
+    recording_anchor: RecordingAnchor | None = None
 
 
 @dataclass(frozen=True)
