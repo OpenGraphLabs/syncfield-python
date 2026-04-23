@@ -72,6 +72,7 @@ The file is organized top-down so the public lifecycle is easy to read:
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import threading
 import time
@@ -1935,9 +1936,8 @@ class SessionOrchestrator:
             # same value via SessionClock.recording_armed_ns, which
             # they can use as an intra-host sync anchor in their
             # capture loop (see StreamBase._begin_recording_window).
-            import dataclasses as _dc
             armed_ns = time.monotonic_ns()
-            self._session_clock = _dc.replace(
+            self._session_clock = dataclasses.replace(
                 self._session_clock, recording_armed_ns=armed_ns
             )
 
