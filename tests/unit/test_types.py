@@ -1,10 +1,11 @@
 """Tests for syncfield.types."""
 
+import dataclasses
 import pytest
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 
-from syncfield.types import FrameTimestamp, SensorSample, SyncPoint
+from syncfield.types import FrameTimestamp, RecordingAnchor, SensorSample, SyncPoint
 from syncfield.health.severity import Severity
 
 
@@ -179,7 +180,6 @@ def test_sensor_sample_nested_round_trip():
 
 
 def test_recording_anchor_with_device_ts():
-    from syncfield.types import RecordingAnchor
     anchor = RecordingAnchor(
         armed_host_ns=1_000_000_000,
         first_frame_host_ns=1_044_000_000,
@@ -195,7 +195,6 @@ def test_recording_anchor_with_device_ts():
 
 
 def test_recording_anchor_without_device_ts():
-    from syncfield.types import RecordingAnchor
     anchor = RecordingAnchor(
         armed_host_ns=1_000,
         first_frame_host_ns=1_044_000_000,
@@ -207,10 +206,20 @@ def test_recording_anchor_without_device_ts():
 
 
 def test_recording_anchor_rejects_first_before_armed():
-    from syncfield.types import RecordingAnchor
-    import pytest
     with pytest.raises(ValueError, match="first_frame_host_ns must be >= armed_host_ns"):
         RecordingAnchor(armed_host_ns=100, first_frame_host_ns=50)
+
+
+def test_recording_anchor_is_frozen():
+    anchor = RecordingAnchor(armed_host_ns=0, first_frame_host_ns=0)
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        anchor.armed_host_ns = 1  # type: ignore[misc]
+
+
+def test_recording_anchor_allows_zero_latency():
+    """first_frame_host_ns == armed_host_ns is legal (zero-latency case)."""
+    anchor = RecordingAnchor(armed_host_ns=1_000, first_frame_host_ns=1_000)
+    assert anchor.first_frame_latency_ns == 0
 
 
 from syncfield.types import (
