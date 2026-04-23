@@ -162,6 +162,7 @@ class UVCWebcamStream(StreamBase):
 
     def start_recording(self, session_clock: SessionClock) -> None:
         """Open the VideoEncoder and flip recording on."""
+        self._begin_recording_window(session_clock)
         if self._thread is None or not self._thread.is_alive():
             self.connect()
         self._output_dir.mkdir(parents=True, exist_ok=True)
@@ -198,6 +199,7 @@ class UVCWebcamStream(StreamBase):
             error=None,
             jitter_p95_ns=jitter_p95,
             jitter_p99_ns=jitter_p99,
+            recording_anchor=self._recording_anchor(),
         )
 
     def disconnect(self) -> None:
@@ -284,6 +286,8 @@ class UVCWebcamStream(StreamBase):
                 frame = next(frame_iter)
                 capture_ns = time.monotonic_ns()
                 if self._recording:
+                    # UVC has no device clock — pass None for device_ns.
+                    self._observe_first_frame(capture_ns, None)
                     if self._prev_capture_ns is not None:
                         self._intervals_ns.append(capture_ns - self._prev_capture_ns)
                     self._prev_capture_ns = capture_ns
