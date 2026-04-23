@@ -143,10 +143,47 @@ def open_uvc_input(
 
     The returned container yields packets via ``.demux()`` which the
     caller decodes frame-by-frame.
+
+    Low-latency tuning
+    ------------------
+    Live camera capture is not file playback — ffmpeg's default demuxer
+    fills a 5 MB packet probe buffer and ``analyzeduration`` waits up
+    to 5 s to finalise stream info before handing any frame to Python.
+    On a Continuity Camera / H.264-over-USB path that adds hundreds of
+    milliseconds of arrival-vs-real-shutter delay and produces a
+    warm-up "burst" where the first interval is ~110 ms and the next
+    few are <20 ms as the backlog drains. Both manifest as jitter in
+    downstream sync.
+
+    The options below reduce every ffmpeg-controllable source of
+    buffering on the input path:
+
+    * ``fflags=nobuffer+flush_packets`` — skip the packet queue fill
+      on open; flush each packet as soon as the demuxer emits it.
+    * ``flags=low_delay`` — decoder stops waiting for B-frame reorder
+      (harmless for camera streams, which are IPPP with ``bf=0``).
+    * ``analyzeduration=0`` — hand the first frame off as soon as
+      stream info is known; don't average over a preset window.
+    * ``max_delay=0`` — demuxer max demux-interleaving delay cap.
+
+    After opening, we additionally clamp the video decoder's
+    ``thread_type`` to ``NONE`` and set the ``LOW_DELAY`` codec flag.
+    Multi-threaded decode can sit on a frame waiting for neighbours
+    to finish — we'd rather burn a little more CPU on one thread and
+    get each frame out immediately.
+
+    ``probesize`` is intentionally left at the ffmpeg default. Dropping
+    it below ~32 KB breaks H.264 probe on Continuity Camera (SPS/PPS
+    may not land in the first packet), which costs more than the
+    milliseconds its default value adds.
     """
     options = {
         "video_size": f"{int(width)}x{int(height)}",
         "framerate": str(int(round(fps))),
+        "fflags": "nobuffer+flush_packets",
+        "flags": "low_delay",
+        "analyzeduration": "0",
+        "max_delay": "0",
     }
     if pixel_format is not None:
         options["pixel_format"] = pixel_format
@@ -168,7 +205,36 @@ def open_uvc_input(
     else:
         raise RuntimeError(f"Unsupported platform for UVC input: {sys.platform}")
 
-    return av.open(url, format=fmt, options=options)
+    container = av.open(url, format=fmt, options=options)
+
+    # Decoder-side low-latency tuning. The demuxer options above only
+    # affect the input/container layer; the H.264 decoder has its own
+    # reordering buffer and thread-pool frame latency. For a live
+    # camera stream neither is desirable — no B-frames arrive, and the
+    # worker-thread batching delays each frame by a few ms while it
+    # waits for enough work. Ask the decoder to emit every frame as
+    # soon as it finishes, single-threaded, with the LOW_DELAY codec
+    # flag asserted. Wrapped in try/except because older PyAV releases
+    # exposed slightly different enum shapes — if we fail to clamp the
+    # decoder we just keep the defaults, which is strictly no worse
+    # than before this function existed.
+    try:
+        for stream in container.streams.video:
+            cc = stream.codec_context
+            try:
+                cc.thread_type = "NONE"
+            except (ValueError, AttributeError):
+                pass
+            try:
+                # PyAV exposes codec flags as an IntFlag; LOW_DELAY is
+                # 0x0008 in ffmpeg's AV_CODEC_FLAG_LOW_DELAY.
+                cc.flags |= 0x0008
+            except (AttributeError, TypeError):
+                pass
+    except Exception:  # pragma: no cover — best-effort
+        pass
+
+    return container
 
 
 def compute_jitter_percentiles(

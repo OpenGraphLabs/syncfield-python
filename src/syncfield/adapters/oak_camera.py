@@ -77,22 +77,22 @@ from syncfield.types import (
 )
 
 
-def _device_shutter_host_ns(msg: Any) -> Optional[int]:
-    """Return the frame's shutter-close time, projected onto the host's
-    monotonic clock, as integer nanoseconds — or ``None`` if unavailable.
+def _device_timestamp_ns(msg: Any) -> Optional[int]:
+    """Return the frame's device-clock timestamp as integer nanoseconds.
 
-    DepthAI periodically cross-correlates its on-chip Myriad-X clock with
-    the host's ``time.monotonic_ns()``, so ``msg.getTimestamp()`` returns
-    a ``datetime.timedelta`` whose value is the frame's **shutter instant
-    already translated into the host clock domain** — upstream of the
-    ISP / encoder / XLink pipeline depth that otherwise biases the
-    arrival-time ``capture_ns`` we stamp in the capture loop.
+    ``msg.getTimestamp()`` is a ``datetime.timedelta`` anchored to the
+    Myriad-X board's own clock (power-up relative). This helper returns
+    the raw value — no attempt to project it onto the host monotonic
+    clock, because DepthAI 3.x does not actually synchronise the two
+    (the earlier ``device_shutter_host_ns`` path discovered ~12 day
+    offsets between boards; cross-domain projection is unsafe).
 
-    Adapters expose this alongside ``capture_ns`` (never in place of it)
-    so a downstream aligner can opportunistically anchor on the true
-    shutter instant for devices that provide one, and fall back to the
-    arrival timestamp for those that don't — preserving SyncField's
-    hardware-agnostic contract.
+    Downstream we use this value only for **inter-frame interval
+    smoothing**: the deltas between consecutive frames' device clocks
+    are jitter-free sensor cadence, which — combined with host arrival
+    as the session anchor — removes host-side XLink/transport jitter
+    from ``capture_ns`` without caring about absolute clock alignment.
+    See ``SyncSession._refine_video_with_device_timestamps``.
     """
     if msg is None:
         return None
@@ -102,8 +102,7 @@ def _device_shutter_host_ns(msg: Any) -> Optional[int]:
         return None
     if td is None:
         return None
-    # Integer arithmetic — avoid float rounding at ns scale for the
-    # ~10¹⁸ ns magnitudes reached after long uptimes.
+    # Integer arithmetic — avoid float rounding at ns magnitudes.
     return ((td.days * 86_400 + td.seconds) * 1_000_000 + td.microseconds) * 1_000
 
 
@@ -287,13 +286,21 @@ class OakCameraStream(StreamBase):
         pass
 
     #: How many times to poll ``dai.Device.getAllAvailableDevices()``
-    #: before giving up. The first call often returns only a subset on
-    #: dual-OAK rigs because XLink enumeration is asynchronous — the
-    #: second board shows up after 0.5–1 s. Three tries with a short
-    #: sleep between comfortably covers that gap without extending the
-    #: happy-path connect time (which still returns on the first call).
-    _ENUMERATE_RETRIES = 3
-    _ENUMERATE_RETRY_DELAY_S = 0.8
+    #: before giving up. XLink enumeration is asynchronous — on multi-
+    #: board rigs the first probe often returns only a subset, and the
+    #: rest appear up to several seconds later while a sibling board
+    #: boots and the Mac USB stack re-quiesces. We've observed:
+    #:
+    #: * dual-OAK (USB-3 + USB-3 on different controllers): ~2 s window
+    #: * dual-OAK involving OAK-D-Lite (USB-2-only board): 10–20 s
+    #:   before the USB-2 board reappears in the enumeration list
+    #: * triple-OAK with USB-2 hub sharing: even longer
+    #:
+    #: 24 s ceiling covers the worst case we've measured without blowing
+    #: up the happy-path connect time — the probe returns on first hit
+    #: when every board is already visible.
+    _ENUMERATE_RETRIES = 16
+    _ENUMERATE_RETRY_DELAY_S = 1.5
 
     def _locate_device(self) -> Any:
         """Find the target OAK, retrying the XLink enumeration if needed.
@@ -715,13 +722,13 @@ class OakCameraStream(StreamBase):
             if rgb_msg is None:
                 continue
 
-            # DepthAI projects the on-device shutter moment into host
-            # monotonic time — pull it here, *before* any handler touches
-            # the message, so downstream sync consumers can anchor on the
-            # true shutter instant instead of the pipeline-depth-biased
-            # arrival stamp. Surfaced via ``SampleEvent.channels`` so the
-            # orchestrator lands it in the jsonl ``extras``.
-            device_shutter_host_ns = _device_shutter_host_ns(rgb_msg)
+            # Device-clock timestamp (raw Myriad-X ns since board power-up).
+            # Pulled here — *before* any handler touches the message — so the
+            # value travels alongside ``capture_ns`` to the orchestrator.
+            # Downstream device-interval smoothing in ``SyncSession`` uses
+            # the deltas between consecutive frames' device clocks to scrub
+            # host-arrival jitter out of the recorded ``capture_ns``.
+            device_ts_ns = _device_timestamp_ns(rgb_msg)
 
             # Recording-window-only jitter collection (see UVC adapter for rationale).
             if self._recording:
@@ -730,9 +737,9 @@ class OakCameraStream(StreamBase):
                 self._prev_capture_ns = capture_ns
 
             if self._encoding == OAK_ENCODING_H264:
-                self._handle_encoded_packet(rgb_msg, capture_ns, device_shutter_host_ns)
+                self._handle_encoded_packet(rgb_msg, capture_ns, device_ts_ns)
             else:
-                self._handle_raw_frame(rgb_msg, capture_ns, device_shutter_host_ns)
+                self._handle_raw_frame(rgb_msg, capture_ns, device_ts_ns)
 
             if self._recording and self._depth_enabled:
                 self._drain_depth_tick()
@@ -741,7 +748,7 @@ class OakCameraStream(StreamBase):
         self,
         msg: Any,
         capture_ns: int,
-        device_shutter_host_ns: Optional[int],
+        device_ts_ns: Optional[int],
     ) -> None:
         """h264 mode — write the on-device encoded packet to the raw
         ``.h264`` file and emit a :class:`SampleEvent`.
@@ -761,9 +768,7 @@ class OakCameraStream(StreamBase):
             # gives us a plain buffer the OS write path prefers.
             self._h264_file.write(bytes(msg.getData()))
         channels = (
-            {"device_shutter_host_ns": device_shutter_host_ns}
-            if device_shutter_host_ns is not None
-            else None
+            {"device_timestamp_ns": device_ts_ns} if device_ts_ns is not None else None
         )
         self._emit_sample(
             SampleEvent(
@@ -778,7 +783,7 @@ class OakCameraStream(StreamBase):
         self,
         msg: Any,
         capture_ns: int,
-        device_shutter_host_ns: Optional[int],
+        device_ts_ns: Optional[int],
     ) -> None:
         """raw mode — publish the BGR frame for preview and host-encode
         via PyAV.
@@ -796,9 +801,7 @@ class OakCameraStream(StreamBase):
         if self._video_writer is not None:
             self._video_writer.write(frame)
         channels = (
-            {"device_shutter_host_ns": device_shutter_host_ns}
-            if device_shutter_host_ns is not None
-            else None
+            {"device_timestamp_ns": device_ts_ns} if device_ts_ns is not None else None
         )
         self._emit_sample(
             SampleEvent(
