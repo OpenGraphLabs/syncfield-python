@@ -60,3 +60,38 @@ def test_anchor_helper_reset_on_second_recording_window():
     assert anchor is not None
     assert anchor.armed_host_ns == 1_000
     assert anchor.first_frame_host_ns == 1_100
+
+
+def test_anchor_helper_safe_when_start_recording_not_called():
+    """If an adapter emits frames before start_recording (e.g. preview
+    phase leaking into the capture loop), anchor must stay None — not
+    crash."""
+    d = _Dummy()
+    d._observe_first_frame(host_ns=100, device_ns=None)
+    assert d._recording_anchor() is None
+
+
+def test_anchor_helper_idempotent_on_repeated_first_frame():
+    """Two consecutive first-frame observations within one recording
+    window: the first wins, the second returns silently."""
+    d = _Dummy()
+    d._begin_recording_window(_clock(armed_ns=100))
+    d._observe_first_frame(host_ns=200, device_ns=None)
+    d._observe_first_frame(host_ns=300, device_ns=None)
+    anchor = d._recording_anchor()
+    assert anchor is not None
+    assert anchor.first_frame_host_ns == 200  # second call was ignored
+
+
+def test_anchor_helper_clamps_negative_clock_skew():
+    """host_ns can trail armed_host_ns under mock clock / test harness.
+    Helper must NOT raise — it clamps to armed_host_ns so
+    RecordingAnchor's first_frame_host_ns >= armed_host_ns invariant
+    holds."""
+    d = _Dummy()
+    d._begin_recording_window(_clock(armed_ns=1_000))
+    d._observe_first_frame(host_ns=500, device_ns=None)  # clock went back
+    anchor = d._recording_anchor()
+    assert anchor is not None
+    assert anchor.first_frame_host_ns == 1_000  # clamped
+    assert anchor.first_frame_latency_ns == 0
