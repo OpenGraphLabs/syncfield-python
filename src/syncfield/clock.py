@@ -28,9 +28,15 @@ class SessionClock:
     Attributes:
         sync_point: The session's :class:`SyncPoint` (monotonic + wall clock
             anchor captured at session start).
+        recording_armed_ns: Common host monotonic_ns captured by the
+            orchestrator right before it fans out ``start_recording()``
+            to every stream. ``None`` during preview phase, non-``None``
+            once recording is armed. All streams receive the same value,
+            so adapters can use it as a shared intra-host sync anchor.
     """
 
     sync_point: SyncPoint
+    recording_armed_ns: int | None = None
 
     @property
     def host_id(self) -> str:
