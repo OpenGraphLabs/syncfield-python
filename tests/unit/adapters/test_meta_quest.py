@@ -414,3 +414,45 @@ def _find_free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
+
+
+# ---------------------------------------------------------------------------
+# Intra-host sync anchor
+# ---------------------------------------------------------------------------
+
+
+class TestRecordingAnchor:
+    """Per-recording-window intra-host sync anchor capture.
+
+    MetaQuestHandStream receives packets via WiFi UDP — the current
+    parser doesn't surface the Quest's device-side ``ts_ms`` as a
+    separate scalar, so ``first_frame_device_ns`` is expected to stay
+    ``None``. ``armed_host_ns`` and ``first_frame_host_ns`` are
+    populated on the first packet that arrives after
+    ``start_recording``.
+    """
+
+    def test_meta_quest_anchor_captured_without_device_ts(self):
+        from syncfield.clock import SessionClock, SyncPoint
+
+        port = _find_free_port()
+        stream = MetaQuestHandStream("quest3", port=port)
+        stream.connect()
+        armed_ns = time.monotonic_ns()
+        clock = SessionClock(
+            sync_point=SyncPoint.create_now("h"),
+            recording_armed_ns=armed_ns,
+        )
+        stream.start_recording(clock)
+
+        _send_packet(port, _make_quest3_packet())
+        time.sleep(0.2)
+
+        report = stream.stop_recording()
+        stream.disconnect()
+
+        assert report.recording_anchor is not None
+        assert report.recording_anchor.armed_host_ns == armed_ns
+        assert report.recording_anchor.first_frame_host_ns >= armed_ns
+        # KEY: Quest adapter doesn't surface device clock — stays None.
+        assert report.recording_anchor.first_frame_device_ns is None

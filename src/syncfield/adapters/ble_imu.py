@@ -304,6 +304,7 @@ class BLEImuGenericStream(StreamBase):
         """Begin counting incoming samples toward the finalization report."""
         if self._thread is None or not self._thread.is_alive():
             self.connect()
+        self._begin_recording_window(session_clock)
         self._recording = True
 
     def stop_recording(self) -> FinalizationReport:
@@ -318,6 +319,7 @@ class BLEImuGenericStream(StreamBase):
             last_sample_at_ns=self._last_at,
             health_events=list(self._collected_health),
             error=None,
+            recording_anchor=self._recording_anchor(),
         )
 
     def disconnect(self) -> None:
@@ -492,6 +494,10 @@ class BLEImuGenericStream(StreamBase):
             sample_ns = recv_ns - (n_samples - 1 - i) * self._sample_period_ns
 
             if self._recording:
+                # No device-side clock in the generic decoder —
+                # ``sample_ns`` is derived from ``recv_ns``, not the
+                # sensor's own clock. Pass None for device_ns.
+                self._observe_first_frame(sample_ns, None)
                 if self._first_at is None:
                     self._first_at = sample_ns
                 self._last_at = sample_ns

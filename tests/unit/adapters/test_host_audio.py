@@ -200,3 +200,59 @@ class TestAudioMetrics:
 
         stream._emit_audio_metrics([0.5], 12345)
         assert len(received) == 0  # Throttled
+
+
+# ---------------------------------------------------------------------------
+# Intra-host sync anchor
+# ---------------------------------------------------------------------------
+
+
+class TestRecordingAnchor:
+    """Per-recording-window intra-host sync anchor capture.
+
+    HostAudioStream has no device-side clock (PortAudio/sounddevice
+    exposes only a host-side capture timestamp), so
+    ``first_frame_device_ns`` must always be ``None``.
+    """
+
+    def test_host_audio_anchor_captured_without_device_ts(
+        self, tmp_path: Path
+    ):
+        import numpy as np
+        from syncfield.clock import SessionClock, SyncPoint
+
+        stream = HostAudioStream("mic", output_dir=tmp_path)
+
+        # Capture the callback sd.InputStream receives so we can fire it
+        # manually without PortAudio hardware.
+        captured_callback = {}
+
+        def _fake_input_stream(**kwargs):
+            captured_callback["cb"] = kwargs["callback"]
+            return MagicMock()
+
+        mock_info = {"name": "Test Mic", "max_input_channels": 2}
+        with patch("sounddevice.query_devices", return_value=mock_info), \
+             patch("sounddevice.InputStream", side_effect=_fake_input_stream):
+            stream.connect()
+
+        armed_ns = 1_234_567_890
+        clock = SessionClock(
+            sync_point=SyncPoint.create_now("h"),
+            recording_armed_ns=armed_ns,
+        )
+        stream.start_recording(clock)
+
+        # Fire the captured callback with a tiny block of float32 samples.
+        # The callback will write to wav and observe the first frame.
+        block = np.zeros((256, 1), dtype=np.float32)
+        captured_callback["cb"](block, 256, None, None)
+
+        report = stream.stop_recording()
+        stream.disconnect()
+
+        assert report.recording_anchor is not None
+        assert report.recording_anchor.armed_host_ns == armed_ns
+        assert report.recording_anchor.first_frame_host_ns >= armed_ns
+        # KEY: host mic has no device clock.
+        assert report.recording_anchor.first_frame_device_ns is None

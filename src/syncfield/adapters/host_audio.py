@@ -174,6 +174,9 @@ class HostAudioStream(StreamBase):
 
             # Write to WAV if recording
             if self._recording and self._wav_writer is not None:
+                # PortAudio / sounddevice exposes no device-side clock
+                # for the host mic — pass None for device_ns.
+                self._observe_first_frame(capture_ns, None)
                 pcm16 = (mono * 32767).astype(np.int16)
                 self._wav_writer.writeframes(pcm16.tobytes())
                 if self._first_at is None:
@@ -203,6 +206,7 @@ class HostAudioStream(StreamBase):
 
     def start_recording(self, session_clock: SessionClock) -> None:
         """Start writing audio to WAV file."""
+        self._begin_recording_window(session_clock)
         self._frame_count = 0
         self._first_at = None
         self._last_at = None
@@ -242,6 +246,7 @@ class HostAudioStream(StreamBase):
             last_sample_at_ns=self._last_at,
             health_events=list(self._collected_health),
             error=None,
+            recording_anchor=self._recording_anchor(),
         )
 
     def disconnect(self) -> None:

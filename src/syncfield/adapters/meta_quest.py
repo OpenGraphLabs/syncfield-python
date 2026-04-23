@@ -436,6 +436,7 @@ class MetaQuestHandStream(StreamBase):
         self._start_discovery_responder()
 
     def start_recording(self, session_clock: SessionClock) -> None:
+        self._begin_recording_window(session_clock)
         self._recording = True
         self._frame_count = 0
         self._first_at = None
@@ -452,6 +453,7 @@ class MetaQuestHandStream(StreamBase):
             last_sample_at_ns=self._last_at,
             health_events=list(self._collected_health),
             error=None,
+            recording_anchor=self._recording_anchor(),
         )
 
     def disconnect(self) -> None:
@@ -744,6 +746,10 @@ class MetaQuestHandStream(StreamBase):
         frame_number = self._frame_count
         self._frame_count += 1
         if self._recording:
+            # Quest packet carries a device-side ``ts_ms``, but the
+            # current parser doesn't expose it as a dedicated field —
+            # pass None so the anchor reports only host-side arrival.
+            self._observe_first_frame(capture_ns, None)
             if self._first_at is None:
                 self._first_at = capture_ns
             self._last_at = capture_ns
