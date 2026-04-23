@@ -278,6 +278,11 @@ class StreamBase:
         ``armed_host_ns`` (preview phase, legacy code path, or clock
         that was never armed).
         """
+        # Single-writer assumption: every adapter has exactly one
+        # capture loop thread calling this helper, so the
+        # check-then-set flag pattern below is race-free in practice.
+        # If an adapter ever calls this from multiple threads, wrap
+        # the body in a threading.Lock.
         if self._first_frame_observed:
             return
         if self._armed_host_ns is None:

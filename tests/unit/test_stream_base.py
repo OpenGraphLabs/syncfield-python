@@ -1,5 +1,3 @@
-import dataclasses
-
 import pytest
 
 from syncfield.clock import SessionClock
