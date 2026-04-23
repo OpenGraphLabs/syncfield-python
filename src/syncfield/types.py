@@ -72,6 +72,54 @@ class SyncPoint:
         }
 
 
+@dataclass(frozen=True)
+class RecordingAnchor:
+    """Per-stream anchor info captured when recording is armed.
+
+    Captures the common host ``armed_host_ns`` (shared by all streams in
+    the session) together with the first recorded frame's ``(host_ts,
+    device_ts)`` pair for this stream. Downstream sync tooling uses the
+    difference ``first_frame_host_ns - armed_host_ns`` to estimate each
+    adapter's observed pipeline latency and remove per-adapter bias when
+    aligning streams.
+
+    Attributes:
+        armed_host_ns: Common host monotonic_ns captured by the
+            orchestrator immediately before ``start_recording()`` is
+            fanned out to streams. Identical across all streams in a
+            single recording window.
+        first_frame_host_ns: Host monotonic_ns at which this stream's
+            first recorded frame arrived on the host.
+        first_frame_device_ns: Optional device-clock timestamp of the
+            first recorded frame. ``None`` for adapters without a
+            device-side clock (UVC webcams, host audio, etc).
+    """
+
+    armed_host_ns: int
+    first_frame_host_ns: int
+    first_frame_device_ns: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.first_frame_host_ns < self.armed_host_ns:
+            raise ValueError(
+                f"first_frame_host_ns must be >= armed_host_ns; "
+                f"got armed={self.armed_host_ns}, first={self.first_frame_host_ns}"
+            )
+
+    @property
+    def first_frame_latency_ns(self) -> int:
+        """Observed latency from armed moment to first frame arrival."""
+        return self.first_frame_host_ns - self.armed_host_ns
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "armed_host_ns": self.armed_host_ns,
+            "first_frame_host_ns": self.first_frame_host_ns,
+            "first_frame_device_ns": self.first_frame_device_ns,
+            "first_frame_latency_ns": self.first_frame_latency_ns,
+        }
+
+
 @dataclass
 class FrameTimestamp:
     """Single timestamp for one data packet (camera frame or sensor sample).

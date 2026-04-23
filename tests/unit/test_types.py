@@ -175,6 +175,44 @@ def test_sensor_sample_nested_round_trip():
     assert restored.channels["gestures"]["pinch"] == 0.95
 
 
+# --- RecordingAnchor tests ---
+
+
+def test_recording_anchor_with_device_ts():
+    from syncfield.types import RecordingAnchor
+    anchor = RecordingAnchor(
+        armed_host_ns=1_000_000_000,
+        first_frame_host_ns=1_044_000_000,
+        first_frame_device_ns=9_876_543_210,
+    )
+    assert anchor.first_frame_latency_ns == 44_000_000
+    assert anchor.to_dict() == {
+        "armed_host_ns": 1_000_000_000,
+        "first_frame_host_ns": 1_044_000_000,
+        "first_frame_device_ns": 9_876_543_210,
+        "first_frame_latency_ns": 44_000_000,
+    }
+
+
+def test_recording_anchor_without_device_ts():
+    from syncfield.types import RecordingAnchor
+    anchor = RecordingAnchor(
+        armed_host_ns=1_000,
+        first_frame_host_ns=1_044_000_000,
+    )
+    assert anchor.first_frame_device_ns is None
+    d = anchor.to_dict()
+    assert d["first_frame_device_ns"] is None
+    assert d["first_frame_latency_ns"] == 1_044_000_000 - 1_000
+
+
+def test_recording_anchor_rejects_first_before_armed():
+    from syncfield.types import RecordingAnchor
+    import pytest
+    with pytest.raises(ValueError, match="first_frame_host_ns must be >= armed_host_ns"):
+        RecordingAnchor(armed_host_ns=100, first_frame_host_ns=50)
+
+
 from syncfield.types import (
     ChirpSpec,
     FinalizationReport,
