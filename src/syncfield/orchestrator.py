@@ -1942,10 +1942,26 @@ class SessionOrchestrator:
             )
 
             recording: List[Stream] = []
+            # DIAG: per-adapter start_recording timing so we can see which
+            # adapter blocks the fan-out (e.g. PortAudio stream init).
+            # Remove once the fan-out is parallelised.
+            fanout_start_ns = time.monotonic_ns()
             try:
                 for stream in self._connected_streams:
+                    t0 = time.monotonic_ns()
                     stream.start_recording(self._session_clock)
+                    elapsed_ms = (time.monotonic_ns() - t0) / 1e6
+                    offset_ms = (t0 - armed_ns) / 1e6
+                    logger.info(
+                        "start_recording fan-out: %s  t_offset=%.2fms  duration=%.2fms",
+                        stream.id, offset_ms, elapsed_ms,
+                    )
                     recording.append(stream)
+                total_ms = (time.monotonic_ns() - fanout_start_ns) / 1e6
+                logger.info(
+                    "start_recording fan-out complete: %d streams in %.2fms",
+                    len(recording), total_ms,
+                )
             except Exception as exc:
                 # Roll back the streams that did start writing.
                 self._log_rollback(exc, len(recording))
