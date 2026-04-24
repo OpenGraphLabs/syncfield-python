@@ -54,6 +54,7 @@ class PushSensorStream(StreamBase):
             self._on_connect(self)
 
     def start_recording(self, session_clock: SessionClock) -> None:
+        self._begin_recording_window(session_clock)
         self._write_core.reset_recording_stats()
         self._writing = True
 
@@ -71,6 +72,7 @@ class PushSensorStream(StreamBase):
             last_sample_at_ns=last_at,
             health_events=list(self._collected_health),
             error=None,
+            recording_anchor=self._recording_anchor(),
         )
 
     def disconnect(self) -> None:
@@ -118,4 +120,6 @@ class PushSensorStream(StreamBase):
                 channels=channels,
             ))
             if self._writing:
+                # Push sensors have no device clock — pass None for device_ns.
+                self._observe_first_frame(capture_ns, None)
                 self._write_core.record_sample(capture_ns)

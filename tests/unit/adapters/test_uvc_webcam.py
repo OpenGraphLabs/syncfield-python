@@ -286,3 +286,43 @@ class TestDecoderResilience:
         assert any(
             "No such device" in (h.detail or "") for h in collected
         ), f"expected fatal OSError in health events, got {collected!r}"
+
+
+class TestRecordingAnchor:
+    """Per-recording-window intra-host sync anchor capture.
+
+    UVC webcams have no device clock — ``first_frame_device_ns`` must
+    always be ``None``, while ``armed_host_ns`` and
+    ``first_frame_host_ns`` are populated on the first recorded frame.
+    """
+
+    def test_uvc_anchor_captured_without_device_ts(
+        self, mock_av_generous, tmp_path
+    ):
+        """UVC webcam has no device clock — anchor has armed_ns and
+        first_frame_host_ns but first_frame_device_ns is None."""
+        from syncfield.adapters.uvc_webcam import UVCWebcamStream
+
+        armed_ns = 1_234_567_890
+        clock = SessionClock(
+            sync_point=SyncPoint.create_now("h"),
+            recording_armed_ns=armed_ns,
+        )
+
+        stream = UVCWebcamStream(
+            "cam", device_index=0, output_dir=tmp_path, fps=30.0
+        )
+        stream.prepare()
+        stream.connect()
+        stream.start_recording(clock)
+        # Let the capture thread drain at least one frame out of the
+        # paced fake iterator.
+        time.sleep(0.1)
+        report = stream.stop_recording()
+        stream.disconnect()
+
+        assert report.recording_anchor is not None
+        assert report.recording_anchor.armed_host_ns == armed_ns
+        assert report.recording_anchor.first_frame_host_ns >= armed_ns
+        # KEY DIFFERENCE from OAK: UVC has no device clock.
+        assert report.recording_anchor.first_frame_device_ns is None

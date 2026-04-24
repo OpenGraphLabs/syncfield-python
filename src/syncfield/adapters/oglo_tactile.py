@@ -259,6 +259,7 @@ class OgloTactileStream(StreamBase):
         """
         if self._thread is None or not self._thread.is_alive():
             self.connect()
+        self._begin_recording_window(session_clock)
         self._recording = True
 
     def stop_recording(self) -> FinalizationReport:
@@ -278,6 +279,7 @@ class OgloTactileStream(StreamBase):
             last_sample_at_ns=self._last_at,
             health_events=list(self._collected_health),
             error=None,
+            recording_anchor=self._recording_anchor(),
         )
 
     def disconnect(self) -> None:
@@ -437,11 +439,16 @@ class OgloTactileStream(StreamBase):
             channels: dict = {
                 name: int(v) for name, v in zip(FINGER_NAMES, values)
             }
-            channels["device_timestamp_ns"] = int(
+            device_ts_ns = int(
                 (timestamp_us + i * _SAMPLE_PERIOD_US) * 1000
             )
+            channels["device_timestamp_ns"] = device_ts_ns
 
             if self._recording:
+                # MCU hardware clock is interpolated per sample (see
+                # device_timestamp_ns above); pass it as the anchor's
+                # device-side timestamp for precise alignment.
+                self._observe_first_frame(recv_ns, device_ts_ns)
                 if self._first_at is None:
                     self._first_at = recv_ns
                 self._last_at = recv_ns

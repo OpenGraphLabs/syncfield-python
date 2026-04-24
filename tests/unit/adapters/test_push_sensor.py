@@ -259,3 +259,37 @@ def test_push_never_raises_for_internal_failures(monkeypatch):
 def test_push_sensor_stream_is_re_exported_from_adapters_package():
     from syncfield.adapters import PushSensorStream as Reexported
     assert Reexported is PushSensorStream
+
+
+# ---------------------------------------------------------------------------
+# Intra-host sync anchor
+# ---------------------------------------------------------------------------
+
+class TestRecordingAnchor:
+    """Per-recording-window intra-host sync anchor capture.
+
+    PushSensorStream has no device clock — ``first_frame_device_ns``
+    must always be ``None``, while ``armed_host_ns`` and
+    ``first_frame_host_ns`` are populated on the first recorded sample.
+    """
+
+    def test_push_sensor_anchor_captured_without_device_ts(self):
+        """Push sensor has no device clock — anchor captured with
+        first_frame_device_ns=None."""
+        stream = PushSensorStream("ble")
+        stream.connect()
+        armed_ns = time.monotonic_ns()
+        clock = SessionClock(
+            sync_point=SyncPoint.create_now("h"),
+            recording_armed_ns=armed_ns,
+        )
+        stream.start_recording(clock)
+        stream.push({"ax": 0.5})
+        report = stream.stop_recording()
+        stream.disconnect()
+
+        assert report.recording_anchor is not None
+        assert report.recording_anchor.armed_host_ns == armed_ns
+        assert report.recording_anchor.first_frame_host_ns >= armed_ns
+        # KEY: push sensors have no device clock.
+        assert report.recording_anchor.first_frame_device_ns is None

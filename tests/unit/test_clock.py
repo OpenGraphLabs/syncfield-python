@@ -44,3 +44,22 @@ def test_session_clock_is_frozen_dataclass():
     assert dataclasses.is_dataclass(clock)
     with pytest.raises(dataclasses.FrozenInstanceError):
         clock.sync_point = SyncPoint.create_now("other")  # type: ignore[misc]
+
+
+def test_session_clock_preview_phase_has_no_armed_ns():
+    clock = _make_clock()
+    assert clock.recording_armed_ns is None
+
+
+def test_session_clock_arm_returns_new_clock_with_armed_ns():
+    clock = _make_clock()
+    armed = dataclasses.replace(clock, recording_armed_ns=12_345)
+    assert armed.recording_armed_ns == 12_345
+    assert clock.recording_armed_ns is None  # original unchanged
+
+
+def test_session_clock_armed_ns_survives_frozen_semantics():
+    clock = _make_clock()
+    armed = dataclasses.replace(clock, recording_armed_ns=500)
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        armed.recording_armed_ns = 700  # type: ignore[misc]

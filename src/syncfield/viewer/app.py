@@ -15,6 +15,7 @@ Thread model:
 from __future__ import annotations
 
 import logging
+import signal
 import threading
 import webbrowser
 from contextlib import contextmanager
@@ -23,6 +24,7 @@ from typing import Iterator, Optional
 import uvicorn
 
 from syncfield.orchestrator import SessionOrchestrator
+from syncfield.types import SessionState
 from syncfield.viewer.poller import SessionPoller
 from syncfield.viewer.server import ViewerServer
 
@@ -79,13 +81,48 @@ def launch(
         title: Browser tab title. Default ``"SyncField"``.
     """
     app = ViewerApp(session, host=host, port=port, title=title)
+
+    # SIGTERM semantics: Python's default SIGTERM handler terminates
+    # the process via the C-level default, which does NOT run
+    # ``finally`` blocks or ``atexit`` handlers. That's how ``kill
+    # <pid>`` used to leave OAK boards booted-and-held even though
+    # ``launch()`` has an apparently-safe teardown in ``finally``.
+    # Install a handler that raises ``SystemExit`` instead — that
+    # unwinds the stack normally, finally runs, ``app.close()``
+    # releases every device, and the process exits cleanly. SIGKILL
+    # still bypasses everything (by design), so the operator needs a
+    # replug for that case — but every cooperative signal now does
+    # the right thing.
+    _prev_sigterm = signal.getsignal(signal.SIGTERM)
+
+    def _on_sigterm(signum, frame):  # noqa: ARG001
+        raise SystemExit(128 + signum)
+
+    try:
+        signal.signal(signal.SIGTERM, _on_sigterm)
+    except ValueError:
+        # Signal handlers can only be installed from the main thread.
+        # When launch() is called off the main thread (unusual, but
+        # e.g. some test harnesses), skip the install — the caller
+        # gave up on signal-driven cleanup by choosing that thread.
+        _prev_sigterm = None
+
     try:
         app.setup()
         app.run()
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, SystemExit):
+        # Both cooperative exits — let `finally` tear down devices.
+        # SystemExit is re-raised after close() so the exit code
+        # propagates; KeyboardInterrupt is swallowed to match the
+        # previous CLI ergonomic (no traceback on Ctrl+C).
         pass
     finally:
         app.close()
+        if _prev_sigterm is not None:
+            try:
+                signal.signal(signal.SIGTERM, _prev_sigterm)
+            except (ValueError, TypeError):  # pragma: no cover
+                pass
 
 
 @contextmanager
@@ -199,10 +236,59 @@ class ViewerApp:
             self._running = False
 
     def close(self) -> None:
-        """Stop uvicorn, the poller, and tear down the session."""
-        # Signal uvicorn to shut down
+        """Stop uvicorn, the poller, and release device handles.
+
+        In blocking mode (``launch``), the viewer owns the session
+        lifecycle — if the session is still holding devices when the
+        viewer shuts down (Ctrl+C, SIGTERM, browser close, crash) it
+        MUST call ``session.disconnect()`` / ``stop()`` on its way out
+        or downstream adapters leak hardware handles. Leaving an OAK
+        booted-and-held like that is the specific failure mode that
+        forces a physical USB replug to recover, so we take two
+        best-effort steps:
+
+        1. If a recording is in progress, stop it so the MP4 is
+           finalised rather than truncated mid-flight.
+        2. If any stream is still connected, disconnect it so the
+           device handles go back to the OS.
+
+        All per-stream exceptions during teardown are swallowed — the
+        invariant is "release as much hardware as we can before this
+        process exits", not "raise the first error we encounter".
+        ``disconnect()`` itself is idempotent from the caller's
+        perspective — we only call it while the session is in a state
+        that allows it.
+        """
+        # Signal uvicorn to shut down first so HTTP requests don't
+        # race against teardown. Safe if uvicorn already stopped.
         if self._uvicorn_server is not None:
             self._uvicorn_server.should_exit = True
+
+        # Best-effort session teardown. Order matters: stop() first so
+        # any in-flight recording finalises cleanly, then disconnect()
+        # so device handles are released. A failed stop() must NOT
+        # prevent disconnect() — that's what leaks handles.
+        try:
+            state = self._session.state
+        except Exception:  # pragma: no cover — accessor corner cases
+            state = None
+        if state == SessionState.RECORDING:
+            try:
+                self._session.stop()
+            except Exception as exc:  # pragma: no cover — best-effort
+                logger.warning("viewer.close: session.stop() raised: %s", exc)
+        # Re-read state — stop() moves us to STOPPED.
+        try:
+            state = self._session.state
+        except Exception:  # pragma: no cover
+            state = None
+        if state in (SessionState.CONNECTED, SessionState.STOPPED):
+            try:
+                self._session.disconnect()
+            except Exception as exc:  # pragma: no cover — best-effort
+                logger.warning(
+                    "viewer.close: session.disconnect() raised: %s", exc
+                )
 
         self._poller.stop()
         self._running = False

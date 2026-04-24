@@ -478,6 +478,45 @@ class TestLifecycle:
 
 
 # ============================================================================
+# Intra-host sync anchor
+# ============================================================================
+
+
+class TestRecordingAnchor:
+    """Per-recording-window intra-host sync anchor capture.
+
+    The generic BLE IMU decoder derives per-sample timestamps from the
+    host's monotonic clock (``recv_ns``), not a sensor-side clock — so
+    ``first_frame_device_ns`` must stay ``None``.
+    """
+
+    def test_ble_imu_anchor_captured_without_device_ts(self, mock_bleak):
+        from syncfield.adapters.ble_imu import BLEImuGenericStream
+
+        stream = BLEImuGenericStream(
+            "imu", profile=_simple_profile(mock_bleak), address="x",
+        )
+        armed_ns = 1_234_567_890
+        clock = SessionClock(
+            sync_point=SyncPoint.create_now("h"),
+            recording_armed_ns=armed_ns,
+        )
+        stream._begin_recording_window(clock)
+        stream._recording = True  # skip the async lifecycle for unit test
+
+        payload = b"\xAA\xBB" + struct.pack("<hhh", 1, 2, 3)
+        stream._dispatch_notification_for_test(payload)
+
+        report = stream.stop_recording()
+
+        assert report.recording_anchor is not None
+        assert report.recording_anchor.armed_host_ns == armed_ns
+        assert report.recording_anchor.first_frame_host_ns >= armed_ns
+        # KEY: generic BLE IMU has no device clock — stays None.
+        assert report.recording_anchor.first_frame_device_ns is None
+
+
+# ============================================================================
 # Optional-dep import guard
 # ============================================================================
 

@@ -324,3 +324,40 @@ def test_stop_recording_returns_finalization_report():
 def test_polling_sensor_stream_is_re_exported_from_adapters_package():
     from syncfield.adapters import PollingSensorStream as Reexported
     assert Reexported is PollingSensorStream
+
+
+# ---------------------------------------------------------------------------
+# Intra-host sync anchor
+# ---------------------------------------------------------------------------
+
+class TestRecordingAnchor:
+    """Per-recording-window intra-host sync anchor capture.
+
+    PollingSensorStream has no device clock — ``first_frame_device_ns``
+    must always be ``None``, while ``armed_host_ns`` and
+    ``first_frame_host_ns`` are populated on the first recorded sample.
+    """
+
+    def test_polling_sensor_anchor_captured_without_device_ts(self):
+        """Polling sensor has no device clock — anchor captured with
+        first_frame_device_ns=None."""
+        stream = PollingSensorStream(
+            "imu", read=lambda: {"x": 1.0}, hz=1000,
+        )
+        stream.connect()
+        armed_ns = time.monotonic_ns()
+        clock = SessionClock(
+            sync_point=SyncPoint.create_now("h"),
+            recording_armed_ns=armed_ns,
+        )
+        stream.start_recording(clock)
+        # Let the capture thread produce at least one recorded sample.
+        time.sleep(0.05)
+        report = stream.stop_recording()
+        stream.disconnect()
+
+        assert report.recording_anchor is not None
+        assert report.recording_anchor.armed_host_ns == armed_ns
+        assert report.recording_anchor.first_frame_host_ns >= armed_ns
+        # KEY: polling sensors have no device clock.
+        assert report.recording_anchor.first_frame_device_ns is None

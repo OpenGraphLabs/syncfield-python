@@ -1,10 +1,11 @@
 """Tests for syncfield.types."""
 
+import dataclasses
 import pytest
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 
-from syncfield.types import FrameTimestamp, SensorSample, SyncPoint
+from syncfield.types import FrameTimestamp, RecordingAnchor, SensorSample, SyncPoint
 from syncfield.health.severity import Severity
 
 
@@ -173,6 +174,52 @@ def test_sensor_sample_nested_round_trip():
     assert restored.channels == channels
     assert restored.channels["joints"]["wrist"] == [0.1, 0.2, 0.3]
     assert restored.channels["gestures"]["pinch"] == 0.95
+
+
+# --- RecordingAnchor tests ---
+
+
+def test_recording_anchor_with_device_ts():
+    anchor = RecordingAnchor(
+        armed_host_ns=1_000_000_000,
+        first_frame_host_ns=1_044_000_000,
+        first_frame_device_ns=9_876_543_210,
+    )
+    assert anchor.first_frame_latency_ns == 44_000_000
+    assert anchor.to_dict() == {
+        "armed_host_ns": 1_000_000_000,
+        "first_frame_host_ns": 1_044_000_000,
+        "first_frame_device_ns": 9_876_543_210,
+        "first_frame_latency_ns": 44_000_000,
+    }
+
+
+def test_recording_anchor_without_device_ts():
+    anchor = RecordingAnchor(
+        armed_host_ns=1_000,
+        first_frame_host_ns=1_044_000_000,
+    )
+    assert anchor.first_frame_device_ns is None
+    d = anchor.to_dict()
+    assert d["first_frame_device_ns"] is None
+    assert d["first_frame_latency_ns"] == 1_044_000_000 - 1_000
+
+
+def test_recording_anchor_rejects_first_before_armed():
+    with pytest.raises(ValueError, match="first_frame_host_ns must be >= armed_host_ns"):
+        RecordingAnchor(armed_host_ns=100, first_frame_host_ns=50)
+
+
+def test_recording_anchor_is_frozen():
+    anchor = RecordingAnchor(armed_host_ns=0, first_frame_host_ns=0)
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        anchor.armed_host_ns = 1  # type: ignore[misc]
+
+
+def test_recording_anchor_allows_zero_latency():
+    """first_frame_host_ns == armed_host_ns is legal (zero-latency case)."""
+    anchor = RecordingAnchor(armed_host_ns=1_000, first_frame_host_ns=1_000)
+    assert anchor.first_frame_latency_ns == 0
 
 
 from syncfield.types import (
@@ -360,4 +407,25 @@ class TestSessionReport:
         )
         assert report.host_id == "rig_01"
         assert report.finalizations == []
+
+
+def test_finalization_report_with_anchor():
+    anchor = RecordingAnchor(
+        armed_host_ns=100, first_frame_host_ns=150, first_frame_device_ns=42
+    )
+    report = FinalizationReport(
+        stream_id="s1", status="completed", frame_count=10,
+        file_path=None, first_sample_at_ns=150, last_sample_at_ns=450,
+        health_events=[], error=None, recording_anchor=anchor,
+    )
+    assert report.recording_anchor is anchor
+
+
+def test_finalization_report_anchor_defaults_to_none():
+    report = FinalizationReport(
+        stream_id="s2", status="completed", frame_count=0,
+        file_path=None, first_sample_at_ns=None, last_sample_at_ns=None,
+        health_events=[], error=None,
+    )
+    assert report.recording_anchor is None
 

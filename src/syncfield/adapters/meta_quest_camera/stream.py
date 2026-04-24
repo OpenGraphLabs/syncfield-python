@@ -207,6 +207,7 @@ class MetaQuestCameraStream(StreamBase):
         if self._recorder is not None:
             raise RuntimeError("recording already in progress")
 
+        self._begin_recording_window(session_clock)
         self._session_id = (
             f"ep_{session_clock.sync_point.timestamp_ms}"
             f"_{session_clock.sync_point.host_id}"
@@ -254,6 +255,7 @@ class MetaQuestCameraStream(StreamBase):
             last_sample_at_ns=self._last_at,
             health_events=list(self._collected_health),
             error=error,
+            recording_anchor=self._recording_anchor(),
         )
 
     # ------------------------------------------------------------------
@@ -333,6 +335,10 @@ class MetaQuestCameraStream(StreamBase):
             recorder.write_frame(
                 frame.jpeg_bytes, frame.capture_ns, frame.quest_native_ns,
             )
+            # Quest exposes a per-frame native-clock timestamp
+            # (``quest_native_ns``) projected into the host domain —
+            # use it as the anchor's device-side ns when present.
+            self._observe_first_frame(frame.capture_ns, frame.quest_native_ns)
             if self._first_at is None:
                 self._first_at = frame.capture_ns
             self._last_at = frame.capture_ns

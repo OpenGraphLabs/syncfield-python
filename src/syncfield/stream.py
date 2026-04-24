@@ -54,6 +54,7 @@ from syncfield.clock import SessionClock
 from syncfield.types import (
     FinalizationReport,
     HealthEvent,
+    RecordingAnchor,
     SampleEvent,
     StreamCapabilities,
     StreamKind,
@@ -205,6 +206,11 @@ class StreamBase:
         self._sample_callbacks: List[SampleCallback] = []
         self._health_callbacks: List[HealthCallback] = []
         self._collected_health: List[HealthEvent] = []
+        # Intra-host sync anchor — captured once per recording window,
+        # when the first frame/sample arrives after start_recording().
+        self._armed_host_ns: int | None = None
+        self._first_frame_observed: bool = False
+        self._anchor: Optional[RecordingAnchor] = None
 
     @property
     def device_key(self) -> Optional[DeviceKey]:
@@ -239,6 +245,66 @@ class StreamBase:
         self._collected_health.append(event)
         for cb in self._health_callbacks:
             cb(event)
+
+    # ------------------------------------------------------------------
+    # Intra-host sync anchor
+    # ------------------------------------------------------------------
+    #
+    # Each recording window shares a common ``armed_host_ns`` captured
+    # by the orchestrator. Adapters call ``_begin_recording_window``
+    # from ``start_recording`` (with the received ``SessionClock``) and
+    # then ``_observe_first_frame`` exactly once from their capture
+    # loop when the first frame/sample of the recording window arrives.
+    # The resulting :class:`RecordingAnchor` is attached to the
+    # stream's :class:`FinalizationReport` by ``stop_recording``.
+
+    def _begin_recording_window(self, session_clock: SessionClock) -> None:
+        """Reset anchor state and remember the armed host timestamp.
+
+        Safe to call even when ``recording_armed_ns`` is ``None``
+        (legacy test harnesses / unit mocks) — the helper becomes a
+        no-op.
+        """
+        self._armed_host_ns = session_clock.recording_armed_ns
+        self._first_frame_observed = False
+        self._anchor = None
+
+    def _observe_first_frame(
+        self, host_ns: int, device_ns: int | None
+    ) -> None:
+        """Capture the anchor exactly once per recording window.
+
+        Subsequent calls are silently ignored. No-op when there is no
+        ``armed_host_ns`` (preview phase, legacy code path, or clock
+        that was never armed).
+        """
+        # Single-writer assumption: every adapter has exactly one
+        # capture loop thread calling this helper, so the
+        # check-then-set flag pattern below is race-free in practice.
+        # If an adapter ever calls this from multiple threads, wrap
+        # the body in a threading.Lock.
+        if self._first_frame_observed:
+            return
+        if self._armed_host_ns is None:
+            return
+        # Guard against host clock going backwards under test mocks or
+        # unusual scheduling — clamp to armed_ns so RecordingAnchor's
+        # first_frame_host_ns >= armed_host_ns invariant holds.
+        safe_host = max(host_ns, self._armed_host_ns)
+        self._anchor = RecordingAnchor(
+            armed_host_ns=self._armed_host_ns,
+            first_frame_host_ns=safe_host,
+            first_frame_device_ns=device_ns,
+        )
+        self._first_frame_observed = True
+
+    def _recording_anchor(self) -> Optional[RecordingAnchor]:
+        """Return the anchor captured for the current recording window.
+
+        Returns ``None`` if ``_observe_first_frame`` has not been called
+        yet, or if the current recording window has no armed clock.
+        """
+        return self._anchor
 
     # ------------------------------------------------------------------
     # Lifecycle methods — subclasses override.

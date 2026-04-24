@@ -260,3 +260,46 @@ class TestLazyExport:
         importlib.reload(adapters)
         assert "OgloTactileStream" in adapters.__all__
         assert hasattr(adapters, "OgloTactileStream")
+
+
+class TestRecordingAnchor:
+    """Per-recording-window intra-host sync anchor capture.
+
+    OGLO gloves expose an MCU hardware clock (interpolated per-sample),
+    so ``first_frame_device_ns`` is expected to be populated (non-None)
+    alongside ``armed_host_ns`` and ``first_frame_host_ns``.
+    """
+
+    def test_oglo_anchor_captured_with_device_ts(self, mock_bleak):
+        from syncfield.adapters.oglo_tactile import OgloTactileStream
+        from syncfield.types import SyncPoint
+
+        stream = OgloTactileStream("tactile_right", address="m")
+        # Skip the async BLE lifecycle for this unit test — we drive the
+        # decode path synchronously via _dispatch_notification_for_test.
+        # Simulate what ``start_recording`` does: prime the anchor state
+        # and flip ``_recording``.
+        armed_ns = 1_234_567_890
+        clock = SessionClock(
+            sync_point=SyncPoint.create_now("h"),
+            recording_armed_ns=armed_ns,
+        )
+        stream._begin_recording_window(clock)
+        stream._recording = True
+
+        # Known MCU timestamp → first sample's device_ts_ns is
+        # timestamp_us * 1000 (i + 0).
+        timestamp_us = 12_345_000
+        samples = [(1, 2, 3, 4, 5)] * 3
+        packet = _build_packet(count=3, timestamp_us=timestamp_us, samples=samples)
+        stream._dispatch_notification_for_test(packet)
+
+        report = stream.stop_recording()
+
+        assert report.recording_anchor is not None
+        assert report.recording_anchor.armed_host_ns == armed_ns
+        assert report.recording_anchor.first_frame_host_ns >= armed_ns
+        # KEY: OGLO exposes MCU hardware clock — anchor carries it.
+        assert (
+            report.recording_anchor.first_frame_device_ns == timestamp_us * 1000
+        )

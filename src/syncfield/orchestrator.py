@@ -72,6 +72,7 @@ The file is organized top-down so the public lifecycle is easy to read:
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import threading
 import time
@@ -417,8 +418,21 @@ class SessionOrchestrator:
         # the right place to fail loudly on port-binding or role-config errors).
         if self._role is not None:
             self._bring_multihost_online()
-            import atexit
-            atexit.register(self._safe_shutdown)
+
+        # Device-level safety net: register a last-chance teardown that
+        # runs on interpreter shutdown. The regular path (viewer.close,
+        # explicit session.disconnect, CLI finally blocks) handles 99%
+        # of teardown — this catches the 1% where an exception bubbles
+        # all the way out or a caller forgot. SIGKILL still bypasses
+        # this (by design), but every cooperative exit path now
+        # guarantees adapters release their hardware.
+        #
+        # Registered unconditionally: single-host sessions also hold
+        # devices and need the same protection. Multi-host teardown
+        # (control plane / advertiser / browser) is folded into the
+        # same callback so there's only one atexit entry per session.
+        import atexit
+        atexit.register(self._safe_shutdown)
 
     def _bring_multihost_online(self) -> None:
         """Spin up control plane + advertiser (or follower browser) at construction time.
@@ -454,11 +468,48 @@ class SessionOrchestrator:
             raise
 
     def _safe_shutdown(self) -> None:
-        """atexit-callable wrapper around shutdown() that swallows errors."""
+        """atexit-callable last-chance teardown — devices + multi-host.
+
+        Runs at interpreter shutdown. Called AFTER the regular
+        ``viewer.close`` / ``session.disconnect`` path if the caller
+        used them; acts as a safety net when they did not.
+
+        Two responsibilities, in order:
+
+        1. If a recording is still in progress or the session is
+           holding devices, stop and disconnect so adapters release
+           their hardware handles. Without this, a crashed script or
+           an unhandled exception leaves OAK boards booted-and-held —
+           the exact failure that forces a physical USB replug.
+        2. Tear down multi-host machinery (``shutdown()``).
+
+        All exceptions are swallowed: ``atexit`` callbacks must not
+        raise (it suppresses subsequent handlers and muddies exit
+        diagnostics). We log at WARNING so operators still see what
+        went wrong if cleanup hit a snag.
+        """
+        try:
+            state = self._state
+        except Exception:
+            state = None
+        if state == SessionState.RECORDING:
+            try:
+                self.stop()
+            except Exception as exc:
+                logger.warning("atexit: session.stop() raised: %s", exc)
+            try:
+                state = self._state
+            except Exception:
+                state = None
+        if state in (SessionState.CONNECTED, SessionState.STOPPED):
+            try:
+                self.disconnect()
+            except Exception as exc:
+                logger.warning("atexit: session.disconnect() raised: %s", exc)
         try:
             self.shutdown()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("atexit: session.shutdown() raised: %s", exc)
 
     def shutdown(self) -> None:
         """Tear down ALL multi-host machinery (control plane + advertiser + browser).
@@ -1635,12 +1686,20 @@ class SessionOrchestrator:
             self.health.start()
 
             connected: List[Stream] = []
+            first_failure: Optional[tuple[str, Exception]] = None
             for stream in self._streams.values():
                 self._set_stream_state(stream.id, "connecting")
                 try:
                     stream.prepare()
                     stream.connect()
                 except Exception as exc:
+                    # Strict all-or-nothing: record the failure, stop
+                    # attempting further streams, and let the rollback
+                    # block below release everything we already opened.
+                    # Rationale: leaving a partially-booted rig in place
+                    # (e.g. one OAK booted, the other dead) leaks device
+                    # handles the user can only recover from by SIGKILL
+                    # + USB replug — the exact pattern we're fixing.
                     self._stream_errors[stream.id] = str(exc)
                     self._set_stream_state(stream.id, "failed")
                     stream._emit_health(HealthEvent(
@@ -1653,7 +1712,8 @@ class SessionOrchestrator:
                         fingerprint=f"{stream.id}:startup-failure",
                         data={"phase": "connect", "outcome": "error", "error": str(exc)},
                     ))
-                    continue
+                    first_failure = (stream.id, exc)
+                    break
                 connected.append(stream)
                 self._stream_errors.pop(stream.id, None)
                 self._set_stream_state(stream.id, "connected")
@@ -1668,15 +1728,22 @@ class SessionOrchestrator:
                     data={"phase": "connect", "outcome": "success"},
                 ))
 
-            if not connected:
+            if first_failure is not None:
+                # Rollback: release every stream that did connect so no
+                # adapter is left holding a device handle. LIFO matches
+                # the convention used elsewhere in the codebase.
+                _rollback_disconnect_streams(connected)
+                for s in connected:
+                    self._set_stream_state(s.id, "disconnected")
                 self._transition(SessionState.IDLE)
                 if self._log_writer is not None:
                     self._log_writer.close()
                     self._log_writer = None
+                failed_id, failed_exc = first_failure
                 raise RuntimeError(
-                    "connect() failed: no streams connected — every adapter raised. "
-                    "Inspect per-stream errors via session._stream_errors."
-                )
+                    f"connect() failed at stream {failed_id!r}: {failed_exc}. "
+                    f"All previously-connected streams have been released."
+                ) from failed_exc
 
             self._connected_streams = connected
 
@@ -1863,6 +1930,16 @@ class SessionOrchestrator:
             # attached. The writers live on ``self`` so the matching
             # close path in ``_finalize_streams`` can flush them.
             self._open_sample_writers()
+
+            # Capture a single shared armed_host_ns immediately before
+            # fanning start_recording out — all streams receive the
+            # same value via SessionClock.recording_armed_ns, which
+            # they can use as an intra-host sync anchor in their
+            # capture loop (see StreamBase._begin_recording_window).
+            armed_ns = time.monotonic_ns()
+            self._session_clock = dataclasses.replace(
+                self._session_clock, recording_armed_ns=armed_ns
+            )
 
             recording: List[Stream] = []
             try:
@@ -2379,6 +2456,16 @@ class SessionOrchestrator:
                     entry["path"] = str(final.file_path)
                 if final.error is not None:
                     entry["error"] = final.error
+                # Intra-host sync anchor: common ``armed_host_ns`` plus
+                # this stream's first-frame timestamps. ``None`` for
+                # empty recordings or adapters that haven't opted in;
+                # downstream sync tooling reads ``first_frame_latency_ns``
+                # to bias-correct per-adapter pipeline latency.
+                entry["recording_anchor"] = (
+                    final.recording_anchor.to_dict()
+                    if final.recording_anchor is not None
+                    else None
+                )
             streams_dict[stream.id] = entry
 
         write_manifest(

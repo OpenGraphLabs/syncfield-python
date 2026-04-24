@@ -243,3 +243,55 @@ class TestLatestFrame:
         # a decoded frame, so the slot stays None.
         assert stream.latest_frame is None
         stream.disconnect()
+
+
+# ---------------------------------------------------------------------------
+# Intra-host sync anchor
+# ---------------------------------------------------------------------------
+
+
+class TestRecordingAnchor:
+    """Per-recording-window intra-host sync anchor capture.
+
+    Quest camera frames carry both a host-projected capture timestamp
+    and a Quest-native timestamp (``quest_native_ns``) surfaced on
+    :class:`MjpegFrame`. The anchor captures both.
+    """
+
+    def test_meta_quest_camera_anchor_captured_with_device_ts(self, tmp_path):
+        stream = MetaQuestCameraStream(
+            id="quest_cam",
+            quest_host="test",
+            output_dir=tmp_path,
+            _transport=_status_only_transport(),
+            resolution=(64, 64),
+        )
+        stream.connect()
+        armed_ns = 1_234_567_890
+        clock = SessionClock(
+            sync_point=SyncPoint.create_now("h"),
+            recording_armed_ns=armed_ns,
+        )
+        stream.start_recording(clock)
+
+        # Push a single JPEG frame into the consumer's sink — same
+        # pattern as TestRecording::test_recording_writes_single_mp4_on_frames.
+        jpeg = _make_jpeg()
+        host_ns = max(armed_ns + 1_000_000, time.monotonic_ns())
+        quest_ns = host_ns - 1_000_000  # arbitrary positive delta
+        stream._preview._frame_sink(
+            MjpegFrame(
+                jpeg_bytes=jpeg,
+                capture_ns=host_ns,
+                quest_native_ns=quest_ns,
+            )
+        )
+
+        report = stream.stop_recording()
+        stream.disconnect()
+
+        assert report.recording_anchor is not None
+        assert report.recording_anchor.armed_host_ns == armed_ns
+        assert report.recording_anchor.first_frame_host_ns >= armed_ns
+        # KEY: Quest camera surfaces quest_native_ns — anchor captures it.
+        assert report.recording_anchor.first_frame_device_ns == quest_ns
