@@ -76,6 +76,7 @@ import dataclasses
 import logging
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from importlib.metadata import version as _pkg_version
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Union
@@ -1942,26 +1943,65 @@ class SessionOrchestrator:
             )
 
             recording: List[Stream] = []
-            # DIAG: per-adapter start_recording timing so we can see which
-            # adapter blocks the fan-out (e.g. PortAudio stream init).
-            # Remove once the fan-out is parallelised.
+            # Parallel fan-out: every adapter's start_recording() runs
+            # in its own worker thread so a slow adapter (e.g. WAV file
+            # header write, filesystem sync) can't delay the
+            # _recording=True flag flip on others. armed_ns was captured
+            # above so all adapters still observe the same anchor.
+            #
+            # Per-adapter timing log (t_offset = when this adapter's
+            # start_recording actually began, duration = how long it
+            # blocked) is retained — it's load-bearing for diagnosing
+            # intra-host sync stalls.
             fanout_start_ns = time.monotonic_ns()
+
+            def _invoke_start_recording(stream: Stream) -> tuple[Stream, int, int]:
+                t0 = time.monotonic_ns()
+                stream.start_recording(self._session_clock)
+                t1 = time.monotonic_ns()
+                return stream, t0, t1
+
+            streams_to_fan_out = list(self._connected_streams)
+            exception: Optional[BaseException] = None
             try:
-                for stream in self._connected_streams:
-                    t0 = time.monotonic_ns()
-                    stream.start_recording(self._session_clock)
-                    elapsed_ms = (time.monotonic_ns() - t0) / 1e6
-                    offset_ms = (t0 - armed_ns) / 1e6
-                    logger.info(
-                        "start_recording fan-out: %s  t_offset=%.2fms  duration=%.2fms",
-                        stream.id, offset_ms, elapsed_ms,
-                    )
-                    recording.append(stream)
+                if not streams_to_fan_out:
+                    pass  # nothing to do
+                else:
+                    with ThreadPoolExecutor(
+                        max_workers=len(streams_to_fan_out),
+                        thread_name_prefix="sf-start-rec",
+                    ) as pool:
+                        futures = {
+                            pool.submit(_invoke_start_recording, s): s
+                            for s in streams_to_fan_out
+                        }
+                        for fut, stream in futures.items():
+                            try:
+                                _stream, t0, t1 = fut.result()
+                                offset_ms = (t0 - armed_ns) / 1e6
+                                duration_ms = (t1 - t0) / 1e6
+                                logger.info(
+                                    "start_recording fan-out: %s  "
+                                    "t_offset=%.2fms  duration=%.2fms",
+                                    stream.id, offset_ms, duration_ms,
+                                )
+                                recording.append(stream)
+                            except BaseException as exc:  # noqa: BLE001
+                                offset_ms = (time.monotonic_ns() - armed_ns) / 1e6
+                                logger.warning(
+                                    "start_recording fan-out: %s  "
+                                    "t_offset≈%.2fms  FAILED: %r",
+                                    stream.id, offset_ms, exc,
+                                )
+                                if exception is None:
+                                    exception = exc
                 total_ms = (time.monotonic_ns() - fanout_start_ns) / 1e6
                 logger.info(
-                    "start_recording fan-out complete: %d streams in %.2fms",
-                    len(recording), total_ms,
+                    "start_recording fan-out complete: %d/%d streams, wall=%.2fms",
+                    len(recording), len(streams_to_fan_out), total_ms,
                 )
+                if exception is not None:
+                    raise exception
             except Exception as exc:
                 # Roll back the streams that did start writing.
                 self._log_rollback(exc, len(recording))
