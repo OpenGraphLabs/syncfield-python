@@ -17,7 +17,10 @@ jobs:
       - name: Set up Node (for viewer frontend)
         uses: actions/setup-node@v6
         with:
-          node-version: "20"
+          # camera-controls (transitive dep via @react-three/drei) requires
+          # Node >= 22. yarn enforces engines.node strictly — npm only warned,
+          # which is how the dep slipped past our previous Node 20 runs.
+          node-version: "22"
           cache: "yarn"
           cache-dependency-path: src/syncfield/viewer/frontend/yarn.lock
 
