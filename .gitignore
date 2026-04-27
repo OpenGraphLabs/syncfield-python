@@ -36,6 +36,9 @@ src/syncfield/viewer/static/
 src/syncfield/viewer/frontend/node_modules/
 src/syncfield/viewer/frontend/dist/
 
+# Claude Code per-user settings
+.claude/
+
 # OS
 .DS_Store
 Thumbs.db
