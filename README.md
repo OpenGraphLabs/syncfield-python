@@ -173,6 +173,26 @@ Written by `stop()`. Maps every stream to its kind, capabilities, and produced f
 }
 ```
 
+## Development
+
+### Viewer frontend
+
+The browser viewer's React app lives in `src/syncfield/viewer/frontend/`. End users do **not** need Node — published wheels ship the prebuilt SPA in `viewer/static/`. Only contributors editing the viewer need to rebuild.
+
+Requirements:
+- **Node ≥ 22** (pinned in `frontend/.nvmrc`; enforced via `package.json` engines). Transitively required by `camera-controls` (via `@react-three/drei`).
+- **yarn** as the single package manager. Do not introduce `package-lock.json`.
+
+```bash
+cd src/syncfield/viewer/frontend
+nvm use                       # picks Node 22 from .nvmrc (optional)
+yarn install --frozen-lockfile
+yarn build                    # writes ../static/ — what the FastAPI server serves
+yarn dev                      # vite dev server on :5173 (HMR)
+```
+
+The publish workflow runs the same `yarn install --frozen-lockfile` + `yarn build` before building the Python wheel, so what you see locally matches what ships on PyPI.
+
 ## License
 
 Apache-2.0
