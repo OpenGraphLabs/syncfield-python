@@ -97,17 +97,20 @@ class TestWriteChirpWav:
 
 
 class TestSyncToneConfig:
-    def test_default_uses_egonaut_validated_defaults(self):
+    def test_default_uses_near_ultrasonic_band(self):
         cfg = SyncToneConfig.default()
         assert cfg.enabled is True
-        assert cfg.start_chirp.from_hz == 400
-        assert cfg.start_chirp.to_hz == 2500
+        # Start chirp rises 17 → 19 kHz (near-ultrasonic, AAC-safe, validated
+        # inaudible to adults on Insta360 Go 3S + MacBook speakers).
+        assert cfg.start_chirp.from_hz == 17000
+        assert cfg.start_chirp.to_hz == 19000
         assert cfg.start_chirp.duration_ms == 500
         assert cfg.start_chirp.amplitude == 0.8
         assert cfg.start_chirp.envelope_ms == 15
-        # Stop chirp is the reverse sweep
-        assert cfg.stop_chirp.from_hz == 2500
-        assert cfg.stop_chirp.to_hz == 400
+        # Stop chirp is the reverse sweep (19 → 17 kHz) so the alignment
+        # core can distinguish start from stop via xcorr sign.
+        assert cfg.stop_chirp.from_hz == 19000
+        assert cfg.stop_chirp.to_hz == 17000
         # Timing margins
         assert cfg.post_start_stabilization_ms == 200
         assert cfg.pre_stop_tail_margin_ms == 200
@@ -115,6 +118,22 @@ class TestSyncToneConfig:
     def test_silent_factory_disables_playback(self):
         cfg = SyncToneConfig.silent()
         assert cfg.enabled is False
+
+    def test_audible_factory_uses_legacy_400_2500_hz(self):
+        cfg = SyncToneConfig.audible()
+        assert cfg.enabled is True
+        # Opt-in audible preset preserves the legacy 400-2500 Hz band that
+        # was the default before the switch to near-ultrasonic.
+        assert cfg.start_chirp.from_hz == 400
+        assert cfg.start_chirp.to_hz == 2500
+        assert cfg.stop_chirp.from_hz == 2500
+        assert cfg.stop_chirp.to_hz == 400
+        # Everything else matches default so downstream timing behaviour
+        # is unchanged.
+        assert cfg.start_chirp.duration_ms == 500
+        assert cfg.start_chirp.amplitude == 0.8
+        assert cfg.countdown_tick is not None
+        assert cfg.post_start_stabilization_ms == 200
 
     def test_is_frozen(self):
         cfg = SyncToneConfig.default()

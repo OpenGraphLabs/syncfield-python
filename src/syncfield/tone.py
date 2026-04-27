@@ -45,16 +45,38 @@ except ImportError:  # pragma: no cover - exercised on machines without numpy
 # Defaults
 # ---------------------------------------------------------------------------
 #
-# These spec values are ported directly from the egonaut production
-# implementation (``EgonautMobile/SoundFeedbackModule.swift``) and have been
-# validated against real iPhone microphones in field recording sessions.
-# The rising-then-falling asymmetry is intentional: it lets the alignment
-# core distinguish start chirps from stop chirps via cross-correlation.
+# Start/stop chirps live in the 17–19 kHz near-ultrasonic band. Validated
+# end-to-end against an Insta360 Go 3S (mic + AAC encoder) and a MacBook
+# built-in speaker: the 17–19 kHz chirp survives the recording path with
+# ~+20 dB SNR, well above the event-detector's 5× prominence floor used
+# by the syncfield sync API. A higher 19–21 kHz candidate was also tested
+# and found dead at the other end — either the MacBook tweeter cannot
+# reach that band cleanly or the AAC encoder drops it. 17–19 kHz is the
+# documented sweet spot: nearly inaudible to adults (hearing typically
+# rolls off above 15–16 kHz), robust across the audio pipeline, and wide
+# enough (2 kHz bandwidth × 500 ms) for sub-millisecond cross-correlation
+# anchoring.
+#
+# The rising-then-falling asymmetry between start and stop is preserved
+# so the alignment core can still distinguish the two via chirp direction.
 
 _DEFAULT_START_CHIRP = ChirpSpec(
-    from_hz=400, to_hz=2500, duration_ms=500, amplitude=0.8, envelope_ms=15
+    from_hz=17000, to_hz=19000, duration_ms=500, amplitude=0.8, envelope_ms=15
 )
 _DEFAULT_STOP_CHIRP = ChirpSpec(
+    from_hz=19000, to_hz=17000, duration_ms=500, amplitude=0.8, envelope_ms=15
+)
+
+# Audible (400-2500 Hz) variant — kept available as an opt-in preset. Use
+# cases: (i) cameras with 16 kHz-or-lower audio cutoff where ultrasonic
+# doesn't survive, (ii) debugging scenarios where the operator wants to
+# hear the chirps fire, (iii) hearing-impaired workflows that rely on a
+# visible/audible cue. These values are the egonaut-validated defaults
+# we used before switching to the near-ultrasonic band.
+_AUDIBLE_START_CHIRP = ChirpSpec(
+    from_hz=400, to_hz=2500, duration_ms=500, amplitude=0.8, envelope_ms=15
+)
+_AUDIBLE_STOP_CHIRP = ChirpSpec(
     from_hz=2500, to_hz=400, duration_ms=500, amplitude=0.8, envelope_ms=15
 )
 
@@ -207,16 +229,41 @@ class SyncToneConfig:
 
     @classmethod
     def default(cls) -> "SyncToneConfig":
-        """Construct with all defaults (chirp enabled)."""
+        """Construct with all defaults (near-ultrasonic chirp enabled).
+
+        Uses the 17–19 kHz band start/stop chirps — nearly inaudible to
+        adult ears but reliably captured by consumer camera mics through
+        typical AAC recording pipelines. Prefer this for production.
+        """
         return cls()
+
+    @classmethod
+    def audible(cls) -> "SyncToneConfig":
+        """Construct with the legacy audible 400–2500 Hz start/stop chirps.
+
+        Opt-in preset for cases where the near-ultrasonic default is not
+        appropriate:
+
+          - cameras/codecs with an audio cutoff below ~16 kHz where the
+            ultrasonic chirp does not survive the recording pipeline,
+          - debugging scenarios where an operator wants to hear that the
+            chirps actually fired,
+          - demos / workflows where a human-audible cue is required.
+
+        All other parameters (duration, envelope, timing margins, countdown
+        tick) match the default.
+        """
+        return cls(
+            start_chirp=_AUDIBLE_START_CHIRP,
+            stop_chirp=_AUDIBLE_STOP_CHIRP,
+        )
 
     @classmethod
     def silent(cls) -> "SyncToneConfig":
         """Construct with chirp disabled.
 
-        Use for recording environments where audible chirps are
-        unacceptable (quiet rooms, meetings) or for headless lab machines
-        with no audio output path.
+        Use for recording environments where *any* chirp is unacceptable
+        or for headless lab machines with no audio output path.
         """
         return cls(enabled=False, countdown_tick=None)
 
