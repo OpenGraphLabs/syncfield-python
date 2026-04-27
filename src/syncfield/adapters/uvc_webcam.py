@@ -1,16 +1,25 @@
-"""UVCWebcamStream — PyAV-based adapter for UVC/USB webcams.
+"""UVCWebcamStream — adapter for UVC/USB webcams (PyAV or OpenCV backend).
 
 Requires the optional ``uvc`` extra:
 
     pip install syncfield[uvc]
 
-The adapter runs a background thread that decodes frames from a PyAV
-input container, timestamps each decoded frame with
-``time.monotonic_ns()`` **before** any further processing, and publishes
-them to :attr:`latest_frame` for the viewer to preview. The **same
-thread** writes to an MP4 via :class:`~._video_encoder.VideoEncoder` and
-emits :class:`~syncfield.types.SampleEvent` — but only while the session
-is in :attr:`~syncfield.SessionState.RECORDING`.
+Two capture backends are supported, selectable per instance via
+``backend="pyav"`` (default) or ``backend="opencv"``. Both drive macOS
+AVFoundation / Linux V4L2 / Windows MSMF under the hood, but through
+different implementations — some UVC cameras hang during ffmpeg's
+avfoundation open while working fine through OpenCV's ``AVCaptureSession``
+path (one example: Sonix VID 0x0c45 OEM webcams on macOS). The OpenCV
+backend is opt-in — leave it off unless PyAV is observed to hang on a
+specific device.
+
+The adapter runs a background thread that reads frames from the chosen
+backend, timestamps each decoded frame with ``time.monotonic_ns()``
+**before** any further processing, and publishes them to
+:attr:`latest_frame` for the viewer to preview. The **same thread**
+writes to an MP4 via :class:`~._video_encoder.VideoEncoder` and emits
+:class:`~syncfield.types.SampleEvent` — but only while the session is in
+:attr:`~syncfield.SessionState.RECORDING`.
 
 Lifecycle
 ---------
@@ -55,7 +64,7 @@ from syncfield.types import (
 
 
 class UVCWebcamStream(StreamBase):
-    """Captures video from a UVC webcam via PyAV.
+    """Captures video from a UVC webcam via PyAV or OpenCV.
 
     Args:
         id: Stream id (also used as the output file name, ``{id}.mp4``).
@@ -67,6 +76,9 @@ class UVCWebcamStream(StreamBase):
         fps: Desired frame rate (defaults to 30.0).
         device_name: Required only on Windows (DirectShow). Ignored on
             macOS / Linux — see :func:`~syncfield.adapters._video_encoder.open_uvc_input`.
+        backend: ``"pyav"`` (default) or ``"opencv"``. Use ``"opencv"`` as
+            a fallback for cameras where PyAV/ffmpeg's avfoundation (macOS)
+            or demuxer (Linux/Windows) hangs or misnegotiates.
     """
 
     # Class-level hints for ``syncfield.discovery``.
@@ -82,7 +94,12 @@ class UVCWebcamStream(StreamBase):
         height: Optional[int] = 720,
         fps: Optional[float] = 30.0,
         device_name: Optional[str] = None,
+        backend: str = "pyav",
     ) -> None:
+        if backend not in ("pyav", "opencv"):
+            raise ValueError(
+                f"backend must be 'pyav' or 'opencv', got {backend!r}"
+            )
         super().__init__(
             id=id,
             kind="video",
@@ -100,6 +117,7 @@ class UVCWebcamStream(StreamBase):
         self._width = int(width) if width else 1280
         self._height = int(height) if height else 720
         self._fps = float(fps) if fps else 30.0
+        self._backend = backend
 
         self._input: Any = None
         self._encoder: Optional[VideoEncoder] = None
@@ -137,8 +155,17 @@ class UVCWebcamStream(StreamBase):
     # ------------------------------------------------------------------
 
     def prepare(self) -> None:
-        """Open the PyAV input container (the camera device)."""
-        if self._input is None:
+        """Open the camera via the configured backend."""
+        if self._input is not None:
+            return
+        if self._backend == "opencv":
+            self._input = _open_opencv_capture(
+                device_index=self._device_index,
+                width=self._width,
+                height=self._height,
+                fps=self._fps,
+            )
+        else:
             self._input = open_uvc_input(
                 device_index=self._device_index,
                 width=self._width,
@@ -256,7 +283,18 @@ class UVCWebcamStream(StreamBase):
         * Recording — also encode to MP4 and emit SampleEvent.
 
         The loop exits when ``_stop_event`` fires or the input container
-        is exhausted (device disconnect).
+        is exhausted (device disconnect). Dispatches to the per-backend
+        implementation — the two paths have different error semantics so
+        they're kept separate rather than merged.
+        """
+        assert self._input is not None
+        if self._backend == "opencv":
+            self._capture_loop_opencv()
+        else:
+            self._capture_loop_pyav()
+
+    def _capture_loop_pyav(self) -> None:
+        """PyAV capture loop.
 
         Transient OS errors (EAGAIN / EINTR) raised by AVFoundation or
         V4L2 during camera warmup are NOT fatal — the demuxer is just
@@ -264,7 +302,6 @@ class UVCWebcamStream(StreamBase):
         keep polling. Only genuinely fatal errors surface as a health
         event and terminate the thread.
         """
-        assert self._input is not None
         # Errno values treated as transient "retry soon":
         # macOS EAGAIN=35, Linux EAGAIN=11, EINTR=4. ``None`` is also
         # treated as transient because PyAV sometimes omits errno on
@@ -349,6 +386,67 @@ class UVCWebcamStream(StreamBase):
                 )
                 return
 
+    def _capture_loop_opencv(self) -> None:
+        """OpenCV capture loop.
+
+        ``cv2.VideoCapture.read()`` returns ``(ret, frame_bgr)`` — a
+        falsey ret means "no frame this call," which on a live camera is
+        transient most of the time (warmup / frame boundary) and fatal
+        rarely (device unplugged). We don't have a clean way to
+        distinguish the two, so back off briefly on each failure and
+        treat a long run of consecutive failures as a disconnect.
+        """
+        cap = self._input
+        consecutive_failures = 0
+        max_consecutive_failures = 200  # ~2s @ 10ms backoff
+
+        while not self._stop_event.is_set():
+            ret, frame_bgr = cap.read()
+            capture_ns = time.monotonic_ns()
+
+            if not ret or frame_bgr is None:
+                consecutive_failures += 1
+                if consecutive_failures >= max_consecutive_failures:
+                    self._emit_health(
+                        HealthEvent(
+                            stream_id=self.id,
+                            kind=HealthEventKind.ERROR,
+                            at_ns=time.monotonic_ns(),
+                            detail=(
+                                f"opencv backend: {consecutive_failures} "
+                                "consecutive read failures — treating as disconnect"
+                            ),
+                        )
+                    )
+                    return
+                time.sleep(0.01)
+                continue
+            consecutive_failures = 0
+
+            if self._recording:
+                self._observe_first_frame(capture_ns, None)
+                if self._prev_capture_ns is not None:
+                    self._intervals_ns.append(capture_ns - self._prev_capture_ns)
+                self._prev_capture_ns = capture_ns
+
+            with self._frame_lock:
+                self._latest_frame = frame_bgr
+
+            if self._recording:
+                if self._first_at is None:
+                    self._first_at = capture_ns
+                self._last_at = capture_ns
+                self._frame_count += 1
+                if self._encoder is not None:
+                    self._encoder.write(frame_bgr)
+                self._emit_sample(
+                    SampleEvent(
+                        stream_id=self.id,
+                        frame_number=self._frame_count - 1,
+                        capture_ns=capture_ns,
+                    )
+                )
+
     # ------------------------------------------------------------------
     # Live preview
     # ------------------------------------------------------------------
@@ -365,7 +463,10 @@ class UVCWebcamStream(StreamBase):
             self._encoder = None
         if self._input is not None:
             try:
-                self._input.close()
+                if self._backend == "opencv":
+                    self._input.release()
+                else:
+                    self._input.close()
             finally:
                 self._input = None
 
@@ -409,6 +510,54 @@ class UVCWebcamStream(StreamBase):
             )
             for entry in raw
         ]
+
+
+# ---------------------------------------------------------------------------
+# OpenCV backend — optional fallback for cameras that hang under PyAV/ffmpeg's
+# avfoundation (macOS) or demuxer (Linux/Windows).
+# ---------------------------------------------------------------------------
+
+
+def _open_opencv_capture(
+    *,
+    device_index: int,
+    width: int,
+    height: int,
+    fps: float,
+):
+    """Open a ``cv2.VideoCapture`` with the platform-native backend.
+
+    Raises ``ImportError`` if opencv-python is not installed, ``OSError``
+    if the device fails to open.
+    """
+    import sys
+
+    try:
+        import cv2
+    except ImportError as exc:
+        raise ImportError(
+            "OpenCV backend requires opencv-python. Install with: "
+            "pip install opencv-python"
+        ) from exc
+
+    if sys.platform == "darwin":
+        api_preference = cv2.CAP_AVFOUNDATION
+    elif sys.platform.startswith("linux"):
+        api_preference = cv2.CAP_V4L2
+    elif sys.platform == "win32":
+        api_preference = cv2.CAP_MSMF
+    else:
+        api_preference = cv2.CAP_ANY
+
+    cap = cv2.VideoCapture(device_index, api_preference)
+    if not cap.isOpened():
+        raise OSError(
+            f"OpenCV failed to open UVC camera at index {device_index}"
+        )
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, float(width))
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, float(height))
+    cap.set(cv2.CAP_PROP_FPS, float(fps))
+    return cap
 
 
 # ---------------------------------------------------------------------------
