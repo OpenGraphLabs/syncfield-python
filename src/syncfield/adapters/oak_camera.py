@@ -888,8 +888,23 @@ class OakCameraStream(StreamBase):
         if self._pipeline is not None:
             try:
                 self._pipeline.stop()
-            except Exception:
-                pass
+                # ``pipeline.stop()`` is async: it signals the pipeline
+                # to tear down but returns before the Myriad-X firmware
+                # is actually reset. A rapid ``Ctrl+C`` → process exit
+                # immediately after stop() frequently left the board
+                # booted-and-held ("zombie state"), forcing a physical
+                # USB replug before the next session could connect.
+                # Sleeping here gives DepthAI's XLink transport time to
+                # send RESET + close the USB endpoint cleanly. 300 ms is
+                # empirically enough on macOS USB 2.0/3.0; still short
+                # enough that operators don't notice the shutdown delay.
+                time.sleep(0.3)
+            except Exception as exc:  # noqa: BLE001 — DepthAI surfaces varied errors here
+                # Log but don't re-raise — disconnect must not break.
+                logger.warning(
+                    "[%s] pipeline.stop() raised, device may need physical "
+                    "replug: %r", self.id, exc,
+                )
             self._pipeline = None
         self._q_rgb = None
         self._q_preview = None
