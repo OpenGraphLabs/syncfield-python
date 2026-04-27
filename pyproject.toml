@@ -80,6 +80,14 @@ Issues = "https://github.com/OpenGraphLabs/syncfield-python/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/syncfield"]
+# viewer/frontend/ is the React/TypeScript build *input* (vite + .tsx +
+# package.json + node_modules). The runtime only reads viewer/static/
+# (the prebuilt SPA bundle), which is force-included below. Excluding
+# the source tree keeps the wheel small and avoids shipping our
+# frontend sources through PyPI.
+exclude = [
+    "src/syncfield/viewer/frontend",
+]
 
 [tool.hatch.build.targets.wheel.force-include]
 "src/syncfield/viewer/static" = "syncfield/viewer/static"
