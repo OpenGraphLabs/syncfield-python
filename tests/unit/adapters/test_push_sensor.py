@@ -268,14 +268,21 @@ def test_push_sensor_stream_is_re_exported_from_adapters_package():
 class TestRecordingAnchor:
     """Per-recording-window intra-host sync anchor capture.
 
-    PushSensorStream has no device clock — ``first_frame_device_ns``
-    must always be ``None``, while ``armed_host_ns`` and
-    ``first_frame_host_ns`` are populated on the first recorded sample.
+    Push sensors fall into two camps:
+
+    - Sources with no device-side clock (host-driven readers, simple
+      sounding boards). Callers omit ``device_ns`` and the anchor's
+      ``first_frame_device_ns`` stays ``None`` — downstream sync uses
+      host arrival latency only.
+    - Sources whose payload carries a sensor-side clock (BLE IMU,
+      network sensors with embedded timestamps). Callers pass
+      ``device_ns`` so the anchor captures the (host_ns, device_ns)
+      pair, matching the contract camera adapters with hardware clocks
+      already follow.
     """
 
     def test_push_sensor_anchor_captured_without_device_ts(self):
-        """Push sensor has no device clock — anchor captured with
-        first_frame_device_ns=None."""
+        """Caller omits ``device_ns`` → anchor stays host-only."""
         stream = PushSensorStream("ble")
         stream.connect()
         armed_ns = time.monotonic_ns()
@@ -291,5 +298,66 @@ class TestRecordingAnchor:
         assert report.recording_anchor is not None
         assert report.recording_anchor.armed_host_ns == armed_ns
         assert report.recording_anchor.first_frame_host_ns >= armed_ns
-        # KEY: push sensors have no device clock.
         assert report.recording_anchor.first_frame_device_ns is None
+
+    def test_push_sensor_anchor_captures_device_ns_when_provided(self):
+        """Caller passes ``device_ns`` → anchor records the pair, mirroring
+        the camera-adapter contract for downstream sync alignment."""
+        stream = PushSensorStream("ble_imu")
+        stream.connect()
+        armed_ns = time.monotonic_ns()
+        clock = SessionClock(
+            sync_point=SyncPoint.create_now("h"),
+            recording_armed_ns=armed_ns,
+        )
+        stream.start_recording(clock)
+        stream.push(
+            {"ax": 0.5},
+            capture_ns=armed_ns + 1_000_000,
+            device_ns=42_123_456_789,
+        )
+        report = stream.stop_recording()
+        stream.disconnect()
+
+        assert report.recording_anchor is not None
+        assert report.recording_anchor.first_frame_device_ns == 42_123_456_789
+
+    def test_push_sensor_only_first_frames_device_ns_anchors(self):
+        """``_observe_first_frame`` is idempotent — only the first sample's
+        device_ns lands in the anchor, even if later samples differ."""
+        stream = PushSensorStream("ble_imu")
+        stream.connect()
+        armed_ns = time.monotonic_ns()
+        clock = SessionClock(
+            sync_point=SyncPoint.create_now("h"),
+            recording_armed_ns=armed_ns,
+        )
+        stream.start_recording(clock)
+        stream.push(
+            {"x": 1.0}, capture_ns=armed_ns + 1_000, device_ns=10_000_000_000
+        )
+        stream.push(
+            {"x": 2.0}, capture_ns=armed_ns + 6_000, device_ns=10_005_000_000
+        )
+        stream.push(
+            {"x": 3.0}, capture_ns=armed_ns + 11_000, device_ns=10_010_000_000
+        )
+        report = stream.stop_recording()
+        stream.disconnect()
+
+        assert report.recording_anchor is not None
+        assert report.recording_anchor.first_frame_device_ns == 10_000_000_000
+
+    def test_push_sensor_device_ns_outside_recording_window_is_dropped(self):
+        """device_ns passed during preview (no active recording) does
+        nothing — the anchor only captures values for an armed window."""
+        stream = PushSensorStream("ble_imu")
+        stream.connect()
+        clock_no_arm = SessionClock(sync_point=SyncPoint.create_now("h"))
+        stream.start_recording(clock_no_arm)
+        stream.push({"x": 1.0}, device_ns=99_999_999_999)
+        report = stream.stop_recording()
+        stream.disconnect()
+
+        # No armed_host_ns means _observe_first_frame is a no-op.
+        assert report.recording_anchor is None

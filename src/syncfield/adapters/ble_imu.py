@@ -86,6 +86,158 @@ class ConfigWrite:
     delay_after_s: float = 0.1
 
 
+_TIMESTAMP_UNIT_MULTIPLIERS_NS: Dict[str, int] = {
+    "ns": 1,
+    "us": 1_000,
+    "ms": 1_000_000,
+    "s": 1_000_000_000,
+}
+
+_VALID_TIMESTAMP_ORIGINS = frozenset({"epoch", "boot", "first_sample"})
+
+
+@dataclass(frozen=True)
+class DeviceTimestampSpec:
+    """How to lift a device-side clock out of decoded BLE IMU samples.
+
+    BLE IMUs vary in whether (and how) they expose their internal clock:
+
+    - Some firmwares emit a separate frame type (e.g. WitMotion's
+      ``0x55 0x50`` TIME packet) that we cannot decode through the
+      single-format channel set used here. Those need a richer profile;
+      this spec only covers the "embedded as a channel" pattern.
+    - Many devices (Mbient MetaMotion+, custom firmwares) include a
+      free-running counter as an extra ``struct`` field at the start of
+      each sample. Set ``field`` to the channel name holding that
+      counter and the adapter will:
+
+      1. consume the channel from the decoded sample (so it does not
+         pollute the recorded payload),
+      2. convert it to nanoseconds using ``units``,
+      3. interpret it via ``origin`` (absolute / boot-relative /
+         first-sample-relative),
+      4. stitch unsigned-counter wraparounds when ``wraparound_bits``
+         is set,
+
+      and pass the resulting ``device_ns`` to ``_observe_first_frame``
+      so the recording anchor records the (host_ns, device_ns) pair the
+      same way camera adapters with hardware clocks already do.
+
+    Attributes:
+        field: Decoded channel name carrying the device timestamp. Must
+            match one of the profile's :class:`ChannelSpec.name`
+            entries — the profile validates this in ``__post_init__``.
+        units: Time units of ``field``: ``"ns" | "us" | "ms" | "s"``.
+        origin: ``"epoch"`` (absolute Unix-epoch) | ``"boot"`` (device
+            uptime, monotonic) | ``"first_sample"`` (re-anchor the
+            first observed sample to the host's monotonic clock so
+            cross-stream comparisons line up).
+        wraparound_bits: Bit width of the underlying unsigned counter
+            for wrap-aware stitching (e.g. 32 for a uint32 ms counter).
+            ``0`` (default) disables wrap handling — set this when the
+            counter is wide enough that a wrap inside one recording is
+            impossible.
+    """
+
+    field: str
+    units: str = "us"
+    origin: str = "boot"
+    wraparound_bits: int = 0
+
+    def __post_init__(self) -> None:
+        if not self.field:
+            raise ValueError("DeviceTimestampSpec.field must be non-empty")
+        if self.units not in _TIMESTAMP_UNIT_MULTIPLIERS_NS:
+            raise ValueError(
+                f"DeviceTimestampSpec.units must be one of "
+                f"{sorted(_TIMESTAMP_UNIT_MULTIPLIERS_NS)}, got {self.units!r}"
+            )
+        if self.origin not in _VALID_TIMESTAMP_ORIGINS:
+            raise ValueError(
+                f"DeviceTimestampSpec.origin must be one of "
+                f"{sorted(_VALID_TIMESTAMP_ORIGINS)}, got {self.origin!r}"
+            )
+        if self.wraparound_bits and self.wraparound_bits not in (16, 24, 32, 48, 64):
+            raise ValueError(
+                "DeviceTimestampSpec.wraparound_bits must be 0, 16, 24, 32, "
+                "48, or 64"
+            )
+
+
+class _DeviceTimestampState:
+    """Stateful helper that converts a per-sample device-clock channel
+    into a monotonically-increasing nanosecond timestamp.
+
+    Encapsulates unit conversion, origin handling, and unsigned-counter
+    wraparound stitching so the BLE adapter's hot path stays readable.
+
+    Single-writer assumption: the BLE notify callback is the only thread
+    that mutates instance state, matching how the surrounding adapter
+    threads its capture loop.
+    """
+
+    def __init__(self, spec: DeviceTimestampSpec) -> None:
+        self._spec = spec
+        self._first_value: Optional[float] = None
+        self._first_anchor_ns: Optional[int] = None
+        self._last_unwrapped: Optional[float] = None
+        self._wrap_offset: float = 0.0
+        self._missing_warned = False
+
+    def consume(self, channels: Dict[str, float]) -> Optional[int]:
+        """Pop the timestamp channel and return device_ns, or ``None``.
+
+        The channel is removed from ``channels`` in place so it does not
+        end up in the recorded sample payload — downstream consumers see
+        only the actual sensor values, just like with profiles that have
+        no timestamp channel.
+        """
+        spec = self._spec
+        try:
+            raw = channels.pop(spec.field)
+        except KeyError:
+            self._missing_warned = True
+            return None
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return None
+
+        if spec.wraparound_bits:
+            modulus = float(1 << spec.wraparound_bits)
+            if self._last_unwrapped is not None:
+                expected_low = self._last_unwrapped - self._wrap_offset
+                # Detect rollover: a counter that drops by ≥ 75% of its
+                # range almost certainly wrapped. The 25% guard handles
+                # ordinary out-of-order arrivals without false positives.
+                if value + (modulus / 4.0) < expected_low:
+                    self._wrap_offset += modulus
+            unwrapped = value + self._wrap_offset
+            self._last_unwrapped = unwrapped
+            value = unwrapped
+
+        unit_multiplier = _TIMESTAMP_UNIT_MULTIPLIERS_NS[spec.units]
+        ns = int(value * unit_multiplier)
+
+        if spec.origin == "first_sample":
+            # Re-anchor first observation to the host's monotonic clock
+            # so cross-stream comparisons line up. Subsequent samples
+            # are deltas from the first device value applied to that
+            # host anchor.
+            if self._first_value is None:
+                self._first_value = value
+                self._first_anchor_ns = time.monotonic_ns()
+                return self._first_anchor_ns
+            assert self._first_anchor_ns is not None
+            delta_ns = int((value - self._first_value) * unit_multiplier)
+            return self._first_anchor_ns + delta_ns
+
+        # "epoch" and "boot" return the unit-converted value as-is — the
+        # SDK's RecordingAnchor stores them verbatim and downstream sync
+        # tooling correlates across streams using the host anchor.
+        return ns
+
+
 @dataclass(frozen=True)
 class BLEImuProfile:
     """Declarative description of one BLE IMU's data + config protocol.
@@ -133,6 +285,10 @@ class BLEImuProfile:
     samples_per_frame: Optional[int] = None
     sample_period_us: int = 0
     description: str = ""
+    # Optional: lift a device timestamp out of each decoded sample and
+    # record it into the per-window RecordingAnchor. See
+    # :class:`DeviceTimestampSpec` for the conversion rules.
+    device_timestamp: Optional[DeviceTimestampSpec] = None
 
     def __post_init__(self) -> None:
         # Cross-check channel count against what the struct format
@@ -157,6 +313,15 @@ class BLEImuProfile:
                 raise ValueError(
                     f"BLEImuProfile: sample_period_us must be > 0 when "
                     f"samples_per_frame > 1 (got {self.sample_period_us})"
+                )
+        if self.device_timestamp is not None:
+            channel_names = {c.name for c in self.channels}
+            if self.device_timestamp.field not in channel_names:
+                raise ValueError(
+                    f"BLEImuProfile.device_timestamp.field "
+                    f"{self.device_timestamp.field!r} is not in channels "
+                    f"{sorted(channel_names)}; the device-clock channel must "
+                    f"appear in struct_format so it can be decoded"
                 )
 
     @property
@@ -231,6 +396,11 @@ class BLEImuGenericStream(StreamBase):
         self._samples_per_frame = profile.samples_per_frame  # Optional[int]
         self._sample_period_ns = profile.sample_period_us * 1000
         self._channels = profile.channels
+        self._device_ts_state: Optional[_DeviceTimestampState] = (
+            _DeviceTimestampState(profile.device_timestamp)
+            if profile.device_timestamp is not None
+            else None
+        )
 
         self._client: Any = None
         self._device: Any = None
@@ -487,6 +657,14 @@ class BLEImuGenericStream(StreamBase):
                 for j, spec in enumerate(self._channels)
             }
 
+            # Lift a device-side timestamp out of the decoded sample when
+            # the profile declares one. The field is consumed (popped) so
+            # it does not pollute the recorded payload, then converted
+            # to nanoseconds with origin/wraparound rules.
+            device_ns: Optional[int] = None
+            if self._device_ts_state is not None:
+                device_ns = self._device_ts_state.consume(channels)
+
             # Anchor the last sample at recv_ns; earlier samples step
             # backward by the configured period. Physically correct:
             # the sensor held earlier samples in its BLE tx buffer
@@ -494,10 +672,13 @@ class BLEImuGenericStream(StreamBase):
             sample_ns = recv_ns - (n_samples - 1 - i) * self._sample_period_ns
 
             if self._recording:
-                # No device-side clock in the generic decoder —
-                # ``sample_ns`` is derived from ``recv_ns``, not the
-                # sensor's own clock. Pass None for device_ns.
-                self._observe_first_frame(sample_ns, None)
+                # ``sample_ns`` is the host-monotonic anchor for sample
+                # events (sample-monitor windowing relies on this clock).
+                # ``device_ns``, when available, rides separately into
+                # the recording anchor's ``first_frame_device_ns`` —
+                # mirroring the contract camera adapters with hardware
+                # clocks already follow.
+                self._observe_first_frame(sample_ns, device_ns)
                 if self._first_at is None:
                     self._first_at = sample_ns
                 self._last_at = sample_ns
@@ -514,6 +695,24 @@ class BLEImuGenericStream(StreamBase):
                 capture_ns=sample_ns,
                 channels=channels,
             ))
+
+    def _dispatch_notification_for_test_with_recv_ns(
+        self, payload: bytes, recv_ns: int
+    ) -> None:
+        """Test hook: dispatch with a deterministic ``recv_ns`` so tests can
+        pin both ``capture_ns`` and ``device_ns`` against expected values
+        without sleeping or mocking ``time.monotonic_ns``."""
+        # We can't easily inject recv_ns through _handle_payload without
+        # widening its public surface, so monkey-patch time briefly. The
+        # test path is single-threaded.
+        import time as _time
+
+        original = _time.monotonic_ns
+        _time.monotonic_ns = lambda: recv_ns  # type: ignore[assignment]
+        try:
+            self._handle_payload(payload)
+        finally:
+            _time.monotonic_ns = original  # type: ignore[assignment]
 
     def _dispatch_notification_for_test(self, payload: bytes) -> None:
         """Feed a raw payload through the decode path synchronously (test hook)."""
@@ -544,12 +743,14 @@ class BLEImuGenericStream(StreamBase):
 
         peripherals = scan_peripherals(timeout=timeout)
 
-        # Adapters that match specific device families filter themselves
-        # in; we exclude their advertised-name prefixes here so a
-        # single peripheral shows up under exactly one adapter. Keep
-        # substrings narrow — a too-broad token silently hides
-        # unrelated peripherals from the picker.
-        _EXCLUDE_NAME_SUBSTRINGS = ("oglo", "wt9", "wt8", "hwt9", "hwt8")
+        # Exclude peripherals already owned by a more-specific adapter
+        # that has its own registered discoverer — keeps a single device
+        # from appearing under two entries in the picker. Only add a
+        # token here when the corresponding adapter actually exists and
+        # is registered via ``register_discoverer``; orphan exclusions
+        # silently hide hardware from users. ``oglo`` is handled by
+        # ``OGLOTactileStream`` in ``oglo_tactile.py``.
+        _EXCLUDE_NAME_SUBSTRINGS = ("oglo",)
 
         results = []
         for peripheral in peripherals:

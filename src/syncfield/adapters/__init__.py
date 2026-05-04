@@ -91,6 +91,7 @@ _OPTIONAL: tuple[tuple[str, str, str, str], ...] = (
     ("syncfield.adapters.ble_imu",           "BLEImuProfile",         "ble",    "bleak"),
     ("syncfield.adapters.ble_imu",           "ChannelSpec",           "ble",    "bleak"),
     ("syncfield.adapters.ble_imu",           "ConfigWrite",           "ble",    "bleak"),
+    ("syncfield.adapters.ble_imu",           "DeviceTimestampSpec",   "ble",    "bleak"),
     ("syncfield.adapters.oglo_tactile",      "OgloTactileStream",     "ble",    "bleak"),
     ("syncfield.adapters.meta_quest_camera", "MetaQuestCameraStream", "camera", "httpx"),
     ("syncfield.adapters.insta360_go3s",     "Go3SStream",            "camera", "bleak + aiohttp + httpx"),

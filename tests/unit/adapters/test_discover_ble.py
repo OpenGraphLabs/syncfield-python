@@ -164,10 +164,11 @@ class TestBLEImuDiscover:
 
         assert device.construct_kwargs == {"address": "11:22:33:44:55:66"}
 
-    def test_wit_family_names_are_excluded(self, mock_bleak):
-        """WiT WT9xx / WT8xx / HWT9xx / HWT8xx don't belong to the
-        generic adapter — they have their own profile presets and
-        should surface via a device-family-specific discovery path."""
+    def test_wit_family_names_are_returned_for_profile_selection(self, mock_bleak):
+        """WiT WT9xx / WT8xx / HWT9xx / HWT8xx have profile presets but
+        no dedicated discoverer, so the generic adapter must surface
+        them — the desktop setup flow then picks the matching preset
+        via ``suggest_preset`` on the advertised name."""
         from syncfield.adapters.ble_imu import BLEImuGenericStream
 
         scan_result = [
@@ -181,7 +182,7 @@ class TestBLEImuDiscover:
             devices = BLEImuGenericStream.discover()
 
         names = {d.display_name for d in devices}
-        assert names == {"Nordic Thingy"}
+        assert names == {"WT901BLE68", "HWT9011-DCL", "Nordic Thingy"}
 
     def test_unnamed_peripheral_gets_fallback_label(self, mock_bleak):
         from syncfield.adapters.ble_imu import BLEImuGenericStream

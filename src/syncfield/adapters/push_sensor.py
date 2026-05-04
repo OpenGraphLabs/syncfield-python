@@ -95,8 +95,32 @@ class PushSensorStream(StreamBase):
         channels: dict[str, ChannelValue],
         *,
         capture_ns: Optional[int] = None,
+        device_ns: Optional[int] = None,
         frame_number: Optional[int] = None,
     ) -> None:
+        """Emit one sample.
+
+        Args:
+            channels: Decoded sample as a flat ``dict[str, ChannelValue]``.
+            capture_ns: Host monotonic nanosecond timestamp at which the
+                sample arrived (or was synthesized for back-filled bursts).
+                Used for ``SampleEvent.capture_ns`` and for the recording
+                anchor's ``first_frame_host_ns``. Defaults to
+                ``time.monotonic_ns()`` at call time.
+            device_ns: Optional device-clock nanosecond timestamp from the
+                sensor itself (e.g. a BLE IMU that includes its own clock
+                in the payload). When provided, it is recorded into the
+                first-frame :class:`RecordingAnchor` so downstream sync
+                tooling can scrub host-arrival jitter using device-clock
+                deltas — exactly the way camera adapters with hardware
+                clocks (Oak, Oglo, MetaQuestCamera) already do. Pass
+                ``None`` (the default) when the sensor has no device-side
+                clock; the anchor's ``first_frame_device_ns`` will be
+                ``None`` and downstream alignment falls back to host
+                arrival latency only.
+            frame_number: Override the running frame counter. Most callers
+                should leave this as ``None`` so the stream auto-increments.
+        """
         if not isinstance(channels, dict):
             raise TypeError(
                 f"PushSensorStream.push: channels must be dict, "
@@ -120,6 +144,10 @@ class PushSensorStream(StreamBase):
                 channels=channels,
             ))
             if self._writing:
-                # Push sensors have no device clock — pass None for device_ns.
-                self._observe_first_frame(capture_ns, None)
+                # ``device_ns`` is recorded into the recording anchor only
+                # for the first frame of each window (``_observe_first_frame``
+                # is idempotent). Pass ``None`` when the sensor has no
+                # device-side clock — the anchor stores ``first_frame_
+                # device_ns=None`` and downstream sync uses host arrival.
+                self._observe_first_frame(capture_ns, device_ns)
                 self._write_core.record_sample(capture_ns)

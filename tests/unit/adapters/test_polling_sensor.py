@@ -333,14 +333,18 @@ def test_polling_sensor_stream_is_re_exported_from_adapters_package():
 class TestRecordingAnchor:
     """Per-recording-window intra-host sync anchor capture.
 
-    PollingSensorStream has no device clock — ``first_frame_device_ns``
-    must always be ``None``, while ``armed_host_ns`` and
-    ``first_frame_host_ns`` are populated on the first recorded sample.
+    PollingSensorStream falls into two camps:
+
+    - Legacy ``read()`` returning a plain ``dict`` — no device clock,
+      anchor's ``first_frame_device_ns`` stays ``None``.
+    - ``read()`` returning ``(channels, device_ns)`` — sensor reads back
+      its own clock alongside the payload (typical for SPI/I2C IMUs that
+      expose an internal timer register). The anchor records device_ns,
+      mirroring how camera adapters with hardware clocks already do.
     """
 
     def test_polling_sensor_anchor_captured_without_device_ts(self):
-        """Polling sensor has no device clock — anchor captured with
-        first_frame_device_ns=None."""
+        """Legacy single-return ``read()`` → host-only anchor."""
         stream = PollingSensorStream(
             "imu", read=lambda: {"x": 1.0}, hz=1000,
         )
@@ -351,7 +355,6 @@ class TestRecordingAnchor:
             recording_armed_ns=armed_ns,
         )
         stream.start_recording(clock)
-        # Let the capture thread produce at least one recorded sample.
         time.sleep(0.05)
         report = stream.stop_recording()
         stream.disconnect()
@@ -359,5 +362,56 @@ class TestRecordingAnchor:
         assert report.recording_anchor is not None
         assert report.recording_anchor.armed_host_ns == armed_ns
         assert report.recording_anchor.first_frame_host_ns >= armed_ns
-        # KEY: polling sensors have no device clock.
         assert report.recording_anchor.first_frame_device_ns is None
+
+    def test_polling_sensor_anchor_records_device_ns_from_read(self):
+        """Two-tuple ``read()`` → anchor captures device_ns."""
+
+        def read():
+            # Sensor returns its current internal timer (here just a
+            # constant for determinism) alongside channel values.
+            return {"x": 1.0}, 7_777_777_777
+
+        stream = PollingSensorStream("imu", read=read, hz=1000)
+        stream.connect()
+        armed_ns = time.monotonic_ns()
+        clock = SessionClock(
+            sync_point=SyncPoint.create_now("h"),
+            recording_armed_ns=armed_ns,
+        )
+        stream.start_recording(clock)
+        time.sleep(0.05)
+        report = stream.stop_recording()
+        stream.disconnect()
+
+        assert report.recording_anchor is not None
+        assert report.recording_anchor.first_frame_device_ns == 7_777_777_777
+
+    def test_polling_sensor_invalid_device_ns_falls_back_to_none(self):
+        """Defensive: a misbehaving ``read()`` that returns a non-int
+        device_ns must not crash the capture loop. The first frame's
+        anchor falls back to host-only and a WARNING is emitted."""
+
+        def read():
+            return {"x": 1.0}, "not-an-int"
+
+        stream = PollingSensorStream("imu", read=read, hz=1000)
+        stream.connect()
+        armed_ns = time.monotonic_ns()
+        clock = SessionClock(
+            sync_point=SyncPoint.create_now("h"),
+            recording_armed_ns=armed_ns,
+        )
+        stream.start_recording(clock)
+        time.sleep(0.05)
+        report = stream.stop_recording()
+        stream.disconnect()
+
+        assert report.recording_anchor is not None
+        assert report.recording_anchor.first_frame_device_ns is None
+        # WARNING reported but capture loop continues.
+        assert any(
+            ev.kind == HealthEventKind.WARNING
+            and "device_ns" in ev.detail
+            for ev in report.health_events
+        )

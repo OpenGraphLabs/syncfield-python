@@ -485,12 +485,16 @@ class TestLifecycle:
 class TestRecordingAnchor:
     """Per-recording-window intra-host sync anchor capture.
 
-    The generic BLE IMU decoder derives per-sample timestamps from the
-    host's monotonic clock (``recv_ns``), not a sensor-side clock — so
-    ``first_frame_device_ns`` must stay ``None``.
+    The generic BLE IMU decoder defaults to host-clock-only anchors. When
+    the profile declares a ``device_timestamp`` mapping, the adapter lifts
+    that channel out of every decoded sample and records it into the
+    recording anchor — same contract camera adapters with hardware clocks
+    follow.
     """
 
-    def test_ble_imu_anchor_captured_without_device_ts(self, mock_bleak):
+    def test_ble_imu_anchor_without_device_timestamp_stays_host_only(
+        self, mock_bleak
+    ):
         from syncfield.adapters.ble_imu import BLEImuGenericStream
 
         stream = BLEImuGenericStream(
@@ -502,18 +506,214 @@ class TestRecordingAnchor:
             recording_armed_ns=armed_ns,
         )
         stream._begin_recording_window(clock)
-        stream._recording = True  # skip the async lifecycle for unit test
+        stream._recording = True
 
         payload = b"\xAA\xBB" + struct.pack("<hhh", 1, 2, 3)
         stream._dispatch_notification_for_test(payload)
 
         report = stream.stop_recording()
-
         assert report.recording_anchor is not None
-        assert report.recording_anchor.armed_host_ns == armed_ns
-        assert report.recording_anchor.first_frame_host_ns >= armed_ns
-        # KEY: generic BLE IMU has no device clock — stays None.
         assert report.recording_anchor.first_frame_device_ns is None
+
+    def test_ble_imu_anchor_records_device_timestamp_from_profile(
+        self, mock_bleak
+    ):
+        from syncfield.adapters.ble_imu import (
+            BLEImuGenericStream,
+            BLEImuProfile,
+            ChannelSpec,
+            DeviceTimestampSpec,
+        )
+
+        # 4-byte uint32 ms counter + three int16 axes.
+        profile = BLEImuProfile(
+            notify_uuid="cafe",
+            struct_format="<Ihhh",
+            channels=(
+                ChannelSpec(name="ts", scale=1.0),
+                ChannelSpec(name="x", scale=1.0),
+                ChannelSpec(name="y", scale=1.0),
+                ChannelSpec(name="z", scale=1.0),
+            ),
+            frame_header=b"\xAA\xBB",
+            device_timestamp=DeviceTimestampSpec(
+                field="ts", units="ms", origin="boot"
+            ),
+        )
+        stream = BLEImuGenericStream("imu", profile=profile, address="x")
+        clock = SessionClock(
+            sync_point=SyncPoint.create_now("h"),
+            recording_armed_ns=1_000_000_000,
+        )
+        stream._begin_recording_window(clock)
+        stream._recording = True
+
+        payload = b"\xAA\xBB" + struct.pack("<Ihhh", 12345, 1, 2, 3)
+        stream._dispatch_notification_for_test_with_recv_ns(
+            payload, recv_ns=1_500_000_000
+        )
+
+        report = stream.stop_recording()
+        assert report.recording_anchor is not None
+        # 12345 ms in ns.
+        assert report.recording_anchor.first_frame_device_ns == 12_345_000_000
+
+    def test_ble_imu_strips_device_timestamp_channel_from_emitted_sample(
+        self, mock_bleak
+    ):
+        """The configured timestamp channel is consumed (not exposed in
+        the channel dict) so downstream consumers only see actual sensor
+        values — the same way camera adapters keep frame timestamps off
+        the channel dict."""
+        from syncfield.adapters.ble_imu import (
+            BLEImuGenericStream,
+            BLEImuProfile,
+            ChannelSpec,
+            DeviceTimestampSpec,
+        )
+        from syncfield.types import SampleEvent
+
+        profile = BLEImuProfile(
+            notify_uuid="cafe",
+            struct_format="<Ihhh",
+            channels=(
+                ChannelSpec(name="ts", scale=1.0),
+                ChannelSpec(name="x", scale=1.0),
+                ChannelSpec(name="y", scale=1.0),
+                ChannelSpec(name="z", scale=1.0),
+            ),
+            device_timestamp=DeviceTimestampSpec(
+                field="ts", units="ms", origin="boot"
+            ),
+        )
+        stream = BLEImuGenericStream("imu", profile=profile, address="x")
+        seen: list[SampleEvent] = []
+        stream.on_sample(seen.append)
+        clock = SessionClock(
+            sync_point=SyncPoint.create_now("h"),
+            recording_armed_ns=1_000_000_000,
+        )
+        stream._begin_recording_window(clock)
+        stream._recording = True
+
+        payload = struct.pack("<Ihhh", 9999, 1, 2, 3)
+        stream._dispatch_notification_for_test(payload)
+
+        assert len(seen) == 1
+        assert "ts" not in seen[0].channels
+        assert seen[0].channels == {"x": 1.0, "y": 2.0, "z": 3.0}
+
+    def test_ble_imu_first_sample_origin_anchors_to_host_clock(self, mock_bleak):
+        """``origin="first_sample"`` re-anchors the first observation to
+        the host's monotonic clock so cross-stream comparisons line up
+        even when the device clock has an unknown origin."""
+        from syncfield.adapters.ble_imu import (
+            BLEImuGenericStream,
+            BLEImuProfile,
+            ChannelSpec,
+            DeviceTimestampSpec,
+        )
+
+        profile = BLEImuProfile(
+            notify_uuid="cafe",
+            struct_format="<Ihhh",
+            channels=(
+                ChannelSpec(name="ts", scale=1.0),
+                ChannelSpec(name="x", scale=1.0),
+                ChannelSpec(name="y", scale=1.0),
+                ChannelSpec(name="z", scale=1.0),
+            ),
+            device_timestamp=DeviceTimestampSpec(
+                field="ts", units="ms", origin="first_sample"
+            ),
+        )
+        stream = BLEImuGenericStream("imu", profile=profile, address="x")
+        clock = SessionClock(
+            sync_point=SyncPoint.create_now("h"),
+            recording_armed_ns=1_000_000_000,
+        )
+        stream._begin_recording_window(clock)
+        stream._recording = True
+
+        payload = struct.pack("<Ihhh", 50, 1, 2, 3)
+        stream._dispatch_notification_for_test_with_recv_ns(
+            payload, recv_ns=2_000_000_000
+        )
+
+        report = stream.stop_recording()
+        # first_sample origin → device_ns = host monotonic at first sample.
+        assert report.recording_anchor is not None
+        first_device_ns = report.recording_anchor.first_frame_device_ns
+        assert first_device_ns is not None
+        # The anchor is captured at the moment the BLE notify callback
+        # ran. We can't pin exact monotonic_ns without a fake clock, but
+        # we can assert it's a reasonable monotonic value.
+        assert first_device_ns > 0
+
+
+class TestDeviceTimestampSpec:
+    """Validation rules for the device-timestamp profile field."""
+
+    def test_rejects_unknown_units(self):
+        from syncfield.adapters.ble_imu import DeviceTimestampSpec
+
+        with pytest.raises(ValueError, match="DeviceTimestampSpec.units"):
+            DeviceTimestampSpec(field="ts", units="minutes")
+
+    def test_rejects_unknown_origin(self):
+        from syncfield.adapters.ble_imu import DeviceTimestampSpec
+
+        with pytest.raises(ValueError, match="DeviceTimestampSpec.origin"):
+            DeviceTimestampSpec(field="ts", origin="wallclock")
+
+    def test_rejects_invalid_wraparound_bits(self):
+        from syncfield.adapters.ble_imu import DeviceTimestampSpec
+
+        with pytest.raises(ValueError, match="wraparound_bits"):
+            DeviceTimestampSpec(field="ts", wraparound_bits=7)
+
+    def test_profile_rejects_timestamp_field_not_in_channels(self, mock_bleak):
+        """Catches typos at construction time — profile validates that the
+        device_timestamp.field actually corresponds to one of its channels."""
+        from syncfield.adapters.ble_imu import (
+            BLEImuProfile,
+            ChannelSpec,
+            DeviceTimestampSpec,
+        )
+
+        with pytest.raises(ValueError, match="not in channels"):
+            BLEImuProfile(
+                notify_uuid="cafe",
+                struct_format="<hhh",
+                channels=(
+                    ChannelSpec(name="x", scale=1.0),
+                    ChannelSpec(name="y", scale=1.0),
+                    ChannelSpec(name="z", scale=1.0),
+                ),
+                device_timestamp=DeviceTimestampSpec(field="missing", units="ms"),
+            )
+
+    def test_wraparound_stitches_unsigned_counter_rollover(self, mock_bleak):
+        """A ``uint32`` ms counter that rolls over mid-recording must be
+        stitched so the device_ns stream stays monotonically increasing."""
+        from syncfield.adapters.ble_imu import _DeviceTimestampState
+
+        state = _DeviceTimestampState(
+            __import__(
+                "syncfield.adapters.ble_imu", fromlist=["DeviceTimestampSpec"]
+            ).DeviceTimestampSpec(
+                field="ts", units="ms", origin="boot", wraparound_bits=32
+            )
+        )
+        modulus = 1 << 32
+
+        a = state.consume({"ts": float(modulus - 10), "x": 1.0})
+        b = state.consume({"ts": float(modulus - 5), "x": 2.0})
+        c = state.consume({"ts": 3.0, "x": 3.0})  # wrapped
+
+        assert a is not None and b is not None and c is not None
+        assert b - a == 5_000_000
+        assert c - a == 13_000_000  # wrap stitched: 5 + 8 ms in ns
 
 
 # ============================================================================

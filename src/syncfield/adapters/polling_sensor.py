@@ -94,7 +94,7 @@ class PollingSensorStream(StreamBase):
         """One iteration of the capture loop. Returns False to halt the loop."""
         loop_start = time.monotonic()
         try:
-            channels = self._read(self._handle) if self._open else self._read()
+            result = self._read(self._handle) if self._open else self._read()
         except Exception as exc:
             self._emit_health(HealthEvent(
                 self.id, HealthEventKind.ERROR,
@@ -105,16 +105,40 @@ class PollingSensorStream(StreamBase):
             time.sleep(self._period)
             return True
 
+        # ``read()`` may return either:
+        #   - ``dict[str, ChannelValue]`` (legacy / no device clock), or
+        #   - ``(dict[str, ChannelValue], device_ns: int | None)`` for
+        #     sensors that read out a device-side clock alongside the
+        #     payload (e.g. an SPI register that exposes the sensor's
+        #     internal timer). The two-tuple form lets the recording
+        #     anchor capture device_ns the same way camera adapters do
+        #     without breaking existing single-return callers.
+        device_ns: Optional[int] = None
+        if isinstance(result, tuple) and len(result) == 2:
+            channels, device_ns = result
+        else:
+            channels = result
+
         if not isinstance(channels, dict):
             self._emit_health(HealthEvent(
                 self.id, HealthEventKind.ERROR,
                 time.monotonic_ns(),
-                f"read() returned {type(channels).__name__}, expected dict",
+                f"read() returned {type(channels).__name__}, expected dict "
+                f"or (dict, device_ns)",
             ))
             if self._on_read_error == "stop":
                 return False
             time.sleep(self._period)
             return True
+
+        if device_ns is not None and not isinstance(device_ns, int):
+            self._emit_health(HealthEvent(
+                self.id, HealthEventKind.WARNING,
+                time.monotonic_ns(),
+                f"read() returned non-int device_ns "
+                f"({type(device_ns).__name__}); ignored for this sample",
+            ))
+            device_ns = None
 
         capture_ns = time.monotonic_ns()
         frame_number = self._write_core.next_frame_number()
@@ -126,8 +150,13 @@ class PollingSensorStream(StreamBase):
         ))
 
         if self._writing:
-            # Polling sensors have no device clock — pass None for device_ns.
-            self._observe_first_frame(capture_ns, None)
+            # ``device_ns`` is recorded into the recording anchor only on
+            # the first frame of each window (``_observe_first_frame`` is
+            # idempotent). When the read callback returns the legacy
+            # dict-only shape, ``device_ns`` stays ``None`` and the
+            # anchor falls back to host-only — preserving backward
+            # compatibility for every existing caller.
+            self._observe_first_frame(capture_ns, device_ns)
             self._write_core.record_sample(capture_ns)
 
         elapsed = time.monotonic() - loop_start
