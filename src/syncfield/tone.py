@@ -289,12 +289,6 @@ class SyncToneConfig:
         a microphone track would produce a ghost ``host_audio`` stream
         that serves no purpose and confuses GUI users.
 
-        The 3/2/1 countdown tick still plays — disabling the
-        ultrasonic / audible chirps does not mean "no audio at all":
-        the operator still wants to hear the recording about to
-        start. Pass ``cls(enabled=False, countdown_tick=None)``
-        explicitly if you also want the countdown silent.
-
         Use for recording environments where the start/stop chirp
         itself is unacceptable (clinical, audio-sensitive subjects)
         but the operator still benefits from a 3/2/1 audible cue.

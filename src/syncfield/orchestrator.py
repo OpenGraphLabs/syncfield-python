@@ -1148,7 +1148,6 @@ class SessionOrchestrator:
             expected_sha = entry.get("sha256")
 
             attempts_left = 2 if verify_checksums else 1
-            last_error: Optional[str] = None
             while attempts_left > 0:
                 attempts_left -= 1
                 try:
@@ -1165,7 +1164,6 @@ class SessionOrchestrator:
                 except httpx.HTTPError as exc:
                     host_report["status"] = "error"
                     host_report["error"] = f"download {raw_rel}: {exc}"
-                    last_error = host_report["error"]
                     break
 
                 if not verify_checksums or expected_sha is None:
@@ -1176,7 +1174,6 @@ class SessionOrchestrator:
                 if attempts_left == 0:
                     host_report["status"] = "checksum_mismatch"
                     host_report["error"] = f"sha256 mismatch on {raw_rel}"
-                    last_error = host_report["error"]
                     break
                 # else: loop and retry once more.
 
@@ -1759,16 +1756,14 @@ class SessionOrchestrator:
         render ``latest_frame`` / plot values without any file being
         written to disk.
 
-        If any stream raises during ``prepare`` or ``connect``, every
-        stream that successfully connected so far is disconnected in
-        LIFO order and the exception re-raises. The session lands back
-        in ``IDLE`` with no lingering device handles.
+        If a stream raises during ``prepare`` or ``connect``, that stream
+        is marked failed and the remaining streams still get a chance to
+        connect. The session only raises if no streams connect at all.
 
         Raises:
             RuntimeError: If the session is not in the ``IDLE`` or
                 ``STOPPED`` state, or if no streams are registered.
-            Exception: Any exception from a stream during prepare /
-                connect propagates after rollback.
+            RuntimeError: If every stream fails during prepare / connect.
         """
         with self._lock:
             if self._state not in (SessionState.IDLE, SessionState.STOPPED):
@@ -1787,20 +1782,16 @@ class SessionOrchestrator:
             self.health.start()
 
             connected: List[Stream] = []
-            first_failure: Optional[tuple[str, Exception]] = None
             for stream in self._streams.values():
                 self._set_stream_state(stream.id, "connecting")
                 try:
                     stream.prepare()
                     stream.connect()
                 except Exception as exc:
-                    # Strict all-or-nothing: record the failure, stop
-                    # attempting further streams, and let the rollback
-                    # block below release everything we already opened.
-                    # Rationale: leaving a partially-booted rig in place
-                    # (e.g. one OAK booted, the other dead) leaks device
-                    # handles the user can only recover from by SIGKILL
-                    # + USB replug — the exact pattern we're fixing.
+                    # Partial-connect semantics: a single bad device should
+                    # not prevent the operator from recording with every
+                    # other connected stream.
+                    _rollback_disconnect_streams([stream])
                     self._stream_errors[stream.id] = str(exc)
                     self._set_stream_state(stream.id, "failed")
                     stream._emit_health(HealthEvent(
@@ -1813,8 +1804,7 @@ class SessionOrchestrator:
                         fingerprint=f"{stream.id}:startup-failure",
                         data={"phase": "connect", "outcome": "error", "error": str(exc)},
                     ))
-                    first_failure = (stream.id, exc)
-                    break
+                    continue
                 connected.append(stream)
                 self._stream_errors.pop(stream.id, None)
                 self._set_stream_state(stream.id, "connected")
@@ -1829,22 +1819,14 @@ class SessionOrchestrator:
                     data={"phase": "connect", "outcome": "success"},
                 ))
 
-            if first_failure is not None:
-                # Rollback: release every stream that did connect so no
-                # adapter is left holding a device handle. LIFO matches
-                # the convention used elsewhere in the codebase.
-                _rollback_disconnect_streams(connected)
-                for s in connected:
-                    self._set_stream_state(s.id, "disconnected")
+            if not connected:
                 self._transition(SessionState.IDLE)
                 if self._log_writer is not None:
                     self._log_writer.close()
                     self._log_writer = None
-                failed_id, failed_exc = first_failure
                 raise RuntimeError(
-                    f"connect() failed at stream {failed_id!r}: {failed_exc}. "
-                    f"All previously-connected streams have been released."
-                ) from failed_exc
+                    "connect() failed: no streams connected successfully"
+                )
 
             self._connected_streams = connected
 
@@ -2494,6 +2476,7 @@ class SessionOrchestrator:
                             clock_source="host_monotonic",
                             clock_domain=clock_domain,
                             uncertainty_ns=event.uncertainty_ns,
+                            device_timestamp_ns=event.device_ns,
                         )
                     )
                 else:
@@ -2511,6 +2494,7 @@ class SessionOrchestrator:
                             clock_domain=clock_domain,
                             uncertainty_ns=event.uncertainty_ns,
                             extras=dict(event.channels) if event.channels else {},
+                            device_timestamp_ns=event.device_ns,
                         )
                     )
             except Exception as exc:  # pragma: no cover - best-effort
@@ -2856,7 +2840,10 @@ class SessionOrchestrator:
             audio.prepare()
             audio.connect()
             self._streams[audio.id] = audio
+            audio.on_health(self._on_stream_health)
             self._connected_streams.append(audio)
+            self._set_stream_state(audio.id, "connected")
+            self._stream_errors.pop(audio.id, None)
             self._auto_audio_stream = audio
             logger.info("Auto-injected host audio stream (mic detected)")
         except Exception as exc:

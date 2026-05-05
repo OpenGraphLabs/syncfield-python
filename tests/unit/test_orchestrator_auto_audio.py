@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
 from syncfield.orchestrator import SessionOrchestrator
 from syncfield.testing import FakeStream
 from syncfield.tone import SyncToneConfig
-from syncfield.types import StreamCapabilities
 
 
 @pytest.fixture(autouse=True)
@@ -30,7 +29,7 @@ def _session(tmp_path: Path, **kwargs) -> SessionOrchestrator:
     return SessionOrchestrator(
         host_id=kwargs.pop("host_id", "rig_01"),
         output_dir=tmp_path,
-        sync_tone=kwargs.pop("sync_tone", SyncToneConfig.silent()),
+        sync_tone=kwargs.pop("sync_tone", SyncToneConfig.default()),
         **kwargs,
     )
 

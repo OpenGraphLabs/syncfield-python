@@ -5,8 +5,21 @@ import pytest
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 
-from syncfield.types import FrameTimestamp, RecordingAnchor, SensorSample, SyncPoint
 from syncfield.health.severity import Severity
+from syncfield.types import (
+    ChirpSpec,
+    FinalizationReport,
+    FrameTimestamp,
+    HealthEvent,
+    HealthEventKind,
+    RecordingAnchor,
+    SampleEvent,
+    SensorSample,
+    SessionReport,
+    SessionState,
+    StreamCapabilities,
+    SyncPoint,
+)
 
 
 def test_sync_point_create_now():
@@ -222,18 +235,6 @@ def test_recording_anchor_allows_zero_latency():
     assert anchor.first_frame_latency_ns == 0
 
 
-from syncfield.types import (
-    ChirpSpec,
-    FinalizationReport,
-    HealthEvent,
-    HealthEventKind,
-    SampleEvent,
-    SessionReport,
-    SessionState,
-    StreamCapabilities,
-)
-
-
 class TestStreamCapabilities:
     def test_is_frozen(self):
         caps = StreamCapabilities(
@@ -349,6 +350,15 @@ class TestSampleEvent:
         assert ev.frame_number == 7
         assert ev.capture_ns == 1000
 
+    def test_device_ns_is_first_class(self):
+        ev = SampleEvent(
+            stream_id="imu",
+            frame_number=3,
+            capture_ns=1000,
+            device_ns=42_000_000_000,
+        )
+        assert ev.device_ns == 42_000_000_000
+
 
 class TestFinalizationReport:
     def test_completed(self):
@@ -428,4 +438,3 @@ def test_finalization_report_anchor_defaults_to_none():
         health_events=[], error=None,
     )
     assert report.recording_anchor is None
-

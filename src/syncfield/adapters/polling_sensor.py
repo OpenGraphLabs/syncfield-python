@@ -169,15 +169,14 @@ class PollingSensorStream(StreamBase):
             frame_number=frame_number,
             capture_ns=capture_ns,
             channels=channels,
+            device_ns=device_ns,
         ))
 
         if self._writing:
-            # ``device_ns`` is recorded into the recording anchor only on
+            # ``device_ns`` is also recorded into the recording anchor on
             # the first frame of each window (``_observe_first_frame`` is
-            # idempotent). When the read callback returns the legacy
-            # dict-only shape, ``device_ns`` stays ``None`` and the
-            # anchor falls back to host-only — preserving backward
-            # compatibility for every existing caller.
+            # idempotent). Per-sample propagation happens above via
+            # SampleEvent.device_ns.
             self._observe_first_frame(capture_ns, device_ns)
             self._write_core.record_sample(capture_ns)
 

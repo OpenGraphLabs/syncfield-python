@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from typing import TYPE_CHECKING
 from unittest.mock import MagicMock
 
 import pytest
@@ -12,6 +13,9 @@ from syncfield.orchestrator import SessionOrchestrator
 from syncfield.testing import FakeStream
 from syncfield.tone import ChirpPlayer, ChirpSpec, SyncToneConfig
 from syncfield.types import ChirpEmission, HealthEventKind, SessionState
+
+if TYPE_CHECKING:
+    from syncfield.multihost.types import SessionAnnouncement
 
 
 def _mk_emission(
@@ -592,7 +596,7 @@ class TestChirpIntegration:
             chirp_player=player,
         )
         session.add(FakeStream("a", provides_audio_track=True))
-        session.start()
+        session.start(countdown_s=0)
         session.stop()
         player.play.assert_not_called()
 
@@ -1248,6 +1252,28 @@ class TestSamplePersistence:
         # ``clock_domain`` so the core can group streams by host later.
         assert all(line["clock_domain"] == "rig_01" for line in lines)
 
+    def test_video_stream_writes_device_ns_as_top_level_timestamp(self, tmp_path):
+        from syncfield.types import SampleEvent
+
+        session = _session(tmp_path)
+        cam = FakeStream("cam")
+        session.add(cam)
+        session.start(countdown_s=0)
+        cam._emit_sample(
+            SampleEvent(
+                stream_id="cam",
+                frame_number=0,
+                capture_ns=1_000_000,
+                device_ns=42_000_000_000,
+            )
+        )
+        session.stop()
+
+        timestamps_path = session.last_episode_dir / "cam.timestamps.jsonl"
+        first = json.loads(timestamps_path.read_text())
+        assert first["device_timestamp_ns"] == 42_000_000_000
+        assert "channels" not in first
+
     def test_sensor_stream_writes_channel_jsonl(self, tmp_path):
         """Sensor streams write ``{id}.jsonl`` including channel data."""
         from syncfield.stream import StreamBase
@@ -1310,6 +1336,59 @@ class TestSamplePersistence:
         assert lines[0]["channels"] == {"ax": 0.1, "ay": -9.8}
         assert lines[1]["frame_number"] == 1
 
+    def test_sensor_stream_writes_device_ns_outside_channels(self, tmp_path):
+        from syncfield.stream import StreamBase
+        from syncfield.types import (
+            FinalizationReport as _FR,
+            SampleEvent as _SE,
+            StreamCapabilities as _SC,
+        )
+
+        class _SensorFake(StreamBase):
+            def __init__(self, id):
+                super().__init__(id=id, kind="sensor", capabilities=_SC())
+
+            def prepare(self):
+                pass
+
+            def start(self, clock):
+                pass
+
+            def stop(self):
+                return _FR(
+                    stream_id=self.id,
+                    status="completed",
+                    frame_count=0,
+                    file_path=None,
+                    first_sample_at_ns=None,
+                    last_sample_at_ns=None,
+                    health_events=[],
+                    error=None,
+                )
+
+            def push(self):
+                self._emit_sample(
+                    _SE(
+                        stream_id=self.id,
+                        frame_number=0,
+                        capture_ns=100,
+                        channels={"ax": 0.1},
+                        device_ns=77_000_000,
+                    )
+                )
+
+        session = _session(tmp_path)
+        imu = _SensorFake("imu")
+        session.add(imu)
+        session.start(countdown_s=0)
+        imu.push()
+        session.stop()
+
+        first = json.loads((session.last_episode_dir / "imu.jsonl").read_text())
+        assert first["channels"] == {"ax": 0.1}
+        assert first["device_timestamp_ns"] == 77_000_000
+        assert "device_timestamp_ns" not in first["channels"]
+
     def test_samples_after_stop_do_not_race_closed_writer(self, tmp_path):
         """The handler's ``active`` flag must neutralize trailing events."""
         session = _session(tmp_path)
@@ -1340,8 +1419,8 @@ class TestSessionLog:
 
         log_path = session.last_episode_dir / "session_log.jsonl"
         assert log_path.exists()
-        lines = [json.loads(l) for l in log_path.read_text().strip().split("\n")]
-        transitions = [l for l in lines if l["kind"] == "state_transition"]
+        lines = [json.loads(line) for line in log_path.read_text().strip().split("\n")]
+        transitions = [entry for entry in lines if entry["kind"] == "state_transition"]
         edges = {(t["from"], t["to"]) for t in transitions}
         # The session log writer opens *after* the episode directory is
         # created inside start(), so the idle → connecting → connected
@@ -1387,8 +1466,8 @@ class TestSessionLog:
 
         log_path = episode_dir / "session_log.jsonl"
         assert log_path.exists()
-        lines = [json.loads(l) for l in log_path.read_text().strip().split("\n")]
-        assert any(l["kind"] == "rollback" for l in lines)
+        lines = [json.loads(line) for line in log_path.read_text().strip().split("\n")]
+        assert any(entry["kind"] == "rollback" for entry in lines)
 
 
 class TestHealthRouting:
@@ -1402,10 +1481,12 @@ class TestHealthRouting:
         session.stop()
 
         lines = [
-            json.loads(l)
-            for l in (session.last_episode_dir / "session_log.jsonl").read_text().strip().split("\n")
+            json.loads(line)
+            for line in (
+                session.last_episode_dir / "session_log.jsonl"
+            ).read_text().strip().split("\n")
         ]
-        health_lines = [l for l in lines if l["kind"] == "health"]
+        health_lines = [entry for entry in lines if entry["kind"] == "health"]
         assert len(health_lines) == 2
         assert health_lines[0]["stream_id"] == "a"
         assert health_lines[0]["health_kind"] == "drop"

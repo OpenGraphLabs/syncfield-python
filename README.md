@@ -70,7 +70,7 @@ add() → connect() → start() → RECORDING → stop() → finalized episode d
                       └── start chirp        └── stop chirp
 ```
 
-Each device is wrapped in a `Stream` adapter with a fixed SPI: `prepare → connect → start_recording → stop_recording → disconnect`. The orchestrator drives all adapters through one atomic state machine. If any stream fails to come up, the rest are rolled back so no partial episode lands on disk. Start and stop chirps become the cross-host alignment anchor in multi-host mode.
+Each device is wrapped in a `Stream` adapter with a fixed SPI: `prepare → connect → start_recording → stop_recording → disconnect`. The orchestrator drives all adapters through one state machine. If one stream fails during connect, it is marked failed and cleaned up while the remaining streams can still record; if every stream fails, the session returns to idle. Start and stop chirps become the cross-host alignment anchor in multi-host mode.
 
 Shipped adapters: `UVCWebcamStream`, `BLEImuGenericStream`, `OakCameraStream`, `MetaQuestCameraStream`, `MetaQuestHandStream`, `Go3SStream` (Insta360), `OgloTactileStream`, `HostAudioStream`, `JSONLFileStream`, `PollingSensorStream`, `PushSensorStream`.
 
@@ -109,7 +109,7 @@ After the leader's `stop()`, `session.collect_from_followers()` pulls every foll
 
 ```json
 {
-  "sdk_version": "0.3.14",
+  "sdk_version": "0.4.0",
   "monotonic_ns": 1234567890123456789,
   "wall_clock_ns": 1709890101000000000,
   "host_id": "mac_studio",
@@ -125,8 +125,8 @@ Optional fields: `chirp_start_ns` / `chirp_stop_ns` / `chirp_spec` (when a chirp
 One JSON object per line.
 
 ```jsonl
-{"frame_number":0,"capture_ns":1234567890123456789,"clock_source":"host_monotonic","clock_domain":"mac_studio"}
-{"frame_number":1,"capture_ns":1234567890156789012,"clock_source":"host_monotonic","clock_domain":"mac_studio"}
+{"frame_number":0,"capture_ns":1234567890123456789,"clock_source":"host_monotonic","clock_domain":"mac_studio","device_timestamp_ns":987654321000}
+{"frame_number":1,"capture_ns":1234567890156789012,"clock_source":"host_monotonic","clock_domain":"mac_studio","device_timestamp_ns":987687654000}
 ```
 
 | Field | Type | Meaning |
@@ -135,15 +135,16 @@ One JSON object per line.
 | `capture_ns` | int | Monotonic ns at data arrival |
 | `clock_source` | string | Typically `"host_monotonic"` |
 | `clock_domain` | string | Matches `host_id` for host-clocked streams |
+| `device_timestamp_ns` | int | Optional device-clock timestamp, kept separate from host `capture_ns` |
 
-`capture_ns` is monotonically non-decreasing within a stream. `clock_domain` is identical across host-clocked streams on the same host. File name must be the literal `{stream_id}.timestamps.jsonl`.
+`capture_ns` is monotonically non-decreasing within a stream. `clock_domain` is identical across host-clocked streams on the same host. Device-clock timestamps, when an adapter exposes them, are persisted as top-level `device_timestamp_ns` so `channels` stays sensor-only. File name must be the literal `{stream_id}.timestamps.jsonl`.
 
 ### `{stream_id}.jsonl` (sensor data)
 
 Each line carries a sample plus a `channels` payload. Leaf values must be numeric. Nested dicts and lists are flattened to dot-notation keys (`joints.wrist.0`) at sync time.
 
 ```jsonl
-{"frame_number":0,"capture_ns":1234567890123456789,"clock_source":"host_monotonic","clock_domain":"mac_studio","channels":{"accel_x":0.12,"accel_y":-9.8,"accel_z":0.05}}
+{"frame_number":0,"capture_ns":1234567890123456789,"clock_source":"host_monotonic","clock_domain":"mac_studio","device_timestamp_ns":987654321000,"channels":{"accel_x":0.12,"accel_y":-9.8,"accel_z":0.05}}
 ```
 
 ### `manifest.json`
@@ -152,7 +153,7 @@ Written by `stop()`. Maps every stream to its kind, capabilities, and produced f
 
 ```json
 {
-  "sdk_version": "0.3.14",
+  "sdk_version": "0.4.0",
   "host_id": "mac_studio",
   "streams": {
     "mac_webcam": {

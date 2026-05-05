@@ -674,10 +674,8 @@ class BLEImuGenericStream(StreamBase):
             if self._recording:
                 # ``sample_ns`` is the host-monotonic anchor for sample
                 # events (sample-monitor windowing relies on this clock).
-                # ``device_ns``, when available, rides separately into
-                # the recording anchor's ``first_frame_device_ns`` —
-                # mirroring the contract camera adapters with hardware
-                # clocks already follow.
+                # ``device_ns``, when available, rides separately through
+                # SampleEvent.device_ns and into the recording anchor.
                 self._observe_first_frame(sample_ns, device_ns)
                 if self._first_at is None:
                     self._first_at = sample_ns
@@ -694,6 +692,7 @@ class BLEImuGenericStream(StreamBase):
                 frame_number=frame_number,
                 capture_ns=sample_ns,
                 channels=channels,
+                device_ns=device_ns,
             ))
 
     def _dispatch_notification_for_test_with_recv_ns(

@@ -9,10 +9,9 @@ bleak hardware or an asyncio loop. The import-guard test uses a patched
 from __future__ import annotations
 
 import importlib
-import json
 import struct
 import sys
-from typing import Any, List
+from typing import List
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -123,7 +122,8 @@ class TestPayloadDecoding:
         assert first["middle"] == 300
         assert first["ring"] == 400
         assert first["pinky"] == 500
-        assert first["device_timestamp_ns"] == 12_345_000 * 1000
+        assert "device_timestamp_ns" not in first
+        assert received[0].device_ns == 12_345_000 * 1000
 
         # Frame numbers increment across the batch
         assert [ev.frame_number for ev in received] == [0, 1, 2]
@@ -141,7 +141,7 @@ class TestPayloadDecoding:
         stream._dispatch_notification_for_test(packet)
 
         assert len(received) == 10
-        device_ns = [ev.channels["device_timestamp_ns"] for ev in received]  # type: ignore[index]
+        device_ns = [ev.device_ns for ev in received]
         deltas = [device_ns[i + 1] - device_ns[i] for i in range(9)]
         # 10 ms = 10_000 µs = 10_000_000 ns, exactly and consistently.
         assert all(d == 10_000_000 for d in deltas)
