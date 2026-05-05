@@ -1,4 +1,13 @@
-"""PollingSensorStream — generic helper for sensors with a read() function."""
+"""PollingSensorStream — generic helper for sensors with a read() function.
+
+SDK contract for GUI consumers (see syncfield-sensor-onboarding-enhancements §5):
+
+3. **Transient transport hiccup auto-reopen.**  When an ``open`` callback is
+   provided, ``PollingSensorStream`` MUST attempt up to
+   :data:`~syncfield.adapters._generic.TRANSIENT_REOPEN_MAX_ATTEMPTS` reopens
+   with exponential backoff before surfacing a stream-level error.  This is
+   implemented via :func:`~syncfield.adapters._generic.retry_open`.
+"""
 
 from __future__ import annotations
 
@@ -10,6 +19,7 @@ from typing import Any, Callable, Literal, Optional
 from syncfield.adapters._generic import (
     _SensorWriteCore,
     _resolve_capabilities,
+    retry_open,
 )
 from syncfield.clock import SessionClock
 from syncfield.stream import DeviceKey, StreamBase
@@ -24,7 +34,19 @@ from syncfield.types import (
 
 
 class PollingSensorStream(StreamBase):
-    """Generic helper that polls a user read() function on a fixed hz."""
+    """Generic helper that polls a user read() function on a fixed hz.
+
+    SDK contract for GUI consumers (see syncfield-sensor-onboarding-enhancements §5):
+
+    3. **Transient transport hiccup auto-reopen.**  When an ``open`` callback
+       is supplied, ``PollingSensorStream.connect()`` MUST attempt up to
+       :data:`~syncfield.adapters._generic.TRANSIENT_REOPEN_MAX_ATTEMPTS` (5)
+       reopens with exponential backoff (≤ 30 s total) before surfacing a
+       stream-level error.  A single ``OSError`` or ``SerialException`` MUST
+       NOT propagate immediately — the adapter retries automatically so that
+       brief USB re-enumerations or connection blips are transparent to GUI
+       users.
+    """
 
     def __init__(
         self,
@@ -173,8 +195,18 @@ class PollingSensorStream(StreamBase):
     # ------------------------------------------------------------------
 
     def connect(self) -> None:
+        """Open the transport and start the polling loop.
+
+        **SDK contract — transient transport reopen (Contract 3):**
+        When an ``open`` callback was provided, this method MUST retry
+        the open up to :data:`~syncfield.adapters._generic.TRANSIENT_REOPEN_MAX_ATTEMPTS`
+        times with exponential backoff before propagating an exception.
+        """
         if self._open is not None:
-            self._handle = self._open()
+            self._handle = retry_open(
+                self._open,
+                stream_id=self.id,
+            )
         self._stop_event.clear()
         self._thread = threading.Thread(
             target=self._capture_loop,
