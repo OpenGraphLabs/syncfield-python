@@ -40,6 +40,24 @@ def test_stream_writer_creates_jsonl(tmp_path: Path):
     assert first["capture_ns"] == 1000
     assert first["clock_source"] == "host_monotonic"
     assert first["clock_domain"] == "h1"
+    assert "device_timestamp_ns" not in first
+
+
+def test_stream_writer_includes_device_timestamp_ns(tmp_path: Path):
+    w = StreamWriter("cam_left", tmp_path)
+    w.open()
+    w.write(
+        FrameTimestamp(
+            frame_number=0,
+            capture_ns=1000,
+            clock_domain="h1",
+            device_timestamp_ns=42_000_000_000,
+        )
+    )
+    w.close()
+
+    first = json.loads((tmp_path / "cam_left.timestamps.jsonl").read_text())
+    assert first["device_timestamp_ns"] == 42_000_000_000
 
 
 def test_stream_writer_count(tmp_path: Path):
@@ -105,6 +123,26 @@ def test_sensor_writer_creates_jsonl(tmp_path: Path):
     assert first["capture_ns"] == 1000
     assert first["channels"] == {"accel_x": 0.0, "accel_y": 0.0}
     assert first["clock_domain"] == "h1"
+    assert "device_timestamp_ns" not in first
+
+
+def test_sensor_writer_includes_device_timestamp_ns(tmp_path: Path):
+    w = SensorWriter("imu", tmp_path)
+    w.open()
+    w.write(
+        SensorSample(
+            frame_number=0,
+            capture_ns=1000,
+            channels={"accel_x": 1.0},
+            clock_domain="h1",
+            device_timestamp_ns=99_000_000,
+        )
+    )
+    w.close()
+
+    first = json.loads((tmp_path / "imu.jsonl").read_text())
+    assert first["channels"] == {"accel_x": 1.0}
+    assert first["device_timestamp_ns"] == 99_000_000
 
 
 def test_sensor_writer_count(tmp_path: Path):

@@ -373,6 +373,8 @@ class TestRecordingAnchor:
             return {"x": 1.0}, 7_777_777_777
 
         stream = PollingSensorStream("imu", read=read, hz=1000)
+        events: list[SampleEvent] = []
+        stream.on_sample(events.append)
         stream.connect()
         armed_ns = time.monotonic_ns()
         clock = SessionClock(
@@ -386,6 +388,8 @@ class TestRecordingAnchor:
 
         assert report.recording_anchor is not None
         assert report.recording_anchor.first_frame_device_ns == 7_777_777_777
+        assert events
+        assert events[0].device_ns == 7_777_777_777
 
     def test_polling_sensor_invalid_device_ns_falls_back_to_none(self):
         """Defensive: a misbehaving ``read()`` that returns a non-int

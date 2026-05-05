@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 
 from syncfield.clock import SessionClock
-from syncfield.types import SyncPoint
+from syncfield.types import SampleEvent, SyncPoint
 
 
 def _clock() -> SessionClock:
@@ -510,6 +510,8 @@ class TestRecordingAnchor:
         )
 
         stream = OakCameraStream("oak", output_dir=tmp_path)
+        received: list[SampleEvent] = []
+        stream.on_sample(received.append)
         stream.prepare()
         stream.connect()
         stream.start_recording(clock)
@@ -523,6 +525,9 @@ class TestRecordingAnchor:
         assert report.recording_anchor.armed_host_ns == armed_ns
         assert report.recording_anchor.first_frame_host_ns >= armed_ns
         assert report.recording_anchor.first_frame_device_ns == known_device_ns
+        assert received
+        assert received[0].device_ns == known_device_ns
+        assert not (received[0].channels and "device_timestamp_ns" in received[0].channels)
 
     def test_no_anchor_when_no_frames_arrive(
         self, mock_depthai, mock_av_generous, tmp_path

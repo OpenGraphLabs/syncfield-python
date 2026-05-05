@@ -26,10 +26,10 @@ Protocol summary (ported from ``TactileConstants.swift``):
 - **Scan filter**: advertised name substring ``"oglo"`` (case-insensitive)
 
 Each decoded sample is emitted as one :class:`~syncfield.types.SampleEvent`
-with channels ``{thumb, index, middle, ring, pinky, device_timestamp_ns}``.
-The MCU hardware clock is **linearly interpolated** across the batch
-(10 samples × 10 ms) so consumers see uniform 100 Hz spacing instead of a
-cluster at every batch boundary — critical for downstream jitter analysis.
+with channels ``{thumb, index, middle, ring, pinky}`` and the interpolated
+MCU hardware clock in ``SampleEvent.device_ns``. The hardware clock is
+**linearly interpolated** across the batch (10 samples × 10 ms) so consumers
+see uniform 100 Hz spacing instead of a cluster at every batch boundary.
 
 Lifecycle
 ---------
@@ -442,12 +442,10 @@ class OgloTactileStream(StreamBase):
             device_ts_ns = int(
                 (timestamp_us + i * _SAMPLE_PERIOD_US) * 1000
             )
-            channels["device_timestamp_ns"] = device_ts_ns
 
             if self._recording:
-                # MCU hardware clock is interpolated per sample (see
-                # device_timestamp_ns above); pass it as the anchor's
-                # device-side timestamp for precise alignment.
+                # MCU hardware clock is interpolated per sample; pass it as
+                # the anchor's device-side timestamp for precise alignment.
                 self._observe_first_frame(recv_ns, device_ts_ns)
                 if self._first_at is None:
                     self._first_at = recv_ns
@@ -468,6 +466,7 @@ class OgloTactileStream(StreamBase):
                     capture_ns=recv_ns,
                     channels=channels,
                     uncertainty_ns=500_000,  # ~0.5 ms — MCU clock precision
+                    device_ns=device_ts_ns,
                 )
             )
 

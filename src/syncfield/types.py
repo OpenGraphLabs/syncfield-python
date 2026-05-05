@@ -133,6 +133,9 @@ class FrameTimestamp:
         clock_source: Origin of the timestamp (always ``"host_monotonic"`` for SDK).
         clock_domain: Host identifier — must match across all streams on the same host.
         uncertainty_ns: Estimated timing uncertainty in nanoseconds.
+        device_timestamp_ns: Optional device-clock timestamp for this frame,
+            carried separately from ``capture_ns`` so host-arrival quality
+            checks keep their original semantics.
         extras: Optional adapter-specific per-frame metadata (e.g.
             ``{"quest_native_ns": 1234567890}`` for clock-drift correction).
             Each key is serialised as a top-level field in the JSONL row,
@@ -145,6 +148,7 @@ class FrameTimestamp:
     clock_domain: str = "local_host"
     uncertainty_ns: int = 5_000_000  # 5 ms
     extras: dict[str, Any] = field(default_factory=dict)
+    device_timestamp_ns: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {
@@ -156,13 +160,15 @@ class FrameTimestamp:
         }
         if self.extras:
             out.update(self.extras)
+        if self.device_timestamp_ns is not None:
+            out["device_timestamp_ns"] = self.device_timestamp_ns
         return out
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> FrameTimestamp:
         known = {
             "frame_number", "capture_ns", "clock_source",
-            "clock_domain", "uncertainty_ns",
+            "clock_domain", "uncertainty_ns", "device_timestamp_ns",
         }
         return cls(
             frame_number=data["frame_number"],
@@ -171,6 +177,7 @@ class FrameTimestamp:
             clock_domain=data.get("clock_domain", "local_host"),
             uncertainty_ns=data.get("uncertainty_ns", 5_000_000),
             extras={k: v for k, v in data.items() if k not in known},
+            device_timestamp_ns=data.get("device_timestamp_ns"),
         )
 
 
@@ -189,6 +196,7 @@ class SensorSample:
         clock_source: Origin of the timestamp.
         clock_domain: Host identifier.
         uncertainty_ns: Estimated timing uncertainty in nanoseconds.
+        device_timestamp_ns: Optional device-clock timestamp for this sample.
     """
 
     frame_number: int
@@ -197,9 +205,10 @@ class SensorSample:
     clock_source: str = "host_monotonic"
     clock_domain: str = "local_host"
     uncertainty_ns: int = 5_000_000  # 5 ms
+    device_timestamp_ns: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        out: dict[str, Any] = {
             "frame_number": self.frame_number,
             "capture_ns": self.capture_ns,
             "clock_source": self.clock_source,
@@ -207,6 +216,9 @@ class SensorSample:
             "uncertainty_ns": self.uncertainty_ns,
             "channels": self.channels,
         }
+        if self.device_timestamp_ns is not None:
+            out["device_timestamp_ns"] = self.device_timestamp_ns
+        return out
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> SensorSample:
@@ -217,6 +229,7 @@ class SensorSample:
             clock_source=data.get("clock_source", "host_monotonic"),
             clock_domain=data.get("clock_domain", "local_host"),
             uncertainty_ns=data.get("uncertainty_ns", 5_000_000),
+            device_timestamp_ns=data.get("device_timestamp_ns"),
         )
 
 
@@ -349,6 +362,7 @@ class SampleEvent:
     channels: dict[str, "ChannelValue"] | None = None
     uncertainty_ns: int = 5_000_000
     clock_domain: str | None = None
+    device_ns: int | None = None
 
 
 @dataclass

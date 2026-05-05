@@ -115,7 +115,7 @@ def test_failed_stream_is_skipped_during_recording(tmp_path: Path):
     assert bad.stop_recording_calls == 0
 
 
-def test_disconnect_does_not_call_stream_disconnect_on_failed(tmp_path: Path):
+def test_failed_stream_gets_connect_failure_cleanup_only(tmp_path: Path):
     from syncfield.testing import FakeStream
 
     class CountingFakeStream(FakeStream):
@@ -137,7 +137,9 @@ def test_disconnect_does_not_call_stream_disconnect_on_failed(tmp_path: Path):
     sess.disconnect()
 
     assert good.disconnect_calls == 1
-    assert bad.disconnect_calls == 0
+    # The failed stream is cleaned up immediately after its connect failure,
+    # then excluded from the later session-level disconnect.
+    assert bad.disconnect_calls == 1
     assert sess._stream_states["good"] == "disconnected"
     assert sess._stream_states["bad"] == "disconnected"
     assert sess._stream_errors == {}

@@ -46,6 +46,7 @@ depthai API directly.
 
 from __future__ import annotations
 
+import logging
 import struct
 import threading
 import time
@@ -76,6 +77,8 @@ from syncfield.types import (
     StreamCapabilities,
 )
 
+logger = logging.getLogger(__name__)
+
 
 def _device_timestamp_ns(msg: Any) -> Optional[int]:
     """Return the frame's device-clock timestamp as integer nanoseconds.
@@ -104,6 +107,11 @@ def _device_timestamp_ns(msg: Any) -> Optional[int]:
         return None
     # Integer arithmetic — avoid float rounding at ns magnitudes.
     return ((td.days * 86_400 + td.seconds) * 1_000_000 + td.microseconds) * 1_000
+
+
+def _device_shutter_host_ns(msg: Any) -> Optional[int]:
+    """Backward-compatible name for the raw OAK device timestamp helper."""
+    return _device_timestamp_ns(msg)
 
 
 #: Supported RGB output encodings.
@@ -770,15 +778,12 @@ class OakCameraStream(StreamBase):
             # ``getData()`` returns a depthai ``VectorUChar``; ``bytes(...)``
             # gives us a plain buffer the OS write path prefers.
             self._h264_file.write(bytes(msg.getData()))
-        channels = (
-            {"device_timestamp_ns": device_ts_ns} if device_ts_ns is not None else None
-        )
         self._emit_sample(
             SampleEvent(
                 stream_id=self.id,
                 frame_number=self._frame_count - 1,
                 capture_ns=capture_ns,
-                channels=channels,
+                device_ns=device_ts_ns,
             )
         )
 
@@ -803,15 +808,12 @@ class OakCameraStream(StreamBase):
         self._frame_count += 1
         if self._video_writer is not None:
             self._video_writer.write(frame)
-        channels = (
-            {"device_timestamp_ns": device_ts_ns} if device_ts_ns is not None else None
-        )
         self._emit_sample(
             SampleEvent(
                 stream_id=self.id,
                 frame_number=self._frame_count - 1,
                 capture_ns=capture_ns,
-                channels=channels,
+                device_ns=device_ts_ns,
             )
         )
 

@@ -127,9 +127,9 @@ class SessionSnapshot:
     chirp_start_ns: Optional[int]
     chirp_stop_ns: Optional[int]
     chirp_enabled: bool
-    chirp_mode: str
-    elapsed_s: float
-    streams: Dict[str, StreamSnapshot]
+    chirp_mode: str = "off"
+    elapsed_s: float = 0.0
+    streams: Dict[str, StreamSnapshot] = field(default_factory=dict)
     active_incidents: List[IncidentSnapshot] = field(default_factory=list)
     resolved_incidents: List[IncidentSnapshot] = field(default_factory=list)
     aggregation: Optional[AggregationSnapshot] = None
@@ -280,13 +280,9 @@ def _is_auxiliary_channel(name: str) -> bool:
     """Return True for channel names that shouldn't appear in the plot.
 
     Adapters sometimes attach metadata channels alongside real sensor
-    readings — the OGLO tactile stream, for example, emits
-    ``device_timestamp_ns`` next to its thumb/index/middle/ring/pinky
-    FSR values so downstream consumers can recover the MCU hardware
-    clock. Those auxiliary values often sit in the nanoseconds range
-    (~10¹⁸) and, if plotted alongside the real 0–65535 readings on a
-    single auto-scaled Y axis, flatten every real reading into a
-    straight baseline.
+    readings. Timestamp-like auxiliary values often sit in the nanoseconds
+    range (~10^18) and, if plotted alongside real readings on a single
+    auto-scaled Y axis, flatten every real reading into a straight baseline.
 
     The rule is deliberately simple so third-party adapters can opt
     channels out of plotting by convention alone — without any API

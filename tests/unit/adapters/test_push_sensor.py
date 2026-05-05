@@ -304,6 +304,8 @@ class TestRecordingAnchor:
         """Caller passes ``device_ns`` → anchor records the pair, mirroring
         the camera-adapter contract for downstream sync alignment."""
         stream = PushSensorStream("ble_imu")
+        events: list[SampleEvent] = []
+        stream.on_sample(events.append)
         stream.connect()
         armed_ns = time.monotonic_ns()
         clock = SessionClock(
@@ -321,6 +323,8 @@ class TestRecordingAnchor:
 
         assert report.recording_anchor is not None
         assert report.recording_anchor.first_frame_device_ns == 42_123_456_789
+        assert events
+        assert events[0].device_ns == 42_123_456_789
 
     def test_push_sensor_only_first_frames_device_ns_anchors(self):
         """``_observe_first_frame`` is idempotent — only the first sample's

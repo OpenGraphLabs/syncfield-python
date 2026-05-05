@@ -227,12 +227,12 @@ class PushSensorStream(StreamBase):
                 frame_number=frame_number,
                 capture_ns=capture_ns,
                 channels=channels,
+                device_ns=device_ns,
             ))
             if self._writing:
-                # ``device_ns`` is recorded into the recording anchor only
+                # ``device_ns`` is also recorded into the recording anchor
                 # for the first frame of each window (``_observe_first_frame``
-                # is idempotent). Pass ``None`` when the sensor has no
-                # device-side clock — the anchor stores ``first_frame_
-                # device_ns=None`` and downstream sync uses host arrival.
+                # is idempotent). Per-sample propagation happens above via
+                # SampleEvent.device_ns.
                 self._observe_first_frame(capture_ns, device_ns)
                 self._write_core.record_sample(capture_ns)

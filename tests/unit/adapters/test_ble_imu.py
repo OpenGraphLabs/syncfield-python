@@ -602,6 +602,7 @@ class TestRecordingAnchor:
         assert len(seen) == 1
         assert "ts" not in seen[0].channels
         assert seen[0].channels == {"x": 1.0, "y": 2.0, "z": 3.0}
+        assert seen[0].device_ns == 9_999_000_000
 
     def test_ble_imu_first_sample_origin_anchors_to_host_clock(self, mock_bleak):
         """``origin="first_sample"`` re-anchors the first observation to
