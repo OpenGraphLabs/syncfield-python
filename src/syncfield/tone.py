@@ -216,6 +216,22 @@ class SyncToneConfig:
         pre_stop_tail_margin_ms: Extra wait time (on top of the stop
             chirp's own duration) before stopping streams so the chirp
             tail is fully captured in any recording audio track.
+        suppress_host_audio: When ``True``, the
+            :class:`~syncfield.orchestrator.SessionOrchestrator` MUST NOT
+            auto-register a ``host_audio`` stream, even when a microphone
+            is detected.  Automatically set by :meth:`silent` so that
+            "silent mode" truly produces no audio-related streams.
+
+    SDK contract for GUI consumers (see syncfield-sensor-onboarding-enhancements §5):
+
+    4. **SyncToneConfig.silent() MUST NOT register a host_audio stream.**
+       When :meth:`silent` is used, the orchestrator MUST skip auto-injection
+       of :class:`~syncfield.adapters.host_audio.HostAudioStream`.  This is
+       enforced via ``suppress_host_audio=True`` on the config object, which
+       the orchestrator reads in both its pre-register and inject helpers.
+       Callers who construct ``SyncToneConfig(enabled=False)`` directly retain
+       the old behaviour (host_audio may still be injected) to preserve
+       backward compatibility.
     """
 
     enabled: bool = True
@@ -226,6 +242,8 @@ class SyncToneConfig:
     )
     post_start_stabilization_ms: int = 200
     pre_stop_tail_margin_ms: int = 200
+    #: Set by :meth:`silent` to suppress host_audio auto-injection (Contract 4).
+    suppress_host_audio: bool = False
 
     @classmethod
     def default(cls) -> "SyncToneConfig":
@@ -260,7 +278,16 @@ class SyncToneConfig:
 
     @classmethod
     def silent(cls) -> "SyncToneConfig":
-        """Construct with the start/stop chirps disabled.
+        """Construct with the start/stop chirps disabled and host_audio suppressed.
+
+        **SDK contract (Contract 4) — silent() MUST NOT register host_audio.**
+        This factory sets ``suppress_host_audio=True`` so the
+        :class:`~syncfield.orchestrator.SessionOrchestrator` MUST skip
+        auto-injection of
+        :class:`~syncfield.adapters.host_audio.HostAudioStream`.  In a
+        truly silent session there is no acoustic sync path, so capturing
+        a microphone track would produce a ghost ``host_audio`` stream
+        that serves no purpose and confuses GUI users.
 
         The 3/2/1 countdown tick still plays — disabling the
         ultrasonic / audible chirps does not mean "no audio at all":
@@ -272,7 +299,7 @@ class SyncToneConfig:
         itself is unacceptable (clinical, audio-sensitive subjects)
         but the operator still benefits from a 3/2/1 audible cue.
         """
-        return cls(enabled=False)
+        return cls(enabled=False, suppress_host_audio=True)
 
 
 # ---------------------------------------------------------------------------

@@ -288,6 +288,26 @@ class SessionOrchestrator:
             require an audio stream — disabling this flag in a
             multi-host session means you must add your own
             audio-capable stream explicitly.
+
+    SDK contracts for GUI consumers (see syncfield-sensor-onboarding-enhancements §5):
+
+    4. **SyncToneConfig.silent() MUST NOT register a host_audio stream.**
+       When the session's ``sync_tone`` has ``suppress_host_audio=True``
+       (set automatically by :meth:`~syncfield.tone.SyncToneConfig.silent`),
+       :meth:`_maybe_preregister_host_audio` and :meth:`_maybe_inject_host_audio`
+       MUST return immediately without registering or connecting any
+       :class:`~syncfield.adapters.host_audio.HostAudioStream`.
+
+    5. **Stream errors MUST NOT propagate to the SessionOrchestrator.**
+       An unhandled exception inside a stream's capture loop (i.e. inside
+       the adapter's background thread that calls ``push()`` or runs the
+       polling loop) MUST NOT raise through the orchestrator or cause the
+       session to transition out of ``RECORDING``.  Each stream runs in
+       its own daemon thread — errors are isolated per stream.  The session
+       continues collecting data from all remaining healthy streams.
+       Errors raised during ``start_recording`` fan-out are handled by the
+       orchestrator's rollback logic but do NOT affect other streams
+       mid-session.
     """
 
     def __init__(
@@ -2753,8 +2773,20 @@ class SessionOrchestrator:
         registered. Only registers the stream (no device open) so the
         viewer can display the audio card immediately. The actual device
         connection happens in :meth:`connect` along with all other streams.
+
+        **SDK contract (Contract 4):** When the session's
+        :class:`~syncfield.tone.SyncToneConfig` has
+        ``suppress_host_audio=True`` (set automatically by
+        :meth:`~syncfield.tone.SyncToneConfig.silent`), this method MUST
+        skip host-audio registration so that a silent-mode session never
+        shows a ghost ``host_audio`` stream in the GUI.
         """
         if not self._enable_host_audio:
+            return
+        # Contract 4: SyncToneConfig.silent() sets suppress_host_audio=True
+        # to signal that no acoustic sync path is desired. Honour it here so
+        # a ghost host_audio stream never appears in the GUI viewer.
+        if self._sync_tone.suppress_host_audio:
             return
 
         try:
@@ -2784,8 +2816,17 @@ class SessionOrchestrator:
         this is a no-op (connect loop handles it). If not yet added
         (e.g. user skipped add() and went straight to connect()), this
         adds and connects it now.
+
+        **SDK contract (Contract 4):** Mirrors the ``suppress_host_audio``
+        check in :meth:`_maybe_preregister_host_audio` — both guards MUST
+        be present to prevent late injection during the connect phase.
         """
         if not self._enable_host_audio:
+            return
+        # Contract 4: honour SyncToneConfig.silent()'s suppress_host_audio
+        # flag at connect() time as well, in case the caller bypassed add()
+        # and went straight to connect() (e.g. legacy one-shot path).
+        if self._sync_tone.suppress_host_audio:
             return
 
         has_audio = any(

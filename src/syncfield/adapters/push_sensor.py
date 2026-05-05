@@ -1,10 +1,27 @@
-"""PushSensorStream — generic helper for callback/asyncio/external-thread sources."""
+"""PushSensorStream — generic helper for callback/asyncio/external-thread sources.
+
+SDK contracts for GUI consumers (see syncfield-sensor-onboarding-enhancements §5):
+
+1. **on_connect callback is non-blocking.**  ``PushSensorStream`` MUST NOT
+   synchronously wait on the callback the user supplied via ``on_connect=``.
+   The SDK fires it in a background daemon thread; the calling thread (and
+   the orchestrator's connect loop) return immediately.  If the user's
+   callback itself blocks, that blocks ONLY the callback's background thread,
+   NOT the stream lifecycle or the viewer's "Connecting…" indicator.
+
+2. **Burst-aware capture_ns interpolation.**  When the user's producer reads
+   N > 1 samples in a single USB/BLE tick, it MUST NOT pass the same
+   ``capture_ns`` to all N ``push()`` calls.  Instead it SHOULD call
+   :func:`burst_timestamps` to obtain per-sample host-monotonic timestamps
+   spaced by ``dt = 1e9 / expected_hz`` nanoseconds, anchored so the *last*
+   sample lands at the actual read instant.
+"""
 
 from __future__ import annotations
 
 import threading
 import time
-from typing import Callable, Optional
+from typing import Callable, List, Optional
 
 from syncfield.adapters._generic import _SensorWriteCore, _resolve_capabilities
 from syncfield.clock import SessionClock
@@ -15,8 +32,62 @@ from syncfield.types import (
 )
 
 
+def burst_timestamps(n: int, *, anchor_ns: Optional[int] = None, expected_hz: float) -> List[int]:
+    """Compute per-sample host-monotonic timestamps for a burst read.
+
+    When a single USB/BLE read returns *n* samples that were collected at a
+    known fixed rate, this helper distributes timestamps so the **last**
+    sample lands at *anchor_ns* (or ``time.monotonic_ns()`` if omitted) and
+    earlier samples step backward by ``1e9 / expected_hz`` nanoseconds.
+
+    The SDK contract for ``PushSensorStream`` requires callers to use this
+    helper (or equivalent arithmetic) rather than passing the same
+    ``capture_ns`` to all ``push()`` calls in a burst.  Clustering N samples
+    at one tick degrades timestamp quality at high rates (1 kHz+) and defeats
+    the sync alignment that depends on per-sample spread.
+
+    Args:
+        n: Number of samples in the burst.  Must be >= 1.
+        anchor_ns: Host monotonic nanosecond timestamp for the *last* sample
+            in the burst.  Defaults to ``time.monotonic_ns()`` at call time.
+        expected_hz: Expected sensor sample rate in Hz.
+
+    Returns:
+        A list of *n* integer nanosecond timestamps in ascending order, with
+        ``timestamps[-1] == anchor_ns`` and adjacent deltas equal to
+        ``round(1e9 / expected_hz)``.
+
+    Example::
+
+        ts = burst_timestamps(5, anchor_ns=recv_ns, expected_hz=1000.0)
+        for i, (sample, capture_ns) in enumerate(zip(burst, ts)):
+            stream.push(sample, capture_ns=capture_ns)
+    """
+    if n < 1:
+        raise ValueError(f"burst_timestamps: n must be >= 1, got {n}")
+    if expected_hz <= 0:
+        raise ValueError(f"burst_timestamps: expected_hz must be > 0, got {expected_hz}")
+    if anchor_ns is None:
+        anchor_ns = time.monotonic_ns()
+    dt_ns = round(1e9 / expected_hz)
+    return [anchor_ns - (n - 1 - i) * dt_ns for i in range(n)]
+
+
 class PushSensorStream(StreamBase):
-    """Generic helper for sensors driven by user-owned producer threads."""
+    """Generic helper for sensors driven by user-owned producer threads.
+
+    SDK contracts for GUI consumers (see syncfield-sensor-onboarding-enhancements §5):
+
+    1. **on_connect callback is non-blocking.**  The SDK fires the callback in
+       a background daemon thread so the orchestrator's connect loop MUST NOT
+       be blocked even if the user's ``on_connect`` coroutine/function takes
+       time to complete.  See :func:`burst_timestamps` for Contract 2.
+
+    2. **Burst-aware capture_ns interpolation.**  Callers who receive N > 1
+       samples per USB/BLE tick MUST distribute timestamps using
+       :func:`burst_timestamps` rather than passing the same ``capture_ns``
+       to every ``push()`` in a burst.
+    """
 
     def __init__(
         self,
@@ -49,9 +120,23 @@ class PushSensorStream(StreamBase):
     # ------------------------------------------------------------------
 
     def connect(self) -> None:
+        """Open the stream for pushing.
+
+        **SDK contract — non-blocking on_connect:**  The user-supplied
+        ``on_connect`` callback MUST NOT block the calling thread.  The
+        SDK fires it in a background daemon thread so the orchestrator's
+        connect loop (and the GUI's "Connecting…" indicator) proceed
+        immediately regardless of how long the callback takes.
+        """
         self._connected = True
         if self._on_connect is not None:
-            self._on_connect(self)
+            t = threading.Thread(
+                target=self._on_connect,
+                args=(self,),
+                name=f"push-sensor-on-connect-{self.id}",
+                daemon=True,
+            )
+            t.start()
 
     def start_recording(self, session_clock: SessionClock) -> None:
         self._begin_recording_window(session_clock)
