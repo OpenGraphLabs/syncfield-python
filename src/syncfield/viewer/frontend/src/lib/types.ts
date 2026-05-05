@@ -25,8 +25,12 @@ export interface StreamSnapshot {
   connection_error: string | null;
 }
 
+export type ChirpMode = "ultrasound" | "audible" | "off";
+
 export interface ChirpInfo {
   enabled: boolean;
+  /** Named preset the current SyncToneConfig falls into. */
+  mode: ChirpMode;
   start_ns: number | null;
   stop_ns: number | null;
 }

@@ -1,9 +1,15 @@
 import { useState } from "react";
 import { cn } from "@/lib/utils";
 
-export function ConnectingOverlay() {
+type OverlayVariant = "aspect" | "fill";
+
+function overlaySizing(variant: OverlayVariant): string {
+  return variant === "fill" ? "h-full w-full" : "aspect-video w-full";
+}
+
+export function ConnectingOverlay({ variant = "aspect" }: { variant?: OverlayVariant } = {}) {
   return (
-    <div className="flex aspect-video w-full items-center justify-center rounded border bg-background-subtle">
+    <div className={`flex ${overlaySizing(variant)} items-center justify-center rounded border bg-background-subtle`}>
       <div className="flex items-center gap-2 text-xs text-muted">
         <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-muted" />
         Connecting…
@@ -12,9 +18,9 @@ export function ConnectingOverlay() {
   );
 }
 
-export function WaitingForDataOverlay() {
+export function WaitingForDataOverlay({ variant = "aspect" }: { variant?: OverlayVariant } = {}) {
   return (
-    <div className="flex aspect-video w-full items-center justify-center rounded border bg-background-subtle">
+    <div className={`flex ${overlaySizing(variant)} items-center justify-center rounded border bg-background-subtle`}>
       <div className="flex items-center gap-2 text-xs text-muted">
         <span className="inline-block h-1.5 w-1.5 rounded-full bg-warning" />
         Connected · waiting for first frame
@@ -23,10 +29,16 @@ export function WaitingForDataOverlay() {
   );
 }
 
-export function FailedOverlay({ error }: { error: string }) {
+export function FailedOverlay({
+  error,
+  variant = "aspect",
+}: {
+  error: string;
+  variant?: OverlayVariant;
+}) {
   const [expanded, setExpanded] = useState(false);
   return (
-    <div className="flex aspect-video w-full flex-col overflow-hidden rounded border border-destructive/30 bg-card">
+    <div className={`flex ${overlaySizing(variant)} flex-col overflow-hidden rounded border border-destructive/30 bg-card`}>
       <div className="flex shrink-0 items-center gap-2 border-b border-destructive/20 px-3 py-2">
         <svg
           width="14"

@@ -111,6 +111,8 @@ class SessionSnapshot:
         chirp_start_ns: Monotonic ns when the start chirp was played.
         chirp_stop_ns: Monotonic ns when the stop chirp was played.
         chirp_enabled: Whether :class:`SyncToneConfig` had chirp enabled.
+        chirp_mode: One of ``"ultrasound"``, ``"audible"``, ``"off"`` — the
+            named preset the current :class:`SyncToneConfig` falls into.
         elapsed_s: Wall-clock seconds since ``start()``, or 0 if idle.
         streams: Ordered map ``stream_id -> StreamSnapshot``.
         active_incidents: Currently open incidents across all streams.
@@ -125,6 +127,7 @@ class SessionSnapshot:
     chirp_start_ns: Optional[int]
     chirp_stop_ns: Optional[int]
     chirp_enabled: bool
+    chirp_mode: str
     elapsed_s: float
     streams: Dict[str, StreamSnapshot]
     active_incidents: List[IncidentSnapshot] = field(default_factory=list)

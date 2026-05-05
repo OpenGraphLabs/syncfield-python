@@ -309,9 +309,13 @@ function SceneContent({ pose }: { pose: ParsedPoseData }) {
 interface Quest3PosePanelProps {
   /** Pose payload as delivered by :hook:`useSensorStream`. */
   pose: Record<string, number[]> | null;
+  variant?: "aspect" | "fill";
 }
 
-export function Quest3PosePanel({ pose: poseData }: Quest3PosePanelProps) {
+export function Quest3PosePanel({
+  pose: poseData,
+  variant = "aspect",
+}: Quest3PosePanelProps) {
   const parsed = useMemo(() => {
     if (!poseData) return null;
     const frame: Quest3Frame = {
@@ -322,16 +326,18 @@ export function Quest3PosePanel({ pose: poseData }: Quest3PosePanelProps) {
     return parseQuest3Frame(frame);
   }, [poseData]);
 
+  const sizing = variant === "fill" ? "h-full w-full" : "aspect-video";
+
   if (!parsed) {
     return (
-      <div className="flex aspect-video items-center justify-center text-xs text-muted">
+      <div className={`flex ${sizing} items-center justify-center text-xs text-muted`}>
         Waiting for hand / head pose…
       </div>
     );
   }
 
   return (
-    <div className="aspect-video" style={{ background: COLORS.bg }}>
+    <div className={sizing} style={{ background: COLORS.bg }}>
       <Canvas camera={{ position: [0.17, 0.15, 0.20], fov: 55 }}>
         <color attach="background" args={[COLORS.bg]} />
         <ambientLight intensity={1.0} />

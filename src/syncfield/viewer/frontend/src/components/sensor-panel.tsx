@@ -5,6 +5,8 @@ import { SensorChart } from "./sensor-chart";
 
 interface SensorPanelProps {
   streamId: string;
+  windowSeconds?: number;
+  variant?: "aspect" | "fill";
 }
 
 /**
@@ -39,7 +41,11 @@ function hasQuest3Pose(pose: Record<string, number[]> | null): boolean {
   return Boolean(pose && Array.isArray(pose.hand_joints) && pose.hand_joints.length > 0);
 }
 
-export function SensorPanel({ streamId }: SensorPanelProps) {
+export function SensorPanel({
+  streamId,
+  windowSeconds,
+  variant = "aspect",
+}: SensorPanelProps) {
   const { channels, pose, isConnected } = useSensorStream(streamId);
   const channelNames = Object.keys(channels);
   const hasScalar = channelNames.length > 0;
@@ -48,16 +54,24 @@ export function SensorPanel({ streamId }: SensorPanelProps) {
 
   if (hasData) {
     if (hasPose) {
-      return <Quest3PosePanel pose={pose} />;
+      return <Quest3PosePanel pose={pose} variant={variant} />;
     }
     if (hasOrientationChannels(channelNames)) {
-      return <PosePanel channels={channels} />;
+      return <PosePanel channels={channels} variant={variant} />;
     }
-    return <SensorChart streamId={streamId} />;
+    return (
+      <SensorChart
+        streamId={streamId}
+        windowSeconds={windowSeconds}
+        variant={variant}
+      />
+    );
   }
 
+  const wrapperClass =
+    variant === "fill" ? "flex h-full w-full" : "flex aspect-video";
   return (
-    <div className="flex aspect-video items-center justify-center text-xs text-muted">
+    <div className={`${wrapperClass} items-center justify-center text-xs text-muted`}>
       {isConnected ? "Waiting for data…" : "Connecting…"}
     </div>
   );

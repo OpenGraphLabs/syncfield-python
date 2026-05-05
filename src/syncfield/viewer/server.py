@@ -117,6 +117,7 @@ def snapshot_to_dict(snapshot: SessionSnapshot) -> Dict[str, Any]:
         "elapsed_s": round(snapshot.elapsed_s, 3),
         "chirp": {
             "enabled": snapshot.chirp_enabled,
+            "mode": snapshot.chirp_mode,
             "start_ns": snapshot.chirp_start_ns,
             "stop_ns": snapshot.chirp_stop_ns,
         },
@@ -500,6 +501,40 @@ class ViewerServer:
                 return JSONResponse(
                     {"devices": [], "error": str(exc)}, status_code=500
                 )
+
+        @app.post("/api/chirp-mode")
+        async def api_set_chirp_mode(request: Request) -> JSONResponse:
+            """Switch the orchestrator's chirp mode at runtime.
+
+            Body: ``{"mode": "ultrasound" | "audible" | "off"}``. Only
+            valid in idle / connected / stopped states; recording-time
+            requests are rejected with HTTP 409.
+            """
+            try:
+                body = await request.json()
+            except Exception:
+                return JSONResponse(
+                    {"error": "request body must be JSON"},
+                    status_code=400,
+                )
+            mode = body.get("mode") if isinstance(body, dict) else None
+            if mode not in ("ultrasound", "audible", "off"):
+                return JSONResponse(
+                    {
+                        "error": (
+                            "field 'mode' must be one of "
+                            "'ultrasound', 'audible', 'off'"
+                        ),
+                    },
+                    status_code=400,
+                )
+            try:
+                self._session.set_chirp_mode(mode)
+            except RuntimeError as exc:
+                return JSONResponse({"error": str(exc)}, status_code=409)
+            except ValueError as exc:
+                return JSONResponse({"error": str(exc)}, status_code=400)
+            return JSONResponse({"mode": self._session.chirp_mode})
 
         @app.post("/api/streams/{stream_id}")
         async def api_add_stream(stream_id: str) -> JSONResponse:

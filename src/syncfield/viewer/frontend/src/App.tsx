@@ -6,7 +6,7 @@ import { cn } from "@/lib/utils";
 import { Header } from "@/components/header";
 import { ControlPanel } from "@/components/control-panel";
 import { SessionClock } from "@/components/session-clock";
-import { StreamCard } from "@/components/stream-card";
+import { StreamDashboard } from "@/components/stream-dashboard";
 import { IncidentPanel } from "@/components/incident-panel";
 import { CountdownOverlay } from "@/components/countdown-overlay";
 import { DiscoveryModal } from "@/components/discovery-modal";
@@ -162,22 +162,17 @@ function RecordView({
       <div className="flex flex-1 overflow-hidden">
         <div className="flex-1 overflow-y-auto p-4">
           {streamList.length > 0 ? (
-            <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-4">
-              {streamList.map((stream) => (
-                <StreamCard
-                  key={stream.id}
-                  stream={stream}
-                  canRemove={canRemove}
-                  onRemove={handleRemoveStream}
-                  activeIncidents={snapshot?.active_incidents ?? []}
-                  sessionState={state}
-                  aggregation={snapshot?.aggregation}
-                  onRetryAggregation={(jobId) =>
-                    sendCommand("retry_aggregation", { job_id: jobId })
-                  }
-                />
-              ))}
-            </div>
+            <StreamDashboard
+              streams={streamList}
+              canRemove={canRemove}
+              onRemove={handleRemoveStream}
+              activeIncidents={snapshot?.active_incidents ?? []}
+              sessionState={state}
+              aggregation={snapshot?.aggregation}
+              onRetryAggregation={(jobId) =>
+                sendCommand("retry_aggregation", { job_id: jobId })
+              }
+            />
           ) : (
             <div className="flex h-full flex-col items-center justify-center gap-3">
               <p className="text-sm text-muted">No streams registered</p>

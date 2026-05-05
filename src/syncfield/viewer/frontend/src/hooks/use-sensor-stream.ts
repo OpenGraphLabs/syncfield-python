@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { sensorStore } from "@/lib/sensor-store";
 
-const MAX_POINTS = 300;
+const DEFAULT_MAX_POINTS = 300;
 
 interface UseSensorStreamReturn {
   /** Per-channel rolling buffer of values. */
@@ -16,6 +16,10 @@ interface UseSensorStreamReturn {
   isConnected: boolean;
 }
 
+interface UseSensorStreamOptions {
+  maxPoints?: number;
+}
+
 /**
  * Subscribe to real-time sensor data for one stream.
  *
@@ -24,7 +28,10 @@ interface UseSensorStreamReturn {
  * under the browser's HTTP/1.1 6-per-origin cap. The returned buffers
  * are local to this hook — each consumer keeps its own rolling window.
  */
-export function useSensorStream(streamId: string): UseSensorStreamReturn {
+export function useSensorStream(
+  streamId: string,
+  options: UseSensorStreamOptions = {},
+): UseSensorStreamReturn {
   const [channels, setChannels] = useState<Record<string, number[]>>({});
   const [labels, setLabels] = useState<number[]>([]);
   const [pose, setPose] = useState<Record<string, number[]> | null>(null);
@@ -32,6 +39,14 @@ export function useSensorStream(streamId: string): UseSensorStreamReturn {
 
   const channelBuf = useRef<Record<string, number[]>>({});
   const labelBuf = useRef<number[]>([]);
+  const maxPointsRef = useRef(DEFAULT_MAX_POINTS);
+
+  useEffect(() => {
+    maxPointsRef.current = Math.max(
+      30,
+      Math.round(options.maxPoints ?? DEFAULT_MAX_POINTS),
+    );
+  }, [options.maxPoints]);
 
   useEffect(() => {
     channelBuf.current = {};
@@ -43,15 +58,15 @@ export function useSensorStream(streamId: string): UseSensorStreamReturn {
     const unsub = sensorStore.subscribe(streamId, (data) => {
       if (data.label !== null && data.label !== undefined) {
         labelBuf.current.push(data.label);
-        if (labelBuf.current.length > MAX_POINTS) {
-          labelBuf.current = labelBuf.current.slice(-MAX_POINTS);
+        if (labelBuf.current.length > maxPointsRef.current) {
+          labelBuf.current = labelBuf.current.slice(-maxPointsRef.current);
         }
       }
       for (const [name, value] of Object.entries(data.channels)) {
         if (!channelBuf.current[name]) channelBuf.current[name] = [];
         channelBuf.current[name].push(value);
-        if (channelBuf.current[name].length > MAX_POINTS) {
-          channelBuf.current[name] = channelBuf.current[name].slice(-MAX_POINTS);
+        if (channelBuf.current[name].length > maxPointsRef.current) {
+          channelBuf.current[name] = channelBuf.current[name].slice(-maxPointsRef.current);
         }
       }
       if (data.pose) setPose(data.pose);

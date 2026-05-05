@@ -23,7 +23,7 @@ import time
 import wave
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, List, Optional, Protocol, runtime_checkable
+from typing import Any, List, Literal, Optional, Protocol, runtime_checkable
 
 from syncfield.types import ChirpEmission, ChirpSource, ChirpSpec
 
@@ -260,12 +260,72 @@ class SyncToneConfig:
 
     @classmethod
     def silent(cls) -> "SyncToneConfig":
-        """Construct with chirp disabled.
+        """Construct with the start/stop chirps disabled.
 
-        Use for recording environments where *any* chirp is unacceptable
-        or for headless lab machines with no audio output path.
+        The 3/2/1 countdown tick still plays — disabling the
+        ultrasonic / audible chirps does not mean "no audio at all":
+        the operator still wants to hear the recording about to
+        start. Pass ``cls(enabled=False, countdown_tick=None)``
+        explicitly if you also want the countdown silent.
+
+        Use for recording environments where the start/stop chirp
+        itself is unacceptable (clinical, audio-sensitive subjects)
+        but the operator still benefits from a 3/2/1 audible cue.
         """
-        return cls(enabled=False, countdown_tick=None)
+        return cls(enabled=False)
+
+
+# ---------------------------------------------------------------------------
+# Mode classification (used by viewer + control plane)
+# ---------------------------------------------------------------------------
+
+ChirpMode = Literal["ultrasound", "audible", "off"]
+
+
+def chirp_mode_of(cfg: SyncToneConfig) -> ChirpMode:
+    """Classify a :class:`SyncToneConfig` into one of three named modes.
+
+    The classification keys off chirp enablement and start-chirp band:
+
+    - ``"off"`` — ``enabled=False`` (no chirp played)
+    - ``"ultrasound"`` — start chirp begins above ~10 kHz (the default
+      17–19 kHz preset and any custom near-ultrasonic spec land here)
+    - ``"audible"`` — start chirp begins below ~10 kHz (legacy
+      400–2500 Hz preset and any custom audible spec)
+
+    The 10 kHz boundary mirrors the practical split between "human
+    perceives as chirp" and "human barely notices" — the actual default
+    is much higher (17 kHz), so any reasonable user configuration falls
+    cleanly on one side.
+    """
+    if not cfg.enabled:
+        return "off"
+    if cfg.start_chirp.from_hz >= 10_000:
+        return "ultrasound"
+    return "audible"
+
+
+def make_sync_tone_for_mode(mode: ChirpMode) -> SyncToneConfig:
+    """Construct the canonical :class:`SyncToneConfig` for a named mode.
+
+    Inverse of :func:`chirp_mode_of` for the three preset modes:
+
+    - ``"ultrasound"`` → :meth:`SyncToneConfig.default`
+    - ``"audible"`` → :meth:`SyncToneConfig.audible`
+    - ``"off"`` → :meth:`SyncToneConfig.silent`
+
+    Raises:
+        ValueError: If ``mode`` is not one of the three known values.
+    """
+    if mode == "ultrasound":
+        return SyncToneConfig.default()
+    if mode == "audible":
+        return SyncToneConfig.audible()
+    if mode == "off":
+        return SyncToneConfig.silent()
+    raise ValueError(
+        f"unknown chirp mode {mode!r}; expected 'ultrasound', 'audible', or 'off'"
+    )
 
 
 # ---------------------------------------------------------------------------

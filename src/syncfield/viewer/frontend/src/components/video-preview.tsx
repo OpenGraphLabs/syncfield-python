@@ -3,6 +3,7 @@ import { cn } from "@/lib/utils";
 
 interface VideoPreviewProps {
   streamId: string;
+  variant?: "aspect" | "fill";
 }
 
 /**
@@ -13,10 +14,11 @@ interface VideoPreviewProps {
  * While the first frame is in-flight we overlay a "waiting" state so
  * the card isn't just a blank box during adapter warmup.
  */
-export function VideoPreview({ streamId }: VideoPreviewProps) {
+export function VideoPreview({ streamId, variant = "aspect" }: VideoPreviewProps) {
   const [loaded, setLoaded] = useState(false);
+  const sizing = variant === "fill" ? "h-full w-full" : "aspect-video w-full";
   return (
-    <div className="relative aspect-video w-full overflow-hidden bg-background-subtle">
+    <div className={cn("relative overflow-hidden bg-background-subtle", sizing)}>
       <img
         src={`/stream/video/${streamId}`}
         alt={`${streamId} preview`}

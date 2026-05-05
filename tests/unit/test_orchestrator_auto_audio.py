@@ -89,6 +89,20 @@ class TestAutoAudioInjection:
 
         assert "host_audio" not in session._streams
 
+    def test_skips_when_enable_host_audio_false(self, tmp_path: Path):
+        """Should NOT inject when enable_host_audio=False, even if mic is available."""
+        session = _session(tmp_path, enable_host_audio=False)
+
+        mock_info = {"name": "Test Mic", "max_input_channels": 1, "default_high_input_latency": 0.01}
+        with patch("syncfield.adapters.host_audio.is_audio_available", return_value=True), \
+             patch("sounddevice.query_devices", return_value=mock_info), \
+             patch("sounddevice.InputStream"):
+            session.add(FakeStream("cam"))
+            session.connect()
+
+        assert "host_audio" not in session._streams
+        assert session._auto_audio_stream is None
+
     def test_kept_on_disconnect(self, tmp_path: Path):
         """Auto-injected stream should stay registered (visible) after disconnect."""
         session = _session(tmp_path)

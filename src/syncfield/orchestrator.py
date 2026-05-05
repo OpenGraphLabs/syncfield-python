@@ -278,6 +278,16 @@ class SessionOrchestrator:
             Followers **never** play chirps — they rely on the
             leader's chirps being captured by every host's microphones
             in the same physical space.
+        enable_host_audio: When ``True`` (default), automatically
+            register a :class:`~syncfield.adapters.host_audio.HostAudioStream`
+            if ``sounddevice`` is available, so the chirp emitted by
+            the leader can be captured for cross-host alignment. Set
+            to ``False`` for single-host sessions where chirp
+            alignment is not needed and the auto-registered audio
+            card in the viewer is not desired. Multi-host roles still
+            require an audio stream — disabling this flag in a
+            multi-host session means you must add your own
+            audio-capable stream explicitly.
     """
 
     def __init__(
@@ -287,6 +297,7 @@ class SessionOrchestrator:
         sync_tone: SyncToneConfig | None = None,
         chirp_player: ChirpPlayer | None = None,
         role: Optional[Role] = None,
+        enable_host_audio: bool = True,
     ) -> None:
         self._host_id = host_id
         self._data_root = Path(output_dir)
@@ -372,6 +383,9 @@ class SessionOrchestrator:
         # Auto-injected host audio stream (if any). Tracked so it can
         # be removed on disconnect.
         self._auto_audio_stream: Optional[Stream] = None
+        # When False, skip the automatic HostAudioStream registration.
+        # Useful for single-host sessions that don't need chirp alignment.
+        self._enable_host_audio: bool = enable_host_audio
 
         # Flipped to True when the episode dir has been created on disk.
         self._episode_dir_created = False
@@ -1646,6 +1660,72 @@ class SessionOrchestrator:
             logger.info("removed stream %s", stream_id)
 
     # ------------------------------------------------------------------
+    # Sync tone — runtime configuration
+    # ------------------------------------------------------------------
+
+    def set_chirp_mode(self, mode: str) -> None:
+        """Switch the active chirp mode at runtime.
+
+        ``mode`` is one of ``"ultrasound"`` (default near-ultrasonic
+        17–19 kHz preset, inaudible to most adults), ``"audible"``
+        (legacy 400–2500 Hz preset, useful for sub-16 kHz audio
+        cutoffs and for human-audible debugging), or ``"off"`` (no
+        start/stop chirps; the 3/2/1 countdown ticks still play
+        unless ``countdown_tick`` is set to ``None``).
+
+        Valid only in :attr:`SessionState.IDLE` and
+        :attr:`SessionState.STOPPED` — the "before/after a session"
+        window. Connecting devices, running a recording, or tearing
+        down all reject the change with :class:`RuntimeError`. To
+        switch chirp mode while connected, call :meth:`disconnect`
+        first; to switch immediately after a recording, the session
+        is already in STOPPED so the call succeeds without further
+        action.
+
+        The chirp player is *not* swapped here — only the
+        :class:`~syncfield.tone.SyncToneConfig` describing what the
+        existing player should emit. The next :meth:`start` cycle
+        uses the new mode immediately.
+
+        Raises:
+            ValueError: If ``mode`` is not one of the three known modes.
+            RuntimeError: If the session is in a state that does not
+                allow chirp reconfiguration.
+        """
+        from syncfield.tone import chirp_mode_of, make_sync_tone_for_mode
+
+        new_tone = make_sync_tone_for_mode(mode)  # validates `mode`
+        with self._lock:
+            if self._state not in (SessionState.IDLE, SessionState.STOPPED):
+                raise RuntimeError(
+                    f"cannot change chirp mode while session is {self._state.value!r}; "
+                    f"only valid in 'idle' or 'stopped' "
+                    f"(call disconnect() first if currently connected)"
+                )
+            old_mode = chirp_mode_of(self._sync_tone)
+            self._sync_tone = new_tone
+            logger.info(
+                "chirp mode: %s → %s (start: %d→%d Hz, stop: %d→%d Hz)",
+                old_mode,
+                mode,
+                new_tone.start_chirp.from_hz,
+                new_tone.start_chirp.to_hz,
+                new_tone.stop_chirp.from_hz,
+                new_tone.stop_chirp.to_hz,
+            )
+
+    @property
+    def chirp_mode(self) -> str:
+        """Current chirp mode classified from :attr:`_sync_tone`.
+
+        See :func:`syncfield.tone.chirp_mode_of` for the classification
+        rules. Returns one of ``"ultrasound"``, ``"audible"``, ``"off"``.
+        """
+        from syncfield.tone import chirp_mode_of
+
+        return chirp_mode_of(self._sync_tone)
+
+    # ------------------------------------------------------------------
     # Lifecycle — connect
     # ------------------------------------------------------------------
 
@@ -2674,6 +2754,9 @@ class SessionOrchestrator:
         viewer can display the audio card immediately. The actual device
         connection happens in :meth:`connect` along with all other streams.
         """
+        if not self._enable_host_audio:
+            return
+
         try:
             from syncfield.adapters.host_audio import (
                 HostAudioStream,
@@ -2702,6 +2785,9 @@ class SessionOrchestrator:
         (e.g. user skipped add() and went straight to connect()), this
         adds and connects it now.
         """
+        if not self._enable_host_audio:
+            return
+
         has_audio = any(
             s.capabilities.provides_audio_track
             for s in self._streams.values()
@@ -2784,19 +2870,25 @@ class SessionOrchestrator:
         are preserved for the session artifacts.
         """
         if self._is_chirp_eligible():
+            spec = self._sync_tone.start_chirp
+            logger.info(
+                "[%s] start chirp: %d→%d Hz, %dms (mode=%s)",
+                self._host_id,
+                spec.from_hz,
+                spec.to_hz,
+                spec.duration_ms,
+                self.chirp_mode,
+            )
             time.sleep(self._sync_tone.post_start_stabilization_ms / 1000.0)
             try:
-                self._chirp_start = self._chirp_player.play(
-                    self._sync_tone.start_chirp
-                )
+                self._chirp_start = self._chirp_player.play(spec)
             except Exception:  # pragma: no cover — audio path is best-effort
                 logger.exception("start chirp playback failed")
             return
 
-        if self._sync_tone.enabled:
+        if not self._sync_tone.enabled:
             logger.info(
-                "[%s] Chirp injection skipped (sync_tone.enabled=False or "
-                "follower role). No operator start cue will be played.",
+                "[%s] start chirp skipped (mode=off). Countdown ticks still play.",
                 self._host_id,
             )
 
@@ -2810,8 +2902,16 @@ class SessionOrchestrator:
         proceeds without waiting for the full tick to drain.
         Exceptions are swallowed: a misbehaving audio path should
         never prevent the recording from starting.
+
+        The countdown tick is intentionally **independent of**
+        ``sync_tone.enabled``: even with the start/stop chirps off
+        ("off" mode), the operator still wants to hear the 3/2/1
+        cue so they know recording is about to begin. Followers,
+        however, never play any operator-side cue — the leader's
+        chirps and the leader's tick are what reach every host's
+        microphones in the same physical space.
         """
-        if not self._is_chirp_eligible():
+        if isinstance(self._role, FollowerRole):
             return
         tick = self._sync_tone.countdown_tick
         if tick is None:
@@ -2833,10 +2933,18 @@ class SessionOrchestrator:
         if not self._is_chirp_eligible():
             return
 
-        self._chirp_stop = self._chirp_player.play(self._sync_tone.stop_chirp)
+        spec = self._sync_tone.stop_chirp
+        logger.info(
+            "[%s] stop chirp: %d→%d Hz, %dms (mode=%s)",
+            self._host_id,
+            spec.from_hz,
+            spec.to_hz,
+            spec.duration_ms,
+            self.chirp_mode,
+        )
+        self._chirp_stop = self._chirp_player.play(spec)
         total_wait_ms = (
-            self._sync_tone.stop_chirp.duration_ms
-            + self._sync_tone.pre_stop_tail_margin_ms
+            spec.duration_ms + self._sync_tone.pre_stop_tail_margin_ms
         )
         time.sleep(total_wait_ms / 1000.0)
 

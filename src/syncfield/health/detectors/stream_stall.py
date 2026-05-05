@@ -1,9 +1,16 @@
-"""StreamStallDetector — fires when a stream stops producing samples."""
+"""StreamStallDetector — fires when a stream stops producing samples.
+
+Only tracks streams that are currently in the ``connected`` connection
+state. When a stream transitions away from ``connected`` (e.g. during
+``stop()`` teardown or an explicit ``disconnect()``), bookkeeping is
+cleared so the inevitable post-teardown silence does not raise a
+spurious ERROR-severity incident every time a recording ends.
+"""
 
 from __future__ import annotations
 
 from collections.abc import Iterator
-from typing import Dict, List
+from typing import Dict, List, Set
 
 from syncfield.health.detector import DetectorBase
 from syncfield.health.severity import Severity
@@ -26,6 +33,9 @@ class StreamStallDetector(DetectorBase):
         self._last_sample_at: Dict[str, int] = {}
         # Per-stream: are we currently firing? prevents duplicates per stall.
         self._stall_active: Dict[str, bool] = {}
+        # Streams currently in the ``connected`` state; only these are
+        # tracked. Disconnected/stopping streams are silent by design.
+        self._connected: Set[str] = set()
 
     # --- observers -------------------------------------------------------
 
@@ -34,11 +44,30 @@ class StreamStallDetector(DetectorBase):
         # A new sample ends any active stall bookkeeping.
         self._stall_active[stream_id] = False
 
+    def observe_connection_state(self, stream_id: str, new_state: str, at_ns: int) -> None:
+        if new_state == "connected":
+            self._connected.add(stream_id)
+            # Treat the connect time as the "last sample" anchor so the
+            # detector waits a full threshold from connect, not from a
+            # stale capture_ns left over from the previous session.
+            self._last_sample_at[stream_id] = at_ns
+            self._stall_active[stream_id] = False
+        else:
+            # idle / connecting / failed / disconnected / stopping →
+            # stop tracking. NoDataDetector handles the warmup window;
+            # post-teardown silence is expected and not an incident.
+            self._connected.discard(stream_id)
+            self._last_sample_at.pop(stream_id, None)
+            self._stall_active.pop(stream_id, None)
+
     # --- tick ------------------------------------------------------------
 
     def tick(self, now_ns: int) -> Iterator[HealthEvent]:
         emitted: List[HealthEvent] = []
-        for stream_id, last in self._last_sample_at.items():
+        for stream_id in self._connected:
+            last = self._last_sample_at.get(stream_id)
+            if last is None:
+                continue
             silence_ns = now_ns - last
             if silence_ns >= self._stall_threshold_ns and not self._stall_active.get(stream_id, False):
                 self._stall_active[stream_id] = True
@@ -57,6 +86,10 @@ class StreamStallDetector(DetectorBase):
     # --- close condition -------------------------------------------------
 
     def close_condition(self, incident: Incident, now_ns: int) -> bool:
+        # Stream no longer connected: close — its silence is no longer
+        # this detector's concern.
+        if incident.stream_id not in self._connected:
+            return True
         last = self._last_sample_at.get(incident.stream_id)
         if last is None:
             return False

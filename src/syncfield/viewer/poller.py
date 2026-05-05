@@ -235,6 +235,7 @@ class SessionPoller:
         chirp_start = getattr(session, "_chirp_start_ns", None)
         chirp_stop = getattr(session, "_chirp_stop_ns", None)
         chirp_enabled = bool(session._sync_tone.enabled)  # type: ignore[attr-defined]
+        chirp_mode = session.chirp_mode
 
         return SessionSnapshot(
             host_id=session.host_id,
@@ -245,6 +246,7 @@ class SessionPoller:
             chirp_start_ns=chirp_start,
             chirp_stop_ns=chirp_stop,
             chirp_enabled=chirp_enabled,
+            chirp_mode=chirp_mode,
             elapsed_s=elapsed_s,
             streams=streams_snapshot,
             active_incidents=active,

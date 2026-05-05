@@ -2,13 +2,15 @@ import { useSensorStream } from "@/hooks/use-sensor-stream";
 
 interface SensorChartProps {
   streamId: string;
+  windowSeconds?: number;
+  variant?: "aspect" | "fill";
 }
 
 /**
  * Real-time sensor chart rendered as inline SVG.
  *
  * Connects to the SSE endpoint via `useSensorStream`, maintains a
- * rolling buffer of 300 points per channel, and draws each channel
+ * rolling buffer sized to the visible window, and draws each channel
  * as a polyline on a shared coordinate system. No chart library
  * dependency — just raw SVG paths.
  */
@@ -26,20 +28,34 @@ const SERIES_COLORS = [
   "#0891B2", // cyan
 ];
 
-export function SensorChart({ streamId }: SensorChartProps) {
-  const { channels, labels, isConnected } = useSensorStream(streamId);
+export function SensorChart({
+  streamId,
+  windowSeconds = 5,
+  variant = "aspect",
+}: SensorChartProps) {
+  const maxPoints = Math.min(6000, Math.max(300, Math.round(windowSeconds * 200)));
+  const { channels, labels, isConnected } = useSensorStream(streamId, { maxPoints });
   const channelNames = Object.keys(channels);
+  const wrapperClass =
+    variant === "fill" ? "h-full w-full px-3 py-2" : "aspect-video px-3 py-2";
+  const placeholderClass =
+    variant === "fill"
+      ? "flex h-full w-full items-center justify-center text-xs text-muted"
+      : "flex aspect-video items-center justify-center text-xs text-muted";
 
   if (channelNames.length === 0) {
     return (
-      <div className="flex aspect-video items-center justify-center text-xs text-muted">
+      <div className={placeholderClass}>
         {isConnected ? "Waiting for data…" : "Connecting…"}
       </div>
     );
   }
 
-  // Compute axis bounds from all channels
-  const allValues = channelNames.flatMap((name) => channels[name] ?? []);
+  const windowed = windowChannels(channels, labels, windowSeconds);
+  const visibleChannels = windowed.channels;
+
+  // Compute axis bounds from visible channels
+  const allValues = channelNames.flatMap((name) => visibleChannels[name] ?? []);
   const yMin = Math.min(...allValues);
   const yMax = Math.max(...allValues);
   const yRange = yMax - yMin || 1; // Avoid division by zero
@@ -47,13 +63,11 @@ export function SensorChart({ streamId }: SensorChartProps) {
   const plotW = CHART_W - PADDING.left - PADDING.right;
   const plotH = CHART_H - PADDING.top - PADDING.bottom;
 
-  const xScale = (i: number) =>
-    PADDING.left + (i / Math.max(labels.length - 1, 1)) * plotW;
   const yScale = (v: number) =>
     PADDING.top + plotH - ((v - yMin) / yRange) * plotH;
 
   return (
-    <div className="aspect-video px-3 py-2">
+    <div className={wrapperClass}>
       <svg
         viewBox={`0 0 ${CHART_W} ${CHART_H}`}
         className="h-full w-full"
@@ -107,13 +121,14 @@ export function SensorChart({ streamId }: SensorChartProps) {
 
         {/* Data lines */}
         {channelNames.map((name, ci) => {
-          const values = channels[name];
+          const values = visibleChannels[name];
           if (!values || values.length < 2) return null;
 
           const points = values
             .map((v, i) => {
               if (Number.isNaN(v)) return null;
-              return `${xScale(i)},${yScale(v)}`;
+              const x = PADDING.left + (i / Math.max(values.length - 1, 1)) * plotW;
+              return `${x},${yScale(v)}`;
             })
             .filter(Boolean)
             .join(" L ");
@@ -135,10 +150,10 @@ export function SensorChart({ streamId }: SensorChartProps) {
         })}
 
         {/* Channel legend */}
-        {channelNames.slice(0, 6).map((name, ci) => (
+        {channelNames.slice(0, 5).map((name, ci) => (
           <g key={name}>
             <rect
-              x={PADDING.left + ci * 36}
+              x={PADDING.left + ci * 34}
               y={CHART_H - 10}
               width={6}
               height={6}
@@ -146,7 +161,7 @@ export function SensorChart({ streamId }: SensorChartProps) {
               fill={SERIES_COLORS[ci % SERIES_COLORS.length]}
             />
             <text
-              x={PADDING.left + ci * 36 + 9}
+              x={PADDING.left + ci * 34 + 9}
               y={CHART_H - 4}
               className="fill-muted"
               fontSize={6}
@@ -155,7 +170,55 @@ export function SensorChart({ streamId }: SensorChartProps) {
             </text>
           </g>
         ))}
+        <text
+          x={CHART_W - PADDING.right}
+          y={CHART_H - 4}
+          textAnchor="end"
+          className="fill-muted font-mono"
+          fontSize={6}
+        >
+          {windowSeconds}s
+        </text>
       </svg>
     </div>
   );
+}
+
+function windowChannels(
+  channels: Record<string, number[]>,
+  labels: number[],
+  windowSeconds: number,
+): { channels: Record<string, number[]>; labels: number[] } {
+  const longestSeries = Math.max(0, ...Object.values(channels).map((values) => values.length));
+  if (longestSeries === 0) return { channels, labels };
+
+  const labelStart = labelWindowStart(labels, windowSeconds);
+  const fallbackCount = Math.min(
+    longestSeries,
+    Math.max(60, Math.round(windowSeconds * 200)),
+  );
+  const start = labelStart ?? Math.max(0, longestSeries - fallbackCount);
+  const nextChannels = Object.fromEntries(
+    Object.entries(channels).map(([name, values]) => [
+      name,
+      values.slice(Math.max(0, values.length - (longestSeries - start))),
+    ]),
+  );
+  const nextLabels =
+    labels.length > 0
+      ? labels.slice(Math.max(0, labels.length - (longestSeries - start)))
+      : Array.from({ length: longestSeries - start }, (_, i) => i);
+  return { channels: nextChannels, labels: nextLabels };
+}
+
+function labelWindowStart(labels: number[], windowSeconds: number): number | null {
+  if (labels.length < 2) return null;
+  const latest = labels[labels.length - 1];
+  const first = labels[0];
+  if (latest === undefined || first === undefined || latest <= first) return null;
+  const span = latest - first;
+  const unitsPerSecond = span > 1_000_000 ? 1_000_000_000 : span > 1_000 ? 1_000 : 1;
+  const threshold = latest - windowSeconds * unitsPerSecond;
+  const index = labels.findIndex((label) => label >= threshold);
+  return index >= 0 ? index : null;
 }

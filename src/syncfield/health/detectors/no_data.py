@@ -21,7 +21,14 @@ class NoDataDetector(DetectorBase):
     name = "no-data"
     default_severity = Severity.ERROR
 
-    def __init__(self, threshold_ns: int = 5_000_000_000) -> None:
+    # 30s default: CoreAudio host_audio first-mic-permission + device
+    # open + first-callback can take 15-25s on a cold macOS process,
+    # and slower hardware (BLE IMU pairing, network-attached cameras)
+    # can be slower still. Anything that fires for normal warmup
+    # drowns the Active Issues panel in self-resolving noise. The
+    # detector is for catching genuine "connected but silent
+    # forever" cases, not warmup latency.
+    def __init__(self, threshold_ns: int = 30_000_000_000) -> None:
         self._threshold_ns = threshold_ns
         self._connected_at: Dict[str, int] = {}
         self._has_sample: Set[str] = set()

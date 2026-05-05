@@ -2,6 +2,7 @@ import { useSensorStream } from "@/hooks/use-sensor-stream";
 
 interface AudioLevelChartProps {
   streamId: string;
+  variant?: "aspect" | "fill";
 }
 
 /**
@@ -11,8 +12,12 @@ interface AudioLevelChartProps {
  * recording). Falls back to "Microphone ready" only when no SSE
  * connection is established.
  */
-export function AudioLevelChart({ streamId }: AudioLevelChartProps) {
+export function AudioLevelChart({
+  streamId,
+  variant = "aspect",
+}: AudioLevelChartProps) {
   const { channels, isConnected } = useSensorStream(streamId);
+  const sizing = variant === "fill" ? "h-full w-full" : "aspect-video";
 
   const rmsValues = channels["rms"] ?? [];
   const peakValues = channels["peak"] ?? [];
@@ -25,7 +30,7 @@ export function AudioLevelChart({ streamId }: AudioLevelChartProps) {
   // No connection or no data yet — show idle mic icon
   if (!isConnected || rmsValues.length === 0) {
     return (
-      <div className="flex aspect-video flex-col items-center justify-center gap-2 px-4 text-muted">
+      <div className={`flex ${sizing} flex-col items-center justify-center gap-2 px-4 text-muted`}>
         <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
           <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z" />
           <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
@@ -37,7 +42,7 @@ export function AudioLevelChart({ streamId }: AudioLevelChartProps) {
   }
 
   return (
-    <div className="flex aspect-video flex-col items-center justify-center gap-3 px-4">
+    <div className={`flex ${sizing} flex-col items-center justify-center gap-3 px-4`}>
       {/* Waveform mini-history */}
       <div className="flex h-16 w-full items-end gap-px">
         {rmsValues.slice(-60).map((v, i) => {
