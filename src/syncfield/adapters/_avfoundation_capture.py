@@ -130,6 +130,28 @@ def select_capture_format(
     return fmt, max_fps, cap_duration
 
 
+def _resolve_device(AVF: Any, unique_id: Optional[str], index: int) -> Any:
+    """Resolve the camera to open, preferring the stable ``unique_id``.
+
+    Positional indices are only meaningful within a single enumeration, and the
+    SDK's in-process enumeration order does NOT match the app's discovery order,
+    so opening by index can select the wrong physical camera — or bind two
+    streams to the same one (two visually-identical Arducams). AVFoundation's
+    ``deviceWithUniqueID:`` looks the device up directly by its stable id, which
+    is the only thing that tells identical cameras apart. Fall back to the
+    positional index only when no ``unique_id`` was supplied (legacy path).
+    """
+    if unique_id:
+        device = AVF.AVCaptureDevice.deviceWithUniqueID_(unique_id)
+        if device is None:
+            raise AVFoundationUnavailable(
+                f"camera with unique_id {unique_id!r} not found "
+                "(unplugged or moved to a different USB port)"
+            )
+        return device
+    return _device_at_index(AVF, index)
+
+
 def _device_at_index(AVF: Any, index: int) -> Any:
     """Resolve ``index`` to an ``AVCaptureDevice`` using the same enumeration
     order as the app-side ``discover_av_devices`` (built-in, then external /
@@ -198,8 +220,17 @@ class NativeAVCapture:
     ``(frame_bgr, capture_ns)`` — a drop-in frame source for the UVC capture loop.
     """
 
-    def __init__(self, *, device_index: int, width: int, height: int, fps: float) -> None:
+    def __init__(
+        self,
+        *,
+        device_index: int,
+        width: int,
+        height: int,
+        fps: float,
+        unique_id: Optional[str] = None,
+    ) -> None:
         self._device_index = int(device_index)
+        self._unique_id = unique_id or None
         self._width = int(width)
         self._height = int(height)
         self._fps = float(fps)
@@ -211,7 +242,7 @@ class NativeAVCapture:
 
     def start(self) -> None:
         objc, AVF, CM, Quartz, NSObject, dispatch_queue_create = _load_frameworks()
-        device = _device_at_index(AVF, self._device_index)
+        device = _resolve_device(AVF, self._unique_id, self._device_index)
         if device is None:
             raise AVFoundationUnavailable(
                 f"no AVFoundation camera at index {self._device_index}"
@@ -257,7 +288,8 @@ class NativeAVCapture:
         self._session = session
         self.selected_max_fps = max_fps
         logger.info(
-            "avfoundation.capture.started device_index=%s size=%sx%s fmt_max_fps=%.0f",
+            "avfoundation.capture.started unique_id=%s device_index=%s size=%sx%s fmt_max_fps=%.0f",
+            self._unique_id,
             self._device_index,
             self._width,
             self._height,

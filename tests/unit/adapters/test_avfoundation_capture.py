@@ -6,10 +6,44 @@ from types import SimpleNamespace
 
 import numpy as np
 
+import pytest
+
 from syncfield.adapters._avfoundation_capture import (
+    AVFoundationUnavailable,
+    _resolve_device,
     bgr_from_pixel_buffer,
     select_capture_format,
 )
+
+
+# --- _resolve_device (identity by unique_id) -------------------------------
+
+
+class _FakeAVF:
+    def __init__(self, by_uid: dict) -> None:
+        self._by_uid = by_uid
+
+        outer = self
+
+        class AVCaptureDevice:  # noqa: N801 - mirrors the ObjC class name
+            @staticmethod
+            def deviceWithUniqueID_(uid):  # noqa: N802
+                return outer._by_uid.get(uid)
+
+        self.AVCaptureDevice = AVCaptureDevice
+
+
+def test_resolve_device_opens_by_unique_id() -> None:
+    avf = _FakeAVF({"UID_A": "camA", "UID_B": "camB"})
+    # Two identical cameras are told apart purely by unique_id.
+    assert _resolve_device(avf, "UID_A", index=0) == "camA"
+    assert _resolve_device(avf, "UID_B", index=0) == "camB"
+
+
+def test_resolve_device_raises_when_unique_id_absent() -> None:
+    avf = _FakeAVF({"UID_A": "camA"})
+    with pytest.raises(AVFoundationUnavailable):
+        _resolve_device(avf, "UID_GONE", index=0)
 
 
 # --- select_capture_format ------------------------------------------------

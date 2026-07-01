@@ -108,6 +108,7 @@ class UVCWebcamStream(StreamBase):
         device_name: Optional[str] = None,
         backend: str = "pyav",
         pixel_format: Optional[str] = None,
+        unique_id: Optional[str] = None,
     ) -> None:
         if backend not in ("pyav", "opencv", "avfoundation"):
             raise ValueError(
@@ -132,6 +133,12 @@ class UVCWebcamStream(StreamBase):
         self._fps = float(fps) if fps else 30.0
         self._backend = backend
         self._pixel_format = pixel_format
+        # Stable AVFoundation uniqueID. The native backend opens the camera by
+        # this rather than the positional index (whose enumeration order differs
+        # between the app and the SDK, which otherwise binds the wrong / a
+        # duplicate camera — and it's the only thing that tells two identical
+        # cameras apart).
+        self._unique_id = unique_id
 
         self._input: Any = None
         self._encoder: Optional[VideoEncoder] = None
@@ -206,6 +213,7 @@ class UVCWebcamStream(StreamBase):
                 width=self._width,
                 height=self._height,
                 fps=self._fps,
+                unique_id=self._unique_id,
             )
             capture.start()
             return capture
