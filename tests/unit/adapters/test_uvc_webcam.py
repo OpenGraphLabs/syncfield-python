@@ -45,6 +45,51 @@ def test_prepare_opens_pyav_input(mock_av, tmp_path):
     assert len(input_calls) == 1
 
 
+def test_prepare_forwards_pixel_format_to_pyav(mock_av, tmp_path):
+    """A requested ``pixel_format`` reaches the avfoundation/v4l2 open options."""
+    from syncfield.adapters.uvc_webcam import UVCWebcamStream
+
+    stream = UVCWebcamStream(
+        "cam", device_index=0, output_dir=tmp_path, pixel_format="nv12"
+    )
+    stream.prepare()
+
+    input_calls = [
+        c for c in mock_av.av.open.call_args_list
+        if c.kwargs.get("mode") != "w"
+    ]
+    assert len(input_calls) == 1
+    assert input_calls[0].kwargs["options"].get("pixel_format") == "nv12"
+
+
+def test_prepare_falls_back_to_auto_when_pixel_format_rejected(mock_av, tmp_path):
+    """If the camera rejects the requested pixel_format, prepare() retries
+    once with auto-negotiation (the pre-existing behaviour) instead of
+    failing the stream. Guarantees worst-case == today.
+    """
+    from syncfield.adapters.uvc_webcam import UVCWebcamStream
+
+    input_container = mock_av.input_container
+
+    def _open(url, *args, **kwargs):  # noqa: ANN001 - MagicMock signature
+        if kwargs.get("options", {}).get("pixel_format"):
+            raise OSError(5, "Input/output error")
+        return input_container
+
+    mock_av.av.open.side_effect = _open
+
+    stream = UVCWebcamStream(
+        "cam", device_index=0, output_dir=tmp_path, pixel_format="nv12"
+    )
+    stream.prepare()  # must not raise
+
+    calls = mock_av.av.open.call_args_list
+    assert len(calls) == 2
+    assert calls[0].kwargs["options"].get("pixel_format") == "nv12"
+    assert calls[1].kwargs["options"].get("pixel_format") is None
+    assert stream._input is input_container
+
+
 def test_start_stop_produces_file_path_in_report(mock_av, tmp_path):
     from syncfield.adapters.uvc_webcam import UVCWebcamStream
 

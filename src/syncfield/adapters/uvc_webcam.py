@@ -42,6 +42,7 @@ paths (tests, scripts that don't use the viewer).
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from pathlib import Path
@@ -62,6 +63,8 @@ from syncfield.types import (
     StreamCapabilities,
 )
 
+logger = logging.getLogger(__name__)
+
 
 class UVCWebcamStream(StreamBase):
     """Captures video from a UVC webcam via PyAV or OpenCV.
@@ -79,6 +82,15 @@ class UVCWebcamStream(StreamBase):
         backend: ``"pyav"`` (default) or ``"opencv"``. Use ``"opencv"`` as
             a fallback for cameras where PyAV/ffmpeg's avfoundation (macOS)
             or demuxer (Linux/Windows) hangs or misnegotiates.
+        pixel_format: Optional wire/buffer pixel format to request
+            (e.g. ``"nv12"``). Left unset by default so the platform
+            demuxer negotiates the camera's own default — which on macOS
+            avfoundation is the heaviest uncompressed ``uyvy422`` (16 bpp).
+            Requesting ``"nv12"`` (12 bpp) cuts per-camera bandwidth ~25%,
+            which matters when several UVC cameras share a USB bus. If the
+            camera rejects the requested format, ``prepare()`` transparently
+            falls back to auto-negotiation, so passing a value is never worse
+            than leaving it unset. Only applies to the ``"pyav"`` backend.
     """
 
     # Class-level hints for ``syncfield.discovery``.
@@ -95,6 +107,7 @@ class UVCWebcamStream(StreamBase):
         fps: Optional[float] = 30.0,
         device_name: Optional[str] = None,
         backend: str = "pyav",
+        pixel_format: Optional[str] = None,
     ) -> None:
         if backend not in ("pyav", "opencv"):
             raise ValueError(
@@ -118,6 +131,7 @@ class UVCWebcamStream(StreamBase):
         self._height = int(height) if height else 720
         self._fps = float(fps) if fps else 30.0
         self._backend = backend
+        self._pixel_format = pixel_format
 
         self._input: Any = None
         self._encoder: Optional[VideoEncoder] = None
@@ -166,12 +180,42 @@ class UVCWebcamStream(StreamBase):
                 fps=self._fps,
             )
         else:
-            self._input = open_uvc_input(
+            self._input = self._open_pyav_input()
+
+    def _open_pyav_input(self) -> Any:
+        """Open the PyAV input, preferring the requested pixel format.
+
+        If a ``pixel_format`` was requested and the camera rejects it
+        (some UVC devices expose only a subset of formats), retry once
+        with auto-negotiation. This guarantees the worst case is
+        identical to leaving ``pixel_format`` unset — no regression for
+        any camera that works today.
+        """
+        try:
+            return open_uvc_input(
                 device_index=self._device_index,
                 width=self._width,
                 height=self._height,
                 fps=self._fps,
                 device_name=self._device_name,
+                pixel_format=self._pixel_format,
+            )
+        except Exception:
+            if self._pixel_format is None:
+                raise
+            logger.warning(
+                "uvc.pixel_format_fallback device_index=%s requested=%r "
+                "rejected by camera; retrying with auto-negotiation",
+                self._device_index,
+                self._pixel_format,
+            )
+            return open_uvc_input(
+                device_index=self._device_index,
+                width=self._width,
+                height=self._height,
+                fps=self._fps,
+                device_name=self._device_name,
+                pixel_format=None,
             )
 
     def connect(self) -> None:
