@@ -109,9 +109,9 @@ class UVCWebcamStream(StreamBase):
         backend: str = "pyav",
         pixel_format: Optional[str] = None,
     ) -> None:
-        if backend not in ("pyav", "opencv"):
+        if backend not in ("pyav", "opencv", "avfoundation"):
             raise ValueError(
-                f"backend must be 'pyav' or 'opencv', got {backend!r}"
+                f"backend must be 'pyav', 'opencv', or 'avfoundation', got {backend!r}"
             )
         super().__init__(
             id=id,
@@ -172,7 +172,9 @@ class UVCWebcamStream(StreamBase):
         """Open the camera via the configured backend."""
         if self._input is not None:
             return
-        if self._backend == "opencv":
+        if self._backend == "avfoundation":
+            self._input = self._open_avfoundation_input()
+        elif self._backend == "opencv":
             self._input = _open_opencv_capture(
                 device_index=self._device_index,
                 width=self._width,
@@ -181,6 +183,44 @@ class UVCWebcamStream(StreamBase):
             )
         else:
             self._input = self._open_pyav_input()
+
+    def _open_avfoundation_input(self) -> Any:
+        """Open the native AVFoundation capture (macOS), falling back to PyAV.
+
+        Native AVFoundation lets us select the camera's MJPEG-backed high-fps
+        format, which keeps USB bandwidth in budget when several cameras stream
+        at once (PyAV's avfoundation demuxer starves them). If the native path
+        is unavailable for any reason — PyObjC missing, no device at the index,
+        an unsupported configuration — we downgrade ``self._backend`` to
+        ``"pyav"`` and open that instead, so the worst case is exactly today's
+        behaviour.
+        """
+        from syncfield.adapters._avfoundation_capture import (
+            AVFoundationUnavailable,
+            NativeAVCapture,
+        )
+
+        try:
+            capture = NativeAVCapture(
+                device_index=self._device_index,
+                width=self._width,
+                height=self._height,
+                fps=self._fps,
+            )
+            capture.start()
+            return capture
+        except Exception as exc:  # noqa: BLE001 - any failure => safe PyAV fallback
+            if not isinstance(exc, AVFoundationUnavailable):
+                logger.warning(
+                    "avfoundation.start_failed device_index=%s: %r", self._device_index, exc
+                )
+            else:
+                logger.warning(
+                    "avfoundation.unavailable device_index=%s: %s", self._device_index, exc
+                )
+            logger.warning("uvc.backend_fallback device_index=%s avfoundation -> pyav", self._device_index)
+            self._backend = "pyav"
+            return self._open_pyav_input()
 
     def _open_pyav_input(self) -> Any:
         """Open the PyAV input, preferring the requested pixel format.
@@ -332,10 +372,61 @@ class UVCWebcamStream(StreamBase):
         they're kept separate rather than merged.
         """
         assert self._input is not None
-        if self._backend == "opencv":
+        if self._backend == "avfoundation":
+            self._capture_loop_avfoundation()
+        elif self._backend == "opencv":
             self._capture_loop_opencv()
         else:
             self._capture_loop_pyav()
+
+    def _capture_loop_avfoundation(self) -> None:
+        """Native AVFoundation capture loop.
+
+        The AVFoundation delegate converts each frame to BGR on a dispatch queue
+        and pushes it onto a bounded queue; here we drain that queue and run the
+        exact same preview / recording / timestamp / sample-event handling as the
+        PyAV loop. ``read()`` returns ``None`` on timeout so the ``_stop_event``
+        is re-checked promptly during teardown.
+        """
+        try:
+            while not self._stop_event.is_set():
+                item = self._input.read(timeout=0.5)
+                if item is None:
+                    continue
+                frame_bgr, capture_ns = item
+                if self._recording:
+                    # UVC has no device clock — pass None for device_ns.
+                    self._observe_first_frame(capture_ns, None)
+                    if self._prev_capture_ns is not None:
+                        self._intervals_ns.append(capture_ns - self._prev_capture_ns)
+                    self._prev_capture_ns = capture_ns
+
+                with self._frame_lock:
+                    self._latest_frame = frame_bgr
+
+                if self._recording:
+                    if self._first_at is None:
+                        self._first_at = capture_ns
+                    self._last_at = capture_ns
+                    self._frame_count += 1
+                    if self._encoder is not None:
+                        self._encoder.write(frame_bgr)
+                    self._emit_sample(
+                        SampleEvent(
+                            stream_id=self.id,
+                            frame_number=self._frame_count - 1,
+                            capture_ns=capture_ns,
+                        )
+                    )
+        except Exception as exc:  # noqa: BLE001 - surface as health, don't crash the thread
+            self._emit_health(
+                HealthEvent(
+                    stream_id=self.id,
+                    kind=HealthEventKind.ERROR,
+                    at_ns=time.monotonic_ns(),
+                    detail=f"avfoundation capture loop ended: {exc!r}",
+                )
+            )
 
     def _capture_loop_pyav(self) -> None:
         """PyAV capture loop.
@@ -507,7 +598,9 @@ class UVCWebcamStream(StreamBase):
             self._encoder = None
         if self._input is not None:
             try:
-                if self._backend == "opencv":
+                if self._backend == "avfoundation":
+                    self._input.stop()
+                elif self._backend == "opencv":
                     self._input.release()
                 else:
                     self._input.close()

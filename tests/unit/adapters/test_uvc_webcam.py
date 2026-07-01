@@ -90,6 +90,35 @@ def test_prepare_falls_back_to_auto_when_pixel_format_rejected(mock_av, tmp_path
     assert stream._input is input_container
 
 
+def test_avfoundation_backend_falls_back_to_pyav_when_unavailable(
+    mock_av, tmp_path, monkeypatch
+):
+    """If the native AVFoundation capture can't start, prepare() downgrades to
+    the PyAV backend and opens that — worst case == today's behaviour."""
+    from syncfield.adapters import _avfoundation_capture
+    from syncfield.adapters.uvc_webcam import UVCWebcamStream
+
+    class _BoomCapture:
+        def __init__(self, **_kwargs):
+            pass
+
+        def start(self):
+            raise _avfoundation_capture.AVFoundationUnavailable("no camera here")
+
+    monkeypatch.setattr(_avfoundation_capture, "NativeAVCapture", _BoomCapture)
+
+    stream = UVCWebcamStream(
+        "cam", device_index=0, output_dir=tmp_path, backend="avfoundation"
+    )
+    stream.prepare()
+
+    assert stream._backend == "pyav"  # downgraded
+    input_calls = [
+        c for c in mock_av.av.open.call_args_list if c.kwargs.get("mode") != "w"
+    ]
+    assert len(input_calls) == 1  # opened the PyAV input instead
+
+
 def test_start_stop_produces_file_path_in_report(mock_av, tmp_path):
     from syncfield.adapters.uvc_webcam import UVCWebcamStream
 
