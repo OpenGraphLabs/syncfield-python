@@ -50,15 +50,24 @@ def test_resolve_device_raises_when_unique_id_absent() -> None:
 
 
 class _Range:
-    def __init__(self, max_fps: float, duration: str) -> None:
+    """Discrete UVC rate range by default (min == max), continuous if told."""
+
+    def __init__(self, max_fps: float, duration: str, min_fps: float | None = None) -> None:
         self._max = max_fps
+        self._min = max_fps if min_fps is None else min_fps
         self._dur = duration
 
     def maxFrameRate(self) -> float:  # noqa: N802 - ObjC selector name
         return self._max
 
+    def minFrameRate(self) -> float:  # noqa: N802 - ObjC selector name
+        return self._min
+
     def minFrameDuration(self):  # noqa: N802 - ObjC selector name
-        return self._dur
+        return f"{self._dur}_min"
+
+    def maxFrameDuration(self):  # noqa: N802 - ObjC selector name
+        return f"{self._dur}_max"
 
 
 class _Format:
@@ -86,6 +95,10 @@ class _CM:
     def CMVideoFormatDescriptionGetDimensions(desc):  # noqa: N802
         return SimpleNamespace(width=desc[0], height=desc[1])
 
+    @staticmethod
+    def CMTimeMake(value, timescale):  # noqa: N802
+        return ("cmtime", value, timescale)
+
 
 def test_select_capture_format_prefers_exact_dims_and_highest_fps() -> None:
     device = _Device(
@@ -98,30 +111,117 @@ def test_select_capture_format_prefers_exact_dims_and_highest_fps() -> None:
         ]
     )
 
-    fmt, max_fps, cap_duration = select_capture_format(
-        device, _CM, width=1280, height=720
+    fmt, max_fps, lock_min, lock_max, pace_to = select_capture_format(
+        device, _CM, width=1280, height=720, fps=30.0
     )
 
     assert max_fps == 120  # chose the MJPEG-backed high-fps 720p format
-    assert cap_duration == "d30_mjpeg"  # 30 fps cap taken from that format
+    # The discrete 30fps mode is locked from BOTH sides so neither a bright
+    # scene (rate up) nor auto-exposure (rate down) can move the cadence.
+    assert lock_min == "d30_mjpeg_min"
+    assert lock_max == "d30_mjpeg_min"
+    assert pace_to is None
+
+
+def test_select_capture_format_locks_discrete_target_rate() -> None:
+    """Real-world case: 4K webcam with discrete [30][25][20][15][10][5]."""
+    device = _Device(
+        [
+            _Format(
+                1280,
+                720,
+                [
+                    _Range(30.00003, "d30"),
+                    _Range(25, "d25"),
+                    _Range(20, "d20"),
+                ],
+            )
+        ]
+    )
+    fmt, _max_fps, lock_min, lock_max, pace_to = select_capture_format(
+        device, _CM, width=1280, height=720, fps=30.0
+    )
+    assert lock_min == "d30_min"
+    assert lock_max == "d30_min"
+    assert pace_to is None
+
+
+def test_select_capture_format_paces_when_camera_only_runs_faster() -> None:
+    """Real-world case: 60-only camera (HC CAM) asked for 30 fps — lock 60 and
+    decimate in software to an exact 2:1."""
+    device = _Device([_Format(1280, 720, [_Range(60.00024, "d60")])])
+    fmt, max_fps, lock_min, lock_max, pace_to = select_capture_format(
+        device, _CM, width=1280, height=720, fps=30.0
+    )
+    assert lock_min == "d60_max"  # slowest rate of the range = longest duration
+    assert lock_max == "d60_max"
+    assert pace_to == 30.0
+
+
+def test_select_capture_format_locks_fastest_when_target_unreachable() -> None:
+    device = _Device([_Format(1280, 720, [_Range(20, "d20"), _Range(10, "d10")])])
+    fmt, _max_fps, lock_min, lock_max, pace_to = select_capture_format(
+        device, _CM, width=1280, height=720, fps=30.0
+    )
+    assert lock_min == "d20_min"
+    assert lock_max == "d20_min"
+    assert pace_to is None
+
+
+def test_select_capture_format_builds_cmtime_for_continuous_range() -> None:
+    device = _Device([_Format(1280, 720, [_Range(60, "cont", min_fps=1)])])
+    fmt, _max_fps, lock_min, lock_max, pace_to = select_capture_format(
+        device, _CM, width=1280, height=720, fps=30.0
+    )
+    assert lock_min == ("cmtime", 1_000_000, 30_000_000)
+    assert lock_max == lock_min
+    assert pace_to is None
 
 
 def test_select_capture_format_falls_back_to_closest_when_no_exact_match() -> None:
     device = _Device([_Format(640, 480, [_Range(30, "d30")])])
-    fmt, max_fps, cap_duration = select_capture_format(
-        device, _CM, width=1280, height=720
+    fmt, max_fps, lock_min, lock_max, pace_to = select_capture_format(
+        device, _CM, width=1280, height=720, fps=30.0
     )
     assert fmt is not None
     assert max_fps == 30
 
 
 def test_select_capture_format_empty_device_returns_none() -> None:
-    fmt, max_fps, cap_duration = select_capture_format(
-        _Device([]), _CM, width=1280, height=720
+    fmt, max_fps, lock_min, lock_max, pace_to = select_capture_format(
+        _Device([]), _CM, width=1280, height=720, fps=30.0
     )
     assert fmt is None
     assert max_fps == 0.0
-    assert cap_duration is None
+    assert lock_min is None and lock_max is None and pace_to is None
+
+
+def test_pacing_decimates_60fps_input_to_uniform_30() -> None:
+    from syncfield.adapters._avfoundation_capture import NativeAVCapture
+
+    cap = NativeAVCapture(device_index=0, width=1280, height=720, fps=30.0)
+    cap._pace_period_ns = int(1e9 / 30)
+    period_60 = int(1e9 / 60)
+    accepted = [
+        ts
+        for i in range(120)
+        if cap._accept_paced(ts := 1_000_000 + i * period_60)
+    ]
+    assert len(accepted) == 60  # exactly half of 120 input frames
+    gaps = {round((b - a) / 1e6) for a, b in zip(accepted, accepted[1:])}
+    assert gaps == {33}  # uniform ~33ms spacing
+
+
+def test_pacing_passes_through_input_at_or_below_target() -> None:
+    from syncfield.adapters._avfoundation_capture import NativeAVCapture
+
+    cap = NativeAVCapture(device_index=0, width=1280, height=720, fps=30.0)
+    cap._pace_period_ns = int(1e9 / 30)
+    period_25 = int(1e9 / 25)
+    accepted = sum(
+        1 for i in range(100) if cap._accept_paced(1_000_000 + i * period_25)
+    )
+    assert accepted >= 95  # 25fps input flows through essentially untouched
 
 
 # --- bgr_from_pixel_buffer -------------------------------------------------

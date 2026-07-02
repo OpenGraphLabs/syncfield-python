@@ -99,17 +99,34 @@ def select_capture_format(
     *,
     width: int,
     height: int,
-) -> tuple[Any, float, Any]:
-    """Choose the capture format and 30-ish-fps cap for ``device``.
+    fps: float = 30.0,
+) -> tuple[Any, float, Any, Any, Optional[float]]:
+    """Choose the capture format and a rate plan that pins delivery to ``fps``.
 
-    Prefers an exact ``width x height`` match, then same width / closest height,
-    then closest overall; among equally-good dimensions it picks the **highest
-    max frame rate**, which is the MJPEG-backed (bandwidth-light) format.
+    Format choice prefers an exact ``width x height`` match, then same width /
+    closest height, then closest overall; among equally-good dimensions it
+    picks the **highest max frame rate**, which is the compressed-on-the-wire
+    (bandwidth-light) format.
 
-    Returns ``(format, max_fps, cap_frame_duration)`` where ``cap_frame_duration``
-    is the ``CMTime`` for the target fps to pass to
-    ``setActiveVideoMinFrameDuration`` (caps the rate so a well-lit camera doesn't
-    blast 120 fps), or ``None`` when no matching range exists.
+    Rate plan — UVC cameras advertise DISCRETE frame-rate ranges (e.g. exactly
+    ``[30] [25] [20]`` or only ``[60]``), and left to themselves they both
+    exceed the target (a 60-only camera free-runs) and undershoot it
+    (auto-exposure stretches frame duration in dim light). To deliver a fixed
+    rate:
+
+    * a range containing the target → **lock** min *and* max frame duration to
+      that range's duration, so the camera can neither exceed the target nor
+      let auto-exposure drop below it (in dim light the image darkens instead
+      of the rate sagging);
+    * only faster ranges exist (e.g. 60-only) → lock the slowest of them and
+      **pace in software** down to the target (60 → 30 is an exact 2:1 drop);
+    * only slower ranges exist → lock the fastest available; the camera
+      simply cannot reach the target.
+
+    Returns ``(format, max_fps, lock_min_duration, lock_max_duration,
+    pace_to_fps)``. Durations are ``CMTime`` values for
+    ``setActiveVideoMin/MaxFrameDuration`` (or ``None``); ``pace_to_fps`` is a
+    software-decimation target for the frame sink (or ``None``).
     """
     best: Optional[tuple[Any, int, int, float]] = None
     best_key: Optional[tuple[Any, ...]] = None
@@ -123,20 +140,50 @@ def select_capture_format(
             fw == width and fh == height,           # exact match wins
             fw == width,                            # then same width
             -(abs(fw - width) + abs(fh - height)),  # then closest dimensions
-            max_fps,                                # then highest fps (MJPEG-backed)
+            max_fps,                                # then highest fps
         )
         if best_key is None or key > best_key:
             best_key, best = key, (fmt, fw, fh, max_fps)
     if best is None:
-        return None, 0.0, None
+        return None, 0.0, None, None, None
     fmt, _fw, _fh, max_fps = best
-    target = min(30.0, max_fps) if max_fps > 0 else 30.0
-    cap_duration = None
-    for r in fmt.videoSupportedFrameRateRanges():
-        if abs(float(r.maxFrameRate()) - target) < 0.6:
-            cap_duration = r.minFrameDuration()
-            break
-    return fmt, max_fps, cap_duration
+    target = float(fps) if fps and fps > 0 else 30.0
+
+    ranges = list(fmt.videoSupportedFrameRateRanges())
+    tolerance = 0.6
+
+    # 1) A range that contains the target: lock the camera to it exactly.
+    containing = [
+        r
+        for r in ranges
+        if float(r.minFrameRate()) - tolerance
+        <= target
+        <= float(r.maxFrameRate()) + tolerance
+    ]
+    if containing:
+        r = min(containing, key=lambda r: abs(float(r.maxFrameRate()) - target))
+        if abs(float(r.maxFrameRate()) - float(r.minFrameRate())) < 0.01:
+            # Discrete mode — use the camera's own duration for the exact rate.
+            duration = r.minFrameDuration()
+        else:
+            # Continuous range — build the CMTime for the requested target.
+            duration = CM.CMTimeMake(1_000_000, int(round(target * 1_000_000)))
+        return fmt, max_fps, duration, duration, None
+
+    # 2) Only faster ranges: lock the slowest one, decimate in software.
+    faster = [r for r in ranges if float(r.minFrameRate()) > target]
+    if faster:
+        r = min(faster, key=lambda r: float(r.minFrameRate()))
+        # Lowest rate of the range == longest duration.
+        duration = r.maxFrameDuration()
+        return fmt, max_fps, duration, duration, target
+
+    # 3) Only slower ranges: lock the fastest available; target is unreachable.
+    if ranges:
+        r = max(ranges, key=lambda r: float(r.maxFrameRate()))
+        duration = r.minFrameDuration()
+        return fmt, max_fps, duration, duration, None
+    return fmt, max_fps, None, None, None
 
 
 def _resolve_device(AVF: Any, unique_id: Optional[str], index: int) -> Any:
@@ -253,6 +300,10 @@ class NativeAVCapture:
         # shrink the timeouts.
         self._first_frame_timeout_s = 3.0
         self._open_attempts = 3
+        # Software pacing (set by _start_session when the camera can only run
+        # faster than the requested fps): emit at most one frame per period.
+        self._pace_period_ns: Optional[int] = None
+        self._next_due_ns: Optional[int] = None
         self.selected_max_fps: float = 0.0
 
     def start(self) -> None:
@@ -348,8 +399,8 @@ class NativeAVCapture:
         dispatch_queue_create: Any,
         device: Any,
     ) -> None:
-        fmt, max_fps, cap_duration = select_capture_format(
-            device, CM, width=self._width, height=self._height
+        fmt, max_fps, lock_min, lock_max, pace_to = select_capture_format(
+            device, CM, width=self._width, height=self._height, fps=self._fps
         )
         session = AVF.AVCaptureSession.alloc().init()
         session.beginConfiguration()
@@ -377,28 +428,42 @@ class NativeAVCapture:
         if fmt is not None and device.lockForConfiguration_(None):
             try:
                 device.setActiveFormat_(fmt)
-                # Cap the frame RATE (min frame DURATION) so a bright scene can't
-                # push 120 fps; leave the max duration unset so the camera may
-                # still drop below target in low light rather than error.
-                if cap_duration is not None:
-                    device.setActiveVideoMinFrameDuration_(cap_duration)
+                # Pin the frame RATE from both sides: min duration stops a
+                # fast camera from exceeding the target, max duration stops
+                # auto-exposure from stretching frames below it (in dim light
+                # the image darkens instead of the rate sagging — a fixed
+                # cadence matters more than brightness for synced capture).
+                if lock_min is not None:
+                    device.setActiveVideoMinFrameDuration_(lock_min)
+                if lock_max is not None:
+                    device.setActiveVideoMaxFrameDuration_(lock_max)
             finally:
                 device.unlockForConfiguration()
+
+        self._pace_period_ns = (
+            int(1_000_000_000 / pace_to) if pace_to and pace_to > 0 else None
+        )
+        self._next_due_ns = None
 
         session.startRunning()
         self._session = session
         self.selected_max_fps = max_fps
         logger.info(
-            "avfoundation.capture.started unique_id=%s device_index=%s size=%sx%s fmt_max_fps=%.0f",
+            "avfoundation.capture.started unique_id=%s device_index=%s size=%sx%s "
+            "fmt_max_fps=%.0f rate_locked=%s pace_to=%s",
             self._unique_id,
             self._device_index,
             self._width,
             self._height,
             max_fps,
+            lock_min is not None,
+            pace_to,
         )
 
     def _on_frame(self, frame_bgr: np.ndarray, capture_ns: int) -> None:
         self._frames_seen += 1
+        if self._pace_period_ns is not None and not self._accept_paced(capture_ns):
+            return
         try:
             self._queue.put_nowait((frame_bgr, capture_ns))
         except queue.Full:
@@ -412,6 +477,29 @@ class NativeAVCapture:
                 self._queue.put_nowait((frame_bgr, capture_ns))
             except queue.Full:
                 pass
+
+    def _accept_paced(self, capture_ns: int) -> bool:
+        """Software decimation to the target fps (e.g. a 60-only camera → 30).
+
+        Emits one frame per pace period on a fixed schedule so the output
+        cadence is uniform; when the camera runs at or below the target the
+        schedule resyncs to the frame clock and everything passes through.
+        """
+        period = self._pace_period_ns
+        assert period is not None
+        due = self._next_due_ns
+        # Quarter-period slack: camera timestamps jitter (and integer ns
+        # rounding alone can land a frame 1ns early); a frame close enough to
+        # its slot must claim it, or the schedule skips a beat.
+        slack = period // 4
+        if due is not None and capture_ns < due - slack:
+            return False
+        if due is None or capture_ns - due > period:
+            # First frame, or the camera fell behind the schedule — resync.
+            self._next_due_ns = capture_ns + period
+        else:
+            self._next_due_ns = due + period
+        return True
 
     def read(self, timeout: float = 0.5) -> Optional[tuple[np.ndarray, int]]:
         """Block up to ``timeout`` for the next ``(frame_bgr, capture_ns)``; return
