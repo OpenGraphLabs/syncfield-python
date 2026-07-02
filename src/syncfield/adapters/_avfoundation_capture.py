@@ -425,6 +425,23 @@ class NativeAVCapture:
         session.addOutput_(output)
         session.commitConfiguration()
 
+        # Pace to the requested fps UNCONDITIONALLY, not only for faster-only
+        # cameras: pacing passes slower input through untouched and decimates
+        # anything faster, so it is the final guarantee that delivery never
+        # exceeds the target regardless of what the device negotiates.
+        self._pace_period_ns = (
+            int(1_000_000_000 / self._fps) if self._fps > 0 else None
+        )
+        self._next_due_ns = None
+
+        session.startRunning()
+
+        # Configure the device AFTER startRunning: when the session starts it
+        # applies its preset (InputPriority — the iOS escape hatch — is not a
+        # supported preset on macOS), silently OVERWRITING any activeFormat /
+        # frame-duration set beforehand. Verified live: identical locks set
+        # pre-start left two cameras on preset-negotiated 25/20 fps; set
+        # post-start they hold an exact 30 fps.
         if fmt is not None and device.lockForConfiguration_(None):
             try:
                 device.setActiveFormat_(fmt)
@@ -440,17 +457,6 @@ class NativeAVCapture:
             finally:
                 device.unlockForConfiguration()
 
-        # Pace to the requested fps UNCONDITIONALLY, not only for faster-only
-        # cameras: pacing passes slower input through untouched, and some UVC
-        # firmware ignores the committed frame interval entirely (observed: a
-        # camera locked to its own discrete 20fps mode still shipping 25fps).
-        # This is the final guarantee that delivery never exceeds the target.
-        self._pace_period_ns = (
-            int(1_000_000_000 / self._fps) if self._fps > 0 else None
-        )
-        self._next_due_ns = None
-
-        session.startRunning()
         self._session = session
         self.selected_max_fps = max_fps
         logger.info(
