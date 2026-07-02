@@ -222,10 +222,7 @@ class UVCWebcamStream(StreamBase):
         ``"pyav"`` and open that instead, so the worst case is exactly today's
         behaviour.
         """
-        from syncfield.adapters._avfoundation_capture import (
-            AVFoundationUnavailable,
-            NativeAVCapture,
-        )
+        from syncfield.adapters._avfoundation_capture import NativeAVCapture
 
         try:
             capture = NativeAVCapture(
@@ -237,16 +234,27 @@ class UVCWebcamStream(StreamBase):
             )
             capture.start()
             return capture
-        except Exception as exc:  # noqa: BLE001 - any failure => safe PyAV fallback
-            if not isinstance(exc, AVFoundationUnavailable):
+        except Exception as exc:  # noqa: BLE001
+            # When we have a unique_id, the PyAV fallback (which opens by the
+            # positional index) could bind the WRONG physical camera and produce
+            # a one-camera-two-streams state. That must never happen: fail the
+            # stream clearly instead of guessing by index.
+            if self._unique_id:
                 logger.warning(
-                    "avfoundation.start_failed device_index=%s: %r", self._device_index, exc
+                    "avfoundation.open_failed unique_id=%s device_index=%s "
+                    "(no positional fallback with a unique_id): %r",
+                    self._unique_id,
+                    self._device_index,
+                    exc,
                 )
-            else:
-                logger.warning(
-                    "avfoundation.unavailable device_index=%s: %s", self._device_index, exc
-                )
-            logger.warning("uvc.backend_fallback device_index=%s avfoundation -> pyav", self._device_index)
+                raise
+            # No unique_id (legacy / ffmpeg discovery): the positional index is
+            # the only identity we have, so falling back to PyAV is acceptable.
+            logger.warning(
+                "uvc.backend_fallback device_index=%s avfoundation -> pyav (no unique_id): %r",
+                self._device_index,
+                exc,
+            )
             self._backend = "pyav"
             return self._open_pyav_input()
 
