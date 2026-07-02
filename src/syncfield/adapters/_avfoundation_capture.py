@@ -440,8 +440,13 @@ class NativeAVCapture:
             finally:
                 device.unlockForConfiguration()
 
+        # Pace to the requested fps UNCONDITIONALLY, not only for faster-only
+        # cameras: pacing passes slower input through untouched, and some UVC
+        # firmware ignores the committed frame interval entirely (observed: a
+        # camera locked to its own discrete 20fps mode still shipping 25fps).
+        # This is the final guarantee that delivery never exceeds the target.
         self._pace_period_ns = (
-            int(1_000_000_000 / pace_to) if pace_to and pace_to > 0 else None
+            int(1_000_000_000 / self._fps) if self._fps > 0 else None
         )
         self._next_due_ns = None
 
