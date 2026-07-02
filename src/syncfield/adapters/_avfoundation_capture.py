@@ -248,9 +248,23 @@ class NativeAVCapture:
         self._delegate: Any = None
         self._dispatch_queue: Any = None
         self._registered_uid: Optional[str] = None
+        self._frames_seen = 0
+        # First-frame verification knobs — instance attributes so tests can
+        # shrink the timeouts.
+        self._first_frame_timeout_s = 3.0
+        self._open_attempts = 3
         self.selected_max_fps: float = 0.0
 
     def start(self) -> None:
+        """Open the camera and verify it actually delivers frames.
+
+        ``AVCaptureSession`` can come up "running" yet deliver nothing after
+        a rapid stop→start on the same camera (observed on macOS 15 when a
+        stream reconcile reopens several cameras back-to-back). A session
+        that opened without frames is indistinguishable from a healthy one
+        by any status API, so the only reliable check is waiting for the
+        first frame — and rebuilding the session when it never comes.
+        """
         if self._session is not None:
             return
         objc, AVF, CM, Quartz, NSObject, dispatch_queue_create = _load_frameworks()
@@ -261,10 +275,40 @@ class NativeAVCapture:
             )
         self._register_open_device(device)
         try:
-            self._start_session(objc, AVF, CM, Quartz, NSObject, dispatch_queue_create, device)
+            for attempt in range(1, self._open_attempts + 1):
+                baseline = self._frames_seen
+                self._start_session(
+                    objc, AVF, CM, Quartz, NSObject, dispatch_queue_create, device
+                )
+                if self._await_frame_after(baseline, self._first_frame_timeout_s):
+                    return
+                logger.warning(
+                    "avfoundation.no_first_frame unique_id=%s device_index=%s "
+                    "attempt=%d/%d — rebuilding capture session",
+                    self._unique_id,
+                    self._device_index,
+                    attempt,
+                    self._open_attempts,
+                )
+                self._teardown_session()
+                time.sleep(0.5 * attempt)
+            raise AVFoundationUnavailable(
+                f"camera unique_id={self._unique_id!r} device_index="
+                f"{self._device_index} started but delivered no frames after "
+                f"{self._open_attempts} attempts"
+            )
         except BaseException:
+            self._teardown_session()
             self._unregister_open_device()
             raise
+
+    def _await_frame_after(self, baseline: int, timeout: float) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self._frames_seen > baseline:
+                return True
+            time.sleep(0.05)
+        return self._frames_seen > baseline
 
     def _register_open_device(self, device: Any) -> None:
         """Claim the resolved camera in the process-wide open registry.
@@ -354,6 +398,7 @@ class NativeAVCapture:
         )
 
     def _on_frame(self, frame_bgr: np.ndarray, capture_ns: int) -> None:
+        self._frames_seen += 1
         try:
             self._queue.put_nowait((frame_bgr, capture_ns))
         except queue.Full:
@@ -376,7 +421,7 @@ class NativeAVCapture:
         except queue.Empty:
             return None
 
-    def stop(self) -> None:
+    def _teardown_session(self) -> None:
         session, self._session = self._session, None
         if session is not None:
             try:
@@ -385,4 +430,18 @@ class NativeAVCapture:
                 logger.debug("avfoundation.stop_running_failed")
         self._delegate = None
         self._dispatch_queue = None
+
+    def stop(self) -> None:
+        self._teardown_session()
         self._unregister_open_device()
+
+    def restart(self) -> None:
+        """Tear the capture down and reopen it (first-frame verified).
+
+        Used by the capture loop to recover a stalled camera — a session
+        that stops delivering frames mid-run never comes back on its own,
+        but a fresh session on the same device does (verified live).
+        """
+        self.stop()
+        time.sleep(0.5)
+        self.start()

@@ -171,6 +171,12 @@ class UVCWebcamStream(StreamBase):
         self._frame_lock = threading.Lock()
         self._latest_frame: Any = None
 
+        # Stall watchdog (avfoundation backend): a capture session that goes
+        # silent never recovers on its own, but a rebuilt session does. The
+        # thresholds are instance attributes so tests can shrink them.
+        self._stall_timeout_s = 5.0
+        self._max_silent_restarts = 3
+
     @property
     def device_key(self) -> Optional[DeviceKey]:
         """Stable hardware id — the AVFoundation ``unique_id`` when known.
@@ -431,12 +437,61 @@ class UVCWebcamStream(StreamBase):
         exact same preview / recording / timestamp / sample-event handling as the
         PyAV loop. ``read()`` returns ``None`` on timeout so the ``_stop_event``
         is re-checked promptly during teardown.
+
+        Stall watchdog: a session that stops delivering frames mid-run
+        (observed on macOS 15, e.g. after other cameras on the bus reopen)
+        never recovers by itself — but a rebuilt session on the same device
+        does. After ``_stall_timeout_s`` of silence the loop restarts the
+        capture, up to ``_max_silent_restarts`` consecutive times; the
+        counter resets whenever a frame arrives. Exhausting the budget (or a
+        failing restart) surfaces a health ERROR and ends the loop so the
+        stream fails loudly instead of sitting connected-but-dead.
         """
+        last_frame_monotonic = time.monotonic()
+        silent_restarts = 0
         try:
             while not self._stop_event.is_set():
                 item = self._input.read(timeout=0.5)
                 if item is None:
+                    if (time.monotonic() - last_frame_monotonic) < self._stall_timeout_s:
+                        continue
+                    if silent_restarts >= self._max_silent_restarts:
+                        self._emit_health(
+                            HealthEvent(
+                                stream_id=self.id,
+                                kind=HealthEventKind.ERROR,
+                                at_ns=time.monotonic_ns(),
+                                detail=(
+                                    "camera delivered no frames after "
+                                    f"{silent_restarts} capture restarts — giving up"
+                                ),
+                            )
+                        )
+                        return
+                    silent_restarts += 1
+                    self._emit_health(
+                        HealthEvent(
+                            stream_id=self.id,
+                            kind=HealthEventKind.RECONNECT,
+                            at_ns=time.monotonic_ns(),
+                            detail=(
+                                f"no frames for {self._stall_timeout_s:.0f}s — "
+                                f"restarting capture ({silent_restarts}/"
+                                f"{self._max_silent_restarts})"
+                            ),
+                        )
+                    )
+                    logger.warning(
+                        "uvc.stall_restart stream=%s attempt=%d/%d",
+                        self.id,
+                        silent_restarts,
+                        self._max_silent_restarts,
+                    )
+                    self._input.restart()
+                    last_frame_monotonic = time.monotonic()
                     continue
+                last_frame_monotonic = time.monotonic()
+                silent_restarts = 0
                 frame_bgr, capture_ns = item
                 if self._recording:
                     # UVC has no device clock — pass None for device_ns.

@@ -235,3 +235,59 @@ def test_stop_unregisters_even_without_session(_clean_registry) -> None:
     cap.stop()
     fresh = NativeAVCapture(device_index=0, width=1280, height=720, fps=30.0)
     fresh._register_open_device(_RegDevice("UID_A"))  # released by stop()
+
+
+# --- first-frame verification ------------------------------------------------
+
+
+def test_start_raises_and_releases_registry_when_no_frames_arrive(
+    monkeypatch, _clean_registry
+) -> None:
+    from syncfield.adapters import _avfoundation_capture as mod
+
+    cap = mod.NativeAVCapture(
+        device_index=0, width=640, height=360, fps=30.0, unique_id="UID_X"
+    )
+    cap._first_frame_timeout_s = 0.05
+    cap._open_attempts = 2
+    monkeypatch.setattr(mod, "_load_frameworks", lambda: (None,) * 6)
+    monkeypatch.setattr(
+        mod, "_resolve_device", lambda _avf, _uid, _idx: _RegDevice("UID_X")
+    )
+    starts: list[int] = []
+    monkeypatch.setattr(
+        cap,
+        "_start_session",
+        lambda *a, **k: starts.append(1),
+        raising=False,
+    )
+
+    with pytest.raises(AVFoundationUnavailable, match="no frames"):
+        cap.start()
+
+    assert len(starts) == 2  # every attempt rebuilt the session
+    # The registry slot must be released so a later open can claim the camera.
+    fresh = mod.NativeAVCapture(device_index=0, width=640, height=360, fps=30.0)
+    fresh._register_open_device(_RegDevice("UID_X"))  # must not raise
+
+
+def test_start_returns_once_first_frame_is_seen(monkeypatch, _clean_registry) -> None:
+    from syncfield.adapters import _avfoundation_capture as mod
+
+    cap = mod.NativeAVCapture(
+        device_index=0, width=640, height=360, fps=30.0, unique_id="UID_X"
+    )
+    cap._first_frame_timeout_s = 0.5
+
+    def fake_start_session(*_a, **_k):
+        cap._frames_seen += 1  # frames flowing immediately
+
+    monkeypatch.setattr(mod, "_load_frameworks", lambda: (None,) * 6)
+    monkeypatch.setattr(
+        mod, "_resolve_device", lambda _avf, _uid, _idx: _RegDevice("UID_X")
+    )
+    monkeypatch.setattr(cap, "_start_session", fake_start_session, raising=False)
+
+    cap.start()
+
+    assert cap._registered_uid == "UID_X"

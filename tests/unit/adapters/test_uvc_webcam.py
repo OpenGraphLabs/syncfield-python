@@ -458,3 +458,89 @@ def test_orchestrator_add_rejects_two_streams_on_one_camera(tmp_path):
                 "cam_b", device_index=2, output_dir=tmp_path, unique_id="0xSAME"
             )
         )
+
+
+class _FakeStallInput:
+    """Fake NativeAVCapture: silent until restarted (optionally forever)."""
+
+    def __init__(self, recovers: bool = True) -> None:
+        self.restarts = 0
+        self._deliver = False
+        self._recovers = recovers
+
+    def read(self, timeout: float = 0.5):
+        import time as _time
+
+        import numpy as _np
+
+        _time.sleep(0.005)
+        if self._deliver:
+            return (_np.zeros((2, 2, 3), dtype=_np.uint8), _time.monotonic_ns())
+        return None
+
+    def restart(self) -> None:
+        self.restarts += 1
+        if self._recovers:
+            self._deliver = True
+
+    def stop(self) -> None:
+        pass
+
+
+def _run_avf_loop(stream, timeout_s: float = 5.0, until=None):
+    import threading
+    import time as _time
+
+    thread = threading.Thread(target=stream._capture_loop_avfoundation)
+    thread.start()
+    deadline = _time.time() + timeout_s
+    while _time.time() < deadline:
+        if until is not None and until():
+            break
+        if not thread.is_alive():
+            break
+        _time.sleep(0.01)
+    stream._stop_event.set()
+    thread.join(timeout=2.0)
+    assert not thread.is_alive()
+
+
+def test_avfoundation_stalled_capture_is_restarted(tmp_path):
+    """A silent capture session must be rebuilt, not waited on forever."""
+    from syncfield.adapters.uvc_webcam import UVCWebcamStream
+
+    stream = UVCWebcamStream(
+        "cam", device_index=0, output_dir=tmp_path, backend="avfoundation"
+    )
+    stream._stall_timeout_s = 0.05
+    stream._input = _FakeStallInput(recovers=True)
+    stream._stop_event.clear()
+
+    _run_avf_loop(stream, until=lambda: stream.latest_frame is not None)
+
+    assert stream._input.restarts == 1
+    assert stream.latest_frame is not None
+
+
+def test_avfoundation_stall_watchdog_gives_up_loudly(tmp_path):
+    """Restart budget exhausted → health ERROR, loop exits (no zombie stream)."""
+    from syncfield.adapters.uvc_webcam import UVCWebcamStream
+    from syncfield.types import HealthEventKind
+
+    stream = UVCWebcamStream(
+        "cam", device_index=0, output_dir=tmp_path, backend="avfoundation"
+    )
+    stream._stall_timeout_s = 0.03
+    stream._max_silent_restarts = 2
+    stream._input = _FakeStallInput(recovers=False)
+    stream._stop_event.clear()
+    events = []
+    stream.on_health(events.append)
+
+    _run_avf_loop(stream)
+
+    assert stream._input.restarts == 2
+    errors = [e for e in events if e.kind is HealthEventKind.ERROR]
+    assert errors and "giving up" in errors[-1].detail
+    reconnects = [e for e in events if e.kind is HealthEventKind.RECONNECT]
+    assert len(reconnects) == 2
