@@ -34,12 +34,21 @@ from __future__ import annotations
 
 import logging
 import queue
+import threading
 import time
 from typing import Any, Optional
 
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+# Process-wide registry of cameras currently opened by a NativeAVCapture.
+# macOS happily lets two AVCaptureSessions share one camera, silently
+# producing the identical stream twice — the exact one-camera-two-streams
+# state the capture pipeline must never enter. The registry turns that
+# silent duplication into a loud AVFoundationUnavailable at open time.
+_OPEN_UNIQUE_IDS: dict[str, str] = {}
+_OPEN_UNIQUE_IDS_LOCK = threading.Lock()
 
 # Screen-capture pseudo devices AVFoundation lists alongside cameras; excluded so
 # our positional index matches the app-side ``discover_av_devices`` enumeration.
@@ -238,15 +247,63 @@ class NativeAVCapture:
         self._session: Any = None
         self._delegate: Any = None
         self._dispatch_queue: Any = None
+        self._registered_uid: Optional[str] = None
         self.selected_max_fps: float = 0.0
 
     def start(self) -> None:
+        if self._session is not None:
+            return
         objc, AVF, CM, Quartz, NSObject, dispatch_queue_create = _load_frameworks()
         device = _resolve_device(AVF, self._unique_id, self._device_index)
         if device is None:
             raise AVFoundationUnavailable(
                 f"no AVFoundation camera at index {self._device_index}"
             )
+        self._register_open_device(device)
+        try:
+            self._start_session(objc, AVF, CM, Quartz, NSObject, dispatch_queue_create, device)
+        except BaseException:
+            self._unregister_open_device()
+            raise
+
+    def _register_open_device(self, device: Any) -> None:
+        """Claim the resolved camera in the process-wide open registry.
+
+        Registration uses the device's own ``uniqueID`` (not the requested
+        ``unique_id``) so positional-index opens are covered too.
+        """
+        uid = str(device.uniqueID() or "") or None
+        if uid is None:
+            return
+        owner = f"index={self._device_index} name={device.localizedName()!r}"
+        with _OPEN_UNIQUE_IDS_LOCK:
+            existing = _OPEN_UNIQUE_IDS.get(uid)
+            if existing is not None:
+                raise AVFoundationUnavailable(
+                    f"camera unique_id={uid!r} is already opened in this process "
+                    f"({existing}) — refusing to bind the same physical camera "
+                    "to a second stream"
+                )
+            _OPEN_UNIQUE_IDS[uid] = owner
+        self._registered_uid = uid
+
+    def _unregister_open_device(self) -> None:
+        uid, self._registered_uid = self._registered_uid, None
+        if uid is None:
+            return
+        with _OPEN_UNIQUE_IDS_LOCK:
+            _OPEN_UNIQUE_IDS.pop(uid, None)
+
+    def _start_session(
+        self,
+        objc: Any,
+        AVF: Any,
+        CM: Any,
+        Quartz: Any,
+        NSObject: Any,
+        dispatch_queue_create: Any,
+        device: Any,
+    ) -> None:
         fmt, max_fps, cap_duration = select_capture_format(
             device, CM, width=self._width, height=self._height
         )
@@ -328,3 +385,4 @@ class NativeAVCapture:
                 logger.debug("avfoundation.stop_running_failed")
         self._delegate = None
         self._dispatch_queue = None
+        self._unregister_open_device()

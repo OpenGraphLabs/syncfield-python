@@ -173,8 +173,16 @@ class UVCWebcamStream(StreamBase):
 
     @property
     def device_key(self) -> Optional[DeviceKey]:
-        """``("uvc_webcam", str(device_index))`` — stable hardware id."""
-        return ("uvc_webcam", str(self._device_index))
+        """Stable hardware id — the AVFoundation ``unique_id`` when known.
+
+        Two streams pointing at one physical camera must collide on this key
+        so :meth:`SessionOrchestrator.add` rejects the second one. The
+        positional index cannot provide that guarantee (different enumeration
+        orders assign the same index to different cameras), so it is only the
+        fallback identity for legacy streams constructed without a
+        ``unique_id``.
+        """
+        return ("uvc_webcam", self._unique_id or str(self._device_index))
 
     def set_output_name(self, output_name: str) -> None:
         """Update the recorded-file stem without touching the live stream.

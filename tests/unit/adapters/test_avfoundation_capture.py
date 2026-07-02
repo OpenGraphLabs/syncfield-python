@@ -166,3 +166,72 @@ def test_bgr_from_pixel_buffer_drops_alpha_and_row_padding() -> None:
     assert list(arr[0, 0]) == [0, 1, 2]
     # Second row starts at byte 12 (stride), not 8 — proves padding is respected.
     assert list(arr[1, 0]) == [12, 13, 14]
+
+
+# --- duplicate-open registry ------------------------------------------------
+
+
+class _RegDevice:
+    def __init__(self, uid: str, name: str = "cam") -> None:
+        self._uid = uid
+        self._name = name
+
+    def uniqueID(self):  # noqa: N802 - ObjC selector name
+        return self._uid
+
+    def localizedName(self):  # noqa: N802 - ObjC selector name
+        return self._name
+
+
+@pytest.fixture()
+def _clean_registry():
+    from syncfield.adapters import _avfoundation_capture as mod
+
+    with mod._OPEN_UNIQUE_IDS_LOCK:
+        mod._OPEN_UNIQUE_IDS.clear()
+    yield
+    with mod._OPEN_UNIQUE_IDS_LOCK:
+        mod._OPEN_UNIQUE_IDS.clear()
+
+
+def test_second_open_of_same_camera_is_rejected(_clean_registry) -> None:
+    from syncfield.adapters._avfoundation_capture import NativeAVCapture
+
+    first = NativeAVCapture(device_index=0, width=1280, height=720, fps=30.0)
+    second = NativeAVCapture(device_index=1, width=1280, height=720, fps=30.0)
+    first._register_open_device(_RegDevice("UID_A"))
+    with pytest.raises(AVFoundationUnavailable, match="already opened"):
+        second._register_open_device(_RegDevice("UID_A"))
+
+
+def test_registry_releases_camera_on_unregister(_clean_registry) -> None:
+    from syncfield.adapters._avfoundation_capture import NativeAVCapture
+
+    first = NativeAVCapture(device_index=0, width=1280, height=720, fps=30.0)
+    first._register_open_device(_RegDevice("UID_A"))
+    first._unregister_open_device()
+
+    second = NativeAVCapture(device_index=1, width=1280, height=720, fps=30.0)
+    second._register_open_device(_RegDevice("UID_A"))  # must not raise
+    assert second._registered_uid == "UID_A"
+
+
+def test_distinct_cameras_register_concurrently(_clean_registry) -> None:
+    from syncfield.adapters._avfoundation_capture import NativeAVCapture
+
+    a = NativeAVCapture(device_index=0, width=1280, height=720, fps=30.0)
+    b = NativeAVCapture(device_index=1, width=1280, height=720, fps=30.0)
+    a._register_open_device(_RegDevice("UID_A"))
+    b._register_open_device(_RegDevice("UID_B"))
+    assert a._registered_uid == "UID_A"
+    assert b._registered_uid == "UID_B"
+
+
+def test_stop_unregisters_even_without_session(_clean_registry) -> None:
+    from syncfield.adapters._avfoundation_capture import NativeAVCapture
+
+    cap = NativeAVCapture(device_index=0, width=1280, height=720, fps=30.0)
+    cap._register_open_device(_RegDevice("UID_A"))
+    cap.stop()
+    fresh = NativeAVCapture(device_index=0, width=1280, height=720, fps=30.0)
+    fresh._register_open_device(_RegDevice("UID_A"))  # released by stop()

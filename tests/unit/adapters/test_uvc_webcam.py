@@ -426,3 +426,35 @@ class TestRecordingAnchor:
         assert report.recording_anchor.first_frame_host_ns >= armed_ns
         # KEY DIFFERENCE from OAK: UVC has no device clock.
         assert report.recording_anchor.first_frame_device_ns is None
+
+
+def test_device_key_prefers_unique_id(tmp_path):
+    from syncfield.adapters.uvc_webcam import UVCWebcamStream
+
+    with_uid = UVCWebcamStream(
+        "cam_a", device_index=0, output_dir=tmp_path, unique_id="0xAABB"
+    )
+    assert with_uid.device_key == ("uvc_webcam", "0xAABB")
+
+    # Legacy streams without a unique_id keep the positional identity.
+    without_uid = UVCWebcamStream("cam_b", device_index=3, output_dir=tmp_path)
+    assert without_uid.device_key == ("uvc_webcam", "3")
+
+
+def test_orchestrator_add_rejects_two_streams_on_one_camera(tmp_path):
+    """Two streams resolving to one physical camera must not both register."""
+    import pytest
+
+    from syncfield.adapters.uvc_webcam import UVCWebcamStream
+    from syncfield.orchestrator import SessionOrchestrator
+
+    session = SessionOrchestrator(host_id="test", output_dir=tmp_path)
+    session.add(
+        UVCWebcamStream("cam_a", device_index=1, output_dir=tmp_path, unique_id="0xSAME")
+    )
+    with pytest.raises(ValueError, match="already registered"):
+        session.add(
+            UVCWebcamStream(
+                "cam_b", device_index=2, output_dir=tmp_path, unique_id="0xSAME"
+            )
+        )
