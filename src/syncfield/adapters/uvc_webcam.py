@@ -109,6 +109,7 @@ class UVCWebcamStream(StreamBase):
         backend: str = "pyav",
         pixel_format: Optional[str] = None,
         unique_id: Optional[str] = None,
+        output_name: Optional[str] = None,
     ) -> None:
         if backend not in ("pyav", "opencv", "avfoundation"):
             raise ValueError(
@@ -142,7 +143,11 @@ class UVCWebcamStream(StreamBase):
 
         self._input: Any = None
         self._encoder: Optional[VideoEncoder] = None
-        self._file_path = self._output_dir / f"{id}.mp4"
+        # Recorded file is named after ``output_name`` (the human alias) when
+        # given, falling back to the stream id. The id keys the live stream; the
+        # filename is a separate, renameable concern.
+        self._output_stem = str(output_name) if output_name else str(id)
+        self._file_path = self._output_dir / f"{self._output_stem}.mp4"
 
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
@@ -170,6 +175,21 @@ class UVCWebcamStream(StreamBase):
     def device_key(self) -> Optional[DeviceKey]:
         """``("uvc_webcam", str(device_index))`` — stable hardware id."""
         return ("uvc_webcam", str(self._device_index))
+
+    def set_output_name(self, output_name: str) -> None:
+        """Update the recorded-file stem without touching the live stream.
+
+        Lets a rename during preview relabel the next recording while the camera
+        keeps running. Ignored once recording has started so an in-flight file is
+        never renamed out from under the encoder.
+        """
+        if self._recording:
+            return
+        stem = str(output_name).strip()
+        if not stem:
+            return
+        self._output_stem = stem
+        self._file_path = self._output_dir / f"{stem}.mp4"
 
     # ------------------------------------------------------------------
     # Stream SPI — 4-phase lifecycle

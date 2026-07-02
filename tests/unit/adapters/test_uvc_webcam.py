@@ -90,6 +90,32 @@ def test_prepare_falls_back_to_auto_when_pixel_format_rejected(mock_av, tmp_path
     assert stream._input is input_container
 
 
+def test_output_name_sets_recorded_file_stem(mock_av, tmp_path):
+    """The recorded file is named after ``output_name`` (the human alias), while
+    the stream is still keyed by its id."""
+    from syncfield.adapters.uvc_webcam import UVCWebcamStream
+
+    stream = UVCWebcamStream(
+        "uvc_webcam_0", device_index=0, output_dir=tmp_path, output_name="ego_left"
+    )
+    assert stream._file_path.name == "ego_left.mp4"
+
+
+def test_set_output_name_relabels_before_recording_and_is_ignored_during(mock_av, tmp_path):
+    from syncfield.adapters.uvc_webcam import UVCWebcamStream
+
+    stream = UVCWebcamStream("uvc_webcam_0", device_index=0, output_dir=tmp_path)
+    assert stream._file_path.name == "uvc_webcam_0.mp4"  # defaults to id
+
+    stream.set_output_name("ego_right")
+    assert stream._file_path.name == "ego_right.mp4"
+
+    # A rename mid-recording must not move the file under the encoder.
+    stream._recording = True
+    stream.set_output_name("too_late")
+    assert stream._file_path.name == "ego_right.mp4"
+
+
 def test_avfoundation_backend_falls_back_to_pyav_when_unavailable(
     mock_av, tmp_path, monkeypatch
 ):
