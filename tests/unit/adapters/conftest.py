@@ -84,6 +84,7 @@ _AV_DEPENDENT_MODULES = (
     "syncfield.adapters._video_encoder",
     "syncfield.adapters.uvc_webcam",
     "syncfield.adapters.oak_camera",
+    "syncfield.adapters.oak_rgb_depth",
 )
 
 
@@ -98,10 +99,20 @@ def _install_fake_av(
     for mod in _AV_DEPENDENT_MODULES:
         sys.modules.pop(mod, None)
     import syncfield.adapters as _adapters_pkg
-    # Remove parent-package attribute cache so the next ``from syncfield.adapters
-    # import _video_encoder`` re-resolves and binds to the fake ``av``.
-    for attr in ("_video_encoder", "uvc_webcam", "oak_camera"):
-        monkeypatch.delattr(_adapters_pkg, attr, raising=False)
+    # Remove the parent-package attribute cache for every evicted submodule so
+    # the next ``from syncfield.adapters import <submod>`` re-resolves against
+    # the freshly-reimported ``sys.modules`` entry instead of a stale attribute.
+    #
+    # This MUST cover the same set as ``_AV_DEPENDENT_MODULES`` (derived below,
+    # not hand-listed): ``from pkg import submod`` reads the package *attribute*
+    # first and only falls back to ``sys.modules`` when the attribute is absent.
+    # If a submodule is popped from ``sys.modules`` (fresh reimport) but its
+    # stale package attribute survives, the two import forms diverge — a test
+    # that patches ``pkg.submod`` (attribute path) then constructs a class from
+    # ``pkg.submod.Cls`` (sys.modules path) patches a different module object
+    # than the class actually uses, and the patch silently no-ops.
+    for _full in _AV_DEPENDENT_MODULES:
+        monkeypatch.delattr(_adapters_pkg, _full.rsplit(".", 1)[-1], raising=False)
     importlib.import_module("syncfield.adapters._video_encoder")
     return SimpleNamespace(
         av=av,

@@ -164,6 +164,22 @@ def __getattr__(name: str):
         globals()["OakCameraStream"] = OakCameraStream
         return OakCameraStream
 
+    if name == "OakRgbDepthStream":
+        # RGB + optional-depth minimal adapter. Importable for callers that
+        # want the .depth.bin path, but NOT auto-registered as a discoverer —
+        # OakCameraStream (the full composite) is the canonical OAK adapter, so
+        # registering both would double-list every attached OAK.
+        try:
+            from syncfield.adapters.oak_rgb_depth import OakRgbDepthStream
+        except ImportError as e:
+            raise _missing_extra_error(
+                "OakRgbDepthStream", "oak", "depthai + av + numpy", str(e)
+            ) from e
+        globals()["OakRgbDepthStream"] = OakRgbDepthStream
+        if "OakRgbDepthStream" not in __all__:
+            __all__.append("OakRgbDepthStream")
+        return OakRgbDepthStream
+
     hint = _MISSING_HINTS.get(name)
     if hint is not None:
         extra, deps, err = hint
@@ -173,4 +189,8 @@ def __getattr__(name: str):
 
 def __dir__() -> list[str]:
     """Surface lazy / missing-extra adapters to dir() and tab completion."""
-    return sorted(set(__all__) | set(_MISSING_HINTS.keys()) | {"OakCameraStream"})
+    return sorted(
+        set(__all__)
+        | set(_MISSING_HINTS.keys())
+        | {"OakCameraStream", "OakRgbDepthStream"}
+    )

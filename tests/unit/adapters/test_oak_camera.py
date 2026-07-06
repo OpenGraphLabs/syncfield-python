@@ -1,562 +1,886 @@
-"""Unit tests for OakCameraStream using a mocked depthai module."""
-
 from __future__ import annotations
 
 import importlib
+import io
+import json
 import sys
-import time
-from unittest.mock import MagicMock
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
-import numpy as np
 import pytest
-
-from syncfield.clock import SessionClock
-from syncfield.types import SampleEvent, SyncPoint
-
-
-def _clock() -> SessionClock:
-    return SessionClock(sync_point=SyncPoint.create_now("h"))
-
-
-def _build_fake_depthai() -> MagicMock:
-    """Return a MagicMock that looks enough like depthai for the adapter.
-
-    Models the depthai v3 pipeline API: Pipeline.build() / start() / stop(),
-    Camera node with requestOutput() → OutputQueue.get() → ImgFrame-like
-    object exposing .getCvFrame() and .getTimestamp().
-
-    Covers both OAK encoding modes:
-
-    * ``"raw"`` legacy path — Camera → BGR frames direct into the
-      capture loop. The main ``rgb_queue`` yields ``_FakeFrame`` objects
-      whose ``.getCvFrame()`` returns a real 1080p zero BGR array.
-    * ``"h264"`` default path — Camera → VideoEncoder → encoded packets
-      that expose ``.getData()`` returning a short fake Annex-B buffer,
-      plus a parallel low-res BGR preview queue. ``pipeline.create`` is
-      given a side_effect so the VideoEncoder node is a distinct mock
-      and exposes a distinct ``.out.createOutputQueue`` wired to the
-      encoded-packet queue.
-
-    The fake queues return unlimited streams — in the 4-phase lifecycle
-    the capture loop runs across both preview (``connect()``) and
-    recording (``start_recording()``), so a fixed budget would get
-    consumed before any recording happens. Tests that want to exercise
-    "queue drains" swap in a narrower side_effect manually.
-    """
-    fake = MagicMock()
-
-    # --- Fake frame object with numpy-shaped data ------------------------
-    class _FakeFrame:
-        def __init__(self) -> None:
-            # Real BGR ndarray so the real VideoEncoder.write() path
-            # (via av.VideoFrame.from_ndarray) accepts it cleanly.
-            self._cv_frame = np.zeros((1080, 1920, 3), dtype=np.uint8)
-
-        def getCvFrame(self) -> np.ndarray:
-            return self._cv_frame
-
-    class _FakeEncodedPacket:
-        """Mimics a dai ``EncodedFrame`` with a short fake Annex-B payload.
-
-        The exact bytes don't matter for unit tests — the adapter only
-        writes them to a raw file and (in real hardware runs) lets PyAV
-        demux them. The on-device test relies on real bitstreams.
-        """
-
-        _FAKE_NAL = b"\x00\x00\x00\x01\x67\x42\x00\x00"  # SPS start marker
-
-        def getData(self) -> bytes:
-            return self._FAKE_NAL
-
-    # --- Fake output queues: unlimited streams --------------------------
-    def make_queue(payload_factory) -> MagicMock:
-        q = MagicMock()
-        q.get.side_effect = lambda timeout=0.1: payload_factory()
-        q.tryGet.return_value = None
-        return q
-
-    rgb_queue = make_queue(_FakeFrame)  # raw mode main queue
-    encoded_queue = make_queue(_FakeEncodedPacket)  # h264 main queue
-    preview_queue = make_queue(_FakeFrame)  # h264 preview queue
-    preview_queue.tryGet.side_effect = lambda: _FakeFrame()
-
-    # --- Fake Camera node -----------------------------------------------
-    camera_node = MagicMock()
-    # Each requestOutput() call returns the same Node.Output mock whose
-    # createOutputQueue() returns ``rgb_queue`` in raw mode and
-    # ``preview_queue`` in h264 mode (since the encoder path uses the
-    # encoder's own ``.out`` for its queue, this queue serves the
-    # viewer preview branch). The adapter calls createOutputQueue once
-    # per branch; MagicMock returns the same value on repeat calls.
-    camera_output = MagicMock(name="CameraOutput")
-    camera_node.requestOutput.return_value = camera_output
-    # Raw mode's queue; h264 preview mode reuses the same factory
-    # because the adapter only reads via ``getCvFrame`` / ``tryGet``.
-    camera_output.createOutputQueue.return_value = rgb_queue
-
-    # --- Fake VideoEncoder node -----------------------------------------
-    encoder_node = MagicMock(name="VideoEncoder")
-    encoder_node.out.createOutputQueue.return_value = encoded_queue
-
-    # --- Fake StereoDepth node ------------------------------------------
-    stereo_node = MagicMock(name="StereoDepth")
-
-    # --- Fake pipeline dispatch on node class ---------------------------
-    pipeline = MagicMock()
-
-    def _pipeline_create(node_cls):  # noqa: ANN001 - MagicMock signature
-        if node_cls is fake.node.VideoEncoder:
-            # Reroute the Camera→encoder link target: if the adapter
-            # later calls createOutputQueue on ``camera_output`` while
-            # building the h264 branch, reroute it to ``preview_queue``
-            # so the preview branch gets a distinct queue from the
-            # encoded one. First call was already for the encoder
-            # input; subsequent calls are for the preview branch.
-            camera_output.createOutputQueue.return_value = preview_queue
-            return encoder_node
-        if node_cls is fake.node.StereoDepth:
-            return stereo_node
-        return camera_node
-
-    pipeline.create.side_effect = _pipeline_create
-    pipeline.getDefaultDevice.return_value.getUsbSpeed.return_value = MagicMock(
-        name="SUPER", value=3
-    )
-
-    fake.Pipeline.return_value = pipeline
-
-    # dai.node namespace — sentinels used in pipeline.create() dispatch.
-    # Using small concrete types keeps ``is`` comparisons stable across
-    # repeated attribute access. StereoDepth needs a nested ``PresetMode``
-    # attribute because the adapter reads ``PresetMode.HIGH_DETAIL`` when
-    # wiring the depth branch.
-    fake.node = MagicMock()
-    fake.node.Camera = type("Camera", (), {})
-    fake.node.VideoEncoder = type("VideoEncoder", (), {})
-
-    class _FakeStereoDepth:
-        class PresetMode:
-            HIGH_DETAIL = object()
-
-    fake.node.StereoDepth = _FakeStereoDepth
-
-    # dai.Device.getAllAvailableDevices()
-    fake.Device.getAllAvailableDevices.return_value = [MagicMock()]
-
-    # dai.ImgFrame.Type sentinels
-    fake.ImgFrame.Type.BGR888p = "BGR888p"
-    fake.ImgFrame.Type.NV12 = "NV12"
-
-    # dai.VideoEncoderProperties.Profile sentinels
-    fake.VideoEncoderProperties.Profile.H264_MAIN = "H264_MAIN"
-
-    # dai.UsbSpeed.SUPER sentinel (for USB-speed warning branch)
-    fake.UsbSpeed.SUPER = MagicMock(value=3)
-
-    return fake
 
 
 @pytest.fixture
-def mock_depthai(monkeypatch):
-    """Patch ``sys.modules['depthai']`` with a fake pipeline.
+def oak_camera_module() -> Any:
+    # depthai is a real installed dependency in the SDK test env, so the
+    # module imports directly. Pipeline tests monkeypatch this module's ``dai``
+    # attribute with a fake locally; there is no global sys.modules swap (which
+    # would pollute the shared depthai module for the other OAK test files).
+    pytest.importorskip("depthai")
+    from syncfield.adapters import oak_camera
 
-    OAK tests that exercise the recording path must also inject
-    ``mock_av_generous`` (from ``conftest.py``) so the shared
-    ``VideoEncoder`` sees a fake ``av`` module.
-    """
-    fake = _build_fake_depthai()
-    monkeypatch.setitem(sys.modules, "depthai", fake)
-    sys.modules.pop("syncfield.adapters.oak_camera", None)
-    yield fake
-    sys.modules.pop("syncfield.adapters.oak_camera", None)
+    return oak_camera
 
 
-class TestCapabilities:
-    def test_capabilities(self, mock_depthai, mock_av_generous, tmp_path):
-        from syncfield.adapters.oak_camera import OakCameraStream
+def test_h264_annex_b_parser_finds_parameter_sets_and_idr(oak_camera_module: Any) -> None:
+    data = b"\x00\x00\x00\x01\x67sps\x00\x00\x01\x68pps\x00\x00\x00\x01\x65idr"
 
-        stream = OakCameraStream("oak", output_dir=tmp_path)
-        assert stream.capabilities.produces_file is True
-        assert stream.capabilities.provides_audio_track is False
-        assert stream.capabilities.is_removable is True
-        assert stream.capabilities.supports_precise_timestamps is True
-        assert stream.kind == "video"
-
-
-class TestLifecycle:
-    """Exercise the 4-phase connect → start_recording → stop_recording → disconnect path.
-
-    In 0.2 the pipeline build moved from ``prepare()`` into
-    ``connect()`` so the viewer can show a live preview before Record
-    is pressed. These tests pin that split down.
-    """
-
-    def test_connect_builds_and_starts_pipeline(
-        self, mock_depthai, mock_av_generous, tmp_path
-    ):
-        fake = mock_depthai
-        from syncfield.adapters.oak_camera import OakCameraStream
-
-        stream = OakCameraStream("oak", output_dir=tmp_path)
-        stream.prepare()
-        # prepare() no longer opens the pipeline — only connect() does.
-        assert fake.Pipeline.call_count == 0
-
-        stream.connect()
-        # Give the capture thread a moment to pull a frame or two.
-        time.sleep(0.05)
-        try:
-            fake.Pipeline.assert_called_once()
-            pipeline = fake.Pipeline.return_value
-            assert pipeline.build.called
-            assert pipeline.start.called
-        finally:
-            stream.disconnect()
-
-    def test_connect_raises_when_no_devices(
-        self, mock_depthai, mock_av_generous, tmp_path
-    ):
-        fake = mock_depthai
-        fake.Device.getAllAvailableDevices.return_value = []
-        from syncfield.adapters.oak_camera import OakCameraStream
-
-        stream = OakCameraStream("oak", output_dir=tmp_path)
-        stream.prepare()
-        with pytest.raises(RuntimeError, match="No OAK devices"):
-            stream.connect()
-
-    def test_full_lifecycle_produces_file_path(
-        self, mock_depthai, mock_av_generous, tmp_path
-    ):
-        from syncfield.adapters.oak_camera import OakCameraStream
-
-        stream = OakCameraStream("oak", output_dir=tmp_path)
-        stream.prepare()
-        stream.connect()
-        stream.start_recording(_clock())
-        # Give the background thread time to read the mocked frames
-        time.sleep(0.15)
-        report = stream.stop_recording()
-        stream.disconnect()
-
-        assert report.status == "completed"
-        assert report.file_path is not None
-        assert report.frame_count >= 1
-
-    def test_disconnect_releases_pipeline(
-        self, mock_depthai, mock_av_generous, tmp_path
-    ):
-        fake = mock_depthai
-        from syncfield.adapters.oak_camera import OakCameraStream
-
-        stream = OakCameraStream("oak", output_dir=tmp_path)
-        stream.prepare()
-        stream.connect()
-        time.sleep(0.05)
-        stream.disconnect()
-
-        pipeline = fake.Pipeline.return_value
-        assert pipeline.stop.called
-
-    def test_legacy_start_stop_still_works(
-        self, mock_depthai, mock_av_generous, tmp_path
-    ):
-        """Old 0.1-era ``prepare() → start() → stop()`` path stays valid."""
-        from syncfield.adapters.oak_camera import OakCameraStream
-
-        stream = OakCameraStream("oak", output_dir=tmp_path)
-        stream.prepare()
-        stream.start(_clock())
-        time.sleep(0.15)
-        report = stream.stop()
-
-        assert report.status == "completed"
-        assert report.file_path is not None
-        assert report.frame_count >= 1
+    assert oak_camera_module._iter_h264_annex_b_nalus(data) == (
+        (7, b"\x00\x00\x00\x01\x67sps"),
+        (8, b"\x00\x00\x01\x68pps"),
+        (5, b"\x00\x00\x00\x01\x65idr"),
+    )
+    assert oak_camera_module._contains_h264_parameter_sets(data)
+    assert oak_camera_module._contains_h264_nal_type(data, 5)
 
 
-class TestDepthOption:
-    def test_depth_enabled_declares_depth_output(
-        self, mock_depthai, mock_av_generous, tmp_path
-    ):
-        """When depth_enabled=True the pipeline builds a StereoDepth node."""
-        fake = mock_depthai
-        from syncfield.adapters.oak_camera import OakCameraStream
+def test_h264_encoder_segment_tuning_uses_short_keyframe_period(
+    oak_camera_module: Any,
+) -> None:
+    calls: list[tuple[str, int]] = []
 
-        stream = OakCameraStream(
-            "oak_d",
-            output_dir=tmp_path,
-            depth_enabled=True,
+    class Encoder:
+        def setNumBFrames(self, value: int) -> None:
+            calls.append(("bframes", value))
+
+        def setKeyframeFrequency(self, value: int) -> None:
+            calls.append(("keyframes", value))
+
+    oak_camera_module._configure_h264_encoder_for_segmented_recording(Encoder(), 30)
+
+    assert calls == [("bframes", 0), ("keyframes", 5)]
+
+
+class _FakeSessionClock:
+    """Minimal SessionClock stand-in — _begin_recording_window only reads
+    ``recording_armed_ns``."""
+
+    recording_armed_ns = None
+
+
+class _EmptyQueue:
+    """Stand-in for a live pipeline output queue that yields no packets."""
+
+    def tryGet(self) -> None:
+        return None
+
+    def tryGetAll(self) -> list[Any]:
+        return []
+
+
+class _Timestamp:
+    def __init__(self, seconds: float = 42.0) -> None:
+        self._seconds = seconds
+
+    def total_seconds(self) -> float:
+        return self._seconds
+
+
+class _Packet:
+    """Fake encoded-video packet: SPS + PPS + IDR in one payload."""
+
+    def __init__(self, data: bytes | None = None, ts_s: float = 42.0) -> None:
+        self._data = (
+            data
+            if data is not None
+            else (b"\x00\x00\x00\x01\x67sps\x00\x00\x01\x68pps\x00\x00\x00\x01\x65idr")
         )
-        stream.prepare()
-        stream.connect()
-        try:
-            # pipeline.create was called twice (Camera + StereoDepth)
-            pipeline = fake.Pipeline.return_value
-            assert pipeline.create.call_count >= 2
-        finally:
-            stream.disconnect()
+        self._ts_s = ts_s
 
-    def test_depth_disabled_by_default(
-        self, mock_depthai, mock_av_generous, tmp_path
-    ):
-        """With depth disabled no StereoDepth node is added.
+    def getData(self) -> bytes:
+        return self._data
 
-        Pinned to ``encoding="raw"`` to keep the call-count assertion
-        focused on the depth branch — h264 mode adds a VideoEncoder
-        node that would otherwise confuse the count.
-        """
-        fake = mock_depthai
-        from syncfield.adapters.oak_camera import OakCameraStream
-
-        stream = OakCameraStream("oak", output_dir=tmp_path, encoding="raw")
-        stream.prepare()
-        stream.connect()
-        try:
-            pipeline = fake.Pipeline.return_value
-            assert pipeline.create.call_count == 1  # RGB only
-        finally:
-            stream.disconnect()
+    def getTimestampDevice(self) -> _Timestamp:
+        return _Timestamp(self._ts_s)
 
 
-class TestEncoding:
-    """Exercise the ``encoding`` parameter — h264 (default) vs raw."""
+def test_recording_h264_packet_emits_sample_with_device_timestamp_extra(
+    oak_camera_module: Any,
+    tmp_path,
+) -> None:
+    stream = oak_camera_module.OakCameraStream("oak_pro", tmp_path)
+    stream._rgb.file = io.BytesIO()
+    stream._recording = True
 
-    def test_h264_default_builds_video_encoder_branch(
-        self, mock_depthai, mock_av_generous, tmp_path
-    ):
-        """Default encoding wires a VideoEncoder node + preview branch.
+    events = []
+    stream.on_sample(events.append)
 
-        Both nodes are created via ``pipeline.create``, so we check
-        that both class sentinels were passed through. The camera
-        itself is also one create call, bringing the total to three
-        when depth is enabled and two when not.
-        """
-        fake = mock_depthai
-        from syncfield.adapters.oak_camera import OakCameraStream
+    stream._handle_camera_packet(stream._rgb, _Packet())
 
-        stream = OakCameraStream("oak", output_dir=tmp_path)
-        assert stream._encoding == "h264"
+    assert stream._frame_count == 1
+    assert stream._rgb.frame_count == 1
+    assert events
+    assert events[0].frame_number == 0
+    if getattr(events[0], "device_ns", None) is not None:
+        assert events[0].device_ns == 42_000_000_000
+    else:
+        assert events[0].channels == {"device_timestamp_ns": 42_000_000_000}
 
-        stream.connect()
-        try:
-            pipeline = fake.Pipeline.return_value
-            created_types = [
-                call.args[0] for call in pipeline.create.call_args_list
+
+def test_aux_camera_packet_gates_on_keyframe_and_writes_timestamps_row(
+    oak_camera_module: Any,
+    tmp_path,
+) -> None:
+    stream = oak_camera_module.OakCameraStream("oak_pro", tmp_path)
+    left = stream._left
+    left.file = io.BytesIO()
+    left.timestamps_file = io.StringIO()
+    stream._recording = True
+
+    events = []
+    stream.on_sample(events.append)
+
+    # Non-IDR packet before any keyframe: remembered nothing, wrote nothing.
+    stream._handle_camera_packet(left, _Packet(b"\x00\x00\x00\x01\x61p-frame"))
+    assert left.frame_count == 0
+    assert left.file.getvalue() == b""
+
+    stream._handle_camera_packet(left, _Packet(ts_s=7.5))
+
+    assert left.frame_count == 1
+    assert b"idr" in left.file.getvalue()
+    row = json.loads(left.timestamps_file.getvalue().splitlines()[0])
+    assert row["frame_number"] == 0
+    assert row["device_timestamp_ns"] == 7_500_000_000
+    assert row["clock_source"] == "host_monotonic"
+    assert row["capture_ns"] > 0
+    # Aux cameras never emit orchestrator samples and never touch the
+    # stream-level RGB counters.
+    assert events == []
+    assert stream._frame_count == 0
+
+
+class _ImuReport:
+    def __init__(self, x: float, y: float, z: float, ts_s: float) -> None:
+        self.x = x
+        self.y = y
+        self.z = z
+        self._ts_s = ts_s
+
+    def getTimestampDevice(self) -> _Timestamp:
+        return _Timestamp(self._ts_s)
+
+
+class _RotationVector:
+    def __init__(self, i: float, j: float, k: float, real: float, ts_s: float) -> None:
+        self.i = i
+        self.j = j
+        self.k = k
+        self.real = real
+        self._ts_s = ts_s
+
+    def getTimestampDevice(self) -> _Timestamp:
+        return _Timestamp(self._ts_s)
+
+
+class _ImuPacket:
+    def __init__(self) -> None:
+        self.acceleroMeter = _ImuReport(0.1, -9.8, 0.2, 1.5)
+        self.gyroscope = _ImuReport(0.01, 0.02, -0.03, 1.5)
+        self.rotationVector = _RotationVector(0.1, 0.2, 0.3, 0.9, 1.5)
+
+
+class _ImuMessage:
+    def __init__(self, n_packets: int = 2) -> None:
+        self.packets = [_ImuPacket() for _ in range(n_packets)]
+
+
+def test_imu_message_writes_canonical_sensor_rows_while_recording(
+    oak_camera_module: Any,
+    tmp_path,
+) -> None:
+    stream = oak_camera_module.OakCameraStream("oak_pro", tmp_path)
+    stream._imu.file = io.StringIO()
+
+    # Not recording yet: packets are dropped.
+    stream._handle_imu_message(_ImuMessage())
+    assert stream._imu.sample_count == 0
+    assert stream._imu.file.getvalue() == ""
+
+    stream._recording = True
+    stream._handle_imu_message(_ImuMessage(n_packets=2))
+
+    lines = stream._imu.file.getvalue().splitlines()
+    assert len(lines) == 2
+    assert stream._imu.sample_count == 2
+    row = json.loads(lines[0])
+    # Canonical SensorSample schema so the sync pipeline's load_sensor_jsonl
+    # reads it (requires capture_ns + a `channels` dict).
+    assert row["frame_number"] == 0
+    assert row["capture_ns"] > 0
+    assert row["device_timestamp_ns"] == 1_500_000_000
+    assert row["clock_source"] == "host_monotonic"
+    channels = row["channels"]
+    assert channels["accel_x"] == 0.1
+    assert channels["accel_y"] == -9.8
+    assert channels["accel_z"] == 0.2
+    assert channels["gyro_x"] == 0.01
+    assert channels["gyro_z"] == -0.03
+    assert channels["quat_x"] == 0.1
+    assert channels["quat_y"] == 0.2
+    assert channels["quat_z"] == 0.3
+    assert channels["quat_w"] == 0.9
+    # No legacy top-level vectors leak into the canonical row.
+    assert "accel" not in row
+    assert "device_ns" not in row
+
+
+def test_stop_recording_reports_partial_when_aux_stream_has_no_data(
+    oak_camera_module: Any,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stream = oak_camera_module.OakCameraStream("oak_pro", tmp_path)
+    monkeypatch.setattr(
+        oak_camera_module,
+        "remux_h264_to_mp4",
+        lambda src, dst, *, fps: Path(dst).write_bytes(b"mp4"),
+    )
+    monkeypatch.setattr(stream, "connect", lambda: None)
+
+    # Left/right are live pipeline outputs that produce zero frames.
+    stream._left.queue = _EmptyQueue()
+    stream._right.queue = _EmptyQueue()
+    stream.start_recording(_FakeSessionClock())
+    stream._handle_camera_packet(stream._rgb, _Packet())
+    report = stream.stop_recording()
+
+    assert report.status == "partial"
+    assert report.error is not None
+    assert "left" in report.error and "right" in report.error
+    assert report.frame_count == 1
+    assert report.file_path == stream._rgb.mp4_path
+    stream.disconnect()
+
+
+def test_stop_recording_remuxes_each_recorded_camera(
+    oak_camera_module: Any,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    remuxed: list[tuple[str, str, float]] = []
+
+    def fake_remux(src, dst, *, fps: float) -> None:
+        remuxed.append((Path(src).name, Path(dst).name, fps))
+        Path(dst).write_bytes(b"mp4")
+
+    stream = oak_camera_module.OakCameraStream("oak_pro", tmp_path, rgb_fps=30, mono_fps=30)
+    monkeypatch.setattr(oak_camera_module, "remux_h264_to_mp4", fake_remux)
+    monkeypatch.setattr(stream, "connect", lambda: None)
+
+    stream._left.queue = _EmptyQueue()
+    stream._right.queue = _EmptyQueue()
+    stream._imu.queue = _EmptyQueue()
+    stream.start_recording(_FakeSessionClock())
+    stream._handle_camera_packet(stream._rgb, _Packet())
+    stream._handle_camera_packet(stream._left, _Packet())
+    stream._handle_camera_packet(stream._right, _Packet())
+    stream._handle_imu_message(_ImuMessage())
+    report = stream.stop_recording()
+
+    assert report.status == "completed"
+    assert report.error is None
+    assert sorted(name for name, _, _ in remuxed) == [
+        "oak_pro.h264",
+        "oak_pro.left.h264",
+        "oak_pro.right.h264",
+    ]
+    assert (tmp_path / "oak_pro.left.mp4").exists()
+    assert (tmp_path / "oak_pro.right.mp4").exists()
+    assert (tmp_path / "oak_pro.imu.jsonl").exists()
+    assert (tmp_path / "oak_pro.left.timestamps.jsonl").exists()
+    stream.disconnect()
+
+
+def test_stop_recording_still_fails_when_rgb_has_no_frames(
+    oak_camera_module: Any,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stream = oak_camera_module.OakCameraStream("oak_pro", tmp_path)
+    monkeypatch.setattr(stream, "connect", lambda: None)
+    stream.start_recording(_FakeSessionClock())
+    report = stream.stop_recording()
+
+    assert report.status == "failed"
+    assert report.error is not None
+    stream.disconnect()
+
+
+class _FakeQueue:
+    pass
+
+
+class _FakeOutput:
+    def createOutputQueue(self, *args: Any, **kwargs: Any) -> _FakeQueue:
+        return _FakeQueue()
+
+
+class _FakeCameraControl:
+    def __init__(self) -> None:
+        self.frame_sync_mode: Any = None
+
+    def setFrameSyncMode(self, mode: Any) -> None:
+        self.frame_sync_mode = mode
+
+
+class _FakeCameraNode:
+    def __init__(self) -> None:
+        self.built_socket: Any = None
+        self.requested: list[tuple[Any, Any, float]] = []
+        self.initialControl = _FakeCameraControl()
+
+    def build(self, socket: Any = None) -> None:
+        self.built_socket = socket
+
+    def requestOutput(self, size: Any, type: Any, fps: float = 30.0) -> _FakeOutput:
+        self.requested.append((size, type, fps))
+        return _FakeOutput()
+
+
+class _FakeEncoderNode:
+    def __init__(self) -> None:
+        self.build_kwargs: dict[str, Any] = {}
+        self.out = _FakeOutput()
+
+    def build(self, **kwargs: Any) -> None:
+        self.build_kwargs = kwargs
+
+    def setNumBFrames(self, value: int) -> None:
+        pass
+
+    def setKeyframeFrequency(self, value: int) -> None:
+        pass
+
+    def setBitrateKbps(self, value: int) -> None:
+        self.bitrate_kbps = value
+
+
+class _FakeImuNode:
+    def __init__(self) -> None:
+        self.enable_calls: list[tuple[Any, int]] = []
+        self.out = _FakeOutput()
+
+    def enableIMUSensor(self, sensors: Any, rate: int) -> None:
+        self.enable_calls.append((sensors, rate))
+
+    def setBatchReportThreshold(self, value: int) -> None:
+        pass
+
+    def setMaxBatchReports(self, value: int) -> None:
+        pass
+
+
+class _FakePipeline:
+    def __init__(self, device: Any) -> None:
+        self.device = device
+        self.nodes: list[Any] = []
+
+    def create(self, node_cls: Any) -> Any:
+        node = node_cls()
+        self.nodes.append(node)
+        return node
+
+
+def _fake_dai_v3() -> SimpleNamespace:
+    sockets = SimpleNamespace(CAM_A="CAM_A", CAM_B="CAM_B", CAM_C="CAM_C")
+    return SimpleNamespace(
+        Pipeline=_FakePipeline,
+        node=SimpleNamespace(
+            Camera=_FakeCameraNode,
+            VideoEncoder=_FakeEncoderNode,
+            IMU=_FakeImuNode,
+        ),
+        CameraBoardSocket=sockets,
+        ImgFrame=SimpleNamespace(Type=SimpleNamespace(NV12="NV12", BGR888p="BGR888p")),
+        VideoEncoderProperties=SimpleNamespace(Profile=SimpleNamespace(H264_MAIN="H264_MAIN")),
+        CameraControl=SimpleNamespace(
+            FrameSyncMode=SimpleNamespace(OUTPUT="OUTPUT", INPUT="INPUT", OFF="OFF")
+        ),
+        IMUSensor=SimpleNamespace(
+            ACCELEROMETER_RAW="ACC_RAW",
+            GYROSCOPE_RAW="GYRO_RAW",
+            ROTATION_VECTOR="ROT_VEC",
+        ),
+    )
+
+
+class _FakeDeviceFull:
+    def getConnectedCameraFeatures(self):
+        return [
+            SimpleNamespace(socket=SimpleNamespace(name=n)) for n in ("CAM_A", "CAM_B", "CAM_C")
+        ]
+
+    def getConnectedIMU(self) -> str:
+        return "BNO086"
+
+
+class _FakeDeviceRgbOnly:
+    def getConnectedCameraFeatures(self):
+        return [SimpleNamespace(socket=SimpleNamespace(name="CAM_A"))]
+
+    def getConnectedIMU(self) -> str:
+        return ""
+
+
+def test_v3_pipeline_builds_all_streams_on_full_device(
+    oak_camera_module: Any,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(oak_camera_module, "dai", _fake_dai_v3())
+    stream = oak_camera_module.OakCameraStream("oak_pro", tmp_path)
+
+    stream._build_v3_pipeline(_FakeDeviceFull())
+
+    assert stream._rgb.queue is not None
+    assert stream._left.queue is not None
+    assert stream._right.queue is not None
+    assert stream._imu.queue is not None
+    assert stream._q_preview is not None
+
+
+def test_v3_pipeline_requests_800p_rgb_and_400p_mono_and_combined_imu_enable(
+    oak_camera_module: Any,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(oak_camera_module, "dai", _fake_dai_v3())
+    stream = oak_camera_module.OakCameraStream("oak_pro", tmp_path)
+
+    pipeline = stream._build_v3_pipeline(_FakeDeviceFull())
+
+    cams = [n for n in pipeline.nodes if isinstance(n, _FakeCameraNode)]
+    imus = [n for n in pipeline.nodes if isinstance(n, _FakeImuNode)]
+    by_socket = {c.built_socket: c for c in cams}
+    assert set(by_socket) == {"CAM_A", "CAM_B", "CAM_C"}
+    # RGB: 800p encoder feed + preview; monos: 400p encoder feed (+ preview,
+    # asserted separately in test_v3_pipeline_builds_mono_preview_queues).
+    assert ((1280, 800), "NV12", 30.0) in by_socket["CAM_A"].requested
+    assert ((640, 400), "NV12", 30.0) in by_socket["CAM_B"].requested
+    assert ((640, 400), "NV12", 30.0) in by_socket["CAM_C"].requested
+    # IMU must be enabled with ONE combined call (separate enables degrade
+    # BNO086 sync output to ~52 Hz — measured on hardware).
+    assert len(imus) == 1
+    assert imus[0].enable_calls == [(["ACC_RAW", "GYRO_RAW", "ROT_VEC"], 400)]
+
+
+def test_v3_pipeline_degrades_to_rgb_only_without_stereo_or_imu(
+    oak_camera_module: Any,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(oak_camera_module, "dai", _fake_dai_v3())
+    stream = oak_camera_module.OakCameraStream("oak_pro", tmp_path)
+
+    pipeline = stream._build_v3_pipeline(_FakeDeviceRgbOnly())
+
+    cams = [n for n in pipeline.nodes if isinstance(n, _FakeCameraNode)]
+    imus = [n for n in pipeline.nodes if isinstance(n, _FakeImuNode)]
+    assert len(cams) == 1
+    assert cams[0].built_socket == "CAM_A"
+    assert imus == []
+    assert stream._rgb.queue is not None
+    assert stream._left.queue is None
+    assert stream._right.queue is None
+    assert stream._imu.queue is None
+    # RGB-only board: no stereo pair to follow, so CAM_A must NOT be forced to
+    # drive an FSYNC line nobody listens to.
+    assert cams[0].initialControl.frame_sync_mode is None
+
+
+def test_v3_pipeline_enables_hardware_frame_sync_across_the_stereo_triplet(
+    oak_camera_module: Any,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CAM_A drives FSYNC (OUTPUT), the monos follow (INPUT) so all three
+    sensors expose the shutter together — measured ~0.02 ms residual vs
+    ~4.6 ms free-running."""
+    monkeypatch.setattr(oak_camera_module, "dai", _fake_dai_v3())
+    stream = oak_camera_module.OakCameraStream("oak_pro", tmp_path)
+
+    pipeline = stream._build_v3_pipeline(_FakeDeviceFull())
+
+    by_socket = {c.built_socket: c for c in pipeline.nodes if isinstance(c, _FakeCameraNode)}
+    assert by_socket["CAM_A"].initialControl.frame_sync_mode == "OUTPUT"
+    assert by_socket["CAM_B"].initialControl.frame_sync_mode == "INPUT"
+    assert by_socket["CAM_C"].initialControl.frame_sync_mode == "INPUT"
+
+
+def test_connected_socket_names_and_imu_detection(oak_camera_module: Any) -> None:
+    class Socket:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+    class Feature:
+        def __init__(self, name: str) -> None:
+            self.socket = Socket(name)
+
+    class Device:
+        def getConnectedCameraFeatures(self):
+            return [Feature("CAM_A"), Feature("CAM_B"), Feature("CAM_C")]
+
+        def getConnectedIMU(self) -> str:
+            return "BNO086"
+
+    class BareDevice:
+        def getConnectedCameraFeatures(self):
+            raise RuntimeError("boom")
+
+        def getConnectedIMU(self) -> str:
+            return "NONE"
+
+    assert oak_camera_module._connected_socket_names(Device()) == frozenset(
+        {"CAM_A", "CAM_B", "CAM_C"}
+    )
+    assert oak_camera_module._connected_imu_name(Device()) == "BNO086"
+    assert oak_camera_module._connected_socket_names(BareDevice()) is None
+    assert oak_camera_module._connected_imu_name(BareDevice()) == ""
+
+
+def test_substreams_reflect_built_queues(oak_camera_module: Any, tmp_path) -> None:
+    stream = oak_camera_module.OakCameraStream("oak_pro", tmp_path)
+    assert stream.substreams() == ()
+
+    stream._left.queue = _EmptyQueue()
+    stream._right.queue = _EmptyQueue()
+    stream._imu.queue = _EmptyQueue()
+
+    subs = stream.substreams()
+    assert [(s.id, s.kind) for s in subs] == [
+        ("oak_pro.left", "video"),
+        ("oak_pro.right", "video"),
+        ("oak_pro.imu", "sensor"),
+    ]
+    assert all(s.label for s in subs)
+
+
+def test_latest_frame_for_returns_substream_preview_frames(
+    oak_camera_module: Any, tmp_path
+) -> None:
+    stream = oak_camera_module.OakCameraStream("oak_pro", tmp_path)
+    assert stream.latest_frame_for("oak_pro.left") is None
+
+    frame = object()
+    with stream._frame_lock:
+        stream._substream_frames["oak_pro.left"] = frame
+    assert stream.latest_frame_for("oak_pro.left") is frame
+    assert stream.latest_frame_for("oak_pro.right") is None
+
+
+def test_imu_messages_emit_live_substream_samples_even_without_recording(
+    oak_camera_module: Any, tmp_path
+) -> None:
+    stream = oak_camera_module.OakCameraStream("oak_pro", tmp_path)
+    events: list[Any] = []
+    stream.on_substream_sample(events.append)
+
+    stream._handle_imu_message(_ImuMessage(n_packets=2))
+
+    assert len(events) == 2
+    event = events[0]
+    assert event.stream_id == "oak_pro.imu"
+    assert event.frame_number == 0
+    assert events[1].frame_number == 1
+    assert event.capture_ns > 0
+    channels = event.channels
+    assert channels["accel_x"] == 0.1
+    assert channels["gyro_z"] == -0.03
+    assert channels["quat"] == [0.1, 0.2, 0.3, 0.9]
+    # Orientation Euler angles derived from the quaternion, in degrees.
+    for key in ("roll", "pitch", "yaw"):
+        assert isinstance(channels[key], float)
+    # File was never opened: nothing recorded, sample_count untouched.
+    assert stream._imu.sample_count == 0
+
+
+def test_second_recording_writes_to_rotated_episode_dir(
+    oak_camera_module: Any,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The SDK orchestrator rotates _output_dir per episode (2nd+ recording in
+    one connect session) but only rebinds ``stream._output_dir`` — not the
+    paths cached inside the per-camera recorders. Every recording must write
+    to the CURRENT _output_dir, else consecutive recordings clobber the first
+    episode's files and leave the new episode empty."""
+    ep1 = tmp_path / "ep1"
+    ep2 = tmp_path / "ep2"
+    stream = oak_camera_module.OakCameraStream("oak_pro", ep1)
+    monkeypatch.setattr(stream, "connect", lambda: None)
+    monkeypatch.setattr(
+        oak_camera_module,
+        "remux_h264_to_mp4",
+        lambda src, dst, *, fps: Path(dst).write_bytes(b"mp4"),
+    )
+
+    # First recording lands in ep1.
+    stream._left.queue = _EmptyQueue()
+    stream._imu.queue = _EmptyQueue()
+    stream.start_recording(_FakeSessionClock())
+    assert stream._rgb.mp4_path == ep1 / "oak_pro.mp4"
+    assert stream._left.mp4_path == ep1 / "oak_pro.left.mp4"
+    assert stream._imu.path == ep1 / "oak_pro.imu.jsonl"
+    stream.stop_recording()
+
+    # Orchestrator rotates the episode dir + rebinds only _output_dir.
+    stream._output_dir = ep2
+
+    stream.start_recording(_FakeSessionClock())
+    # Every recorder path must now point at ep2, not the stale ep1.
+    assert stream._rgb.mp4_path == ep2 / "oak_pro.mp4"
+    assert stream._rgb.h264_path == ep2 / "oak_pro.h264"
+    assert stream._left.mp4_path == ep2 / "oak_pro.left.mp4"
+    assert stream._left.timestamps_path == ep2 / "oak_pro.left.timestamps.jsonl"
+    assert stream._right.mp4_path == ep2 / "oak_pro.right.mp4"
+    assert stream._imu.path == ep2 / "oak_pro.imu.jsonl"
+    stream.disconnect()
+
+
+def test_recorded_artifacts_lists_aux_streams_after_stop(
+    oak_camera_module: Any,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After a recording with mono + IMU, the composite reports its aux
+    streams so the desktop backend can fold them into the manifest (and
+    the sync pipeline can align all four)."""
+    stream = oak_camera_module.OakCameraStream("oak_pro", tmp_path)
+    monkeypatch.setattr(
+        oak_camera_module,
+        "remux_h264_to_mp4",
+        lambda src, dst, *, fps: Path(dst).write_bytes(b"mp4"),
+    )
+    monkeypatch.setattr(stream, "connect", lambda: None)
+
+    # Before any recording there are no artifacts.
+    assert stream.recorded_artifacts() == ()
+
+    stream._left.queue = _EmptyQueue()
+    stream._right.queue = _EmptyQueue()
+    stream._imu.queue = _EmptyQueue()
+    stream.start_recording(_FakeSessionClock())
+    stream._handle_camera_packet(stream._rgb, _Packet())
+    stream._handle_camera_packet(stream._left, _Packet())
+    stream._handle_camera_packet(stream._right, _Packet())
+    stream._recording = True
+    stream._handle_imu_message(_ImuMessage(n_packets=3))
+    stream.stop_recording()
+
+    arts = {a.stream_id: a for a in stream.recorded_artifacts()}
+    # Primary RGB is NOT an aux artifact (it is the orchestrator stream).
+    assert "oak_pro" not in arts
+    assert set(arts) == {"oak_pro.left", "oak_pro.right", "oak_pro.imu"}
+    assert arts["oak_pro.left"].kind == "video"
+    assert arts["oak_pro.left"].path == stream._left.mp4_path
+    assert arts["oak_pro.left"].frame_count == 1
+    assert arts["oak_pro.imu"].kind == "sensor"
+    assert arts["oak_pro.imu"].path == stream._imu.path
+    assert arts["oak_pro.imu"].frame_count == 3
+    stream.disconnect()
+
+
+def test_recorded_artifacts_omits_aux_streams_with_no_data(
+    oak_camera_module: Any,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An aux stream that produced no decodable file must not appear in the
+    manifest — otherwise sync would try to align a missing/empty file."""
+    stream = oak_camera_module.OakCameraStream("oak_pro", tmp_path)
+    monkeypatch.setattr(
+        oak_camera_module,
+        "remux_h264_to_mp4",
+        lambda src, dst, *, fps: Path(dst).write_bytes(b"mp4"),
+    )
+    monkeypatch.setattr(stream, "connect", lambda: None)
+
+    stream._left.queue = _EmptyQueue()  # live, but never produces a frame
+    stream._imu.queue = _EmptyQueue()
+    stream.start_recording(_FakeSessionClock())
+    stream._handle_camera_packet(stream._rgb, _Packet())
+    stream.stop_recording()
+
+    # left produced no keyframe, imu produced no samples → no artifacts.
+    assert stream.recorded_artifacts() == ()
+    stream.disconnect()
+
+
+def test_quat_to_euler_identity_and_yaw(oak_camera_module: Any) -> None:
+    import math
+
+    roll, pitch, yaw = oak_camera_module._quat_to_euler_deg(0.0, 0.0, 0.0, 1.0)
+    assert (round(roll, 6), round(pitch, 6), round(yaw, 6)) == (0.0, 0.0, 0.0)
+    # 90° yaw about Z: q = (0, 0, sin45, cos45)
+    s = math.sin(math.pi / 4)
+    c = math.cos(math.pi / 4)
+    roll, pitch, yaw = oak_camera_module._quat_to_euler_deg(0.0, 0.0, s, c)
+    assert abs(yaw - 90.0) < 1e-6
+    assert abs(roll) < 1e-6 and abs(pitch) < 1e-6
+
+
+class _FakeCalibDevice:
+    """Device + CalibrationHandler double for calibration summary tests."""
+
+    class _Calib:
+        def eepromToJson(self) -> dict[str, Any]:
+            return {"version": 7, "boardName": "DM9098"}
+
+        def getCameraIntrinsics(self, socket: Any, width: int = 0, height: int = 0):
+            scale = 0.5 if width == 640 else 1.0
+            return [
+                [565.0 * scale, 0.0, 640.0 * scale],
+                [0.0, 565.0 * scale, 400.0 * scale],
+                [0.0, 0.0, 1.0],
             ]
-            assert fake.node.Camera in created_types
-            assert fake.node.VideoEncoder in created_types
-        finally:
-            stream.disconnect()
 
-    def test_h264_recording_produces_mp4_via_remux(
-        self, mock_depthai, mock_av_generous, tmp_path
-    ):
-        """Full lifecycle in h264 mode yields a FinalizationReport with
-        ``file_path`` set to the target MP4.
+        def getDistortionCoefficients(self, socket: Any):
+            return [0.1, 0.2]
 
-        The raw ``.h264`` intermediate file is created during the
-        recording window; after :meth:`stop_recording` runs the remux
-        it should be gone. The mocked ``av`` pipeline completes the
-        remux with an empty packet stream, which is enough to verify
-        the control-flow works end-to-end.
-        """
-        from syncfield.adapters.oak_camera import OakCameraStream
+        def getFov(self, socket: Any):
+            return 127.0
 
-        stream = OakCameraStream("oak", output_dir=tmp_path)
-        stream.connect()
-        stream.start_recording(_clock())
-
-        h264_path = tmp_path / "oak.h264"
-        # Capture thread should open the intermediate bitstream file
-        # almost immediately after start_recording flips the flag.
-        # Give it a beat to produce a few samples.
-        time.sleep(0.15)
-
-        report = stream.stop_recording()
-        stream.disconnect()
-
-        assert report.status == "completed"
-        assert report.file_path == tmp_path / "oak.mp4"
-        # Remux succeeded under the mock, so the intermediate file
-        # should have been cleaned up.
-        assert not h264_path.exists()
-
-    def test_raw_mode_opt_in_keeps_legacy_pipeline(
-        self, mock_depthai, mock_av_generous, tmp_path
-    ):
-        """Explicit ``encoding="raw"`` should skip the VideoEncoder."""
-        fake = mock_depthai
-        from syncfield.adapters.oak_camera import OakCameraStream
-
-        stream = OakCameraStream("oak", output_dir=tmp_path, encoding="raw")
-        stream.connect()
-        try:
-            pipeline = fake.Pipeline.return_value
-            created_types = [
-                call.args[0] for call in pipeline.create.call_args_list
+        def getCameraExtrinsics(self, src: Any, dst: Any):
+            return [
+                [1.0, 0.0, 0.0, -7.5],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
             ]
-            assert fake.node.Camera in created_types
-            assert fake.node.VideoEncoder not in created_types
-        finally:
-            stream.disconnect()
 
-    def test_invalid_encoding_raises(self, mock_depthai, mock_av_generous, tmp_path):
-        from syncfield.adapters.oak_camera import OakCameraStream
+        def getImuToCameraExtrinsics(self, dst: Any):
+            return [
+                [0.0, 1.0, 0.0, 7.75],
+                [1.0, 0.0, 0.0, -0.2],
+                [0.0, 0.0, -1.0, 2.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ]
 
-        with pytest.raises(ValueError, match="encoding"):
-            OakCameraStream("oak", output_dir=tmp_path, encoding="vp9")
+        def getBaselineDistance(self) -> float:
+            return 7.5
 
+    def readCalibration(self) -> _FakeCalibDevice._Calib:
+        return self._Calib()
 
-class TestImportGuard:
-    def test_depthai_missing_raises_clear_install_hint(self, monkeypatch):
-        monkeypatch.setitem(sys.modules, "depthai", None)
-        sys.modules.pop("syncfield.adapters.oak_camera", None)
-        import syncfield.adapters as _pkg
-        monkeypatch.delattr(_pkg, "oak_camera", raising=False)
-        with pytest.raises(ImportError, match=r"syncfield\[oak\]"):
-            importlib.import_module("syncfield.adapters.oak_camera")
+    def getDeviceName(self) -> str:
+        return "OAK-D-PRO-W"
 
+    def getProductName(self) -> str:
+        return "OAK-D-PRO-W-97"
 
-class TestDeviceShutterHostNs:
-    """``_device_shutter_host_ns`` projects the DepthAI on-device shutter
-    instant onto the host monotonic clock, as integer nanoseconds.
+    def getDeviceId(self) -> str:
+        return "1944301091E3965A00"
 
-    It is called on every frame before the message reaches any handler,
-    so the contract is: never raise, return ``None`` on any form of
-    missing / malformed timestamp, and use integer arithmetic to avoid
-    float rounding at the ~10¹⁸ ns magnitudes reached after long uptimes.
-    """
-
-    def _load_helper(self, mock_depthai):  # noqa: ARG002 - fixture runs for side effects
-        from syncfield.adapters.oak_camera import _device_shutter_host_ns
-        return _device_shutter_host_ns
-
-    def test_converts_timedelta_to_nanoseconds(self, mock_depthai):
-        from datetime import timedelta
-
-        helper = self._load_helper(mock_depthai)
-        msg = MagicMock()
-        # 5 s, 500 μs — a realistic pipeline-warmup-era value.
-        msg.getTimestamp.return_value = timedelta(seconds=5, microseconds=500)
-
-        assert helper(msg) == 5_000_500_000
-
-    def test_preserves_nanosecond_precision_for_large_values(self, mock_depthai):
-        """Integer math survives datetime's microsecond resolution AND the
-        ~10¹⁸ ns range reached after multi-day uptime."""
-        from datetime import timedelta
-
-        helper = self._load_helper(mock_depthai)
-        msg = MagicMock()
-        msg.getTimestamp.return_value = timedelta(days=1, seconds=2, microseconds=3)
-
-        # (86400 + 2) * 10⁹  +  3 * 10³
-        expected = (86_400 + 2) * 1_000_000_000 + 3 * 1_000
-        assert helper(msg) == expected
-
-    def test_none_message_returns_none(self, mock_depthai):
-        assert self._load_helper(mock_depthai)(None) is None
-
-    def test_get_timestamp_raising_returns_none(self, mock_depthai):
-        helper = self._load_helper(mock_depthai)
-        msg = MagicMock()
-        msg.getTimestamp.side_effect = RuntimeError("not ready yet")
-
-        assert helper(msg) is None
-
-    def test_get_timestamp_returning_none_returns_none(self, mock_depthai):
-        helper = self._load_helper(mock_depthai)
-        msg = MagicMock()
-        msg.getTimestamp.return_value = None
-
-        assert helper(msg) is None
+    def getConnectedIMU(self) -> str:
+        return "BNO086"
 
 
-class TestRecordingAnchor:
-    """Per-recording-window intra-host sync anchor capture.
+def test_calibration_summary_scales_intrinsics_to_recorded_resolution(
+    oak_camera_module: Any,
+) -> None:
+    summary = oak_camera_module._build_calibration_summary(
+        _FakeCalibDevice(),
+        [
+            ("rgb", "CAM_A", "socketA", (1280, 800), 30.0),
+            ("left", "CAM_B", "socketB", (640, 400), 30.0),
+            ("right", "CAM_C", "socketC", (640, 400), 30.0),
+        ],
+    )
 
-    OAK cameras expose a real on-device shutter timestamp, so the
-    anchor's ``first_frame_device_ns`` is expected to be populated
-    (non-``None``) on the very first frame that arrives after
-    ``start_recording()``.
-    """
+    assert summary is not None
+    assert summary["schema"] == "syncfield.oak_calibration.v1"
+    assert summary["device"]["device_id"] == "1944301091E3965A00"
+    assert summary["eeprom"] == {"version": 7, "boardName": "DM9098"}
+    rgb = summary["streams"]["rgb"]
+    assert rgb["socket"] == "CAM_A"
+    assert rgb["resolution"] == [1280, 800]
+    assert rgb["intrinsics"][0][0] == 565.0
+    left = summary["streams"]["left"]
+    assert left["resolution"] == [640, 400]
+    assert left["intrinsics"][0][0] == 282.5  # scaled to 640x400
+    assert summary["stereo"]["baseline_cm"] == 7.5
+    assert summary["imu"]["type"] == "BNO086"
+    assert "extrinsics" in summary
 
-    def test_anchor_captured_from_first_frame(
-        self, mock_depthai, mock_av_generous, tmp_path, monkeypatch
-    ):
-        """After arming the clock and pushing frames through the fake
-        pipeline, ``stop_recording`` returns a :class:`FinalizationReport`
-        whose ``recording_anchor`` captures the armed host ns, the host
-        arrival ns of the first recorded frame, and the device-clock
-        timestamp of that frame."""
-        from syncfield.adapters import oak_camera
-        from syncfield.adapters.oak_camera import OakCameraStream
 
-        # Force a known, non-None device timestamp on every frame so the
-        # assertion on ``first_frame_device_ns`` is unambiguous. The
-        # fake ``_FakeFrame`` / ``_FakeEncodedPacket`` payloads used by
-        # the shared fixture don't define ``getTimestamp``, so the real
-        # helper would return ``None``.
-        known_device_ns = 42_000_000_000
-        monkeypatch.setattr(
-            oak_camera, "_device_timestamp_ns", lambda msg: known_device_ns
+def test_calibration_summary_returns_none_when_unreadable(
+    oak_camera_module: Any,
+) -> None:
+    class BrokenDevice:
+        def readCalibration(self):
+            raise RuntimeError("no eeprom")
+
+    assert (
+        oak_camera_module._build_calibration_summary(
+            BrokenDevice(), [("rgb", "CAM_A", "socketA", (1280, 800), 30.0)]
         )
+        is None
+    )
 
-        armed_ns = 1_234_567_890
-        clock = SessionClock(
-            sync_point=SyncPoint.create_now("h"),
-            recording_armed_ns=armed_ns,
-        )
 
-        stream = OakCameraStream("oak", output_dir=tmp_path)
-        received: list[SampleEvent] = []
-        stream.on_sample(received.append)
-        stream.prepare()
-        stream.connect()
-        stream.start_recording(clock)
-        # Let the capture thread drain at least one frame out of the
-        # unlimited fake queue.
-        time.sleep(0.15)
-        report = stream.stop_recording()
-        stream.disconnect()
+def test_start_recording_writes_calibration_json(
+    oak_camera_module: Any,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stream = oak_camera_module.OakCameraStream("oak_pro", tmp_path)
+    monkeypatch.setattr(stream, "connect", lambda: None)
+    stream._calibration = {"schema": "syncfield.oak_calibration.v1", "x": 1}
 
-        assert report.recording_anchor is not None
-        assert report.recording_anchor.armed_host_ns == armed_ns
-        assert report.recording_anchor.first_frame_host_ns >= armed_ns
-        assert report.recording_anchor.first_frame_device_ns == known_device_ns
-        assert received
-        assert received[0].device_ns == known_device_ns
-        assert not (received[0].channels and "device_timestamp_ns" in received[0].channels)
+    stream.start_recording(_FakeSessionClock())
+    stream._recording = False
 
-    def test_no_anchor_when_no_frames_arrive(
-        self, mock_depthai, mock_av_generous, tmp_path
-    ):
-        """If ``start_recording`` is called but zero frames arrive before
-        ``stop_recording``, the report's ``recording_anchor`` stays
-        ``None``."""
-        from syncfield.adapters.oak_camera import OakCameraStream
+    path = tmp_path / "oak_pro.calibration.json"
+    assert path.exists()
+    assert json.loads(path.read_text())["x"] == 1
 
-        armed_ns = 9_876_543_210
-        clock = SessionClock(
-            sync_point=SyncPoint.create_now("h"),
-            recording_armed_ns=armed_ns,
-        )
 
-        stream = OakCameraStream("oak", output_dir=tmp_path)
-        stream.prepare()
-        stream.connect()
-        # Starve the capture loop so the recording window sees no frames.
-        # ``_safe_get_rgb`` swallows exceptions and returns ``None``, so
-        # raising from ``get`` keeps the loop spinning without producing
-        # a frame. Set BEFORE ``start_recording`` and give the capture
-        # thread a beat to settle on the new side_effect so no in-flight
-        # frame slips past the ``_recording`` flag flip.
-        stream._q_rgb.get.side_effect = RuntimeError("starved")
-        time.sleep(0.05)
-        stream.start_recording(clock)
-        time.sleep(0.1)
-        report = stream.stop_recording()
-        stream.disconnect()
+def test_v3_pipeline_builds_mono_preview_queues(
+    oak_camera_module: Any,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(oak_camera_module, "dai", _fake_dai_v3())
+    stream = oak_camera_module.OakCameraStream("oak_pro", tmp_path)
 
-        assert report.recording_anchor is None
+    pipeline = stream._build_v3_pipeline(_FakeDeviceFull())
+
+    cams = [n for n in pipeline.nodes if isinstance(n, _FakeCameraNode)]
+    by_socket = {c.built_socket: c for c in cams}
+    # Monos now request the encoder feed AND a small BGR preview.
+    assert ((640, 400), "NV12", 30.0) in by_socket["CAM_B"].requested
+    assert ((320, 200), "BGR888p", 10.0) in by_socket["CAM_B"].requested
+    assert ((320, 200), "BGR888p", 10.0) in by_socket["CAM_C"].requested
+    assert set(stream._substream_preview_queues) == {"oak_pro.left", "oak_pro.right"}
+
+
+def test_sample_event_falls_back_to_channels_for_legacy_syncfield(
+    oak_camera_module: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class LegacySampleEvent:
+        def __init__(
+            self,
+            stream_id: str,
+            frame_number: int,
+            capture_ns: int,
+            channels: dict[str, int] | None = None,
+        ) -> None:
+            self.stream_id = stream_id
+            self.frame_number = frame_number
+            self.capture_ns = capture_ns
+            self.channels = channels
+
+    monkeypatch.setattr(oak_camera_module, "SampleEvent", LegacySampleEvent)
+    monkeypatch.setattr(oak_camera_module, "_SAMPLE_EVENT_SUPPORTS_DEVICE_NS", False)
+
+    event = oak_camera_module._sample_event(
+        stream_id="oak_pro",
+        frame_number=0,
+        capture_ns=1,
+        device_ts_ns=42_000_000_000,
+    )
+
+    assert event.channels == {"device_timestamp_ns": 42_000_000_000}

@@ -1,181 +1,313 @@
-"""OakCameraStream — DepthAI-based reference adapter for Luxonis OAK cameras.
+"""Full OAK-D Pro capture adapter using DepthAI's stable multi-device API.
 
-Supports OAK-1, OAK-D, OAK-D Lite, OAK-D S2 and related devices through the
-DepthAI v3 pipeline API. The adapter captures RGB frames to an MP4 file via
-the shared :class:`~syncfield.adapters._video_encoder.VideoEncoder` (PyAV)
-and, when ``depth_enabled=True``, also writes a raw uint16 depth stream
-(little-endian, millimeters) to a sibling ``.depth.bin`` file.
+One physical OAK is modeled as one composite stream: a single ``dai.Device``
+and pipeline capture RGB (CAM_A), the stereo mono pair (CAM_B/CAM_C), and the
+IMU together, so the desktop reconcile loop never has to coordinate multiple
+handles to the same board. Artifacts share the RGB stem:
 
-Requires the ``oak`` optional extra:
+* ``{id}.mp4`` + orchestrator-written ``{id}.timestamps.jsonl`` — RGB
+* ``{id}.left.mp4`` / ``{id}.right.mp4`` + stream-written
+  ``{id}.{side}.timestamps.jsonl`` — stereo monos
+* ``{id}.imu.jsonl`` — one row per synced IMU packet (accel + gyro + quat)
 
-    pip install syncfield[oak]     # depthai
-
-The ``VideoEncoder`` dependency (PyAV) ships with the base package.
-
-Lifecycle
----------
-
-This adapter implements the 4-phase :class:`~syncfield.Stream` SPI so
-the viewer can show live OAK preview frames **before** Record is
-pressed:
-
-* ``prepare()``       — create the output directory.
-* ``connect()``       — discover the target device, build and start the
-  DepthAI pipeline, spawn the capture thread in preview-only mode.
-  ``latest_frame`` begins updating as soon as the pipeline warms up.
-* ``start_recording()`` — open the MP4 (and optional depth binary)
-  writer and flip the ``_recording`` flag so the running capture loop
-  starts writing and emitting :class:`SampleEvent`\\ s.
-* ``stop_recording()`` — flip the flag back off, close the writers,
-  return the finalization report. The capture loop **keeps running**
-  so preview stays live and the operator can start another recording
-  without rebuilding the pipeline.
-* ``disconnect()``    — signal the capture thread, join it, and
-  release the DepthAI pipeline.
-
-Legacy ``start()`` / ``stop()`` are still supported for 0.1-era code
-paths — they collapse the new lifecycle into a one-shot
-``connect + start_recording`` / ``stop_recording + disconnect`` pair.
-
-The adapter is intentionally thinner than the full-featured OakCamera class
-used inside opengraph-studio/recorder — it ships the 80% common case (RGB +
-optional depth) so the code stays small and easy to extend. For IMU, stereo
-rectified output, or advanced calibration, write a subclass against the
-depthai API directly.
+Hardware constraint (measured on OAK-D Pro W, RVC2): three 800p streams cap
+at ~20 fps regardless of encoder load, while RGB 800p30 plus two mono
+640x400@30 runs at full rate — hence the default mono resolution. Mono and
+IMU capture require the DepthAI v3 API; the legacy (v2) pipeline path stays
+RGB-only.
 """
 
 from __future__ import annotations
 
-import logging
-import struct
+import json
+import math
 import threading
 import time
+from collections import deque
+from collections.abc import Callable
+from dataclasses import dataclass
+from inspect import signature
 from pathlib import Path
-from typing import Any, Optional, Tuple
+from types import SimpleNamespace
+from typing import Any, cast
 
-try:
-    import depthai as dai  # type: ignore[import-not-found]
-except ImportError as exc:  # pragma: no cover - exercised via sys.modules patch
-    raise ImportError(
-        "OakCameraStream requires depthai. "
-        "Install with `pip install syncfield[oak]`."
-    ) from exc
-
-from syncfield.adapters._video_encoder import (
-    VideoEncoder,
+import depthai as dai  # type: ignore[import-not-found]
+import logging
+from syncfield.adapters._video_encoder import (  # type: ignore[reportMissingImports]
     compute_jitter_percentiles,
     remux_h264_to_mp4,
 )
-
-from syncfield.clock import SessionClock
-from syncfield.stream import StreamBase
-from syncfield.types import (
+from syncfield.clock import SessionClock  # type: ignore[reportMissingImports]
+from syncfield.stream import StreamBase  # type: ignore[reportMissingImports]
+from syncfield.types import (  # type: ignore[reportMissingImports]
     FinalizationReport,
-    HealthEvent,
-    HealthEventKind,
     SampleEvent,
     StreamCapabilities,
 )
 
 logger = logging.getLogger(__name__)
 
+_SAMPLE_EVENT_SUPPORTS_DEVICE_NS = "device_ns" in signature(SampleEvent).parameters
 
-def _device_timestamp_ns(msg: Any) -> Optional[int]:
-    """Return the frame's device-clock timestamp as integer nanoseconds.
 
-    ``msg.getTimestamp()`` is a ``datetime.timedelta`` anchored to the
-    Myriad-X board's own clock (power-up relative). This helper returns
-    the raw value — no attempt to project it onto the host monotonic
-    clock, because DepthAI 3.x does not actually synchronise the two
-    (the earlier ``device_shutter_host_ns`` path discovered ~12 day
-    offsets between boards; cross-domain projection is unsafe).
+@dataclass(frozen=True)
+class OakSubstream:
+    """Descriptor for a derived (non-orchestrator) stream of a composite OAK.
 
-    Downstream we use this value only for **inter-frame interval
-    smoothing**: the deltas between consecutive frames' device clocks
-    are jitter-free sensor cadence, which — combined with host arrival
-    as the session anchor — removes host-side XLink/transport jitter
-    from ``capture_ns`` without caring about absolute clock alignment.
-    See ``SyncSession._refine_video_with_device_timestamps``.
+    Substreams are views onto the composite stream's pipeline — they share
+    its device handle and lifecycle and are surfaced to the UI by the preview
+    backend, but they are not independently connectable.
     """
-    if msg is None:
+
+    id: str
+    kind: str  # "video" | "sensor"
+    label: str
+    expected_hz: float | None = None
+
+
+@dataclass(frozen=True)
+class OakArtifact:
+    """A recorded auxiliary file the composite produced besides its primary.
+
+    The SDK orchestrator only knows the composite as one stream, so its
+    ``manifest.json`` lists only the primary (RGB). The desktop backend folds
+    these descriptors into the manifest after ``stop()`` so the sync pipeline
+    discovers and aligns every OAK stream (left/right mono, IMU), not just RGB.
+    """
+
+    stream_id: str
+    kind: str  # "video" | "sensor"
+    path: Path
+    frame_count: int
+
+
+class _H264Recorder:
+    """Recording state for one on-device H.264 encoder output.
+
+    The primary (RGB) recorder leaves ``timestamps_path`` unset — its
+    per-frame timestamps flow through ``SampleEvent`` into the orchestrator's
+    ``{id}.timestamps.jsonl``. Aux recorders write their own timestamps file
+    because the orchestrator only knows about the composite stream's primary
+    samples.
+    """
+
+    def __init__(
+        self,
+        *,
+        label: str,
+        is_primary: bool = False,
+    ) -> None:
+        self.label = label
+        # Paths are (re)bound from the composite's _output_dir at every
+        # start_recording so consecutive recordings follow the episode dir.
+        self.h264_path: Path = Path()
+        self.mp4_path: Path = Path()
+        self.timestamps_path: Path | None = None
+        self.is_primary = is_primary
+        self.queue: Any | None = None
+        self.file: Any | None = None
+        self.timestamps_file: Any | None = None
+        self.sps: bytes | None = None
+        self.pps: bytes | None = None
+        self.started_on_keyframe = False
+        self.frame_count = 0
+        self.first_at: int | None = None
+        self.last_at: int | None = None
+        self.prev_capture_ns: int | None = None
+        self.intervals_ns: list[int] = []
+        # Rolling packet-arrival timestamps for the live capture-rate readout,
+        # tracked in preview AND recording (unlike frame_count, which only
+        # counts recorded frames). Guarded because the API thread reads it.
+        self._recent_lock = threading.Lock()
+        self._recent_ns: deque[int] = deque(maxlen=90)
+
+    def observe_capture(self, capture_ns: int) -> None:
+        with self._recent_lock:
+            self._recent_ns.append(capture_ns)
+
+    def capture_hz(self) -> float:
+        with self._recent_lock:
+            recent = tuple(self._recent_ns)
+        if len(recent) < 2:
+            return 0.0
+        span_s = (recent[-1] - recent[0]) / 1_000_000_000
+        return (len(recent) - 1) / span_s if span_s > 0 else 0.0
+
+    def remember_parameter_sets(self, data: bytes) -> None:
+        for nal_type, nal in _iter_h264_annex_b_nalus(data):
+            if nal_type == 7:
+                self.sps = nal
+            elif nal_type == 8:
+                self.pps = nal
+
+    def parameter_sets(self) -> bytes:
+        if self.sps is None or self.pps is None:
+            return b""
+        return self.sps + self.pps
+
+    def begin_recording(self) -> None:
+        self.frame_count = 0
+        self.first_at = None
+        self.last_at = None
+        self.prev_capture_ns = None
+        self.intervals_ns = []
+        self.started_on_keyframe = False
+        if not self.is_primary and self.queue is None:
+            return
+        if self.h264_path.exists():
+            try:
+                self.h264_path.unlink()
+            except OSError:
+                pass
+        self.file = open(self.h264_path, "wb")
+        if self.timestamps_path is not None:
+            self.timestamps_file = open(self.timestamps_path, "w", encoding="utf-8")
+
+    def write_frame(self, data: bytes, capture_ns: int, device_ts_ns: int | None) -> bool:
+        """Append one encoded packet; returns False until the IDR gate opens."""
+        if not self.started_on_keyframe:
+            if not _contains_h264_nal_type(data, 5):
+                return False
+            parameter_sets = self.parameter_sets()
+            if not parameter_sets:
+                return False
+            if self.file is not None and not _contains_h264_parameter_sets(data):
+                self.file.write(parameter_sets)
+            self.started_on_keyframe = True
+
+        if self.first_at is None:
+            self.first_at = capture_ns
+        self.last_at = capture_ns
+        if self.prev_capture_ns is not None:
+            self.intervals_ns.append(capture_ns - self.prev_capture_ns)
+        self.prev_capture_ns = capture_ns
+
+        frame_number = self.frame_count
+        self.frame_count += 1
+        if self.file is not None:
+            self.file.write(data)
+        if self.timestamps_file is not None:
+            self.timestamps_file.write(
+                json.dumps(
+                    {
+                        "frame_number": frame_number,
+                        "capture_ns": capture_ns,
+                        "clock_source": "host_monotonic",
+                        "device_timestamp_ns": device_ts_ns,
+                    }
+                )
+                + "\n"
+            )
+        return True
+
+    def close_files(self) -> None:
+        if self.file is not None:
+            try:
+                self.file.flush()
+                self.file.close()
+            finally:
+                self.file = None
+        if self.timestamps_file is not None:
+            try:
+                self.timestamps_file.flush()
+                self.timestamps_file.close()
+            finally:
+                self.timestamps_file = None
+
+    def finish_recording(self, fps: float) -> str | None:
+        """Close + remux this camera's capture; returns an error string or None.
+
+        Only meaningful for recorders whose queue was live during the
+        recording window (callers skip inactive ones).
+        """
+        self.close_files()
+        if self.frame_count <= 0 or not self.h264_path.exists():
+            return f"{self.label}: no decodable H.264 keyframe arrived during recording."
+        try:
+            remux_h264_to_mp4(self.h264_path, self.mp4_path, fps=fps)
+        except Exception as exc:  # noqa: BLE001
+            return f"{self.label}: H.264 remux failed: {exc}"
+        if not (self.mp4_path.exists() and self.mp4_path.stat().st_size > 0):
+            try:
+                if self.mp4_path.exists():
+                    self.mp4_path.unlink()
+            except OSError:
+                pass
+            return f"{self.label}: remuxed MP4 is empty."
+        try:
+            self.h264_path.unlink()
+        except OSError:
+            pass
         return None
-    try:
-        td = msg.getTimestamp()
-    except Exception:
-        return None
-    if td is None:
-        return None
-    # Integer arithmetic — avoid float rounding at ns magnitudes.
-    return ((td.days * 86_400 + td.seconds) * 1_000_000 + td.microseconds) * 1_000
 
 
-def _device_shutter_host_ns(msg: Any) -> Optional[int]:
-    """Backward-compatible name for the raw OAK device timestamp helper."""
-    return _device_timestamp_ns(msg)
+class _ImuRecorder:
+    """JSONL sink for synced IMU packets (accel + gyro + rotation vector).
 
+    Written from the dedicated IMU thread and closed from the main thread, so
+    file access is guarded by a lock to avoid writing to a handle another
+    thread is closing.
+    """
 
-#: Supported RGB output encodings.
-#:
-#: * ``"h264"`` — on-device H.264 hardware encoder (default). Full-res
-#:   frames travel over XLink as compressed bitstream, cutting USB
-#:   bandwidth ~20-50x versus raw and eliminating the host-side PyAV
-#:   encode on the capture thread. A separate low-res BGR branch feeds
-#:   the viewer preview so ``latest_frame`` still updates in real time.
-#: * ``"raw"`` — uncompressed BGR888p streamed over XLink and re-
-#:   encoded host-side via PyAV. Retained as a fallback for environments
-#:   where the on-device encoder is unavailable or when a caller wants
-#:   direct access to BGR frames in the capture loop.
-OAK_ENCODING_H264 = "h264"
-OAK_ENCODING_RAW = "raw"
-_OAK_ENCODINGS = (OAK_ENCODING_H264, OAK_ENCODING_RAW)
+    def __init__(self) -> None:
+        # Rebound from the composite's _output_dir at every start_recording.
+        self.path: Path = Path()
+        self.queue: Any | None = None
+        self.file: Any | None = None
+        self.sample_count = 0
+        self._lock = threading.Lock()
+
+    def begin_recording(self) -> None:
+        if self.queue is None:
+            self.sample_count = 0
+            return
+        with self._lock:
+            self.sample_count = 0
+            if self.path.exists():
+                try:
+                    self.path.unlink()
+                except OSError:
+                    pass
+            self.file = open(self.path, "w", encoding="utf-8")
+
+    def write_row(self, row: dict[str, Any]) -> bool:
+        """Append one canonical SensorSample row; returns whether it landed."""
+        with self._lock:
+            if self.file is None:
+                return False
+            self.file.write(json.dumps(row) + "\n")
+            self.sample_count += 1
+            return True
+
+    def close_file(self) -> None:
+        with self._lock:
+            if self.file is not None:
+                try:
+                    self.file.flush()
+                    self.file.close()
+                finally:
+                    self.file = None
 
 
 class OakCameraStream(StreamBase):
-    """Captures RGB (and optional depth) from a Luxonis OAK camera.
+    """Full-stream OAK-D Pro capture: RGB + stereo mono pair + IMU.
 
-    See the module docstring for the full 4-phase lifecycle. In short:
+    One physical OAK is captured through a single ``dai.Device`` and pipeline:
+    RGB (CAM_A) 800p30 H.264, the stereo mono pair (CAM_B/CAM_C) 400p30 H.264,
+    and the BNO086 IMU. The three cameras are hardware frame-synced (FSYNC), so
+    every stream's frame N shares a device timestamp to ~0.02 ms; per-frame
+    device timestamps are recorded for downstream device-clock alignment. Full
+    factory calibration is read from EEPROM and written to
+    ``{id}.calibration.json``.
 
-    * ``connect()`` builds and starts the DepthAI pipeline so
-      :attr:`latest_frame` begins updating (live viewer preview).
-    * ``start_recording(session_clock)`` opens the MP4 (and optional
-      depth bin) writer and flips the ``_recording`` flag so the
-      already-running capture loop begins writing and emitting samples.
-    * ``stop_recording()`` closes the writers but leaves the pipeline
-      running so preview stays live.
-    * ``disconnect()`` tears down the pipeline.
-
-    Args:
-        id: Stream id (also used as the output file name: ``{id}.mp4``).
-        output_dir: Directory for the MP4 (and optional depth) file.
-        rgb_resolution: Desired RGB resolution as ``(width, height)``.
-            Defaults to 720p — enough for most Physical AI benchmark
-            and imitation-learning workloads while keeping the XLink
-            budget small when two OAK boards share a USB bus. Pass
-            ``(1920, 1080)`` to opt into 1080p.
-        rgb_fps: Desired RGB frame rate.
-        depth_enabled: If True, also capture raw depth to ``{id}.depth.bin``.
-        depth_resolution: Depth resolution as ``(width, height)``. Must be a
-            resolution supported by the device (e.g. ``(640, 400)``).
-        depth_fps: Depth frame rate.
-        encoding: ``"h264"`` (default) routes frames through the OAK's
-            on-device H.264 hardware encoder so only compressed
-            packets traverse XLink. ``"raw"`` falls back to the
-            uncompressed BGR888p pipeline re-encoded host-side by
-            PyAV — retained for debugging and environments without
-            the on-device encoder.
-        h264_bitrate_kbps: Target CBR bitrate for h264 mode. ``0``
-            (default) lets DepthAI pick based on resolution + fps.
-        h264_keyframe_interval: Insert an IDR keyframe every N frames.
-            ``None`` (default) picks one keyframe per second (= fps).
-        preview_resolution: Low-res BGR size used to feed the viewer
-            preview in h264 mode. Does not affect the recorded MP4.
-        preview_fps: Frame rate of the low-res preview branch.
+    Presence of the stereo pair and IMU is feature-detected per device, so OAK
+    models without them keep working as RGB-only. Aux stream failures never
+    fail an otherwise-good RGB recording — they downgrade the finalization
+    status to ``"partial"`` naming the losses. For the RGB + optional-depth
+    minimal adapter, use :class:`OakRgbDepthStream` instead.
     """
 
-    # Class-level hints for the discovery registry (see
-    # ``syncfield.discovery``). ``_discovery_kind`` filters adapters by
-    # Stream kind; ``_discovery_adapter_type`` is the stable string id
-    # used in ``DiscoveryReport.errors`` keys and the CLI output.
+    #: Discovery metadata (registered via ``syncfield.discovery``).
     _discovery_kind = "video"
     _discovery_adapter_type = "oak_camera"
 
@@ -183,29 +315,24 @@ class OakCameraStream(StreamBase):
         self,
         id: str,
         output_dir: Path | str,
-        device_id: Optional[str] = None,
-        rgb_resolution: Tuple[int, int] = (1280, 720),
+        device_id: str | None = None,
         rgb_fps: int = 30,
-        depth_enabled: bool = False,
-        depth_resolution: Tuple[int, int] = (640, 400),
-        depth_fps: int = 30,
-        encoding: str = OAK_ENCODING_H264,
-        h264_bitrate_kbps: int = 0,
-        h264_keyframe_interval: Optional[int] = None,
-        preview_resolution: Tuple[int, int] = (320, 180),
-        preview_fps: float = 10.0,
+        rgb_resolution: tuple[int, int] = (1280, 800),
+        h264_bitrate_kbps: int = 8_000,
+        preview_resolution: tuple[int, int] = (320, 200),
+        mono_resolution: tuple[int, int] = (640, 400),
+        mono_fps: int = 30,
+        mono_bitrate_kbps: int = 4_000,
+        imu_rate_hz: int = 400,
+        enable_mono: bool = True,
+        enable_imu: bool = True,
+        **_: Any,
     ) -> None:
-        if encoding not in _OAK_ENCODINGS:
-            raise ValueError(
-                f"OakCameraStream.encoding must be one of {_OAK_ENCODINGS!r}, "
-                f"got {encoding!r}"
-            )
-
         super().__init__(
             id=id,
             kind="video",
             capabilities=StreamCapabilities(
-                provides_audio_track=False,  # OAK cameras have no audio
+                provides_audio_track=False,
                 supports_precise_timestamps=True,
                 is_removable=True,
                 produces_file=True,
@@ -214,343 +341,264 @@ class OakCameraStream(StreamBase):
         )
         self._output_dir = Path(output_dir)
         self._device_id = device_id
+        self._rgb_fps = int(rgb_fps)
         self._rgb_resolution = rgb_resolution
-        self._rgb_fps = rgb_fps
-        self._depth_enabled = depth_enabled
-        self._depth_resolution = depth_resolution
-        self._depth_fps = depth_fps
-
-        self._encoding = encoding
-        self._h264_bitrate_kbps = int(h264_bitrate_kbps)
-        # Default to one keyframe per second (== rgb_fps). Users that record
-        # long clips and care about seek granularity can lower this.
-        self._h264_keyframe_interval = (
-            int(h264_keyframe_interval)
-            if h264_keyframe_interval is not None
-            else int(rgb_fps)
-        )
+        self._h264_bitrate_bps = int(h264_bitrate_kbps) * 1000
         self._preview_resolution = preview_resolution
-        self._preview_fps = float(preview_fps)
+        self._mono_resolution = mono_resolution
+        self._mono_fps = int(mono_fps)
+        self._mono_bitrate_bps = int(mono_bitrate_kbps) * 1000
+        self._imu_rate_hz = int(imu_rate_hz)
+        self._enable_mono = enable_mono
+        self._enable_imu = enable_imu
 
-        # Pipeline + queue handles (populated in connect()).
-        self._pipeline: Any = None
-        # In h264 mode ``_q_rgb`` yields encoded packets from the
-        # on-device VideoEncoder; in raw mode it yields full-res BGR
-        # frames directly from the camera. The capture loop dispatches
-        # on ``self._encoding`` to pick the right handler.
-        self._q_rgb: Any = None
-        self._q_preview: Any = None
-        self._q_depth: Any = None
+        self._rgb = _H264Recorder(label="rgb", is_primary=True)
+        self._left = _H264Recorder(label="left")
+        self._right = _H264Recorder(label="right")
+        self._imu = _ImuRecorder()
+        self._rebind_output_paths()
 
-        # Recording state.
-        self._mp4_path = self._output_dir / f"{id}.mp4"
-        # Raw intermediate bitstream used only in h264 mode. Written to
-        # disk during the recording window and remuxed into ``_mp4_path``
-        # at ``stop_recording`` time. Removed on successful remux; kept
-        # in place on failure so the footage is recoverable.
-        self._h264_path = self._output_dir / f"{id}.h264"
-        self._depth_path = self._output_dir / f"{id}.depth.bin"
-        self._video_writer: Optional[VideoEncoder] = None
-        self._h264_file: Any = None
-        self._depth_file: Any = None
-        self._thread: Optional[threading.Thread] = None
+        self._device: Any | None = None
+        self._pipeline: Any | None = None
+        self._q_preview: Any | None = None
+        self._queues_lock = threading.Lock()
+        self._thread: threading.Thread | None = None
+        self._imu_thread: threading.Thread | None = None
         self._stop_event = threading.Event()
-        self._frame_count = 0
-        self._depth_frame_count = 0
-        self._first_at: Optional[int] = None
-        self._last_at: Optional[int] = None
-
-        # Jitter collection: inter-frame intervals (ns) over the current
-        # recording window. Reset in start_recording().
-        self._prev_capture_ns: Optional[int] = None
-        self._intervals_ns: list[int] = []
-
-        # True while the capture loop should write frames to disk and
-        # emit ``SampleEvent``. ``connect()`` leaves this False so the
-        # CONNECTED preview phase never touches the filesystem;
-        # ``start_recording()`` flips it True; ``stop_recording()``
-        # flips it False again while the capture thread keeps running.
-        self._recording = False
-
-        # Live preview support — the viewer reads ``latest_frame`` to render
-        # the stream card thumbnail. ``_frame_lock`` protects handoff between
-        # the capture thread and the reader.
         self._frame_lock = threading.Lock()
         self._latest_frame: Any = None
+        self._substream_preview_queues: dict[str, Any] = {}
+        self._substream_frames: dict[str, Any] = {}
+        self._substream_callbacks: list[Callable[[Any], None]] = []
+        self._imu_live_seq = 0
+        self._calibration: dict[str, Any] | None = None
+        self._built_camera_configs: list[tuple[str, str, Any, tuple[int, int], float]] = []
+        self._recorded_artifacts: tuple[OakArtifact, ...] = ()
+        self._health_lock = threading.Lock()
+        self._recording_path_timestamps_ns: deque[int] = deque(maxlen=1200)
+        self._recording = False
+        self._capture_error: str | None = None
+        # Mirror of the RGB recorder's frame count: preview health monitoring
+        # reads ``stream._frame_count`` directly (see preview._sdk_frame_count).
+        self._frame_count = 0
 
-    # ------------------------------------------------------------------
-    # Stream SPI — 4-phase lifecycle
-    # ------------------------------------------------------------------
+    def _rebind_output_paths(self) -> None:
+        """Re-derive every recorder file path from the current ``_output_dir``.
+
+        The SDK orchestrator rotates ``_output_dir`` for each episode (a 2nd+
+        recording in one connect session) and rebinds only ``stream._output_dir``
+        via ``_rebind_stream_output_dirs`` — it cannot reach the paths cached
+        inside the per-camera recorders. Calling this at every
+        ``start_recording`` makes consecutive recordings idempotently follow
+        the current episode dir instead of clobbering the first one.
+        """
+        d = self._output_dir
+        sid = self.id
+        self._rgb.h264_path = d / f"{sid}.h264"
+        self._rgb.mp4_path = d / f"{sid}.mp4"
+        self._left.h264_path = d / f"{sid}.left.h264"
+        self._left.mp4_path = d / f"{sid}.left.mp4"
+        self._left.timestamps_path = d / f"{sid}.left.timestamps.jsonl"
+        self._right.h264_path = d / f"{sid}.right.h264"
+        self._right.mp4_path = d / f"{sid}.right.mp4"
+        self._right.timestamps_path = d / f"{sid}.right.timestamps.jsonl"
+        self._imu.path = d / f"{sid}.imu.jsonl"
+
+    @classmethod
+    def discover(cls, *, timeout: float = 5.0) -> list:
+        """Enumerate currently attached OAK devices for SDK-side discovery.
+
+        Uses ``depthai.Device.getAllAvailableDevices`` (near-instant; ``timeout``
+        is accepted for interface consistency). Each result pins its
+        ``device_id`` to the OAK serial so auto-added streams bind to a specific
+        board when several are attached. Never propagates errors.
+        """
+        from syncfield.discovery import DiscoveredDevice
+
+        try:
+            devices_info = dai.Device.getAllAvailableDevices()
+        except Exception:  # noqa: BLE001
+            return []
+
+        results = []
+        for info in devices_info:
+            device_id = getattr(info, "deviceId", None) or ""
+            name = getattr(info, "name", None) or "OAK"
+            state = getattr(info, "state", None)
+            state_str = (getattr(state, "name", None) or str(state)) if state else ""
+            parts = [f"OAK · {device_id[:8]}…"] if device_id else ["OAK"]
+            if state_str:
+                parts.append(state_str.lower())
+            results.append(
+                DiscoveredDevice(
+                    adapter_type="oak_camera",
+                    adapter_cls=cls,
+                    kind="video",
+                    display_name=name or "OAK camera",
+                    description=" · ".join(parts),
+                    device_id=device_id or name or "oak",
+                    construct_kwargs=({"device_id": device_id} if device_id else {}),
+                    accepts_output_dir=True,
+                )
+            )
+        return results
 
     def prepare(self) -> None:
-        """Validate the adapter is ready to connect.
-
-        The heavy lifting — device discovery, pipeline build, pipeline
-        start — happens in :meth:`connect` so the viewer can show a
-        live preview as soon as the session enters the ``CONNECTED``
-        state. ``prepare()`` stays cheap and idempotent.
-        Output directory is created later in ``start_recording()``.
-        """
         pass
 
-    #: How many times to poll ``dai.Device.getAllAvailableDevices()``
-    #: before giving up. XLink enumeration is asynchronous — on multi-
-    #: board rigs the first probe often returns only a subset, and the
-    #: rest appear up to several seconds later while a sibling board
-    #: boots and the Mac USB stack re-quiesces. We've observed:
-    #:
-    #: * dual-OAK (USB-3 + USB-3 on different controllers): ~2 s window
-    #: * dual-OAK involving OAK-D-Lite (USB-2-only board): 10–20 s
-    #:   before the USB-2 board reappears in the enumeration list
-    #: * triple-OAK with USB-2 hub sharing: even longer
-    #:
-    #: 24 s ceiling covers the worst case we've measured without blowing
-    #: up the happy-path connect time — the probe returns on first hit
-    #: when every board is already visible.
-    _ENUMERATE_RETRIES = 16
-    _ENUMERATE_RETRY_DELAY_S = 1.5
-
-    def _locate_device(self) -> Any:
-        """Find the target OAK, retrying the XLink enumeration if needed.
-
-        ``dai.Device.getAllAvailableDevices()`` is an asynchronous probe
-        over XLink. On dual-OAK rigs the first call frequently returns
-        only one of the two boards, then 500–1000 ms later the second
-        board appears. When the caller pinned a specific ``device_id``
-        and it's missing from the first probe, we re-probe up to
-        :attr:`_ENUMERATE_RETRIES` times before raising — that's the
-        difference between a flaky startup and a hard failure the
-        operator has to replug around.
-
-        When ``device_id`` is ``None`` (pick any), we return on the
-        first non-empty result so auto-pick stays fast.
-
-        Raises:
-            RuntimeError: If no device is found after exhausting all
-                retries, or if the pinned ``device_id`` never appears.
-        """
-        last_seen: list = []
-        for attempt in range(self._ENUMERATE_RETRIES):
-            devices = dai.Device.getAllAvailableDevices()
-            last_seen = devices
-            if devices:
-                if self._device_id is None:
-                    return devices[0]
-                for dev in devices:
-                    if getattr(dev, "deviceId", None) == self._device_id:
-                        return dev
-            if attempt < self._ENUMERATE_RETRIES - 1:
-                time.sleep(self._ENUMERATE_RETRY_DELAY_S)
-
-        if not last_seen:
-            raise RuntimeError(
-                "No OAK devices found after "
-                f"{self._ENUMERATE_RETRIES} enumeration attempts. Check "
-                "cables, power, and that no other DepthAI process is "
-                "holding the board."
-            )
-        available = [getattr(d, "deviceId", "?") for d in last_seen]
-        raise RuntimeError(
-            f"OAK device_id {self._device_id!r} not found after "
-            f"{self._ENUMERATE_RETRIES} enumeration attempts. Visible "
-            f"devices: {available}. If the missing device is physically "
-            f"attached, unplug and replug its USB cable — Myriad-X "
-            f"boards can enter a zombie state after an unclean shutdown."
-        )
-
     def connect(self) -> None:
-        """Open the DepthAI pipeline and spawn the preview capture thread.
-
-        Discovers the requested device (by ``device_id`` if supplied,
-        else the first attached OAK), builds the pipeline, starts it,
-        and spawns the capture thread in **preview-only** mode:
-        :attr:`latest_frame` updates continuously, but no file is
-        written and no :class:`SampleEvent` is emitted until
-        :meth:`start_recording` flips the ``_recording`` flag.
-
-        Idempotent — calling ``connect()`` on an already-connected
-        stream is a no-op so legacy callers that jump straight to
-        ``start()`` don't spawn a second capture thread.
-
-        Raises:
-            RuntimeError: If no OAK devices are connected, or if the
-                requested ``device_id`` is not among the currently
-                attached devices after :attr:`_ENUMERATE_RETRIES`
-                probe attempts.
-        """
-        self._install_depthai_bridge()
-
         if self._thread is not None and self._thread.is_alive():
             return
-
-        selected = self._locate_device()
-
-        self._pipeline = self._build_pipeline()
-        # DepthAI v3 build() accepts an optional device info; older
-        # shims without the argument fall back to "first available".
         try:
-            self._pipeline.build(selected)
-        except TypeError:
-            self._pipeline.build()
-        self._pipeline.start()
-
-        # Short warmup — the first few frames are often None while the
-        # camera settles. Keeps the capture loop's error counters clean.
-        time.sleep(1.0)
-
-        # Reset counters so a reconnect starts clean.
-        self._recording = False
-        self._frame_count = 0
-        self._depth_frame_count = 0
-        self._first_at = None
-        self._last_at = None
-        self._stop_event.clear()
-        self._thread = threading.Thread(
-            target=self._capture_loop, name=f"oak-{self.id}", daemon=True
-        )
-        self._thread.start()
+            if _has_legacy_xlink_out():
+                self._connect_legacy_pipeline()
+            else:
+                self._connect_v3_pipeline()
+            self._install_depthai_bridge()
+            self._recording = False
+            self._stop_event.clear()
+            self._thread = threading.Thread(
+                target=self._capture_loop,
+                name=f"desktop-oak-{self.id}",
+                daemon=True,
+            )
+            self._thread.start()
+            # The IMU (~200 Hz) gets its own thread so heavy video draining +
+            # preview JPEG encoding on the capture thread can't starve it — a
+            # shared thread dropped ~5% of IMU samples and pulled the rate to
+            # ~180 Hz under full GUI load (measured).
+            if self._imu.queue is not None:
+                self._imu_thread = threading.Thread(
+                    target=self._imu_loop,
+                    name=f"desktop-oak-imu-{self.id}",
+                    daemon=True,
+                )
+                self._imu_thread.start()
+        except Exception:
+            self.disconnect()
+            raise
 
     def start_recording(self, session_clock: SessionClock) -> None:
-        """Open output files and flip the recording flag.
-
-        The capture thread is already running from :meth:`connect`, so
-        this is a writer construction plus a boolean flip — fast enough
-        to run atomically across every stream in the orchestrator's
-        start phase.
-
-        In h264 mode the "writer" is just a raw file handle for the
-        compressed bitstream; the MP4 container is synthesised at
-        :meth:`stop_recording` time via :func:`remux_h264_to_mp4`.
-
-        If the caller skipped :meth:`connect` (legacy 0.1 ``start()``
-        path), the pipeline is started here first so the writer always
-        has a feeder.
-        """
         self._begin_recording_window(session_clock)
         if self._thread is None or not self._thread.is_alive():
             self.connect()
+        # Follow the current episode dir: the orchestrator rotates _output_dir
+        # per recording but can't rebind the nested recorder paths.
+        self._rebind_output_paths()
         self._output_dir.mkdir(parents=True, exist_ok=True)
-
-        # Reset per-recording counters so a second recording in the same
-        # session starts clean.
+        with self._health_lock:
+            self._recording_path_timestamps_ns.clear()
+        self._capture_error = None
         self._frame_count = 0
-        self._depth_frame_count = 0
-        self._first_at = None
-        self._last_at = None
-        self._prev_capture_ns = None
-        self._intervals_ns = []
-
-        if self._encoding == OAK_ENCODING_H264:
-            # Drop any stale bitstream from a crashed prior session so
-            # the capture loop never writes on top of foreign bytes.
-            if self._h264_path.exists():
-                try:
-                    self._h264_path.unlink()
-                except OSError:
-                    pass
-            self._h264_file = open(self._h264_path, "wb")
-        else:
-            width, height = self._rgb_resolution
-            self._video_writer = VideoEncoder.open(
-                self._mp4_path,
-                width=width,
-                height=height,
-                fps=float(self._rgb_fps),
-            )
-
-        if self._depth_enabled:
-            self._depth_file = open(self._depth_path, "wb")
-
-        # Flip the flag LAST so the capture loop doesn't race into a
-        # half-built writer.
+        for recorder in (self._rgb, self._left, self._right):
+            recorder.begin_recording()
+        self._imu.begin_recording()
+        self._write_calibration_file()
+        self._drain_stale_packets()
         self._recording = True
 
+    def _write_calibration_file(self) -> None:
+        if self._calibration is None:
+            return
+        path = self._output_dir / f"{self.id}.calibration.json"
+        try:
+            path.write_text(json.dumps(self._calibration, indent=2), encoding="utf-8")
+        except OSError as exc:
+            logger.warning("OAK %s: failed to write calibration file: %s", self.id, exc)
+
     def stop_recording(self) -> FinalizationReport:
-        """Flip recording off, close the writers, return the report.
-
-        The pipeline stays live so the viewer preview keeps rendering
-        and the operator can start a fresh recording on the same
-        session without re-opening hardware.
-
-        In h264 mode the raw ``.h264`` bitstream is remuxed into the
-        target ``.mp4`` here (copy-mode, near-instant). If the remux
-        fails the raw file is left in place so the footage is
-        recoverable and a health event is emitted so the operator can
-        see it in the session report.
-        """
         self._recording = False
-        self._release_writers()
+        for recorder in (self._left, self._right):
+            recorder.close_files()
+        self._imu.close_file()
 
-        mp4_available = self._finalize_mp4()
+        # Primary (RGB) result decides completed-vs-failed, exactly as before
+        # aux streams existed.
+        self._rgb.close_files()
+        mp4_available = False
+        error = self._capture_error
+        status = "completed"
+        if self._rgb.frame_count > 0 and self._rgb.h264_path.exists():
+            try:
+                remux_h264_to_mp4(self._rgb.h264_path, self._rgb.mp4_path, fps=float(self._rgb_fps))
+                mp4_available = (
+                    self._rgb.mp4_path.exists() and self._rgb.mp4_path.stat().st_size > 0
+                )
+                if mp4_available:
+                    try:
+                        self._rgb.h264_path.unlink()
+                    except OSError:
+                        pass
+            except Exception as exc:  # noqa: BLE001
+                status = "failed"
+                error = f"H.264 remux failed: {exc}"
+                try:
+                    if self._rgb.mp4_path.exists() and self._rgb.mp4_path.stat().st_size == 0:
+                        self._rgb.mp4_path.unlink()
+                except OSError:
+                    pass
+        elif error is None:
+            status = "failed"
+            error = "No decodable H.264 keyframe arrived during recording."
 
-        jitter_p95, jitter_p99 = compute_jitter_percentiles(self._intervals_ns)
+        if error is not None:
+            status = "failed"
+
+        aux_errors: list[str] = []
+        artifacts: list[OakArtifact] = []
+        for recorder in (self._left, self._right):
+            if recorder.queue is None:
+                continue
+            aux_error = recorder.finish_recording(float(self._mono_fps))
+            if aux_error is not None:
+                aux_errors.append(aux_error)
+            else:
+                artifacts.append(
+                    OakArtifact(
+                        stream_id=f"{self.id}.{recorder.label}",
+                        kind="video",
+                        path=recorder.mp4_path,
+                        frame_count=recorder.frame_count,
+                    )
+                )
+        if self._imu.queue is not None:
+            if self._imu.sample_count == 0:
+                aux_errors.append("imu: no samples arrived during recording.")
+            elif self._imu.path.exists():
+                artifacts.append(
+                    OakArtifact(
+                        stream_id=f"{self.id}.imu",
+                        kind="sensor",
+                        path=self._imu.path,
+                        frame_count=self._imu.sample_count,
+                    )
+                )
+        self._recorded_artifacts = tuple(artifacts)
+        if aux_errors:
+            logger.warning("OAK %s aux capture losses: %s", self.id, "; ".join(aux_errors))
+            if status == "completed":
+                status = "partial"
+                error = "; ".join(aux_errors)
+
+        jitter_p95, jitter_p99 = compute_jitter_percentiles(self._rgb.intervals_ns)
         return FinalizationReport(
             stream_id=self.id,
-            status="completed",
-            frame_count=self._frame_count,
-            file_path=(
-                self._mp4_path if self._frame_count > 0 and mp4_available else None
-            ),
-            first_sample_at_ns=self._first_at,
-            last_sample_at_ns=self._last_at,
-            health_events=list(self._collected_health),
-            error=None,
+            status=status,
+            frame_count=self._rgb.frame_count,
+            file_path=self._rgb.mp4_path if mp4_available else None,
+            first_sample_at_ns=self._rgb.first_at,
+            last_sample_at_ns=self._rgb.last_at,
+            health_events=[],
+            error=error,
             jitter_p95_ns=jitter_p95,
             jitter_p99_ns=jitter_p99,
             recording_anchor=self._recording_anchor(),
         )
 
-    def _finalize_mp4(self) -> bool:
-        """Produce ``_mp4_path`` from the captured bitstream.
-
-        * raw mode — the PyAV ``VideoEncoder`` already wrote the MP4
-          during the recording window; nothing to do.
-        * h264 mode — remux ``_h264_path`` into ``_mp4_path`` in copy
-          mode.
-
-        Returns ``True`` if an MP4 file is available on disk after
-        this call, ``False`` if the remux failed. A failure is
-        surfaced as a health event so it shows up in the session
-        report without aborting the whole finalization.
-        """
-        if self._encoding != OAK_ENCODING_H264:
-            return True
-        if self._frame_count <= 0 or not self._h264_path.exists():
-            return False
-        try:
-            remux_h264_to_mp4(
-                self._h264_path,
-                self._mp4_path,
-                fps=float(self._rgb_fps),
-            )
-        except Exception as exc:  # noqa: BLE001 - PyAV surfaces diverse errors
-            self._emit_health(
-                HealthEvent(
-                    stream_id=self.id,
-                    kind=HealthEventKind.ERROR,
-                    at_ns=time.monotonic_ns(),
-                    detail=(
-                        f"h264 → mp4 remux failed: {exc!r}; "
-                        f"raw bitstream kept at {self._h264_path}"
-                    ),
-                )
-            )
-            return False
-        # Remux succeeded — clean up the intermediate bitstream.
-        try:
-            self._h264_path.unlink()
-        except OSError:
-            pass
-        return True
-
     def _install_depthai_bridge(self) -> None:
-        """Install a logging.Handler that converts depthai native log records into HealthEvents.
-
-        Idempotent. Registered on depthai's module logger so every internal
-        warning/error that depthai emits during this stream's lifetime is
-        routed to the IncidentTracker via :meth:`_emit_health`.
-        """
+        """Route depthai's native log records to HealthEvents. Idempotent."""
         import logging as _logging
+
         from syncfield.health.detectors.depthai_bridge import DepthAILoggerBridge
 
         if getattr(self, "_depthai_bridge", None) is not None:
@@ -564,6 +612,7 @@ class OakCameraStream(StreamBase):
     def _uninstall_depthai_bridge(self) -> None:
         """Remove the depthai logging handler. Idempotent."""
         import logging as _logging
+
         bridge = getattr(self, "_depthai_bridge", None)
         if bridge is None:
             return
@@ -571,103 +620,194 @@ class OakCameraStream(StreamBase):
         self._depthai_bridge = None
 
     def disconnect(self) -> None:
-        """Stop the capture thread and release the DepthAI pipeline.
-
-        Called when the session returns to ``IDLE``. Idempotent —
-        calling twice is safe. After this call the adapter holds no
-        DepthAI handles.
-        """
         self._stop_event.set()
+        self._uninstall_depthai_bridge()
         if self._thread is not None:
             self._thread.join(timeout=3.0)
             self._thread = None
-        self._release_pipeline()
-        self._uninstall_depthai_bridge()
-
-    # ------------------------------------------------------------------
-    # Legacy one-shot lifecycle
-    # ------------------------------------------------------------------
+        if self._imu_thread is not None:
+            self._imu_thread.join(timeout=3.0)
+            self._imu_thread = None
+        for recorder in (self._rgb, self._left, self._right):
+            recorder.close_files()
+        self._imu.close_file()
+        pipeline = getattr(self, "_pipeline", None)
+        if pipeline is not None:
+            stop = getattr(pipeline, "stop", None)
+            if callable(stop):
+                try:
+                    stop()
+                    time.sleep(0.3)
+                except Exception:
+                    pass
+            self._pipeline = None
+        if self._device is not None:
+            close = getattr(self._device, "close", None)
+            if callable(close):
+                close()
+            self._device = None
+        with self._queues_lock:
+            self._rgb.queue = None
+            self._left.queue = None
+            self._right.queue = None
+            self._imu.queue = None
+        self._q_preview = None
+        self._substream_preview_queues = {}
+        with self._frame_lock:
+            self._substream_frames = {}
 
     def start(self, session_clock: SessionClock) -> None:
-        """Legacy one-shot start — ``connect() + start_recording()``.
-
-        Exists so 0.1-era scripts that call ``prepare() → start() →
-        stop()`` keep working without changes. New callers (the
-        viewer, the 4-phase orchestrator path) should use
-        :meth:`connect` and :meth:`start_recording` directly to get
-        live preview before the first Record click.
-        """
         self.connect()
         self.start_recording(session_clock)
 
     def stop(self) -> FinalizationReport:
-        """Legacy one-shot stop — ``stop_recording() + disconnect()``."""
         report = self.stop_recording()
         self.disconnect()
         return report
 
-    # ------------------------------------------------------------------
-    # Pipeline construction
-    # ------------------------------------------------------------------
+    @property
+    def latest_frame(self) -> Any:
+        with self._frame_lock:
+            return self._latest_frame
 
-    def _build_pipeline(self) -> Any:
-        """Build a DepthAI v3 pipeline with the requested outputs.
+    def latest_frame_for(self, substream_id: str) -> Any:
+        """Latest preview frame for a video substream (``{id}.left``/``.right``)."""
+        with self._frame_lock:
+            return self._substream_frames.get(substream_id)
 
-        Always creates an RGB ``Camera`` node. The shape of the RGB
-        subgraph depends on :attr:`_encoding`:
+    def substream_capture_hz(self, substream_id: str) -> float:
+        """True sensor capture rate of a video substream (30 fps), not the
+        throttled ~10 fps preview cadence the UI would otherwise infer."""
+        recorder = {
+            f"{self.id}.left": self._left,
+            f"{self.id}.right": self._right,
+        }.get(substream_id)
+        return recorder.capture_hz() if recorder is not None else 0.0
 
-        * ``"h264"`` — full-res NV12 output fans into a ``VideoEncoder``
-          that emits compressed H.264 over XLink. A parallel low-res
-          BGR branch feeds the viewer preview without paying the
-          full-res bandwidth cost.
-        * ``"raw"`` — legacy single-branch BGR888p stream straight out
-          of the camera. The capture loop re-encodes host-side via
-          PyAV.
+    def substreams(self) -> tuple[OakSubstream, ...]:
+        """Derived streams currently live on this device's pipeline."""
+        subs: list[OakSubstream] = []
+        if self._left.queue is not None:
+            subs.append(OakSubstream(f"{self.id}.left", "video", "Left mono", expected_hz=10.0))
+        if self._right.queue is not None:
+            subs.append(OakSubstream(f"{self.id}.right", "video", "Right mono", expected_hz=10.0))
+        if self._imu.queue is not None:
+            # expected_hz stays None: BNO086 grants roughly half the requested
+            # rate (~195 Hz for a 400 Hz ask), so a threshold against the
+            # request would misreport healthy capture as degraded.
+            subs.append(OakSubstream(f"{self.id}.imu", "sensor", "IMU"))
+        return tuple(subs)
 
-        If ``depth_enabled`` is True, also creates a ``StereoDepth``
-        node wired to the on-board mono cameras.
+    def recorded_artifacts(self) -> tuple[OakArtifact, ...]:
+        """Aux files (left/right mono, IMU) written by the last recording.
+
+        The desktop backend folds these into ``manifest.json`` after
+        ``stop()`` so every OAK stream — not just the primary RGB the SDK
+        orchestrator knows about — is discovered and aligned by the sync
+        pipeline. Empty until a recording finalizes; excludes aux streams
+        that produced no decodable output.
         """
+        return self._recorded_artifacts
+
+    def on_substream_sample(self, callback: Callable[[Any], None]) -> None:
+        """Register a callback for derived-substream samples (IMU live data).
+
+        Deliberately separate from ``on_sample`` — orchestrator sample writers
+        must never see substream events, or IMU rows would pollute the
+        composite's ``{id}.timestamps.jsonl``.
+        """
+        self._substream_callbacks.append(callback)
+
+    def _emit_substream_sample(self, event: Any) -> None:
+        for callback in self._substream_callbacks:
+            try:
+                callback(event)
+            except Exception:  # noqa: BLE001
+                logger.debug("substream sample callback failed for %s", self.id)
+
+    @property
+    def device_key(self) -> str | None:
+        return f"oak_camera:{self._device_id}" if self._device_id else None
+
+    def _connect_legacy_pipeline(self) -> None:
+        device_info = dai.DeviceInfo(self._device_id) if self._device_id else None
+        pipeline = self._build_legacy_pipeline()
+        device = (
+            dai.Device(pipeline, device_info) if device_info is not None else dai.Device(pipeline)
+        )
+        self._device = device
+        self._rgb.queue = device.getOutputQueue(name="h264", maxSize=30, blocking=False)
+        self._q_preview = device.getOutputQueue(name="preview", maxSize=4, blocking=False)
+        logger.info(
+            "OAK %s: legacy DepthAI (v2) API detected; mono/IMU capture requires v3 — "
+            "recording RGB only",
+            self.id,
+        )
+
+    def _connect_v3_pipeline(self) -> None:
+        device_info = dai.DeviceInfo(self._device_id) if self._device_id else None
+        self._device = dai.Device(device_info) if device_info is not None else dai.Device()
+        pipeline = self._build_v3_pipeline(self._device)
+        self._calibration = _build_calibration_summary(self._device, self._built_camera_configs)
+        if self._calibration is None:
+            logger.warning(
+                "OAK %s: device calibration unavailable; sessions will lack %s.calibration.json",
+                self.id,
+                self.id,
+            )
+        pipeline.start()
+        self._pipeline = pipeline
+
+    def _build_legacy_pipeline(self) -> Any:
         pipeline = dai.Pipeline()
+        cam = pipeline.create(dai.node.ColorCamera)
+        cam.setBoardSocket(dai.CameraBoardSocket.CAM_A)
+        cam.setResolution(dai.ColorCameraProperties.SensorResolution.THE_720_P)
+        cam.setFps(float(self._rgb_fps))
+        cam.setPreviewSize(*self._preview_resolution)
+        cam.setInterleaved(False)
 
-        # --- RGB camera --------------------------------------------------
-        cam = pipeline.create(dai.node.Camera)
-        cam.build()
+        enc = pipeline.create(dai.node.VideoEncoder)
+        enc.setDefaultProfilePreset(
+            self._rgb_fps,
+            dai.VideoEncoderProperties.Profile.H264_MAIN,
+        )
+        _configure_h264_encoder_for_segmented_recording(enc, self._rgb_fps)
+        if self._h264_bitrate_bps > 0:
+            enc.setBitrate(self._h264_bitrate_bps)
+        cam.video.link(enc.input)
 
-        if self._encoding == OAK_ENCODING_H264:
-            self._build_h264_branch(pipeline, cam)
-        else:
-            rgb_out = cam.requestOutput(
-                self._rgb_resolution,
-                dai.ImgFrame.Type.BGR888p,
-                fps=float(self._rgb_fps),
-            )
-            self._q_rgb = rgb_out.createOutputQueue()
+        h264_out = _create_xlink_out(pipeline)
+        h264_out.setStreamName("h264")
+        enc.bitstream.link(h264_out.input)
 
-        # --- Optional stereo depth --------------------------------------
-        if self._depth_enabled:
-            stereo = pipeline.create(dai.node.StereoDepth)
-            stereo.build(
-                autoCreateCameras=True,
-                presetMode=dai.node.StereoDepth.PresetMode.HIGH_DETAIL,
-                size=self._depth_resolution,
-                fps=float(self._depth_fps),
-            )
-            self._q_depth = stereo.depth.createOutputQueue()
-
+        preview_out = _create_xlink_out(pipeline)
+        preview_out.setStreamName("preview")
+        cam.preview.link(preview_out.input)
         return pipeline
 
-    def _build_h264_branch(self, pipeline: Any, cam: Any) -> None:
-        """Wire Camera → VideoEncoder (full-res, compressed) plus a
-        low-res BGR preview branch used only for ``latest_frame``.
+    def _build_v3_pipeline(self, device: Any) -> Any:
+        pipeline = dai.Pipeline(device)
+        socket_names = _connected_socket_names(device)
+        imu_name = _connected_imu_name(device)
+        self._built_camera_configs = []
+        # Hardware frame sync: with the stereo pair present, CAM_A drives the
+        # FSYNC line (OUTPUT) and the monos follow it (INPUT), so all three
+        # sensors expose the shutter at the same instant. Measured: rgb<->mono
+        # per-frame device-timestamp residual drops from ~4.6 ms (free-run) to
+        # ~0.02 ms. Only meaningful when the monos are built to follow.
+        stereo_available = (
+            self._enable_mono and socket_names is not None and {"CAM_B", "CAM_C"} <= socket_names
+        )
 
-        Must be called exactly once from :meth:`_build_pipeline` when
-        ``encoding == "h264"``. Populates ``self._q_rgb`` with the
-        encoded-bitstream queue and ``self._q_preview`` with the live
-        preview queue.
-        """
-        # Full-resolution NV12 feed for the hardware encoder. NV12 is
-        # the encoder's native pixel layout; requesting BGR here would
-        # force an on-device CSC and lose the bandwidth win.
+        cam = pipeline.create(dai.node.Camera)
+        try:
+            cam.build(dai.CameraBoardSocket.CAM_A)
+        except TypeError:
+            cam.build()
+        if stereo_available:
+            _apply_frame_sync(cam, "OUTPUT", self.id, "CAM_A")
+
         encoder_in = cam.requestOutput(
             self._rgb_resolution,
             dai.ImgFrame.Type.NV12,
@@ -678,349 +818,590 @@ class OakCameraStream(StreamBase):
             input=encoder_in,
             frameRate=float(self._rgb_fps),
             profile=dai.VideoEncoderProperties.Profile.H264_MAIN,
-            keyframeFrequency=self._h264_keyframe_interval,
         )
-        if self._h264_bitrate_kbps > 0:
-            encoder.setBitrateKbps(self._h264_bitrate_kbps)
-        self._q_rgb = encoder.out.createOutputQueue()
+        _configure_h264_encoder_for_segmented_recording(encoder, self._rgb_fps)
+        if self._h264_bitrate_bps > 0:
+            encoder.setBitrateKbps(max(1, self._h264_bitrate_bps // 1000))
+        self._rgb.queue = encoder.out.createOutputQueue()
+        self._built_camera_configs.append(
+            (
+                "rgb",
+                "CAM_A",
+                dai.CameraBoardSocket.CAM_A,
+                self._rgb_resolution,
+                float(self._rgb_fps),
+            )
+        )
 
-        # Low-res BGR feed for the viewer. At 320x180×10fps this costs
-        # ~1.7 MB/s per camera — negligible compared to the old
-        # 1080p×30fps BGR firehose that saturated USB.
         preview_out = cam.requestOutput(
             self._preview_resolution,
             dai.ImgFrame.Type.BGR888p,
-            fps=self._preview_fps,
+            fps=min(10.0, float(self._rgb_fps)),
         )
         self._q_preview = preview_out.createOutputQueue()
 
-    # ------------------------------------------------------------------
-    # Capture loop
-    # ------------------------------------------------------------------
+        if self._enable_mono:
+            if stereo_available:
+                for socket, socket_name, recorder in (
+                    (dai.CameraBoardSocket.CAM_B, "CAM_B", self._left),
+                    (dai.CameraBoardSocket.CAM_C, "CAM_C", self._right),
+                ):
+                    mono = pipeline.create(dai.node.Camera)
+                    mono.build(socket)
+                    _apply_frame_sync(mono, "INPUT", self.id, socket_name)
+                    mono_out = mono.requestOutput(
+                        self._mono_resolution,
+                        dai.ImgFrame.Type.NV12,
+                        fps=float(self._mono_fps),
+                    )
+                    mono_encoder = pipeline.create(dai.node.VideoEncoder)
+                    mono_encoder.build(
+                        input=mono_out,
+                        frameRate=float(self._mono_fps),
+                        profile=dai.VideoEncoderProperties.Profile.H264_MAIN,
+                    )
+                    _configure_h264_encoder_for_segmented_recording(mono_encoder, self._mono_fps)
+                    if self._mono_bitrate_bps > 0:
+                        mono_encoder.setBitrateKbps(max(1, self._mono_bitrate_bps // 1000))
+                    recorder.queue = mono_encoder.out.createOutputQueue(maxSize=30, blocking=False)
+                    self._built_camera_configs.append(
+                        (
+                            recorder.label,
+                            socket_name,
+                            socket,
+                            self._mono_resolution,
+                            float(self._mono_fps),
+                        )
+                    )
+                    mono_preview = mono.requestOutput(
+                        self._preview_resolution,
+                        dai.ImgFrame.Type.BGR888p,
+                        fps=min(10.0, float(self._mono_fps)),
+                    )
+                    self._substream_preview_queues[f"{self.id}.{recorder.label}"] = (
+                        mono_preview.createOutputQueue(maxSize=4, blocking=False)
+                    )
+            else:
+                logger.warning(
+                    "OAK %s: stereo sockets unavailable (connected=%s); recording RGB only",
+                    self.id,
+                    sorted(socket_names) if socket_names else socket_names,
+                )
+
+        if self._enable_imu:
+            if imu_name:
+                imu = pipeline.create(dai.node.IMU)
+                # One combined enable call on purpose: enabling the sensors
+                # separately degrades BNO086 synced output to ~52 Hz, while
+                # the combined form delivers ~195 Hz (measured on hardware).
+                imu.enableIMUSensor(
+                    [
+                        dai.IMUSensor.ACCELEROMETER_RAW,
+                        dai.IMUSensor.GYROSCOPE_RAW,
+                        dai.IMUSensor.ROTATION_VECTOR,
+                    ],
+                    self._imu_rate_hz,
+                )
+                imu.setBatchReportThreshold(5)
+                imu.setMaxBatchReports(30)
+                # Large host queue: the IMU (~196 Hz) shares one capture thread
+                # with three H.264 video drains, so a busy loop iteration must
+                # not overflow it. 200 gives ~1 s of device-side buffering.
+                self._imu.queue = imu.out.createOutputQueue(maxSize=200, blocking=False)
+            else:
+                logger.info("OAK %s: no IMU reported by device; skipping IMU capture", self.id)
+
+        return pipeline
 
     def _capture_loop(self) -> None:
-        """Body of the background thread — tight read/timestamp/write loop.
-
-        Two phases, distinguished by the ``_recording`` flag:
-
-        * **Preview** (``_recording == False``) — publish every frame
-          to ``latest_frame`` so the viewer card stays live, but do
-          **not** write to the MP4, update frame counters, or emit
-          ``SampleEvent``. The capture runs continuously from the
-          moment :meth:`connect` spawned this thread.
-        * **Recording** (``_recording == True``) — same preview
-          publish, plus write to the on-disk bitstream (h264 mode) or
-          MP4 via PyAV (raw mode), advance ``_frame_count``, drain a
-          depth tick, and emit ``SampleEvent``. The capture timestamp
-          is sampled *immediately* after ``queue.get()`` so the jitter
-          between the physical frame and the recorded monotonic time
-          stays as small as possible.
-
-        The loop exits when ``_stop_event`` fires (from
-        :meth:`disconnect`).
-        """
-        while not self._stop_event.is_set():
-            rgb_msg = self._safe_get_rgb()
-            capture_ns = time.monotonic_ns()
-
-            # In h264 mode the viewer preview rides a separate low-res
-            # BGR branch — poll it opportunistically so ``latest_frame``
-            # keeps updating even if the main encoded queue is quiet.
-            if self._encoding == OAK_ENCODING_H264:
-                self._drain_preview_tick()
-
-            if rgb_msg is None:
-                continue
-
-            # Device-clock timestamp (raw Myriad-X ns since board power-up).
-            # Pulled here — *before* any handler touches the message — so the
-            # value travels alongside ``capture_ns`` to the orchestrator.
-            # Downstream device-interval smoothing in ``SyncSession`` uses
-            # the deltas between consecutive frames' device clocks to scrub
-            # host-arrival jitter out of the recorded ``capture_ns``.
-            device_ts_ns = _device_timestamp_ns(rgb_msg)
-
-            # Recording-window-only jitter collection (see UVC adapter for rationale).
-            if self._recording:
-                self._observe_first_frame(capture_ns, device_ts_ns)
-                if self._prev_capture_ns is not None:
-                    self._intervals_ns.append(capture_ns - self._prev_capture_ns)
-                self._prev_capture_ns = capture_ns
-
-            if self._encoding == OAK_ENCODING_H264:
-                self._handle_encoded_packet(rgb_msg, capture_ns, device_ts_ns)
-            else:
-                self._handle_raw_frame(rgb_msg, capture_ns, device_ts_ns)
-
-            if self._recording and self._depth_enabled:
-                self._drain_depth_tick()
-
-    def _handle_encoded_packet(
-        self,
-        msg: Any,
-        capture_ns: int,
-        device_ts_ns: Optional[int],
-    ) -> None:
-        """h264 mode — write the on-device encoded packet to the raw
-        ``.h264`` file and emit a :class:`SampleEvent`.
-
-        The packet payload is Annex-B H.264 with SPS/PPS inline, so the
-        raw file is directly decodable and can be remuxed into an MP4
-        at ``stop_recording`` time with no re-encoding.
-        """
-        if not self._recording:
-            return
-        if self._first_at is None:
-            self._first_at = capture_ns
-        self._last_at = capture_ns
-        self._frame_count += 1
-        if self._h264_file is not None:
-            # ``getData()`` returns a depthai ``VectorUChar``; ``bytes(...)``
-            # gives us a plain buffer the OS write path prefers.
-            self._h264_file.write(bytes(msg.getData()))
-        self._emit_sample(
-            SampleEvent(
-                stream_id=self.id,
-                frame_number=self._frame_count - 1,
-                capture_ns=capture_ns,
-                device_ns=device_ts_ns,
-            )
-        )
-
-    def _handle_raw_frame(
-        self,
-        msg: Any,
-        capture_ns: int,
-        device_ts_ns: Optional[int],
-    ) -> None:
-        """raw mode — publish the BGR frame for preview and host-encode
-        via PyAV.
-        """
-        frame = msg.getCvFrame()
-        with self._frame_lock:
-            self._latest_frame = frame
-
-        if not self._recording:
-            return
-        if self._first_at is None:
-            self._first_at = capture_ns
-        self._last_at = capture_ns
-        self._frame_count += 1
-        if self._video_writer is not None:
-            self._video_writer.write(frame)
-        self._emit_sample(
-            SampleEvent(
-                stream_id=self.id,
-                frame_number=self._frame_count - 1,
-                capture_ns=capture_ns,
-                device_ns=device_ts_ns,
-            )
-        )
-
-    def _drain_preview_tick(self) -> None:
-        """h264 mode only — non-blocking pull from the low-res BGR
-        preview queue. Publishes the most recent frame to
-        :attr:`latest_frame` for the viewer.
-        """
-        if self._q_preview is None:
-            return
         try:
+            while not self._stop_event.is_set():
+                self._drain_preview()
+                got_packets = False
+                for recorder in (self._rgb, self._left, self._right):
+                    packets = self._drain_queue(recorder)
+                    for pkt in packets:
+                        self._handle_camera_packet(recorder, pkt)
+                    got_packets = got_packets or bool(packets)
+                if not got_packets:
+                    self._stop_event.wait(0.002)
+        except Exception as exc:  # noqa: BLE001
+            self._capture_error = f"{type(exc).__name__}: {exc}"
+            logger.exception("OAK capture loop failed for %s", self.id)
+
+    def _imu_loop(self) -> None:
+        """Drain the IMU on its own thread, decoupled from video/preview load."""
+        try:
+            while not self._stop_event.is_set():
+                messages = self._drain_queue(self._imu)
+                for msg in messages:
+                    self._handle_imu_message(msg)
+                if not messages:
+                    self._stop_event.wait(0.001)
+        except Exception as exc:  # noqa: BLE001
+            self._capture_error = f"{type(exc).__name__}: {exc}"
+            logger.exception("OAK IMU loop failed for %s", self.id)
+
+    def _drain_preview(self) -> None:
+        if self._q_preview is not None:
             msg = self._q_preview.tryGet()
-        except Exception:
-            return
-        if msg is None:
-            return
-        try:
+            if msg is not None:
+                frame = msg.getCvFrame()
+                with self._frame_lock:
+                    self._latest_frame = frame
+        for substream_id, queue in self._substream_preview_queues.items():
+            msg = queue.tryGet()
+            if msg is None:
+                continue
             frame = msg.getCvFrame()
-        except Exception:
-            return
-        with self._frame_lock:
-            self._latest_frame = frame
+            with self._frame_lock:
+                self._substream_frames[substream_id] = frame
 
-    def _safe_get_rgb(self) -> Any:
-        """Pull one RGB frame from the queue, swallowing timeouts."""
-        try:
-            return self._q_rgb.get(timeout=0.1)
-        except Exception:
-            return None
+    def _drain_queue(self, holder: _H264Recorder | _ImuRecorder) -> tuple[Any, ...]:
+        with self._queues_lock:
+            queue = holder.queue
+            if queue is None:
+                return ()
+            get_all = getattr(queue, "tryGetAll", None)
+            if callable(get_all):
+                packets = tuple(get_all())
+                if packets:
+                    return packets
+            pkt = queue.tryGet()
+            return (pkt,) if pkt is not None else ()
 
-    def _drain_depth_tick(self) -> None:
-        """Non-blocking depth pull — write whatever is ready this tick."""
-        if self._q_depth is None or self._depth_file is None:
+    def _drain_stale_packets(self) -> None:
+        for recorder in (self._rgb, self._left, self._right):
+            for pkt in self._drain_queue(recorder):
+                try:
+                    recorder.remember_parameter_sets(_packet_bytes(pkt))
+                except Exception:  # noqa: BLE001
+                    logger.debug("stale OAK H.264 packet drain failed for %s", self.id)
+        # Pre-recording IMU samples are preview-phase noise — discard them so
+        # the JSONL starts at the recording window like the video files do.
+        self._drain_queue(self._imu)
+
+    def _handle_camera_packet(self, recorder: _H264Recorder, pkt: Any) -> None:
+        capture_ns = time.monotonic_ns()
+        data = _packet_bytes(pkt)
+        recorder.remember_parameter_sets(data)
+        recorder.observe_capture(capture_ns)
+        if recorder.is_primary:
+            self._observe_recording_path_frame(capture_ns)
+        if not self._recording:
             return
-        depth_msg = self._q_depth.tryGet()
-        if depth_msg is None:
+
+        device_ts_ns = _timestamp_ns(getattr(pkt, "getTimestampDevice", None))
+        if not recorder.write_frame(data, capture_ns, device_ts_ns):
             return
+        if recorder.is_primary:
+            self._observe_first_frame(capture_ns, device_ts_ns)
+            self._frame_count = recorder.frame_count
+            self._emit_sample(
+                _sample_event(
+                    stream_id=self.id,
+                    frame_number=recorder.frame_count - 1,
+                    capture_ns=capture_ns,
+                    device_ts_ns=device_ts_ns,
+                )
+            )
+
+    def _handle_imu_message(self, msg: Any) -> None:
+        capture_ns = time.monotonic_ns()
+        recording = self._recording
+        for pkt in getattr(msg, "packets", ()) or ():
+            reading = _imu_reading(pkt)
+            if reading is None:
+                continue
+            channels, device_ns = reading
+            if recording:
+                # Canonical SensorSample schema so the sync pipeline's
+                # load_sensor_jsonl reads it (needs capture_ns + a channels
+                # dict). clock_domain is omitted so sync inherits the primary
+                # stream's domain, keeping the intra-host alignment path.
+                # write_row is a thread-safe no-op once the file is closed.
+                self._imu.write_row(
+                    {
+                        "frame_number": self._imu.sample_count,
+                        "capture_ns": capture_ns,
+                        "channels": channels,
+                        "clock_source": "host_monotonic",
+                        "uncertainty_ns": 5_000_000,
+                        "device_timestamp_ns": device_ns,
+                    }
+                )
+            if self._substream_callbacks:
+                self._emit_substream_sample(
+                    _imu_live_event(f"{self.id}.imu", channels, self._imu_live_seq, capture_ns)
+                )
+            self._imu_live_seq += 1
+
+    def recording_health_window(self, start_ns: int, end_ns: int) -> tuple[int, ...]:
+        """Return encoded-frame dequeue timestamps for a preflight window."""
+        with self._health_lock:
+            samples = tuple(self._recording_path_timestamps_ns)
+        return tuple(ts for ts in samples if start_ns <= ts <= end_ns)
+
+    def _observe_recording_path_frame(self, capture_ns: int) -> None:
+        with self._health_lock:
+            self._recording_path_timestamps_ns.append(capture_ns)
+
+
+def _apply_frame_sync(cam: Any, role: str, stream_id: str, socket_name: str) -> None:
+    """Put one camera into hardware frame-sync as OUTPUT (master) or INPUT.
+
+    Best-effort + feature-detected: a DepthAI build or board that lacks
+    ``setFrameSyncMode`` / the requested role just falls back to free-running
+    capture (the sync pipeline still aligns via device timestamps, only less
+    tightly), so a failure is logged, never fatal.
+    """
+    try:
+        control = cam.initialControl
+        mode = getattr(dai.CameraControl.FrameSyncMode, role)
+        control.setFrameSyncMode(mode)
+    except Exception as exc:  # noqa: BLE001
+        logger.info(
+            "OAK %s: hardware frame sync unavailable for %s (%s); using free-run",
+            stream_id,
+            socket_name,
+            exc,
+        )
+
+
+def _connected_socket_names(device: Any) -> frozenset[str] | None:
+    """Names of camera sockets the device reports, or None when unknowable.
+
+    ``None`` (probe failed) deliberately reads as "don't build mono nodes":
+    building a pipeline against absent sockets fails the whole connect, which
+    would regress RGB capture on boards in a degraded state.
+    """
+    try:
+        features = device.getConnectedCameraFeatures()
+    except Exception:  # noqa: BLE001
+        return None
+    names: set[str] = set()
+    for feature in features or ():
+        socket = getattr(feature, "socket", None)
+        if socket is None:
+            continue
+        names.add(str(getattr(socket, "name", socket)).split(".")[-1])
+    return frozenset(names)
+
+
+def _connected_imu_name(device: Any) -> str:
+    try:
+        getter = getattr(device, "getConnectedIMU", None)
+        value = getter() if callable(getter) else ""
+    except Exception:  # noqa: BLE001
+        return ""
+    name = str(value or "").strip()
+    return "" if name.upper() == "NONE" else name
+
+
+def _imu_reading(pkt: Any) -> tuple[dict[str, float], int | None] | None:
+    """Extract canonical scalar channels + device timestamp from an IMU packet.
+
+    Channels are raw and lossless: ``accel_x/y/z`` (m/s²), ``gyro_x/y/z``
+    (rad/s), ``quat_x/y/z/w`` (rotation-vector quaternion). Returns ``None``
+    when the packet carries none of the three sensors.
+    """
+    accel = getattr(pkt, "acceleroMeter", None)
+    gyro = getattr(pkt, "gyroscope", None)
+    rotation = getattr(pkt, "rotationVector", None)
+
+    device_ns: int | None = None
+    for report in (accel, gyro, rotation):
+        if report is None:
+            continue
+        device_ns = _timestamp_ns(getattr(report, "getTimestampDevice", None))
+        if device_ns is not None:
+            break
+
+    channels: dict[str, float] = {}
+    if accel is not None and hasattr(accel, "x"):
+        channels["accel_x"] = accel.x
+        channels["accel_y"] = accel.y
+        channels["accel_z"] = accel.z
+    if gyro is not None and hasattr(gyro, "x"):
+        channels["gyro_x"] = gyro.x
+        channels["gyro_y"] = gyro.y
+        channels["gyro_z"] = gyro.z
+    if rotation is not None and hasattr(rotation, "i"):
+        channels["quat_x"] = rotation.i
+        channels["quat_y"] = rotation.j
+        channels["quat_z"] = rotation.k
+        channels["quat_w"] = rotation.real
+    return (channels, device_ns) if channels else None
+
+
+def _quat_to_euler_deg(i: float, j: float, k: float, real: float) -> tuple[float, float, float]:
+    """Quaternion (x, y, z, w) → intrinsic roll/pitch/yaw in degrees."""
+    x, y, z, w = i, j, k, real
+    roll = math.atan2(2.0 * (w * x + y * z), 1.0 - 2.0 * (x * x + y * y))
+    pitch = math.asin(max(-1.0, min(1.0, 2.0 * (w * y - z * x))))
+    yaw = math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+    return math.degrees(roll), math.degrees(pitch), math.degrees(yaw)
+
+
+def _imu_live_event(stream_id: str, channels: dict[str, float], seq: int, capture_ns: int) -> Any:
+    """Shape one IMU reading as a live substream sample for the preview UI.
+
+    Carries the raw scalar channels for the sensor chart plus roll/pitch/yaw
+    (derived from the rotation vector) and the quaternion as a vector channel,
+    both of which drive the orientation pose panel.
+    """
+    enriched: dict[str, Any] = dict(channels)
+    if all(k in channels for k in ("quat_x", "quat_y", "quat_z", "quat_w")):
+        quat = [channels["quat_x"], channels["quat_y"], channels["quat_z"], channels["quat_w"]]
+        roll, pitch, yaw = _quat_to_euler_deg(*quat)
+        enriched["roll"] = roll
+        enriched["pitch"] = pitch
+        enriched["yaw"] = yaw
+        enriched["quat"] = quat
+    return SimpleNamespace(
+        stream_id=stream_id,
+        frame_number=seq,
+        capture_ns=capture_ns,
+        channels=enriched,
+    )
+
+
+def _build_calibration_summary(
+    device: Any,
+    camera_configs: list[tuple[str, str, Any, tuple[int, int], float]],
+) -> dict[str, Any] | None:
+    """Serialize the device's EEPROM calibration for the recorded streams.
+
+    ``camera_configs`` rows are ``(label, socket_name, socket, (w, h), fps)``
+    for every camera actually built into the pipeline. Intrinsics are scaled
+    to each recorded resolution so downstream consumers can use them without
+    knowing the sensor-native calibration size. Every section is best-effort:
+    a missing piece is omitted, never fatal; returns None only when the
+    calibration handler itself is unreadable.
+    """
+    try:
+        calibration = device.readCalibration()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("OAK calibration read failed: %s", exc)
+        return None
+
+    summary: dict[str, Any] = {"schema": "syncfield.oak_calibration.v1"}
+
+    device_section: dict[str, Any] = {}
+    for key, getter_name in (
+        ("device_id", "getDeviceId"),
+        ("name", "getDeviceName"),
+        ("product", "getProductName"),
+    ):
         try:
-            depth_frame = depth_msg.getFrame()  # uint16, little-endian, mm
-            self._depth_file.write(depth_frame.tobytes())
-            self._depth_frame_count += 1
-        except Exception:
-            # Depth is best-effort — a transient failure should not tear
-            # down the RGB capture loop.
+            getter = getattr(device, getter_name, None)
+            if callable(getter):
+                device_section[key] = str(getter())
+        except Exception:  # noqa: BLE001
+            pass
+    summary["device"] = device_section
+
+    try:
+        summary["eeprom"] = calibration.eepromToJson()
+    except Exception:  # noqa: BLE001
+        pass
+
+    streams: dict[str, Any] = {}
+    for label, socket_name, socket, resolution, fps in camera_configs:
+        stream_section: dict[str, Any] = {
+            "socket": socket_name,
+            "resolution": list(resolution),
+            "fps": fps,
+        }
+        try:
+            stream_section["intrinsics"] = calibration.getCameraIntrinsics(
+                socket, resolution[0], resolution[1]
+            )
+        except Exception:  # noqa: BLE001
+            try:
+                stream_section["intrinsics_native"] = calibration.getCameraIntrinsics(socket)
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            stream_section["distortion_coefficients"] = list(
+                calibration.getDistortionCoefficients(socket)
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            stream_section["hfov_deg"] = float(calibration.getFov(socket))
+        except Exception:  # noqa: BLE001
+            pass
+        streams[label] = stream_section
+    summary["streams"] = streams
+
+    sockets_by_label = {label: socket for label, _, socket, _, _ in camera_configs}
+    extrinsics: dict[str, Any] = {}
+    for name, src_label, dst_label in (
+        ("left_to_right", "left", "right"),
+        ("rgb_to_left", "rgb", "left"),
+        ("rgb_to_right", "rgb", "right"),
+    ):
+        src = sockets_by_label.get(src_label)
+        dst = sockets_by_label.get(dst_label)
+        if src is None or dst is None:
+            continue
+        try:
+            extrinsics[name] = _transform_section(calibration.getCameraExtrinsics(src, dst))
+        except Exception:  # noqa: BLE001
+            pass
+    if extrinsics:
+        summary["extrinsics"] = extrinsics
+
+    stereo: dict[str, Any] = {}
+    if "left" in sockets_by_label and "right" in sockets_by_label:
+        try:
+            stereo["baseline_cm"] = float(calibration.getBaselineDistance())
+        except Exception:  # noqa: BLE001
+            pass
+        stereo["left_socket"] = next(
+            (name for label, name, _, _, _ in camera_configs if label == "left"), None
+        )
+        stereo["right_socket"] = next(
+            (name for label, name, _, _, _ in camera_configs if label == "right"), None
+        )
+    if stereo:
+        summary["stereo"] = stereo
+
+    imu_section: dict[str, Any] = {}
+    try:
+        imu_name = _connected_imu_name(device)
+        if imu_name:
+            imu_section["type"] = imu_name
+    except Exception:  # noqa: BLE001
+        pass
+    imu_target = sockets_by_label.get("left") or sockets_by_label.get("rgb")
+    imu_target_label = "left" if "left" in sockets_by_label else "rgb"
+    if imu_target is not None:
+        try:
+            imu_section[f"imu_to_{imu_target_label}"] = _transform_section(
+                calibration.getImuToCameraExtrinsics(imu_target)
+            )
+        except Exception:  # noqa: BLE001
+            pass
+    if imu_section:
+        summary["imu"] = imu_section
+
+    return summary
+
+
+def _transform_section(matrix_4x4: Any) -> dict[str, Any]:
+    rows = [list(row) for row in matrix_4x4]
+    return {
+        "rotation": [row[:3] for row in rows[:3]],
+        "translation_cm": [rows[0][3], rows[1][3], rows[2][3]],
+    }
+
+
+def _timestamp_ns(getter: Any) -> int | None:
+    if not callable(getter):
+        return None
+    try:
+        value = getter()
+    except Exception:  # noqa: BLE001
+        return None
+    if value is None:
+        return None
+    total_seconds = getattr(value, "total_seconds", None)
+    if callable(total_seconds):
+        return int(cast(Callable[[], float], total_seconds)() * 1_000_000_000)
+    return None
+
+
+def _sample_event(
+    *,
+    stream_id: str,
+    frame_number: int,
+    capture_ns: int,
+    device_ts_ns: int | None,
+) -> SampleEvent:
+    kwargs: dict[str, Any] = {
+        "stream_id": stream_id,
+        "frame_number": frame_number,
+        "capture_ns": capture_ns,
+    }
+    if device_ts_ns is not None:
+        if _SAMPLE_EVENT_SUPPORTS_DEVICE_NS:
+            kwargs["device_ns"] = device_ts_ns
+        else:
+            # syncfield 0.3.x has no SampleEvent.device_ns; for video
+            # streams the orchestrator serializes channels as top-level
+            # FrameTimestamp extras, preserving device_timestamp_ns.
+            kwargs["channels"] = {"device_timestamp_ns": device_ts_ns}
+    return SampleEvent(**kwargs)
+
+
+def _has_legacy_xlink_out() -> bool:
+    return hasattr(dai.Pipeline, "createXLinkOut") or hasattr(dai.node, "XLinkOut")
+
+
+def _create_xlink_out(pipeline: Any) -> Any:
+    create_xlink_out = getattr(pipeline, "createXLinkOut", None)
+    if callable(create_xlink_out):
+        return create_xlink_out()
+    return pipeline.create(dai.node.XLinkOut)
+
+
+def _configure_h264_encoder_for_segmented_recording(encoder: Any, fps: int) -> None:
+    """Tune encoder output so files can start cleanly after live preview."""
+    set_num_b_frames = getattr(encoder, "setNumBFrames", None)
+    if callable(set_num_b_frames):
+        try:
+            set_num_b_frames(0)
+        except Exception:  # noqa: BLE001
+            pass
+    set_keyframe_frequency = getattr(encoder, "setKeyframeFrequency", None)
+    if callable(set_keyframe_frequency):
+        try:
+            set_keyframe_frequency(max(1, min(int(fps), 5)))
+        except Exception:  # noqa: BLE001
             pass
 
-    # ------------------------------------------------------------------
-    # Resource cleanup
-    # ------------------------------------------------------------------
 
-    def _release_writers(self) -> None:
-        if self._video_writer is not None:
-            try:
-                self._video_writer.close()
-            except Exception:
-                pass
-            self._video_writer = None
-        if self._h264_file is not None:
-            try:
-                self._h264_file.flush()
-                self._h264_file.close()
-            except Exception:
-                pass
-            self._h264_file = None
-        if self._depth_file is not None:
-            try:
-                self._depth_file.flush()
-                self._depth_file.close()
-            except Exception:
-                pass
-            self._depth_file = None
-
-    def _release_pipeline(self) -> None:
-        if self._pipeline is not None:
-            try:
-                self._pipeline.stop()
-                # ``pipeline.stop()`` is async: it signals the pipeline
-                # to tear down but returns before the Myriad-X firmware
-                # is actually reset. A rapid ``Ctrl+C`` → process exit
-                # immediately after stop() frequently left the board
-                # booted-and-held ("zombie state"), forcing a physical
-                # USB replug before the next session could connect.
-                # Sleeping here gives DepthAI's XLink transport time to
-                # send RESET + close the USB endpoint cleanly. 300 ms is
-                # empirically enough on macOS USB 2.0/3.0; still short
-                # enough that operators don't notice the shutdown delay.
-                time.sleep(0.3)
-            except Exception as exc:  # noqa: BLE001 — DepthAI surfaces varied errors here
-                # Log but don't re-raise — disconnect must not break.
-                logger.warning(
-                    "[%s] pipeline.stop() raised, device may need physical "
-                    "replug: %r", self.id, exc,
-                )
-            self._pipeline = None
-        self._q_rgb = None
-        self._q_preview = None
-        self._q_depth = None
-
-    # ------------------------------------------------------------------
-    # Live preview
-    # ------------------------------------------------------------------
-
-    @property
-    def latest_frame(self) -> Any:
-        """Return the most recently captured RGB frame, or ``None``.
-
-        Thread-safe: the frame reference is published under a lock by the
-        capture thread. Readers that mutate the returned array should
-        ``.copy()`` it first — the viewer uploads it as a texture
-        immediately and never mutates it in place.
-        """
-        with self._frame_lock:
-            return self._latest_frame
-
-    # ------------------------------------------------------------------
-    # Discovery
-    # ------------------------------------------------------------------
-
-    @classmethod
-    def discover(cls, *, timeout: float = 5.0) -> list:
-        """Enumerate currently attached OAK devices.
-
-        Uses :func:`depthai.Device.getAllAvailableDevices` which is
-        near-instant (sub-millisecond) — ``timeout`` is accepted for
-        interface consistency but effectively ignored.
-
-        Each returned :class:`~syncfield.discovery.DiscoveredDevice`
-        has its ``device_id`` populated from the OAK serial
-        (``deviceId``), so auto-added streams from ``scan_and_add`` pin
-        to specific devices even when multiple OAKs are attached.
-
-        Returns:
-            List of :class:`~syncfield.discovery.DiscoveredDevice`. Empty
-            list if no devices found or if the depthai probe raises for
-            any reason — discovery never propagates errors.
-        """
-        from syncfield.discovery import DiscoveredDevice
-
-        try:
-            devices_info = dai.Device.getAllAvailableDevices()
-        except Exception:
-            return []
-
-        results = []
-        for info in devices_info:
-            device_id = getattr(info, "deviceId", None) or ""
-            name = getattr(info, "name", None) or "OAK"
-            state = getattr(info, "state", None)
-            state_str = getattr(state, "name", None) or str(state) if state else ""
-
-            description_parts = [f"OAK · {device_id[:8]}…"] if device_id else ["OAK"]
-            if state_str:
-                description_parts.append(state_str.lower())
-            description = " · ".join(description_parts)
-
-            results.append(
-                DiscoveredDevice(
-                    adapter_type="oak_camera",
-                    adapter_cls=cls,
-                    kind="video",
-                    display_name=name or "OAK camera",
-                    description=description,
-                    device_id=device_id or name or "oak",
-                    construct_kwargs=(
-                        {"device_id": device_id} if device_id else {}
-                    ),
-                    accepts_output_dir=True,
-                )
-            )
-        return results
+def _packet_bytes(pkt: Any) -> bytes:
+    data = pkt.getData()
+    tobytes = getattr(data, "tobytes", None)
+    return tobytes() if callable(tobytes) else bytes(data)
 
 
-# ---------------------------------------------------------------------------
-# Depth binary format helper
-# ---------------------------------------------------------------------------
-#
-# The ``.depth.bin`` file is a simple concatenation of raw uint16 depth frames
-# in row-major order. No header. Consumers need the resolution (which they
-# can read from the manifest or know out of band) to reshape the buffer.
-# This helper is purely informational — adapters do not need to call it.
+def _contains_h264_parameter_sets(data: bytes) -> bool:
+    nal_types = {nal_type for nal_type, _ in _iter_h264_annex_b_nalus(data)}
+    return 7 in nal_types and 8 in nal_types
 
 
-def iter_depth_frames(
-    path: Path | str,
-    width: int,
-    height: int,
-):  # pragma: no cover - convenience helper, not exercised by adapter tests
-    """Yield successive depth frames from a raw ``.depth.bin`` file.
+def _contains_h264_nal_type(data: bytes, nal_type: int) -> bool:
+    return any(kind == nal_type for kind, _ in _iter_h264_annex_b_nalus(data))
 
-    Args:
-        path: Path to the ``.depth.bin`` file produced by OakCameraStream.
-        width: Depth width in pixels (as configured on the stream).
-        height: Depth height in pixels.
 
-    Yields:
-        Tuples of ``(frame_index, flat_uint16_list)``. Callers that want
-        numpy arrays can do ``np.asarray(values, dtype=np.uint16).reshape(
-        height, width)``.
-    """
-    frame_bytes = width * height * 2
-    fmt = f"<{width * height}H"
-    path = Path(path)
-    with path.open("rb") as f:
-        idx = 0
-        while True:
-            chunk = f.read(frame_bytes)
-            if len(chunk) < frame_bytes:
-                return
-            yield idx, list(struct.unpack(fmt, chunk))
-            idx += 1
+def _iter_h264_annex_b_nalus(data: bytes) -> tuple[tuple[int, bytes], ...]:
+    nalus: list[tuple[int, bytes]] = []
+    starts = list(_annex_b_start_codes(data))
+    for idx, (start, header) in enumerate(starts):
+        end = starts[idx + 1][0] if idx + 1 < len(starts) else len(data)
+        if header >= end:
+            continue
+        nal_type = data[header] & 0x1F
+        nalus.append((nal_type, data[start:end]))
+    return tuple(nalus)
+
+
+def _annex_b_start_codes(data: bytes) -> tuple[tuple[int, int], ...]:
+    starts: list[tuple[int, int]] = []
+    i = 0
+    size = len(data)
+    while i + 3 <= size:
+        if i + 4 <= size and data[i : i + 4] == b"\x00\x00\x00\x01":
+            starts.append((i, i + 4))
+            i += 4
+            continue
+        if data[i : i + 3] == b"\x00\x00\x01":
+            starts.append((i, i + 3))
+            i += 3
+            continue
+        i += 1
+    return tuple(starts)
