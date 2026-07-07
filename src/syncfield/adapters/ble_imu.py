@@ -748,7 +748,7 @@ class BLEImuGenericStream(StreamBase):
         # token here when the corresponding adapter actually exists and
         # is registered via ``register_discoverer``; orphan exclusions
         # silently hide hardware from users. ``oglo`` is handled by
-        # ``OGLOTactileStream`` in ``oglo_tactile.py``.
+        # ``OgloTactileStream`` in the ``oglo`` package.
         _EXCLUDE_NAME_SUBSTRINGS = ("oglo",)
 
         results = []

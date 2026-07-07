@@ -22,12 +22,14 @@ def mock_bleak(monkeypatch):
     """Install a minimal fake ``bleak`` so the adapter modules import."""
     fake = MagicMock()
     monkeypatch.setitem(sys.modules, "bleak", fake)
-    sys.modules.pop("syncfield.adapters.oglo_tactile", None)
+    sys.modules.pop("syncfield.adapters.oglo", None)
+    sys.modules.pop("syncfield.adapters.oglo.stream", None)
     sys.modules.pop("syncfield.adapters.ble_imu", None)
-    importlib.import_module("syncfield.adapters.oglo_tactile")
+    importlib.import_module("syncfield.adapters.oglo")
     importlib.import_module("syncfield.adapters.ble_imu")
     yield fake
-    sys.modules.pop("syncfield.adapters.oglo_tactile", None)
+    sys.modules.pop("syncfield.adapters.oglo", None)
+    sys.modules.pop("syncfield.adapters.oglo.stream", None)
     sys.modules.pop("syncfield.adapters.ble_imu", None)
 
 
@@ -43,7 +45,7 @@ def _peripheral(name: str, address: str) -> SimpleNamespace:
 
 class TestOgloDiscover:
     def test_filters_by_name_substring(self, mock_bleak):
-        from syncfield.adapters.oglo_tactile import OgloTactileStream
+        from syncfield.adapters.oglo import OgloTactileStream
 
         scan_result = [
             _peripheral("OGLO Left", "AA:BB:CC:DD:EE:01"),
@@ -63,7 +65,7 @@ class TestOgloDiscover:
         assert all(d.kind == "sensor" for d in devices)
 
     def test_infers_hand_from_name(self, mock_bleak):
-        from syncfield.adapters.oglo_tactile import OgloTactileStream
+        from syncfield.adapters.oglo import OgloTactileStream
 
         scan_result = [
             _peripheral("OGLO Left Glove", "AA:01"),
@@ -82,7 +84,7 @@ class TestOgloDiscover:
         assert by_name["OGLO"].construct_kwargs["hand"] == "unknown"
 
     def test_address_is_populated_in_construct_kwargs(self, mock_bleak):
-        from syncfield.adapters.oglo_tactile import OgloTactileStream
+        from syncfield.adapters.oglo import OgloTactileStream
 
         with patch(
             "syncfield.discovery._ble.scan_peripherals",
@@ -93,7 +95,7 @@ class TestOgloDiscover:
         assert device.construct_kwargs["address"] == "11:22:33:44:55:66"
 
     def test_empty_scan_returns_empty_list(self, mock_bleak):
-        from syncfield.adapters.oglo_tactile import OgloTactileStream
+        from syncfield.adapters.oglo import OgloTactileStream
 
         with patch(
             "syncfield.discovery._ble.scan_peripherals", return_value=[]
@@ -101,7 +103,7 @@ class TestOgloDiscover:
             assert OgloTactileStream.discover() == []
 
     def test_case_insensitive_match(self, mock_bleak):
-        from syncfield.adapters.oglo_tactile import OgloTactileStream
+        from syncfield.adapters.oglo import OgloTactileStream
 
         with patch(
             "syncfield.discovery._ble.scan_peripherals",

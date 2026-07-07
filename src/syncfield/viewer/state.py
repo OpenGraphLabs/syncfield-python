@@ -177,8 +177,8 @@ class StreamStatsBuffer:
         starts with ``_`` or contains ``timestamp`` — are skipped from
         the plot buffer. Those values often live in the nanoseconds
         range (~10¹⁸) and would otherwise dominate the auto-scaled Y
-        axis, squashing real sensor readings (0–65535 for OGLO FSRs)
-        flat against the baseline.
+        axis, squashing real sensor readings (0–4095 for OGLO 12-bit
+        taxels) flat against the baseline.
         """
         self._fps_window.append(capture_ns)
         self._plot_timestamps.append(capture_ns / 1e9)
