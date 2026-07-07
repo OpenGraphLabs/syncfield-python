@@ -544,3 +544,37 @@ def test_avfoundation_stall_watchdog_gives_up_loudly(tmp_path):
     assert errors and "giving up" in errors[-1].detail
     reconnects = [e for e in events if e.kind is HealthEventKind.RECONNECT]
     assert len(reconnects) == 2
+
+
+def test_writes_intrinsic_calibration_sidecar_when_provided(tmp_path):
+    """A UVC stream given a CameraCalibration drops {stem}.calibration.json."""
+    import json
+
+    from syncfield.adapters.uvc_webcam import UVCWebcamStream
+    from syncfield.calibration import CameraCalibration
+
+    calib = CameraCalibration(
+        camera_matrix=[[560.0, 0.0, 640.0], [0.0, 560.0, 360.0], [0.0, 0.0, 1.0]],
+        distortion_coefficients=[0.1, -0.02, 0.0, 0.0, 0.0],
+        resolution=(1280, 720),
+        source="measured",
+        rms_reprojection_error=0.29,
+    )
+    stream = UVCWebcamStream(
+        "cam", device_index=0, output_dir=tmp_path,
+        output_name="ego_center", calibration=calib,
+    )
+    stream._write_calibration_file()
+    path = tmp_path / "ego_center.calibration.json"
+    assert path.exists()
+    doc = json.loads(path.read_text())
+    assert doc["schema"] == "syncfield.camera_calibration.v1"
+    assert doc["camera_matrix"][0][0] == 560.0
+
+
+def test_no_calibration_sidecar_when_absent(tmp_path):
+    from syncfield.adapters.uvc_webcam import UVCWebcamStream
+
+    stream = UVCWebcamStream("cam", device_index=0, output_dir=tmp_path)
+    stream._write_calibration_file()  # no calibration → no file
+    assert not (tmp_path / "cam.calibration.json").exists()

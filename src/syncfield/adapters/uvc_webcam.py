@@ -53,6 +53,7 @@ from syncfield.adapters._video_encoder import (
     compute_jitter_percentiles,
     open_uvc_input,
 )
+from syncfield.calibration import CameraCalibration, write_calibration_file
 from syncfield.clock import SessionClock
 from syncfield.stream import DeviceKey, StreamBase
 from syncfield.types import (
@@ -110,6 +111,7 @@ class UVCWebcamStream(StreamBase):
         pixel_format: Optional[str] = None,
         unique_id: Optional[str] = None,
         output_name: Optional[str] = None,
+        calibration: "CameraCalibration | None" = None,
     ) -> None:
         if backend not in ("pyav", "opencv", "avfoundation"):
             raise ValueError(
@@ -148,6 +150,10 @@ class UVCWebcamStream(StreamBase):
         # filename is a separate, renameable concern.
         self._output_stem = str(output_name) if output_name else str(id)
         self._file_path = self._output_dir / f"{self._output_stem}.mp4"
+        # Optional intrinsic calibration for this physical camera; when set it
+        # is written next to the video as {stem}.calibration.json at record
+        # start, mirroring the OAK adapter's sidecar.
+        self._calibration = calibration
 
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
@@ -327,6 +333,9 @@ class UVCWebcamStream(StreamBase):
         if self._thread is None or not self._thread.is_alive():
             self.connect()
         self._output_dir.mkdir(parents=True, exist_ok=True)
+        # Emit the intrinsic calibration sidecar first, so it exists even if
+        # encoding later fails.
+        self._write_calibration_file()
         # Reset per-recording counters so a second recording in the
         # same session starts clean.
         self._frame_count = 0
@@ -341,6 +350,12 @@ class UVCWebcamStream(StreamBase):
             fps=self._fps,
         )
         self._recording = True
+
+    def _write_calibration_file(self) -> None:
+        """Write ``{stem}.calibration.json`` if this camera has a calibration."""
+        if self._calibration is None:
+            return
+        write_calibration_file(self._output_dir, self._output_stem, self._calibration)
 
     def stop_recording(self) -> FinalizationReport:
         """Flip recording off, close the encoder, emit the report."""
