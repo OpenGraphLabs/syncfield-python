@@ -56,6 +56,11 @@ _configure_default_logging()
 from syncfield.clock import SessionClock
 from syncfield.orchestrator import SessionOrchestrator
 from syncfield.roles import FollowerRole, LeaderRole, RoleKind
+from syncfield.calibration import (
+    CAMERA_CALIBRATION_SCHEMA,
+    CameraCalibration,
+    write_calibration_file,
+)
 from syncfield.stream import Stream, StreamBase
 from syncfield.supervision import ReconnectPolicy, StreamSupervisor
 from syncfield.tone import ChirpSpec, SyncToneConfig
@@ -96,6 +101,10 @@ __all__ = [
     "StreamConnectionState",
     "ReconnectPolicy",
     "StreamSupervisor",
+    # Camera calibration
+    "CameraCalibration",
+    "CAMERA_CALIBRATION_SCHEMA",
+    "write_calibration_file",
     # Sync tone / chirp
     "SyncToneConfig",
     "ChirpSpec",
