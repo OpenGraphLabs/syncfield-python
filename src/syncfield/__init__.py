@@ -57,6 +57,7 @@ from syncfield.clock import SessionClock
 from syncfield.orchestrator import SessionOrchestrator
 from syncfield.roles import FollowerRole, LeaderRole, RoleKind
 from syncfield.stream import Stream, StreamBase
+from syncfield.supervision import ReconnectPolicy, StreamSupervisor
 from syncfield.tone import ChirpSpec, SyncToneConfig
 from syncfield.types import (
     ChirpEmission,
@@ -68,7 +69,9 @@ from syncfield.types import (
     SessionReport,
     SessionState,
     StreamCapabilities,
+    StreamConnectionState,
     StreamKind,
+    StreamStatus,
     SyncPoint,
 )
 
@@ -88,6 +91,11 @@ __all__ = [
     "HealthEvent",
     "HealthEventKind",
     "SyncPoint",
+    # Stream health + supervision
+    "StreamStatus",
+    "StreamConnectionState",
+    "ReconnectPolicy",
+    "StreamSupervisor",
     # Sync tone / chirp
     "SyncToneConfig",
     "ChirpSpec",

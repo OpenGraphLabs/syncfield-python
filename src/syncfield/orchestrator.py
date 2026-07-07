@@ -74,6 +74,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import queue
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -88,6 +89,7 @@ from syncfield.multihost.browser import SessionBrowser
 from syncfield.multihost.types import SessionAnnouncement
 from syncfield.roles import FollowerRole, LeaderRole
 from syncfield.stream import Stream
+from syncfield.supervision import ReconnectPolicy, StreamSupervisor
 from syncfield.tone import ChirpPlayer, SyncToneConfig, create_default_player
 from syncfield.types import (
     ChirpEmission,
@@ -99,6 +101,7 @@ from syncfield.types import (
     SensorSample,
     SessionReport,
     SessionState,
+    StreamConnectionState,
     SyncPoint,
 )
 from syncfield.writer import (
@@ -117,6 +120,9 @@ from syncfield.writer import (
 SampleWriter = Union[StreamWriter, SensorWriter]
 
 logger = logging.getLogger(__name__)
+
+#: Sentinel pushed onto the reconnect queue to unblock and stop the worker.
+_RECONNECT_STOP = object()
 
 #: Discriminated union of the multi-host role configs.
 Role = Union[LeaderRole, FollowerRole]
@@ -318,6 +324,7 @@ class SessionOrchestrator:
         chirp_player: ChirpPlayer | None = None,
         role: Optional[Role] = None,
         enable_host_audio: bool = True,
+        reconnect_policy: "ReconnectPolicy | None" = None,
     ) -> None:
         self._host_id = host_id
         self._data_root = Path(output_dir)
@@ -446,6 +453,32 @@ class SessionOrchestrator:
 
         # Throttle tracker for writer stats emission — keyed by stream_id.
         self._last_writer_stats_emit_at: Dict[str, int] = {}
+
+        # Stream supervision — owns the reliable per-stream health state
+        # machine (see syncfield.supervision). It is driven by the same
+        # lifecycle transitions the orchestrator already performs plus sample
+        # arrivals and capture-loop deaths, and it powers the public
+        # stream_status()/stream_statuses()/on_stream_status() API. Reconnect
+        # is opt-in: with the default disabled policy the supervisor only
+        # tracks and reports state (no threads, no incidents, no retries) so
+        # existing sessions are byte-for-byte unchanged.
+        self._reconnect_policy = reconnect_policy or ReconnectPolicy.disabled()
+        self._supervisor = StreamSupervisor(
+            self._reconnect_policy,
+            on_status=self._dispatch_stream_status,
+            on_transition=self._on_supervisor_transition,
+            request_reconnect=self._enqueue_reconnect,
+            now=time.monotonic_ns,
+        )
+        self._status_callbacks: List[Callable[[Any], None]] = []
+        # Reconnect execution plumbing — a worker thread drains this queue,
+        # performs stream.reconnect(), and reports the outcome back to the
+        # supervisor. Started/stopped alongside a recording cycle only when a
+        # reconnect policy is enabled (see _start_supervision).
+        self._reconnect_queue: "queue.Queue[str]" = queue.Queue()
+        self._reconnect_worker: Optional[threading.Thread] = None
+        self._supervisor_monitor: Optional[threading.Thread] = None
+        self._supervision_stop = threading.Event()
 
         # Multi-host: start control plane + advertiser (or follower browser)
         # at construction time so cluster discovery is independent of device
@@ -1604,8 +1637,16 @@ class SessionOrchestrator:
 
         self._streams[stream.id] = stream
         stream.on_health(self._on_stream_health)
+        _caps = stream.capabilities
+        self._supervisor.register(
+            stream.id,
+            target_hz=_caps.target_hz,
+            is_removable=_caps.is_removable,
+            supports_recording_reconnect=_caps.supports_recording_reconnect,
+        )
         stream.on_sample(lambda s, _sid=stream.id: (
             self.health.observe_sample(_sid, s),
+            self._supervisor.note_sample(_sid, s.capture_ns),
             self._emit_writer_stats(_sid),
         ))
         self.health.register_stream(stream.id, stream.capabilities.target_hz)
@@ -1840,6 +1881,10 @@ class SessionOrchestrator:
             self.health.start()
 
             self._transition(SessionState.CONNECTED)
+
+            # Bring the supervision threads online (no-op unless a reconnect
+            # policy is enabled) so preview-phase drops recover before Record.
+            self._start_supervision()
 
     # ------------------------------------------------------------------
     # Lifecycle — start (countdown → record → chirp)
@@ -2121,6 +2166,11 @@ class SessionOrchestrator:
             self._maybe_play_start_chirp()
             self.health.start()
             self._transition(SessionState.RECORDING)
+            # Recording-phase gate: only adapters that opt in
+            # (supports_recording_reconnect) are reconnected once we're
+            # writing; the supervisor enforces this per stream.
+            self._supervisor.set_recording(True)
+            self._start_supervision()
 
             # Distribute the leader's SessionConfig to every preparing
             # follower before announcing 'recording'. A rejection from
@@ -2189,6 +2239,9 @@ class SessionOrchestrator:
             self._maybe_play_stop_chirp_and_wait()
 
             finalizations = self._finalize_streams()
+            # Leaving the recording window: drop the recording-phase gate so
+            # any later reconnect (explicit-connect path) is preview-semantics.
+            self._supervisor.set_recording(False)
 
             # Stop the health worker and close any still-open incidents.
             # Must run AFTER finalize_streams (so stall detectors see the
@@ -2220,6 +2273,7 @@ class SessionOrchestrator:
                 # won't call disconnect(); tear down EVERYTHING here,
                 # including the multi-host infrastructure connect()
                 # brought up on their behalf.
+                self._stop_supervision()
                 self._transition(SessionState.STOPPED)
                 if self._log_writer is not None:
                     self._log_writer.close()
@@ -2354,6 +2408,9 @@ class SessionOrchestrator:
                     f"disconnect() requires CONNECTED or STOPPED state; "
                     f"current state is {self._state.value}"
                 )
+            # Stop supervision first so no reconnect fires mid-teardown. Safe
+            # under self._lock: the worker/monitor never acquire it.
+            self._stop_supervision()
             _rollback_disconnect_streams(self._connected_streams)
             self._connected_streams = []
 
@@ -2672,6 +2729,26 @@ class SessionOrchestrator:
         if self._log_writer is not None:
             self._log_writer.log_health(event)
         self.health.observe_health(event.stream_id, event)
+        # A fatal capture-loop death arrives as an ERROR event. Route it into
+        # the supervisor so it can drive bounded reconnect — but only when the
+        # stream was actually up, which excludes connect-phase startup
+        # failures (already handled via _set_stream_state) and events from the
+        # supervisor's own transitions (source="supervisor").
+        if (
+            event.kind is HealthEventKind.ERROR
+            and event.source != "supervisor"
+        ):
+            try:
+                state = self._supervisor.status(event.stream_id).state
+            except KeyError:
+                return
+            if state in (
+                StreamConnectionState.CONNECTED,
+                StreamConnectionState.STALLED,
+            ):
+                self._supervisor.note_capture_error(
+                    event.stream_id, event.detail or "capture loop error"
+                )
 
     def _emit_writer_stats(self, stream_id: str) -> None:
         """Emit WriterStats to the health system at most ~10 Hz per stream."""
@@ -2719,9 +2796,167 @@ class SessionOrchestrator:
         The health worker may not be running yet (e.g. this is called
         from add() when the session is IDLE) — observe_connection_state
         is a no-op in that case.
+
+        This is also the single funnel that drives the reliable
+        :class:`~syncfield.supervision.StreamSupervisor` state machine, so the
+        public ``stream_status()`` view always matches the orchestrator's own
+        lifecycle actions. Supervisor notes for a not-yet-registered stream id
+        (e.g. a late-injected internal stream) are safe no-ops.
         """
         self._stream_states[stream_id] = new_state
         self.health.observe_connection_state(stream_id, new_state, time.monotonic_ns())
+        sup = self._supervisor
+        if new_state == "connecting":
+            sup.note_connecting(stream_id)
+        elif new_state == "connected":
+            sup.note_connected(stream_id)
+        elif new_state == "failed":
+            sup.note_connect_failed(
+                stream_id, self._stream_errors.get(stream_id, "connect failed")
+            )
+        elif new_state == "disconnected":
+            sup.note_disconnected(stream_id)
+        # "idle": the supervisor already starts registered streams IDLE.
+
+    # ------------------------------------------------------------------
+    # Public per-stream status API (backed by the supervisor)
+    # ------------------------------------------------------------------
+
+    def on_stream_status(self, callback: Callable[[Any], None]) -> None:
+        """Register a callback invoked on every per-stream status change.
+
+        The callback receives a :class:`~syncfield.types.StreamStatus`
+        snapshot on each transition (connect / stall / reconnecting /
+        recovered / failed / disconnect). Use it to drive a live UI (kiosk
+        pre-flight, viewer) or an app-side policy supervisor without polling.
+        Callbacks must be cheap and non-blocking; exceptions are logged and
+        swallowed so one bad subscriber cannot break supervision.
+        """
+        self._status_callbacks.append(callback)
+
+    def stream_status(self, stream_id: str):
+        """Return the current :class:`~syncfield.types.StreamStatus`.
+
+        Raises ``KeyError`` if the stream id was never added.
+        """
+        return self._supervisor.status(stream_id)
+
+    def stream_statuses(self) -> dict:
+        """Return a ``{stream_id: StreamStatus}`` snapshot of all streams."""
+        return self._supervisor.statuses()
+
+    def _dispatch_stream_status(self, status) -> None:
+        """Fan a supervisor status change out to on_stream_status subscribers."""
+        for cb in list(self._status_callbacks):
+            try:
+                cb(status)
+            except Exception:
+                logger.exception(
+                    "on_stream_status callback failed for %s", status.stream_id
+                )
+
+    def _on_supervisor_transition(self, event: HealthEvent) -> None:
+        """Feed a supervisor health transition into the incident/log layer.
+
+        Gated on an enabled reconnect policy: with the default disabled
+        policy the health/incident outputs are byte-for-byte identical to
+        before supervision existed (the supervisor still tracks state for the
+        status API, it just doesn't emit into the incident stream).
+        """
+        if not self._reconnect_policy.enabled:
+            return
+        if self._log_writer is not None:
+            self._log_writer.log_health(event)
+        self.health.observe_health(event.stream_id, event)
+
+    def _enqueue_reconnect(self, stream_id: str) -> None:
+        """Queue a reconnect attempt for the supervision worker to execute."""
+        self._reconnect_queue.put(stream_id)
+
+    # ------------------------------------------------------------------
+    # Supervision threads — a periodic monitor (stall detection + reconnect
+    # scheduling) and a worker that performs the actual device reconnect.
+    # Both run ONLY while a reconnect policy is enabled, so the default
+    # (disabled) session spawns no extra threads.
+    # ------------------------------------------------------------------
+
+    def _start_supervision(self) -> None:
+        if not self._reconnect_policy.enabled:
+            return
+        if self._supervisor_monitor is not None:
+            return  # already running for this connected cycle
+        self._supervision_stop.clear()
+        self._supervisor_monitor = threading.Thread(
+            target=self._supervision_monitor_loop,
+            name=f"sf-supervisor-{self._host_id}",
+            daemon=True,
+        )
+        self._reconnect_worker = threading.Thread(
+            target=self._reconnect_worker_loop,
+            name=f"sf-reconnect-{self._host_id}",
+            daemon=True,
+        )
+        self._supervisor_monitor.start()
+        self._reconnect_worker.start()
+
+    def _stop_supervision(self) -> None:
+        if self._supervisor_monitor is None and self._reconnect_worker is None:
+            return
+        self._supervision_stop.set()
+        self._reconnect_queue.put(_RECONNECT_STOP)  # unblock the worker's get()
+        for t in (self._supervisor_monitor, self._reconnect_worker):
+            if t is not None:
+                t.join(timeout=2.0)
+        self._supervisor_monitor = None
+        self._reconnect_worker = None
+
+    def _supervision_monitor_loop(self) -> None:
+        # ~10 Hz tick; stop.wait doubles as the sleep and the shutdown signal.
+        while not self._supervision_stop.wait(0.1):
+            try:
+                self._supervisor.tick()
+            except Exception:
+                logger.exception("supervisor tick failed")
+
+    def _reconnect_worker_loop(self) -> None:
+        while True:
+            sid = self._reconnect_queue.get()
+            if sid is _RECONNECT_STOP or self._supervision_stop.is_set():
+                break
+            self._perform_reconnect(sid)
+
+    def _perform_reconnect(self, stream_id: str) -> None:
+        """Re-open one dropped stream and report the outcome to the supervisor.
+
+        Runs on the reconnect worker thread. For adapters that advertise
+        ``supports_recording_reconnect`` we also re-arm writing with the live
+        session clock so the stream resumes into the same recording window.
+        """
+        stream = self._streams.get(stream_id)
+        if stream is None:
+            self._supervisor.note_reconnect_result(
+                stream_id, ok=False, error="stream no longer registered"
+            )
+            return
+        try:
+            stream.reconnect()
+            # Read session phase WITHOUT self._lock: stream.reconnect() above
+            # does device I/O and could be slow, and _stop_supervision() joins
+            # this worker while holding self._lock — acquiring it here would
+            # deadlock. Both reads are single atomic attribute loads.
+            recording = self._state is SessionState.RECORDING
+            clock = self._session_clock
+            if (
+                recording
+                and stream.capabilities.supports_recording_reconnect
+                and clock is not None
+            ):
+                stream.start_recording(clock)
+            self._supervisor.note_reconnect_result(stream_id, ok=True)
+        except Exception as exc:
+            self._supervisor.note_reconnect_result(
+                stream_id, ok=False, error=str(exc)
+            )
 
     # ------------------------------------------------------------------
     # Episode lifecycle

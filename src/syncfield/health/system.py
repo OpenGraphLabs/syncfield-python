@@ -6,9 +6,6 @@ from typing import Callable, Dict, Iterable, Iterator, Optional
 
 from syncfield.health.detector import Detector
 from syncfield.health.detectors.adapter_passthrough import AdapterEventPassthrough
-from syncfield.health.detectors.backpressure import BackpressureDetector
-from syncfield.health.detectors.fps_drop import FpsDropDetector
-from syncfield.health.detectors.jitter import JitterDetector
 from syncfield.health.detectors.no_data import NoDataDetector
 from syncfield.health.detectors.startup_failure import StartupFailureDetector
 from syncfield.health.detectors.stream_stall import StreamStallDetector
@@ -128,11 +125,14 @@ class HealthSystem:
         self._target_hz_by_stream[stream_id] = target_hz
 
     def _install_default_detectors(self) -> None:
-        target_getter = lambda sid: self._target_hz_by_stream.get(sid)
+        # Default health surface = reliable, high-signal, transition-based
+        # detectors only. The soft-threshold quality metrics (fps-drop,
+        # jitter) and the zero-fed backpressure detector were the source of
+        # the "noisy and unused" health stream and are no longer installed by
+        # default; liveness now also flows through the StreamSupervisor. The
+        # detector classes remain importable for callers that explicitly want
+        # them, but they are opt-in.
         self.register(AdapterEventPassthrough())
         self.register(StreamStallDetector())
-        self.register(FpsDropDetector(target_getter=target_getter))
-        self.register(JitterDetector(target_getter=target_getter))
         self.register(StartupFailureDetector())
-        self.register(BackpressureDetector())
         self.register(NoDataDetector())

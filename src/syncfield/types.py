@@ -251,6 +251,14 @@ class StreamCapabilities:
             than an in-memory sample stream.
         live_preview: True if the stream should route to a live video preview
             (rather than a standalone recorder panel). Defaults to True.
+        supports_recording_reconnect: True if the adapter can safely resume a
+            stream that dropped **mid-recording** — i.e. re-open the device and
+            continue writing the same output without corrupting the bundle
+            (stable frame numbering, append-not-truncate). Opt-in and default
+            ``False`` because re-opening a video file mid-recording is unsafe
+            for most encoders; sensor/BLE adapters that append JSONL can set it.
+            The supervisor only attempts recording-phase reconnect for streams
+            that declare this.
     """
 
     provides_audio_track: bool = False
@@ -259,6 +267,7 @@ class StreamCapabilities:
     produces_file: bool = False
     target_hz: float | None = None
     live_preview: bool = True
+    supports_recording_reconnect: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -268,6 +277,7 @@ class StreamCapabilities:
             "produces_file": self.produces_file,
             "target_hz": self.target_hz,
             "live_preview": self.live_preview,
+            "supports_recording_reconnect": self.supports_recording_reconnect,
         }
 
 
@@ -300,6 +310,82 @@ class SessionState(Enum):
     RECORDING = "recording"
     STOPPING = "stopping"
     STOPPED = "stopped"
+
+
+class StreamConnectionState(Enum):
+    """Health state of a single stream, owned by the reconnect supervisor.
+
+    A stream walks a small, reliable state machine. Unlike the session-level
+    :class:`SessionState`, this is **per stream** and captures both connection
+    and liveness in one dimension so consumers (the kiosk pre-flight screen,
+    the app-side policy supervisor, the viewer) read one unambiguous value.
+
+    Transitions — and only transitions — produce a health event, which keeps
+    the signal high and the noise low::
+
+        IDLE → CONNECTING → CONNECTED
+                              │  ├─ (no data)      → STALLED → CONNECTED
+                              │  └─ (device drops) → RECONNECTING → CONNECTED
+                              │                                   └→ FAILED
+                              └─ (connect fails)  → FAILED
+        CONNECTED → DISCONNECTED   (clean teardown)
+
+    The string values match the orchestrator's internal ``_stream_states``
+    bookkeeping so a snapshot round-trips without translation.
+
+    Attributes:
+        IDLE: Registered with the session but not yet connected.
+        CONNECTING: ``connect()`` in progress.
+        CONNECTED: Device open and data flowing (the healthy steady state).
+        STALLED: Connected but no samples for the liveness window — a
+            recoverable observation, not necessarily terminal.
+        RECONNECTING: The supervisor is attempting bounded recovery after a
+            drop or unrecoverable stall.
+        FAILED: Terminal-unhealthy — ``connect()`` failed, a capture loop died
+            with no reconnect policy, or reconnect attempts were exhausted.
+        DISCONNECTED: Cleanly torn down by the orchestrator (session → IDLE).
+    """
+
+    IDLE = "idle"
+    CONNECTING = "connecting"
+    CONNECTED = "connected"
+    STALLED = "stalled"
+    RECONNECTING = "reconnecting"
+    FAILED = "failed"
+    DISCONNECTED = "disconnected"
+
+
+@dataclass(frozen=True)
+class StreamStatus:
+    """Immutable snapshot of a single stream's supervised health.
+
+    Returned by ``SessionOrchestrator.stream_status()`` /
+    ``stream_statuses()`` and delivered to ``on_stream_status`` callbacks on
+    every state transition. This is the public replacement for reaching into
+    the orchestrator's private ``_stream_states`` / ``_stream_errors`` dicts.
+
+    Attributes:
+        stream_id: The stream this status describes.
+        state: Current :class:`StreamConnectionState`.
+        error: Human-readable reason when ``state`` is ``FAILED`` /
+            ``RECONNECTING`` / ``STALLED``; ``None`` when healthy.
+        reconnect_attempts: Number of reconnect attempts made in the current
+            recovery episode (reset to 0 once the stream returns to
+            ``CONNECTED``).
+    """
+
+    stream_id: str
+    state: StreamConnectionState
+    error: str | None = None
+    reconnect_attempts: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "stream_id": self.stream_id,
+            "state": self.state.value,
+            "error": self.error,
+            "reconnect_attempts": self.reconnect_attempts,
+        }
 
 
 class HealthEventKind(Enum):

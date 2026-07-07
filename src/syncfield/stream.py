@@ -160,6 +160,7 @@ class Stream(Protocol):
     def start_recording(self, session_clock: SessionClock) -> None: ...
     def stop_recording(self) -> FinalizationReport: ...
     def disconnect(self) -> None: ...
+    def reconnect(self) -> None: ...
     def on_sample(self, callback: SampleCallback) -> None: ...
     def on_health(self, callback: HealthCallback) -> None: ...
 
@@ -411,3 +412,28 @@ class StreamBase:
         :meth:`stop` instead.
         """
         pass
+
+    def reconnect(self) -> None:
+        """Re-open a device that dropped, without re-registering the stream.
+
+        Called by the orchestrator's reconnect supervisor when this stream's
+        capture loop died or stalled unrecoverably. The default is the safe,
+        adapter-agnostic sequence ``disconnect()`` then ``connect()``: release
+        any lingering OS handle, then re-open and re-spawn the capture loop so
+        preview data flows again.
+
+        Override when an adapter can reconnect more cheaply (e.g. re-subscribe
+        a BLE characteristic without a full teardown) or needs to preserve
+        in-flight state. Implementations must be safe to call from a thread
+        other than the original capture thread and must leave the stream in the
+        same shape a fresh :meth:`connect` would.
+
+        Recording-phase resume: after ``reconnect()`` the orchestrator calls
+        :meth:`start_recording` again (with the live session clock) **only**
+        for adapters that advertise
+        :attr:`~syncfield.types.StreamCapabilities.supports_recording_reconnect`;
+        such adapters are responsible for continuing their output without
+        corrupting the bundle.
+        """
+        self.disconnect()
+        self.connect()

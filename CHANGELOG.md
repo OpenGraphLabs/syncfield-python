@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.6.0
+
+- **Reliable stream health + supervision.** New `syncfield.supervision` module with a per-stream health state machine (`StreamConnectionState`: idle → connecting → connected → stalled → reconnecting → failed/disconnected) that emits **transition-only** events — replacing the previous noisy, effectively-unused health signal. Exposed as an immutable `StreamStatus` snapshot.
+- **Public per-stream status API** on `SessionOrchestrator`: `stream_status(id)`, `stream_statuses()`, and `on_stream_status(cb)`. Consumers no longer reach into private `_stream_states` / `_stream_errors`.
+- **Bounded reconnect.** Opt-in `ReconnectPolicy` (disabled by default → zero behaviour change) drives automatic, backed-off reconnection of dropped streams. Preview/pre-flight drops always recover; mid-recording reconnect is gated behind the new `StreamCapabilities.supports_recording_reconnect` (default `False`) so video adapters can't corrupt a bundle. `Stream.reconnect()` added to the SPI with a safe `disconnect()`+`connect()` default.
+- **Capture-loop death is now first-class.** A dying capture thread (the highest-signal reliability event) drives the supervisor's state machine and reconnect instead of being dropped from the incident layer.
+- **De-noised the default health surface.** The soft-threshold quality detectors `fps-drop` and `jitter`, and the zero-fed (dead) `backpressure` detector, are no longer installed by default; the reliable `stream-stall`, `no-data`, `startup-failure`, and adapter/crash detectors remain. The detector classes stay importable for explicit opt-in.
+
 ## 0.5.0
 
 - Promoted the full OAK-D Pro composite adapter (3 cameras + IMU + hardware FSYNC + EEPROM calibration) into the SDK as the canonical `OakCameraStream`; the prior RGB+optional-depth adapter is preserved as `OakRgbDepthStream`.

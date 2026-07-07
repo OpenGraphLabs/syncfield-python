@@ -36,16 +36,25 @@ def test_health_system_register_and_unregister():
 def test_health_system_installs_default_detectors():
     hs = HealthSystem()
     names = {d.name for d in hs.iter_detectors()}
+    # Reliable, high-signal detectors — connection/liveness/crash lifecycle.
     for expected in (
         "adapter",
         "stream-stall",
-        "fps-drop",
-        "jitter",
         "startup-failure",
-        "backpressure",
         "no-data",
     ):
         assert expected in names, f"missing default detector: {expected}"
+
+
+def test_noisy_quality_detectors_are_not_installed_by_default():
+    # fps-drop / jitter / backpressure are soft-threshold quality metrics (and
+    # backpressure was fed only zeros — dead code). They emitted noise into the
+    # incident stream and are no longer part of the default health surface.
+    hs = HealthSystem()
+    names = {d.name for d in hs.iter_detectors()}
+    assert "fps-drop" not in names
+    assert "jitter" not in names
+    assert "backpressure" not in names
 
 
 def test_health_system_callbacks_fire_on_open_and_close():
@@ -99,16 +108,13 @@ def test_health_system_register_after_start_warns():
         hs.stop()
 
 
-def test_register_stream_propagates_target_hz_to_detectors():
+def test_register_stream_records_target_hz():
+    # The rate declaration is still accepted and stored; liveness monitoring
+    # now lives in the supervisor (which reads capabilities.target_hz directly),
+    # so this no longer wires into the removed fps-drop/jitter detectors.
     hs = HealthSystem()
     hs.register_stream("cam", 30.0)
-
-    fps = next(d for d in hs.iter_detectors() if d.name == "fps-drop")
-    jitter = next(d for d in hs.iter_detectors() if d.name == "jitter")
-
-    assert fps._target_getter("cam") == 30.0
-    assert jitter._target_getter("cam") == 30.0
-    assert fps._target_getter("unknown") is None
+    assert hs._target_hz_by_stream["cam"] == 30.0
 
 
 def test_health_system_observe_connection_state_routes_to_worker():
