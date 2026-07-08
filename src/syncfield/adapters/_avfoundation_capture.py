@@ -271,6 +271,30 @@ def _delegate_class(objc: Any, NSObject: Any, Quartz: Any, CM: Any) -> Any:
     return _DELEGATE_CLS
 
 
+def _lock_for_configuration(
+    device: Any, *, attempts: int = 12, delay_s: float = 0.05
+) -> bool:
+    """Acquire exclusive config ownership of an ``AVCaptureDevice``.
+
+    ``lockForConfiguration:`` has an ``NSError**`` out-parameter, so PyObjC
+    returns a ``(succeeded, error)`` tuple (a non-empty tuple is always
+    truthy — the source of the crash this guards against). The lock can also
+    fail transiently in the moment right after ``startRunning``, and a second
+    identical camera can lose the race, so retry briefly.
+
+    Returns ``True`` only when the lock is actually held; the caller MUST then
+    call ``unlockForConfiguration``. Returns ``False`` (never raises) when the
+    lock cannot be taken, so the caller can fall back to the preset format.
+    """
+    for _ in range(max(1, attempts)):
+        result = device.lockForConfiguration_(None)
+        locked = result[0] if isinstance(result, tuple) else bool(result)
+        if locked:
+            return True
+        time.sleep(delay_s)
+    return False
+
+
 class NativeAVCapture:
     """Owns an ``AVCaptureSession`` and exposes a ``read()`` that yields
     ``(frame_bgr, capture_ns)`` — a drop-in frame source for the UVC capture loop.
@@ -442,7 +466,19 @@ class NativeAVCapture:
         # frame-duration set beforehand. Verified live: identical locks set
         # pre-start left two cameras on preset-negotiated 25/20 fps; set
         # post-start they hold an exact 30 fps.
-        if fmt is not None and device.lockForConfiguration_(None):
+        # ``lockForConfiguration:`` takes an ``NSError**`` out-parameter, so
+        # PyObjC returns a ``(succeeded, error)`` TUPLE — which is ALWAYS
+        # truthy. The old ``if … lockForConfiguration_(None):`` therefore fell
+        # through to ``setActiveFormat:`` even when the lock was NOT granted,
+        # and AVFoundation then threw ``NSGenericException`` ("may not be called
+        # without first successfully gaining exclusive ownership"). With two
+        # identical cameras the second one loses the lock race right after
+        # ``startRunning``, so this crashed the whole preview connect. Unpack
+        # the result, retry the transient post-start contention, and only
+        # configure the device once the lock is truly held — otherwise keep the
+        # session-preset format instead of crashing.
+        locked = _lock_for_configuration(device) if fmt is not None else False
+        if locked:
             try:
                 device.setActiveFormat_(fmt)
                 # Pin the frame RATE from both sides: min duration stops a
@@ -456,6 +492,13 @@ class NativeAVCapture:
                     device.setActiveVideoMaxFrameDuration_(lock_max)
             finally:
                 device.unlockForConfiguration()
+        elif fmt is not None:
+            logger.warning(
+                "avfoundation.capture could not lock device %s for configuration; "
+                "keeping the session-preset format (a second identical camera can "
+                "lose the post-start lock race)",
+                self._unique_id,
+            )
 
         self._session = session
         self.selected_max_fps = max_fps

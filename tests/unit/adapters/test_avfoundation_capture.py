@@ -10,10 +10,58 @@ import pytest
 
 from syncfield.adapters._avfoundation_capture import (
     AVFoundationUnavailable,
+    _lock_for_configuration,
     _resolve_device,
     bgr_from_pixel_buffer,
     select_capture_format,
 )
+
+
+# --- _lock_for_configuration (PyObjC NSError** out-param → tuple) -----------
+
+
+class _LockDevice:
+    """Fake AVCaptureDevice whose ``lockForConfiguration_`` returns whatever the
+    scripted sequence dictates. Real PyObjC returns a ``(succeeded, error)``
+    tuple because of the ``NSError**`` out-parameter."""
+
+    def __init__(self, results: list) -> None:
+        self._results = list(results)
+        self.calls = 0
+
+    def lockForConfiguration_(self, _err):  # noqa: N802 - mirrors ObjC selector
+        self.calls += 1
+        return self._results.pop(0) if self._results else self._results and None
+
+
+def test_lock_for_configuration_unpacks_success_tuple(monkeypatch) -> None:
+    monkeypatch.setattr("syncfield.adapters._avfoundation_capture.time.sleep", lambda _s: None)
+    device = _LockDevice([(True, None)])
+    assert _lock_for_configuration(device) is True
+    assert device.calls == 1
+
+
+def test_lock_for_configuration_respects_failure_tuple(monkeypatch) -> None:
+    # A (False, error) tuple is TRUTHY — the bug was treating it as success and
+    # then crashing in setActiveFormat. The helper must return False.
+    monkeypatch.setattr("syncfield.adapters._avfoundation_capture.time.sleep", lambda _s: None)
+    err = SimpleNamespace(localizedDescription=lambda: "busy")
+    device = _LockDevice([(False, err)] * 12)
+    assert _lock_for_configuration(device, attempts=12) is False
+    assert device.calls == 12
+
+
+def test_lock_for_configuration_retries_transient_failure(monkeypatch) -> None:
+    monkeypatch.setattr("syncfield.adapters._avfoundation_capture.time.sleep", lambda _s: None)
+    device = _LockDevice([(False, None), (False, None), (True, None)])
+    assert _lock_for_configuration(device, attempts=12) is True
+    assert device.calls == 3
+
+
+def test_lock_for_configuration_accepts_bare_bool(monkeypatch) -> None:
+    monkeypatch.setattr("syncfield.adapters._avfoundation_capture.time.sleep", lambda _s: None)
+    device = _LockDevice([True])
+    assert _lock_for_configuration(device) is True
 
 
 # --- _resolve_device (identity by unique_id) -------------------------------
