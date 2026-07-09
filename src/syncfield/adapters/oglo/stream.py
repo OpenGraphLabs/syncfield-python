@@ -30,6 +30,8 @@ Requires the optional ``ble`` extra::
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
 import threading
 import time
 from collections import deque
@@ -58,6 +60,8 @@ from syncfield.types import (
     StreamCapabilities,
 )
 from syncfield.writer import SensorWriter
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # GATT layout (firmware source of truth; base = ASCII "FRS_BLE\0").
@@ -130,6 +134,7 @@ class OgloTactileStream(StreamBase):
         scan_timeout: float = 10.0,
         connect_timeout: float = 10.0,
         output_dir: Path | str | None = None,
+        calibration: Optional[dict[str, Any]] = None,
     ) -> None:
         super().__init__(
             id=id,
@@ -153,6 +158,10 @@ class OgloTactileStream(StreamBase):
         self._scan_timeout = scan_timeout
         self._connect_timeout = connect_timeout
         self._output_dir = Path(output_dir) if output_dir is not None else Path.cwd()
+        # Both-hands OGLO extrinsic calibration (``syncfield.oglo_calibration.v1``);
+        # this glove writes only its authoritative side on record. See
+        # :meth:`_write_calibration_file`.
+        self._calibration = calibration
 
         self._client: Any = None
         self._device: Any = None  # BLEDevice from scan, or address string
@@ -251,10 +260,33 @@ class OgloTactileStream(StreamBase):
         if self._thread is None or not self._thread.is_alive():
             self.connect()
         self._rebind_output_paths()
+        self._write_calibration_file()
         self._open_imu_writer()
         self._imu_frame_count = 0
         self._begin_recording_window(session_clock)
         self._recording = True
+
+    def _write_calibration_file(self) -> None:
+        """Write ``{id}.calibration.json`` for this glove's authoritative side.
+
+        Mirrors the OAK composite: the marker + wrist-IMU extrinsics ride into
+        the episode next to the tactile/IMU data so SLAM / hand-pose consumers
+        get them with zero extra steps. ``self._hand`` is authoritative once the
+        manifest is read (post-connect); a wrong pre-connect hint never leaks the
+        wrong side. Never raises — calibration must not block a recording.
+        """
+        from syncfield.oglo_calibration import oglo_side_document
+
+        doc = oglo_side_document(self._calibration, self._hand)
+        if doc is None:
+            return
+        path = self._output_dir / f"{self.id}.calibration.json"
+        try:
+            path.write_text(json.dumps(doc, indent=2), encoding="utf-8")
+        except OSError as exc:  # pragma: no cover - defensive
+            logger.warning(
+                "OGLO %s: failed to write calibration file: %s", self.id, exc
+            )
 
     def stop_recording(self) -> FinalizationReport:
         """Flip recording off, close the IMU file, snapshot the report.

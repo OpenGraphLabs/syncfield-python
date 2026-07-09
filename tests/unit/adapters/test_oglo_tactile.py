@@ -276,6 +276,62 @@ class TestRecording:
         assert artifacts[0].stream_id == "oglo.imu"
         assert artifacts[0].frame_count == 3
 
+    def test_calibration_file_written_for_authoritative_side(self, oglo_module, tmp_path):
+        from syncfield.oglo_calibration import OGLO_CALIBRATION_SCHEMA
+
+        full = {
+            "schema": OGLO_CALIBRATION_SCHEMA,
+            "rig_id": "OGLO-MT-CASE-07",
+            "units": "meters",
+            "convention": "T_wrist_from_marker",
+            "usage": "wrist pose",
+            "hands": {
+                "right": {
+                    "wrist_frame": "right_wrist",
+                    "markers": [{"id": 4}, {"id": 5}, {"id": 6}, {"id": 7}],
+                    "imu": {"part": "ICM-42688-P", "orientation_confirmed": True},
+                },
+                "left": {
+                    "wrist_frame": "left_wrist",
+                    "markers": [{"id": 0}, {"id": 1}, {"id": 2}, {"id": 3}],
+                    "imu": {"part": "ICM-42688-P", "orientation_confirmed": False, "R": None},
+                },
+            },
+            "source": {"file": "oglo_marker_extrinsics.json"},
+        }
+        s = oglo_module.OgloTactileStream(
+            "oglo", address="addr", output_dir=tmp_path, calibration=full, hand="left"
+        )
+        # Authoritative side (manifest) wins over the construct-time hint.
+        s._hand = "right"
+        s._output_dir = tmp_path
+        s._write_calibration_file()
+
+        cal = tmp_path / "oglo.calibration.json"
+        assert cal.exists()
+        doc = json.loads(cal.read_text())
+        assert doc["schema"] == OGLO_CALIBRATION_SCHEMA
+        assert doc["side"] == "right"
+        assert doc["wrist_frame"] == "right_wrist"
+        assert [m["id"] for m in doc["markers"]] == [4, 5, 6, 7]
+        assert doc["imu"]["orientation_confirmed"] is True
+        assert "hands" not in doc
+
+    def test_no_calibration_file_without_calibration_or_side(self, oglo_module, tmp_path):
+        s = oglo_module.OgloTactileStream("oglo", address="addr", output_dir=tmp_path)
+        s._output_dir = tmp_path
+        s._hand = "right"
+        s._write_calibration_file()  # no calibration -> no file
+        assert not (tmp_path / "oglo.calibration.json").exists()
+
+        s2 = oglo_module.OgloTactileStream(
+            "oglo", address="addr", output_dir=tmp_path, calibration={"hands": {"right": {}}}
+        )
+        s2._output_dir = tmp_path
+        s2._hand = "unknown"  # no authoritative side -> no file
+        s2._write_calibration_file()
+        assert not (tmp_path / "oglo.calibration.json").exists()
+
     def test_consecutive_recordings_follow_rotated_output_dir(self, oglo_module, tmp_path):
         s = oglo_module.OgloTactileStream("oglo", address="addr", output_dir=tmp_path)
         ep1 = tmp_path / "ep1"
