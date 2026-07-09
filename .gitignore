@@ -42,3 +42,6 @@ src/syncfield/viewer/frontend/dist/
 # OS
 .DS_Store
 Thumbs.db
+
+# superpowers scratch
+.superpowers/
