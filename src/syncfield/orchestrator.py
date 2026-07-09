@@ -2028,6 +2028,16 @@ class SessionOrchestrator:
                 self._episode_dir_created = True
                 logger.info("Episode dir created: %s", self._output_dir)
 
+            # Adapters that self-write files the orchestrator never sees
+            # (OakCameraStream's mono/IMU/calibration, OgloTactileStream's
+            # wrist IMU) cache their output directory at construction. If the
+            # caller passed the data root instead of ``session.output_dir``,
+            # those files would land outside the episode — silently. Rebinding
+            # here makes the constructor argument irrelevant: every adapter
+            # follows the current episode. Idempotent; ``_prepare_next_episode``
+            # already does the same for episodes 2..n.
+            self._rebind_stream_output_dirs()
+
             # Open session log now that the directory exists.
             if self._log_writer is None:
                 self._log_writer = SessionLogWriter(self._output_dir)
