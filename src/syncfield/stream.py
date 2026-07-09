@@ -48,9 +48,11 @@ implement the protocol from scratch; both paths are equally well supported.
 
 from __future__ import annotations
 
+import dataclasses
 from typing import Callable, List, Optional, Protocol, Tuple, runtime_checkable
 
 from syncfield.clock import SessionClock
+from syncfield.health.severity import Severity, severity_for_kind
 from syncfield.types import (
     FinalizationReport,
     HealthEvent,
@@ -266,7 +268,23 @@ class StreamBase:
             cb(event)
 
     def _emit_health(self, event: HealthEvent) -> None:
-        """Forward a health event to callbacks and buffer it for finalization."""
+        """Forward a health event to callbacks and buffer it for finalization.
+
+        This is the single choke point every adapter goes through, so it is
+        also where the platform holds up the contract documented on
+        :class:`~syncfield.types.HealthEvent`: adapters may leave
+        ``severity`` / ``fingerprint`` at their safe defaults and the
+        platform fills them in here before the event reaches the
+        ``IncidentTracker`` (which requires a non-empty ``fingerprint`` and
+        otherwise raises). An adapter that explicitly set either field wins
+        — we only fill in what was left at its default.
+        """
+        if not event.fingerprint:
+            event = dataclasses.replace(
+                event, fingerprint=f"{event.stream_id}:{event.kind.value}"
+            )
+        if event.severity is Severity.INFO:
+            event = dataclasses.replace(event, severity=severity_for_kind(event.kind))
         self._collected_health.append(event)
         for cb in self._health_callbacks:
             cb(event)

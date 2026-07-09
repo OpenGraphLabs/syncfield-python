@@ -21,15 +21,11 @@ from syncfield.types import (
 
 
 def _severity_for(kind: HealthEventKind):
-    from syncfield.health.severity import Severity
-    mapping = {
-        HealthEventKind.HEARTBEAT: Severity.INFO,
-        HealthEventKind.RECONNECT: Severity.INFO,
-        HealthEventKind.DROP: Severity.WARNING,
-        HealthEventKind.WARNING: Severity.WARNING,
-        HealthEventKind.ERROR: Severity.ERROR,
-    }
-    return mapping.get(kind, Severity.WARNING)
+    # Delegates to the platform's canonical mapping so this test helper and
+    # StreamBase._emit_health() cannot drift apart. See
+    # syncfield.health.severity.severity_for_kind.
+    from syncfield.health.severity import severity_for_kind
+    return severity_for_kind(kind)
 
 
 class FakeStream(StreamBase):

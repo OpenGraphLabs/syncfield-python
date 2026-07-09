@@ -86,10 +86,19 @@ def test_stream_base_routes_health_to_callback_and_buffer():
     demo.on_health(received.append)
     ev = HealthEvent("x", HealthEventKind.HEARTBEAT, at_ns=100)
     demo._emit_health(ev)
-    assert received == [ev]
-    # Also accumulated internally for inclusion in FinalizationReport
+    # StreamBase._emit_health() fills in the platform-owned fingerprint the
+    # adapter left at its default ("") before forwarding — see
+    # syncfield.health.severity.severity_for_kind and the HealthEvent
+    # docstring's "platform fills them in" contract.
+    assert len(received) == 1
+    assert received[0].stream_id == ev.stream_id
+    assert received[0].kind == ev.kind
+    assert received[0].at_ns == ev.at_ns
+    assert received[0].fingerprint == "x:heartbeat"
+    # Also accumulated internally for inclusion in FinalizationReport — the
+    # same platform-filled event reaches both destinations.
     report = demo.stop()
-    assert ev in report.health_events
+    assert received[0] in report.health_events
 
 
 def test_stream_base_supports_multiple_sample_callbacks():
