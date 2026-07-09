@@ -441,7 +441,7 @@ def test_v3_pipeline_builds_all_streams_on_full_device(
     assert stream._q_preview is not None
 
 
-def test_v3_pipeline_requests_800p_rgb_and_400p_mono_and_combined_imu_enable(
+def test_v3_pipeline_requests_640p_mono_30fps_and_400p_rgb_and_combined_imu_enable(
     oak_camera_module: Any,
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
@@ -455,11 +455,14 @@ def test_v3_pipeline_requests_800p_rgb_and_400p_mono_and_combined_imu_enable(
     imus = [n for n in pipeline.nodes if isinstance(n, _FakeImuNode)]
     by_socket = {c.built_socket: c for c in cams}
     assert set(by_socket) == {"CAM_A", "CAM_B", "CAM_C"}
-    # RGB: 800p encoder feed + preview; monos: 400p encoder feed (+ preview,
-    # asserted separately in test_v3_pipeline_builds_mono_preview_queues).
-    assert ((1280, 800), "NV12", 30.0) in by_socket["CAM_A"].requested
-    assert ((640, 400), "NV12", 30.0) in by_socket["CAM_B"].requested
-    assert ((640, 400), "NV12", 30.0) in by_socket["CAM_C"].requested
+    # 30 fps is the priority → mono 1024x640 (640p, native 16:10) so all three
+    # streams sustain a clean 30 fps (0 drops, measured) on RVC2; RGB is held at
+    # the SAME 30 fps (matched rates keep the ISP interleave regular — a
+    # mismatched RGB rate makes the monos jitter). 720p mono tops out at 24 fps
+    # on this chip. See the module docstring for the full bandwidth findings.
+    assert ((640, 400), "NV12", 30.0) in by_socket["CAM_A"].requested
+    assert ((1024, 640), "NV12", 30.0) in by_socket["CAM_B"].requested
+    assert ((1024, 640), "NV12", 30.0) in by_socket["CAM_C"].requested
     # IMU must be enabled with ONE combined call (separate enables degrade
     # BNO086 sync output to ~52 Hz — measured on hardware).
     assert len(imus) == 1
@@ -850,7 +853,7 @@ def test_v3_pipeline_builds_mono_preview_queues(
     cams = [n for n in pipeline.nodes if isinstance(n, _FakeCameraNode)]
     by_socket = {c.built_socket: c for c in cams}
     # Monos now request the encoder feed AND a small BGR preview.
-    assert ((640, 400), "NV12", 30.0) in by_socket["CAM_B"].requested
+    assert ((1024, 640), "NV12", 30.0) in by_socket["CAM_B"].requested
     assert ((320, 200), "BGR888p", 10.0) in by_socket["CAM_B"].requested
     assert ((320, 200), "BGR888p", 10.0) in by_socket["CAM_C"].requested
     assert set(stream._substream_preview_queues) == {"oak_pro.left", "oak_pro.right"}

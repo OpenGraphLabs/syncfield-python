@@ -10,11 +10,25 @@ handles to the same board. Artifacts share the RGB stem:
   ``{id}.{side}.timestamps.jsonl`` — stereo monos
 * ``{id}.imu.jsonl`` — one row per synced IMU packet (accel + gyro + quat)
 
-Hardware constraint (measured on OAK-D Pro W, RVC2): three 800p streams cap
-at ~20 fps regardless of encoder load, while RGB 800p30 plus two mono
-640x400@30 runs at full rate — hence the default mono resolution. Mono and
-IMU capture require the DepthAI v3 API; the legacy (v2) pipeline path stays
-RGB-only.
+Hardware constraint (measured on OAK-D Pro-W, RVC2, USB3): the RVC2 ISP
+sustains ~47 MP/s across all cameras. A full 30 fps on the stereo mono pair is
+the priority for our data, so the defaults capture mono 1024x640 (640p at the
+sensor's native 16:10) with RGB at 640x400, all three at 30 fps. Measured facts
+on real hardware (10 s recordings):
+
+* mono 1024x640 x2 @ 30 fps + RGB 640x400 @ 30 fps = clean, 0 drops (~47 MP/s,
+  at the ceiling but stable — reproducible).
+* mono 1152x720 x2 @ 30 fps = ~50 MP/s FOR THE MONO PAIR ALONE, over the
+  ceiling — delivers an irregular ~24-26 fps WITH drops even with RGB off. So
+  720p @ 30 fps is NOT attainable on this chip; 720p tops out at a clean 24 fps.
+* All streams share ONE frame rate: a mismatched RGB rate (e.g. 10 fps) desyncs
+  the ISP interleave and makes the mono pair jitter/drop, so matched rates
+  matter more than shaving RGB frames.
+
+Trade frame rate for resolution by editing the defaults: mono 1152x720 @ 24
+(all rates matched) is clean if you need 720p; raising ``rgb_resolution`` or
+mono fps past this budget pushes the mono pair into drops. Mono and IMU capture
+require the DepthAI v3 API; the legacy (v2) pipeline path stays RGB-only.
 """
 
 from __future__ import annotations
@@ -293,8 +307,10 @@ class OakCameraStream(StreamBase):
     """Full-stream OAK-D Pro capture: RGB + stereo mono pair + IMU.
 
     One physical OAK is captured through a single ``dai.Device`` and pipeline:
-    RGB (CAM_A) 800p30 H.264, the stereo mono pair (CAM_B/CAM_C) 400p30 H.264,
-    and the BNO086 IMU. The three cameras are hardware frame-synced (FSYNC), so
+    RGB (CAM_A) 400p30 H.264, the stereo mono pair (CAM_B/CAM_C) 640p30 H.264
+    (1024x640, native 16:10), and the BNO086 IMU. See the module docstring for
+    the bandwidth rationale (30 fps priority; 720p mono would cap at 24 fps on
+    RVC2). The three cameras are hardware frame-synced (FSYNC), so
     every stream's frame N shares a device timestamp to ~0.02 ms; per-frame
     device timestamps are recorded for downstream device-clock alignment. Full
     factory calibration is read from EEPROM and written to
@@ -317,10 +333,10 @@ class OakCameraStream(StreamBase):
         output_dir: Path | str,
         device_id: str | None = None,
         rgb_fps: int = 30,
-        rgb_resolution: tuple[int, int] = (1280, 800),
+        rgb_resolution: tuple[int, int] = (640, 400),
         h264_bitrate_kbps: int = 8_000,
         preview_resolution: tuple[int, int] = (320, 200),
-        mono_resolution: tuple[int, int] = (640, 400),
+        mono_resolution: tuple[int, int] = (1024, 640),
         mono_fps: int = 30,
         mono_bitrate_kbps: int = 4_000,
         imu_rate_hz: int = 400,
