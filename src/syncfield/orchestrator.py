@@ -2495,10 +2495,14 @@ class SessionOrchestrator:
         """
         for stream in self._connected_streams:
             writer: SampleWriter
+            # Name the timestamps/sensor file after ``output_name`` (the alias),
+            # matching the MP4 + calibration, so all of a stream's artifacts —
+            # and its manifest key below — share one consistent name.
+            output_name = getattr(stream, "output_name", None) or stream.id
             if stream.kind == "sensor":
-                writer = SensorWriter(stream.id, self._output_dir)
+                writer = SensorWriter(output_name, self._output_dir)
             else:
-                writer = StreamWriter(stream.id, self._output_dir)
+                writer = StreamWriter(output_name, self._output_dir)
             writer.open()
             active: List[bool] = [True]
             stream.on_sample(self._make_sample_handler(writer, active))
@@ -2663,7 +2667,11 @@ class SessionOrchestrator:
                     if final.recording_anchor is not None
                     else None
                 )
-            streams_dict[stream.id] = entry
+            # Key the manifest by ``output_name`` (the alias) so it matches the
+            # MP4 / timestamps stems — one consistent name per stream through
+            # raw and synced data. Falls back to ``id`` when no alias was set.
+            manifest_key = getattr(stream, "output_name", None) or stream.id
+            streams_dict[manifest_key] = entry
 
         write_manifest(
             self._host_id,
@@ -2844,6 +2852,21 @@ class SessionOrchestrator:
     def stream_statuses(self) -> dict:
         """Return a ``{stream_id: StreamStatus}`` snapshot of all streams."""
         return self._supervisor.statuses()
+
+    def note_stream_activity(self, stream_id: str, at_ns: int) -> None:
+        """Record external evidence that a stream is alive.
+
+        The supervisor derives stalls from *sample* arrivals, which for video
+        adapters flow only during a recording. A caller that has an independent
+        liveness signal outside recording — e.g. the desktop preview monitor
+        watching ``latest_frame`` advance — feeds it here so a camera that is
+        producing preview frames isn't reported ``STALLED`` (which would set a
+        connection error, fail the quality gate, and block the next recording).
+        Treated exactly like a sample arrival: it refreshes the stall clock and
+        recovers a stream that had already been marked stalled. A no-op for
+        unknown stream ids.
+        """
+        self._supervisor.note_sample(stream_id, at_ns)
 
     def _dispatch_stream_status(self, status) -> None:
         """Fan a supervisor status change out to on_stream_status subscribers."""

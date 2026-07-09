@@ -184,6 +184,13 @@ class UVCWebcamStream(StreamBase):
         self._max_silent_restarts = 3
 
     @property
+    def output_name(self) -> str:
+        """Stem shared by every recorded artifact (MP4, calibration,
+        timestamps) and the manifest key — the human alias when one was set,
+        else the stream id."""
+        return self._output_stem
+
+    @property
     def device_key(self) -> Optional[DeviceKey]:
         """Stable hardware id — the AVFoundation ``unique_id`` when known.
 

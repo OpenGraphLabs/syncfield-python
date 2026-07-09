@@ -134,6 +134,15 @@ class Stream(Protocol):
     def id(self) -> str: ...
 
     @property
+    def output_name(self) -> str:
+        """Name for this stream's recorded artifacts + manifest key.
+
+        Defaults to :attr:`id` (see :class:`StreamBase`); adapters that take a
+        human alias override it so all of a stream's files share one name.
+        """
+        ...
+
+    @property
     def kind(self) -> StreamKind: ...
 
     @property
@@ -223,6 +232,21 @@ class StreamBase:
         See :data:`DeviceKey`.
         """
         return None
+
+    @property
+    def output_name(self) -> str:
+        """Name used for this stream's recorded artifacts and manifest key.
+
+        Every file a stream produces — the MP4, the ``.calibration.json``, the
+        ``.timestamps.jsonl`` — plus the stream's manifest key share this one
+        name, so an episode is consistently named. Defaults to :attr:`id`;
+        adapters that accept a human ``output_name``/alias override it (e.g.
+        :class:`~syncfield.adapters.uvc_webcam.UVCWebcamStream` returns its
+        output stem). Keeping ``id`` as the live-connection key while artifacts
+        use ``output_name`` lets a rename change file names without re-keying
+        the running stream.
+        """
+        return self.id
 
     def on_sample(self, callback: SampleCallback) -> None:
         """Register a callback invoked for every sample emitted by this stream."""

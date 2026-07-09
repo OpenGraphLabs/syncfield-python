@@ -1252,6 +1252,81 @@ class TestSamplePersistence:
         # ``clock_domain`` so the core can group streams by host later.
         assert all(line["clock_domain"] == "rig_01" for line in lines)
 
+    def test_note_stream_activity_feeds_supervisor_liveness(self, tmp_path):
+        """Preview-frame liveness fed via ``note_stream_activity`` updates the
+        supervisor's sample clock, so a video stream that produces preview
+        frames but (by design) emits no recording samples outside a recording
+        is not false-stalled — which otherwise poisons the quality gate and
+        blocks the next recording."""
+        session = _session(tmp_path)
+        cam = FakeStream("cam")
+        session.add(cam)  # registers "cam" in the supervisor
+        session.note_stream_activity("cam", 424242)
+        assert session._supervisor._streams["cam"].last_sample_ns == 424242
+        # Unknown stream is a safe no-op.
+        session.note_stream_activity("nope", 1)
+
+    def test_recorded_artifacts_use_output_name_not_stream_id(self, tmp_path):
+        """All of a stream's recorded artifacts share one name — its
+        ``output_name`` (the human alias). The MP4/calibration already use it;
+        the timestamps file and the manifest key must too, so raw and synced
+        data are named consistently instead of splitting alias vs index."""
+
+        class _Aliased(FakeStream):
+            @property
+            def output_name(self) -> str:
+                return "ego_left"
+
+        session = _session(tmp_path)
+        cam = _Aliased("uvc_webcam_0")
+        session.add(cam)
+        session.start(countdown_s=0)
+        cam.push_sample(frame_number=0, capture_ns=1_000_000)
+        session.stop()
+
+        assert (session.last_episode_dir / "ego_left.timestamps.jsonl").exists()
+        assert not (
+            session.last_episode_dir / "uvc_webcam_0.timestamps.jsonl"
+        ).exists()
+        manifest = json.loads(
+            (session.last_episode_dir / "manifest.json").read_text()
+        )
+        assert "ego_left" in manifest["streams"]
+        assert "uvc_webcam_0" not in manifest["streams"]
+
+    def test_output_name_set_before_recording_renames_all_artifacts(self, tmp_path):
+        """Reconciling the output name right before recording (what the desktop
+        app does for every staged stream, so a persisted alias that hydrated
+        after the preview connected still lands correctly) renames the
+        timestamps file and manifest key — even though the stream connected
+        under its default id."""
+
+        class _Renamable(FakeStream):
+            def __init__(self, id: str) -> None:
+                super().__init__(id)
+                self._alias: str | None = None
+
+            @property
+            def output_name(self) -> str:
+                return self._alias or self.id
+
+            def set_output_name(self, name: str) -> None:
+                self._alias = name
+
+        session = _session(tmp_path)
+        cam = _Renamable("uvc_webcam_0")  # connected under the default id
+        session.add(cam)
+        cam.set_output_name("ego_left")  # desktop pushes the alias before record
+        session.start(countdown_s=0)
+        cam.push_sample(frame_number=0, capture_ns=1_000_000)
+        session.stop()
+
+        assert (session.last_episode_dir / "ego_left.timestamps.jsonl").exists()
+        manifest = json.loads(
+            (session.last_episode_dir / "manifest.json").read_text()
+        )
+        assert "ego_left" in manifest["streams"]
+
     def test_video_stream_writes_device_ns_as_top_level_timestamp(self, tmp_path):
         from syncfield.types import SampleEvent
 

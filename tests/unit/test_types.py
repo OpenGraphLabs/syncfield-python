@@ -269,6 +269,7 @@ class TestStreamCapabilities:
             "produces_file": True,
             "target_hz": None,
             "live_preview": True,
+            "supports_recording_reconnect": False,
         }
 
 
