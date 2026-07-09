@@ -64,6 +64,21 @@ class TestCameraCalibration:
         assert c2.resolution == (1280, 800)
         assert c2.rms_reprojection_error == 0.31
 
+    def test_distortion_model_defaults_to_radtan(self):
+        # Backward compat: calibrations written before this field existed (and
+        # the default construction) are pinhole radtan.
+        assert _calib().distortion_model == "opencv_radtan"
+        assert _calib().to_dict()["distortion_model"] == "opencv_radtan"
+        legacy = _calib().to_dict()
+        del legacy["distortion_model"]
+        assert CameraCalibration.from_dict(legacy).distortion_model == "opencv_radtan"
+
+    def test_distortion_model_round_trips(self):
+        # A fisheye calibration must carry its model as the undistort contract.
+        d = _calib(distortion_model="kannala_brandt").to_dict()
+        assert d["distortion_model"] == "kannala_brandt"
+        assert CameraCalibration.from_dict(d).distortion_model == "kannala_brandt"
+
 
 class TestWriteCalibrationFile:
     def test_writes_named_sidecar(self, tmp_path):

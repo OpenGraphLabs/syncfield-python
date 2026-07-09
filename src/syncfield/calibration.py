@@ -46,6 +46,12 @@ class CameraCalibration:
     distortion_coefficients: list[float]
     resolution: tuple[int, int]
     model: str | None = None
+    # Distortion/projection model — the DOWNSTREAM CONTRACT for undistortion:
+    # ``opencv_radtan`` / ``opencv_rational`` are pinhole (cv2.undistort);
+    # ``kannala_brandt`` is fisheye (cv2.fisheye.undistort*). Defaults to
+    # radtan for backward compatibility with calibrations written before this
+    # field existed.
+    distortion_model: str = "opencv_radtan"
     source: CalibrationSource = "measured"
     rms_reprojection_error: float | None = None
     measured_at: str | None = None
@@ -60,6 +66,7 @@ class CameraCalibration:
             "distortion_coefficients": [float(x) for x in self.distortion_coefficients],
             "resolution": [int(self.resolution[0]), int(self.resolution[1])],
             "model": self.model,
+            "distortion_model": self.distortion_model,
             "provenance": {
                 "source": self.source,
                 "rms_reprojection_error": self.rms_reprojection_error,
@@ -84,6 +91,7 @@ class CameraCalibration:
             "distortion_coefficients",
             "resolution",
             "model",
+            "distortion_model",
             "provenance",
         }
         extra = {k: v for k, v in data.items() if k not in known}
@@ -92,6 +100,7 @@ class CameraCalibration:
             distortion_coefficients=[float(x) for x in data["distortion_coefficients"]],
             resolution=(int(res[0]), int(res[1])),
             model=data.get("model"),
+            distortion_model=data.get("distortion_model", "opencv_radtan"),
             source=prov.get("source", "imported"),
             rms_reprojection_error=prov.get("rms_reprojection_error"),
             measured_at=prov.get("measured_at"),
