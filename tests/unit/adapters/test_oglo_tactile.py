@@ -161,6 +161,62 @@ class TestConstruction:
         with pytest.raises(ValueError):
             oglo_module.OgloTactileStream("oglo", address=None, ble_name="")
 
+    @pytest.mark.parametrize("empty", ["", "   ", "\t"])
+    def test_an_empty_address_means_not_supplied(self, oglo_module, empty):
+        """`prepare()` used to test `self._address is not None`, so `""` — what
+        an unset config field looks like; og-skill's kiosk read exactly that out
+        of /etc/og-kiosk/device.json — skipped the name scan and handed the
+        empty string to bleak as the target device."""
+        s = oglo_module.OgloTactileStream("oglo", address=empty, hand="left")
+        assert s._address is None
+
+    def test_an_address_is_stripped_not_dialled_with_whitespace(self, oglo_module):
+        s = oglo_module.OgloTactileStream("oglo", address="  AA:BB  ")
+        assert s._address == "AA:BB"
+
+    def test_prepare_with_an_empty_address_scans_by_name_and_hand(self, oglo_module, monkeypatch):
+        left = SimpleNamespace(name="OGLO_LEFT_TEST01", address="28:84:85:BB:60:ED")
+        right = SimpleNamespace(name="OGLO RIGHT", address="28:84:85:BB:AF:3D")
+        adv = SimpleNamespace(local_name=None)
+
+        async def fake_discover(timeout, return_adv):  # noqa: ARG001
+            # Right advertises first: the old first-match code would hand it to
+            # the left stream.
+            return {right.address: (right, adv), left.address: (left, adv)}
+
+        # `oglo_module` is the package; the fake `bleak` lives on the stream
+        # module that actually imported it.
+        stream_module = sys.modules["syncfield.adapters.oglo.stream"]
+        monkeypatch.setattr(
+            stream_module.bleak, "BleakScanner", SimpleNamespace(discover=fake_discover)
+        )
+
+        left_stream = oglo_module.OgloTactileStream("tactile_left", address="", hand="left")
+        right_stream = oglo_module.OgloTactileStream("tactile_right", address="", hand="right")
+        left_stream.prepare()
+        right_stream.prepare()
+
+        assert left_stream._device is left
+        assert right_stream._device is right
+
+    def test_prepare_raises_when_the_hand_is_not_on_the_air(self, oglo_module, monkeypatch):
+        left = SimpleNamespace(name="OGLO LEFT", address="AA")
+        adv = SimpleNamespace(local_name=None)
+
+        async def fake_discover(timeout, return_adv):  # noqa: ARG001
+            return {left.address: (left, adv)}
+
+        # `oglo_module` is the package; the fake `bleak` lives on the stream
+        # module that actually imported it.
+        stream_module = sys.modules["syncfield.adapters.oglo.stream"]
+        monkeypatch.setattr(
+            stream_module.bleak, "BleakScanner", SimpleNamespace(discover=fake_discover)
+        )
+
+        stream = oglo_module.OgloTactileStream("tactile_right", address="", hand="right")
+        with pytest.raises(RuntimeError, match="not found"):
+            stream.prepare()
+
     def test_discovery_metadata(self, oglo_module):
         cls = oglo_module.OgloTactileStream
         assert cls._discovery_kind == "sensor"

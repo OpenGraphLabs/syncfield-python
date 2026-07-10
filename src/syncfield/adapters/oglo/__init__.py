@@ -12,6 +12,7 @@ The pure wire-format parser lives in :mod:`syncfield.adapters.oglo.packet`.
 from __future__ import annotations
 
 from syncfield.adapters.oglo.manifest import OgloDeviceManifest
+from syncfield.adapters.oglo.selection import AmbiguousGloveError, GloveCandidate, select_glove
 from syncfield.adapters.oglo.packet import OgloProtocolError
 from syncfield.adapters.oglo.stream import (
     CONFIG_CHAR_UUID,
@@ -23,6 +24,9 @@ from syncfield.adapters.oglo.stream import (
 )
 
 __all__ = [
+    "AmbiguousGloveError",
+    "GloveCandidate",
+    "select_glove",
     "OgloTactileStream",
     "OgloDeviceManifest",
     "OgloProtocolError",

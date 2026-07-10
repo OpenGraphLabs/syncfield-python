@@ -47,6 +47,7 @@ except ImportError as exc:  # pragma: no cover - exercised via sys.modules patch
         "Install with `pip install 'syncfield[ble]'`."
     ) from exc
 
+from syncfield.adapters.oglo.selection import GloveCandidate, select_glove
 from syncfield.adapters.oglo.manifest import OgloDeviceManifest
 from syncfield.adapters.oglo.packet import OgloProtocolError, parse_v5
 from syncfield.clock import SessionClock
@@ -107,13 +108,17 @@ class OgloTactileStream(StreamBase):
         id: Stream identifier.
         address: Explicit BLE address (or macOS platform UUID). Preferred when
             you already know which glove to connect to. One of ``address`` or
-            ``ble_name`` must be supplied.
+            ``ble_name`` must be supplied. An empty string counts as "not
+            supplied" — it is what an unset config field looks like.
         ble_name: Advertised-name substring to match during scanning. Default
             ``"oglo"`` (case-insensitive) — the firmware advertises
             ``OGLO`` / ``OGLO LEFT`` / ``OGLO RIGHT``.
-        hand: Optional hand hint (``"left"`` | ``"right"`` | ``"unknown"``).
-            Only a pre-connect hint — the manifest ``side`` is authoritative
-            once connected and overrides it.
+        hand: ``"left"`` | ``"right"`` | ``"unknown"``. When it names a side and
+            no *address* was given, the scan matches on the side token in the
+            advertised name, and two peripherals answering to the same hand is
+            an :class:`~syncfield.adapters.oglo.selection.AmbiguousGloveError`
+            rather than a coin flip. After connecting, the manifest's ``side``
+            is authoritative and overrides this hint.
         scan_timeout: BLE scan window in seconds when using ``ble_name``.
         connect_timeout: Seconds to wait for connect + manifest validation
             before :meth:`connect` gives up.
@@ -152,7 +157,12 @@ class OgloTactileStream(StreamBase):
                 f"[{id}] OgloTactileStream needs either 'address' or 'ble_name'"
             )
 
-        self._address = address
+        # An empty or whitespace-only address means "not supplied", not "connect
+        # to the empty string". `prepare()` used to test `is not None`, so a
+        # caller reading an unset field out of a config file -- og-skill's kiosk
+        # read `""` straight out of `/etc/og-kiosk/device.json` -- would skip the
+        # name scan entirely and hand `""` to bleak as the target device.
+        self._address = address.strip() if isinstance(address, str) and address.strip() else None
         self._ble_name = ble_name
         self._hand = hand
         self._scan_timeout = scan_timeout
@@ -211,7 +221,8 @@ class OgloTactileStream(StreamBase):
         if self._device is None:
             raise RuntimeError(
                 f"[{self.id}] OGLO glove not found "
-                f"(name filter={self._ble_name!r}, timeout={self._scan_timeout}s)"
+                f"(name filter={self._ble_name!r}, hand={self._hand!r}, "
+                f"timeout={self._scan_timeout}s)"
             )
 
     def connect(self) -> None:
@@ -474,20 +485,30 @@ class OgloTactileStream(StreamBase):
         self._handle_payload(bytes(payload))
 
     async def _scan_for_glove(self) -> Any:
-        """Scan for a peripheral whose advertised name contains ``ble_name``."""
-        filter_lower = self._ble_name.lower()
+        """Scan, then pick the peripheral that matches ``ble_name`` *and*
+        ``hand``.
+
+        This used to return the first peripheral whose name contained
+        ``ble_name`` and ignore ``hand`` outright. With both gloves powered on,
+        the left and the right stream matched the same device and dict order
+        decided which — writing one hand's taxels under the other hand's name.
+        Selection now lives in ``selection.select_glove``, which raises rather
+        than guess. See that module.
+        """
         results = await bleak.BleakScanner.discover(
             timeout=self._scan_timeout, return_adv=True
         )
-        for _address, (device, adv) in results.items():
-            candidates = [
-                (getattr(device, "name", None) or ""),
-                (getattr(adv, "local_name", None) or ""),
-            ]
-            for candidate in candidates:
-                if filter_lower in candidate.lower():
-                    return device
-        return None
+        candidates = [
+            GloveCandidate(
+                device,
+                [
+                    getattr(device, "name", None) or "",
+                    getattr(adv, "local_name", None) or "",
+                ],
+            )
+            for _address, (device, adv) in results.items()
+        ]
+        return select_glove(candidates, ble_name=self._ble_name, hand=self._hand)
 
     def _apply_manifest(self, manifest: OgloDeviceManifest) -> None:
         """Cache the validated manifest and precompute taxel channel labels.
