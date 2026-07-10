@@ -1549,6 +1549,19 @@ class SessionOrchestrator:
         return self._role
 
     @property
+    def sync_point(self) -> Optional[SyncPoint]:
+        """The reference time captured at :meth:`start`, or ``None`` before it.
+
+        ``sync_point.json`` is only written at :meth:`stop`, so a host that
+        loses power mid-recording leaves an episode whose monotonic timestamps
+        cannot be anchored to a wall clock — the recording is unrecoverable even
+        though every media file survived. Exposing the captured point lets a
+        caller persist it as soon as recording begins. og-skill's Pi kiosk does
+        exactly that (design spec section 13, crash recovery).
+        """
+        return self._sync_point
+
+    @property
     def session_id(self) -> Optional[str]:
         """Return the shared multi-host session id.
 
