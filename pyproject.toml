@@ -39,7 +39,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-ble = ["bleak>=0.21"]
+ble = ["bleak>=0.21", "pyserial>=3.5"]  # pyserial: OGLO USB CDC wired transport
 # OakCameraStream uses depthai v3 for the pipeline and PyAV for the MP4
 # writer (also via _video_encoder, hence numpy). Install `syncfield[oak]`
 # for the full OAK capture path.

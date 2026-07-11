@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from syncfield.adapters.oglo.manifest import OgloDeviceManifest
 from syncfield.adapters.oglo.selection import AmbiguousGloveError, GloveCandidate, select_glove
+from syncfield.adapters.oglo.usb_packet import UsbFrame, iter_usb_frames, parse_usb_frame
 from syncfield.adapters.oglo.packet import OgloProtocolError
 from syncfield.adapters.oglo.stream import (
     CONFIG_CHAR_UUID,
@@ -24,6 +25,9 @@ from syncfield.adapters.oglo.stream import (
 )
 
 __all__ = [
+    "UsbFrame",
+    "iter_usb_frames",
+    "parse_usb_frame",
     "AmbiguousGloveError",
     "GloveCandidate",
     "select_glove",

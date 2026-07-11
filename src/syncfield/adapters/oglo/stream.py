@@ -49,7 +49,12 @@ except ImportError as exc:  # pragma: no cover - exercised via sys.modules patch
 
 from syncfield.adapters.oglo.selection import GloveCandidate, select_glove
 from syncfield.adapters.oglo.manifest import OgloDeviceManifest
-from syncfield.adapters.oglo.packet import OgloProtocolError, parse_v5
+from syncfield.adapters.oglo.packet import OgloProtocolError, OgloSample, parse_v5
+from syncfield.adapters.oglo.usb_packet import (
+    STREAM_OFF_COMMAND,
+    STREAM_ON_COMMAND,
+    iter_usb_frames,
+)
 from syncfield.clock import SessionClock
 from syncfield.stream import StreamBase
 from syncfield.types import (
@@ -140,6 +145,7 @@ class OgloTactileStream(StreamBase):
         connect_timeout: float = 10.0,
         output_dir: Path | str | None = None,
         calibration: Optional[dict[str, Any]] = None,
+        serial_port: Optional[str] = None,
     ) -> None:
         super().__init__(
             id=id,
@@ -152,9 +158,14 @@ class OgloTactileStream(StreamBase):
                 produces_file=False,
             ),
         )
-        if not address and not ble_name:
+        # A serial port selects the USB CDC transport (wired), which is preferred:
+        # no BLE bandwidth ceiling, no shared wifi/BT chip contention, no silent
+        # link stalls. When absent, fall back to the BLE transport below, which
+        # still needs an address or a name to scan for.
+        self._serial_port = serial_port.strip() if isinstance(serial_port, str) and serial_port.strip() else None
+        if self._serial_port is None and not address and not ble_name:
             raise ValueError(
-                f"[{id}] OgloTactileStream needs either 'address' or 'ble_name'"
+                f"[{id}] OgloTactileStream needs 'serial_port', 'address', or 'ble_name'"
             )
 
         # An empty or whitespace-only address means "not supplied", not "connect
@@ -175,6 +186,7 @@ class OgloTactileStream(StreamBase):
 
         self._client: Any = None
         self._device: Any = None  # BLEDevice from scan, or address string
+        self._serial: Any = None  # pyserial handle when on the USB transport
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
@@ -212,6 +224,8 @@ class OgloTactileStream(StreamBase):
 
     def prepare(self) -> None:
         """Resolve the target device (explicit address or name scan)."""
+        if self._serial_port is not None:
+            return  # wired: no BLE device to resolve
         if self._address is not None:
             self._device = self._address
             return
@@ -236,8 +250,6 @@ class OgloTactileStream(StreamBase):
         """
         if self._thread is not None and self._thread.is_alive():
             return
-        if self._device is None:
-            self.prepare()
 
         self._recording = False
         self._frame_count = 0
@@ -248,12 +260,24 @@ class OgloTactileStream(StreamBase):
         self._manifest = None
         self._ready_event.clear()
         self._stop_event.clear()
-        self._thread = threading.Thread(
-            target=self._run_event_loop,
-            name=f"oglo-{self.id}",
-            daemon=True,
-        )
-        self._thread.start()
+
+        if self._serial_port is not None:
+            # Wired: no GATT manifest to read, so synthesise the firmware-default
+            # one (schema 5, 80 taxels, side from the `hand` hint) — the channel
+            # labels and file layout then match the BLE path byte-for-byte.
+            self._manifest = self._synthesise_usb_manifest()
+            self._apply_manifest(self._manifest)
+            self._thread = threading.Thread(
+                target=self._run_usb_reader, name=f"oglo-usb-{self.id}", daemon=True,
+            )
+            self._thread.start()
+        else:
+            if self._device is None:
+                self.prepare()
+            self._thread = threading.Thread(
+                target=self._run_event_loop, name=f"oglo-{self.id}", daemon=True,
+            )
+            self._thread.start()
 
         if not self._ready_event.wait(timeout=self._connect_timeout):
             self._stop_event.set()
@@ -523,6 +547,123 @@ class OgloTactileStream(StreamBase):
     # ------------------------------------------------------------------
     # Payload decoding (unit-testable without asyncio / bleak)
     # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # USB CDC transport (wired, preferred)
+    # ------------------------------------------------------------------
+
+    def _synthesise_usb_manifest(self) -> OgloDeviceManifest:
+        """The firmware-default manifest for a wired glove.
+
+        USB carries no config characteristic, so there is nothing to read. The
+        shipped firmware's defaults are fixed (schema 5, 80 taxels, 5×4×4), and
+        the side comes from the ``hand`` hint the agent already resolved from the
+        USB serial number. Building it through ``from_json`` reuses the exact
+        label/geometry logic the BLE path uses, so ``{id}.jsonl`` is identical
+        across transports.
+        """
+        side = self._hand if self._hand in ("left", "right") else "unknown"
+        return OgloDeviceManifest.from_json(
+            json.dumps({"device": "oglo", "side": side, "schema_ver": 5})
+        )
+
+    def _run_usb_reader(self) -> None:
+        """Open the serial port, enable the binary stream, and pump frames.
+
+        Mirrors ``_run_event_loop``'s contract: set ``_ready_event`` once the
+        stream is live (or ``_connect_error`` on failure), then loop until
+        ``_stop_event``. Each decoded frame goes through ``_handle_usb_frame``,
+        which feeds the same ``_emit_sample``/``_handle_imu`` path as BLE.
+        """
+        ser = None
+        try:
+            import serial  # lazy: only the wired path needs pyserial
+
+            ser = serial.Serial(self._serial_port, 115200, timeout=0.1)
+            self._serial = ser
+            time.sleep(0.2)
+            ser.reset_input_buffer()
+            # A leading newline flushes any partial command the port buffered,
+            # so STREAM BIN ON is parsed cleanly (a stray `#HB` tail otherwise
+            # prefixes it and the firmware answers `#ERR unknown command`).
+            ser.write(b"\n")
+            ser.flush()
+            time.sleep(0.15)
+            ser.reset_input_buffer()
+            ser.write(STREAM_ON_COMMAND)
+            ser.flush()
+        except Exception as exc:  # noqa: BLE001 - report to connect() caller
+            self._connect_error = exc
+            self._ready_event.set()
+            if ser is not None:
+                try:
+                    ser.close()
+                except Exception:
+                    pass
+            return
+
+        self._ready_event.set()
+
+        buffer = b""
+        seq = 0
+        try:
+            while not self._stop_event.is_set():
+                try:
+                    chunk = ser.read(4096)
+                except Exception:
+                    logger.exception("[%s] USB read failed", self.id)
+                    break
+                if not chunk:
+                    continue
+                buffer += chunk
+                frames, buffer = iter_usb_frames(buffer)
+                for frame in frames:
+                    self._handle_usb_frame(frame.to_sample(seq))
+                    seq += 1
+        finally:
+            try:
+                ser.write(STREAM_OFF_COMMAND)
+                ser.flush()
+                ser.close()
+            except Exception:
+                pass
+            self._serial = None
+
+    def _handle_usb_frame(self, sample: OgloSample) -> None:
+        """One decoded USB sample → the same taxel + wrist-IMU fan-out as BLE.
+
+        USB delivers one sample per frame (no batch), so there is no seq_base
+        gap to detect the way BLE does — the reader's running counter is the
+        sequence, and a lost USB frame simply advances device_us with no gap
+        marker. Everything from ``_emit_sample`` onward is transport-agnostic.
+        """
+        recv_ns = time.monotonic_ns()
+        labels = self._channel_labels
+        device_ns = sample.device_ns
+        channels = {labels[i]: int(v) for i, v in enumerate(sample.taxels)}
+
+        if self._recording:
+            self._observe_first_frame(recv_ns, device_ns)
+            if self._first_at is None:
+                self._first_at = recv_ns
+            self._last_at = recv_ns
+            self._frame_count += 1
+            frame_number = self._frame_count - 1
+        else:
+            frame_number = -1
+
+        self._emit_sample(
+            SampleEvent(
+                stream_id=self.id,
+                frame_number=frame_number,
+                capture_ns=recv_ns,
+                channels=channels,
+                uncertainty_ns=500_000,
+                device_ns=device_ns,
+            )
+        )
+        if sample.imu is not None:
+            self._handle_imu(sample.imu, recv_ns, device_ns)
 
     def _handle_payload(self, payload: bytes) -> None:
         """Decode one packed12 v5 packet into taxel + IMU samples."""
