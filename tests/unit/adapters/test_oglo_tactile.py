@@ -441,6 +441,24 @@ class TestLifecycle:
         with pytest.raises(oglo_module.OgloProtocolError, match="schema_ver"):
             s.connect()
 
+    def test_connect_falls_back_to_schema5_default_on_truncated_manifest(
+        self, oglo_module, monkeypatch
+    ):
+        # BlueZ truncates the config read at the ATT-MTU boundary, yielding
+        # invalid JSON even for a healthy schema-5 glove. Connect must recover by
+        # synthesising the schema-5 default (identical to the wired path) rather
+        # than failing — this is the path both Pi gloves take.
+        truncated = b'{"schema_ver": 5, "side": "left", "serial": "OGLO-01234567'
+        monkeypatch.setattr(_FakeClient, "manifest_bytes", truncated)
+        s = oglo_module.OgloTactileStream("oglo", address="addr", hand="left")
+        s.connect()
+        try:
+            assert s.manifest is not None
+            assert s.manifest.schema_ver == 5
+            assert s.hand == "left"  # side comes from the hand hint
+        finally:
+            s.disconnect()
+
     def test_notify_decodes_after_connect(self, oglo_module):
         s = oglo_module.OgloTactileStream("oglo", address="addr")
         got = []

@@ -342,6 +342,8 @@ class OakCameraStream(StreamBase):
         imu_rate_hz: int = 400,
         enable_mono: bool = True,
         enable_imu: bool = True,
+        enable_mono_preview: bool = True,
+        rgb_preview_from_h264: bool = False,
         **_: Any,
     ) -> None:
         super().__init__(
@@ -367,6 +369,16 @@ class OakCameraStream(StreamBase):
         self._imu_rate_hz = int(imu_rate_hz)
         self._enable_mono = enable_mono
         self._enable_imu = enable_imu
+        # Preview outputs are extra ISP downscales on the cameras — see the
+        # module docstring's bandwidth budget. On an ISP-bound config (e.g. a
+        # Pi kiosk recording RGB at high resolution), they steal from capture.
+        # ``enable_mono_preview=False`` skips the mono downscales (a kiosk that
+        # only shows the RGB view never uses them). ``rgb_preview_from_h264``
+        # drops the RGB ISP preview output too and instead decodes the encoded
+        # H.264 stream host-side for the preview, so recording keeps the ISP to
+        # itself and stays at the encode-only budget.
+        self._enable_mono_preview = enable_mono_preview
+        self._rgb_preview_from_h264 = rgb_preview_from_h264
 
         self._rgb = _H264Recorder(label="rgb", is_primary=True)
         self._left = _H264Recorder(label="left")
@@ -380,6 +392,14 @@ class OakCameraStream(StreamBase):
         self._queues_lock = threading.Lock()
         self._thread: threading.Thread | None = None
         self._imu_thread: threading.Thread | None = None
+        # Host-side preview decoder (only used when rgb_preview_from_h264): a
+        # dedicated thread decodes the newest RGB keyframe so the capture thread
+        # never pays H.264 decode cost.
+        self._preview_decode_thread: threading.Thread | None = None
+        self._preview_keyframe: bytes | None = None
+        self._preview_keyframe_lock = threading.Lock()
+        self._preview_wake = threading.Event()
+        self._last_preview_keyframe_ns = 0
         self._stop_event = threading.Event()
         self._frame_lock = threading.Lock()
         self._latest_frame: Any = None
@@ -490,6 +510,14 @@ class OakCameraStream(StreamBase):
                     daemon=True,
                 )
                 self._imu_thread.start()
+            if self._rgb_preview_from_h264:
+                self._preview_wake.clear()
+                self._preview_decode_thread = threading.Thread(
+                    target=self._preview_decode_loop,
+                    name=f"desktop-oak-preview-{self.id}",
+                    daemon=True,
+                )
+                self._preview_decode_thread.start()
         except Exception:
             self.disconnect()
             raise
@@ -637,6 +665,7 @@ class OakCameraStream(StreamBase):
 
     def disconnect(self) -> None:
         self._stop_event.set()
+        self._preview_wake.set()  # unblock the preview decode thread's wait()
         self._uninstall_depthai_bridge()
         if self._thread is not None:
             self._thread.join(timeout=3.0)
@@ -644,6 +673,9 @@ class OakCameraStream(StreamBase):
         if self._imu_thread is not None:
             self._imu_thread.join(timeout=3.0)
             self._imu_thread = None
+        if self._preview_decode_thread is not None:
+            self._preview_decode_thread.join(timeout=3.0)
+            self._preview_decode_thread = None
         for recorder in (self._rgb, self._left, self._right):
             recorder.close_files()
         self._imu.close_file()
@@ -849,12 +881,17 @@ class OakCameraStream(StreamBase):
             )
         )
 
-        preview_out = cam.requestOutput(
-            self._preview_resolution,
-            dai.ImgFrame.Type.BGR888p,
-            fps=min(10.0, float(self._rgb_fps)),
-        )
-        self._q_preview = preview_out.createOutputQueue()
+        # Skip the RGB ISP preview output when previewing from H.264: on an
+        # ISP-bound config it is a second output on the busiest camera (CAM_A),
+        # which starves the high-res encode stream. The preview is decoded from
+        # the encode bitstream instead (see _preview_decode_loop).
+        if not self._rgb_preview_from_h264:
+            preview_out = cam.requestOutput(
+                self._preview_resolution,
+                dai.ImgFrame.Type.BGR888p,
+                fps=min(10.0, float(self._rgb_fps)),
+            )
+            self._q_preview = preview_out.createOutputQueue()
 
         if self._enable_mono:
             if stereo_available:
@@ -889,14 +926,15 @@ class OakCameraStream(StreamBase):
                             float(self._mono_fps),
                         )
                     )
-                    mono_preview = mono.requestOutput(
-                        self._preview_resolution,
-                        dai.ImgFrame.Type.BGR888p,
-                        fps=min(10.0, float(self._mono_fps)),
-                    )
-                    self._substream_preview_queues[f"{self.id}.{recorder.label}"] = (
-                        mono_preview.createOutputQueue(maxSize=4, blocking=False)
-                    )
+                    if self._enable_mono_preview:
+                        mono_preview = mono.requestOutput(
+                            self._preview_resolution,
+                            dai.ImgFrame.Type.BGR888p,
+                            fps=min(10.0, float(self._mono_fps)),
+                        )
+                        self._substream_preview_queues[f"{self.id}.{recorder.label}"] = (
+                            mono_preview.createOutputQueue(maxSize=4, blocking=False)
+                        )
             else:
                 logger.warning(
                     "OAK %s: stereo sockets unavailable (connected=%s); recording RGB only",
@@ -1004,6 +1042,8 @@ class OakCameraStream(StreamBase):
         recorder.observe_capture(capture_ns)
         if recorder.is_primary:
             self._observe_recording_path_frame(capture_ns)
+            if self._rgb_preview_from_h264:
+                self._maybe_stash_preview_keyframe(data, capture_ns)
         if not self._recording:
             return
 
@@ -1061,6 +1101,72 @@ class OakCameraStream(StreamBase):
     def _observe_recording_path_frame(self, capture_ns: int) -> None:
         with self._health_lock:
             self._recording_path_timestamps_ns.append(capture_ns)
+
+    def _maybe_stash_preview_keyframe(self, data: bytes, capture_ns: int) -> None:
+        """Hand the newest RGB IDR keyframe to the decode thread (H.264 preview
+        mode only). Throttled to ~6 fps, and it only stashes bytes + wakes the
+        thread — the decode itself runs on ``_preview_decode_loop`` so the
+        capture thread's drain never pays decode cost. Each stashed blob is a
+        self-contained access unit (SPS + PPS + IDR) so it decodes standalone.
+        """
+        if capture_ns - self._last_preview_keyframe_ns < 150_000_000:
+            return
+        if not _contains_h264_nal_type(data, 5):
+            return
+        parameter_sets = self._rgb.parameter_sets()
+        if not parameter_sets:
+            return
+        blob = data if _contains_h264_parameter_sets(data) else parameter_sets + data
+        self._last_preview_keyframe_ns = capture_ns
+        with self._preview_keyframe_lock:
+            self._preview_keyframe = blob
+        self._preview_wake.set()
+
+    def _preview_decode_loop(self) -> None:
+        """Decode the latest stashed RGB keyframe into the preview frame.
+
+        Idles on ``_preview_wake`` until a new keyframe arrives, so it burns no
+        CPU between the ~6 fps keyframes. Each keyframe is an IDR access unit and
+        decodes without inter-frame state, so dropping intermediate ones is fine.
+        """
+        while not self._stop_event.is_set():
+            if not self._preview_wake.wait(timeout=0.5):
+                continue
+            self._preview_wake.clear()
+            if self._stop_event.is_set():
+                break
+            with self._preview_keyframe_lock:
+                blob = self._preview_keyframe
+                self._preview_keyframe = None
+            if not blob:
+                continue
+            frame = self._decode_keyframe_to_bgr(blob)
+            if frame is not None:
+                with self._frame_lock:
+                    self._latest_frame = frame
+
+    def _decode_keyframe_to_bgr(self, blob: bytes) -> Any:
+        """Decode one standalone H.264 IDR access unit to a preview-sized BGR
+        ndarray. Best-effort: any failure (PyAV missing, undecodable bytes)
+        returns ``None`` so the preview endpoint serves its placeholder — it
+        never raises into capture. A fresh codec context per call keeps decodes
+        independent (no carried state) at the ~6 fps this runs.
+        """
+        try:
+            import av  # type: ignore[import-not-found]
+        except Exception:  # noqa: BLE001
+            return None
+        try:
+            width, height = self._preview_resolution
+            codec = av.CodecContext.create("h264", "r")
+            for packet in codec.parse(blob):
+                for frame in codec.decode(packet):
+                    return frame.reformat(
+                        width=width, height=height, format="bgr24"
+                    ).to_ndarray()
+        except Exception:  # noqa: BLE001
+            logger.debug("OAK %s: preview keyframe decode failed", self.id)
+        return None
 
 
 def _apply_frame_sync(cam: Any, role: str, stream_id: str, socket_name: str) -> None:

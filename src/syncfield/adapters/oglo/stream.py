@@ -80,6 +80,17 @@ CONFIG_CHAR_UUID = "4652535f-424c-4500-0002-000000000001"
 IMU_CHANNELS = ("ax", "ay", "az", "gx", "gy", "gz")
 
 
+def _manifest_bytes_are_valid_json(raw: bytes) -> bool:
+    """True if *raw* parses as JSON. Distinguishes a BlueZ-truncated config read
+    (invalid JSON → recoverable via the schema-5 default) from a manifest that
+    parses but fails validation (a real protocol mismatch → must fail loud)."""
+    try:
+        json.loads(raw)
+        return True
+    except (ValueError, UnicodeDecodeError):
+        return False
+
+
 @dataclass(frozen=True)
 class OgloSubstream:
     """Descriptor for a derived stream of the OGLO glove (the wrist IMU)."""
@@ -465,10 +476,15 @@ class OgloTactileStream(StreamBase):
         try:
             self._client = bleak.BleakClient(self._device)
             await self._client.connect()
-            raw_manifest = await self._client.read_gatt_char(CONFIG_CHAR_UUID)
+            raw_manifest = bytes(await self._client.read_gatt_char(CONFIG_CHAR_UUID))
             try:
-                manifest = OgloDeviceManifest.from_json(bytes(raw_manifest))
-            except Exception as manifest_exc:  # noqa: BLE001
+                manifest = OgloDeviceManifest.from_json(raw_manifest)
+            except OgloProtocolError as manifest_exc:
+                if _manifest_bytes_are_valid_json(raw_manifest):
+                    # The bytes parsed as JSON but failed validation (e.g. an
+                    # unsupported schema_ver) — a genuine protocol mismatch, not a
+                    # transport artifact. Surface it; do not silently mis-decode.
+                    raise
                 # The config characteristic can read back TRUNCATED over BLE (an
                 # ATT-MTU / firmware buffer limit) even though the glove is a
                 # standard schema-5 device — observed on RDR02 REV_D, whose full
@@ -479,7 +495,7 @@ class OgloTactileStream(StreamBase):
                 # rather than failing the whole connect. The side comes from the
                 # hand hint (advertised name / operator selection).
                 logger.warning(
-                    "[%s] BLE config manifest unreadable (%s); using schema-5 default",
+                    "[%s] BLE config manifest truncated/unreadable (%s); using schema-5 default",
                     self.id, manifest_exc,
                 )
                 manifest = self._synthesise_usb_manifest()

@@ -512,6 +512,65 @@ def test_v3_pipeline_enables_hardware_frame_sync_across_the_stereo_triplet(
     assert by_socket["CAM_C"].initialControl.frame_sync_mode == "INPUT"
 
 
+def test_v3_pipeline_rgb_preview_from_h264_skips_isp_preview_output(
+    oak_camera_module: Any,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """H.264 preview mode requests NO second ISP output on CAM_A: the preview is
+    decoded host-side from the encode stream, so the busiest camera does single
+    ISP duty and the recording keeps the full ISP budget (all three at 30 fps)."""
+    monkeypatch.setattr(oak_camera_module, "dai", _fake_dai_v3())
+    stream = oak_camera_module.OakCameraStream("oak_pro", tmp_path, rgb_preview_from_h264=True)
+
+    pipeline = stream._build_v3_pipeline(_FakeDeviceFull())
+
+    assert stream._q_preview is None
+    by_socket = {c.built_socket: c for c in pipeline.nodes if isinstance(c, _FakeCameraNode)}
+    formats = [fmt for _, fmt, _ in by_socket["CAM_A"].requested]
+    assert "BGR888p" not in formats  # no preview downscale on CAM_A
+    assert "NV12" in formats  # encode output still present
+    # Recording streams are all unaffected.
+    assert stream._rgb.queue is not None
+    assert stream._left.queue is not None
+    assert stream._right.queue is not None
+    assert stream._imu.queue is not None
+
+
+def test_v3_pipeline_disables_mono_preview_outputs(
+    oak_camera_module: Any,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """enable_mono_preview=False builds no mono preview downscales (a kiosk that
+    only shows the RGB view never uses them), freeing ISP budget for capture."""
+    monkeypatch.setattr(oak_camera_module, "dai", _fake_dai_v3())
+    stream = oak_camera_module.OakCameraStream("oak_pro", tmp_path, enable_mono_preview=False)
+
+    pipeline = stream._build_v3_pipeline(_FakeDeviceFull())
+
+    assert stream._substream_preview_queues == {}
+    by_socket = {c.built_socket: c for c in pipeline.nodes if isinstance(c, _FakeCameraNode)}
+    for socket in ("CAM_B", "CAM_C"):
+        formats = [fmt for _, fmt, _ in by_socket[socket].requested]
+        assert "BGR888p" not in formats
+        assert "NV12" in formats
+    # Mono recording queues still built.
+    assert stream._left.queue is not None
+    assert stream._right.queue is not None
+
+
+def test_decode_keyframe_to_bgr_is_best_effort_on_undecodable_bytes(
+    oak_camera_module: Any,
+    tmp_path,
+) -> None:
+    """The host-side preview decoder never raises into capture: undecodable
+    bytes (or a missing PyAV) return None so the endpoint serves its
+    placeholder."""
+    stream = oak_camera_module.OakCameraStream("oak_pro", tmp_path)
+    assert stream._decode_keyframe_to_bgr(b"\x00\x00\x00\x01not-a-real-frame") is None
+
+
 def test_connected_socket_names_and_imu_detection(oak_camera_module: Any) -> None:
     class Socket:
         def __init__(self, name: str) -> None:
