@@ -466,7 +466,24 @@ class OgloTactileStream(StreamBase):
             self._client = bleak.BleakClient(self._device)
             await self._client.connect()
             raw_manifest = await self._client.read_gatt_char(CONFIG_CHAR_UUID)
-            self._apply_manifest(OgloDeviceManifest.from_json(bytes(raw_manifest)))
+            try:
+                manifest = OgloDeviceManifest.from_json(bytes(raw_manifest))
+            except Exception as manifest_exc:  # noqa: BLE001
+                # The config characteristic can read back TRUNCATED over BLE (an
+                # ATT-MTU / firmware buffer limit) even though the glove is a
+                # standard schema-5 device — observed on RDR02 REV_D, whose full
+                # config is fine over the wired GET CONFIG but is cut ~510 bytes
+                # over GATT, yielding invalid JSON. The manifest only supplies the
+                # FIXED schema-5 geometry (80 taxels, 5×4×4) plus the side, so fall
+                # back to the synthesised default (identical to the wired path)
+                # rather than failing the whole connect. The side comes from the
+                # hand hint (advertised name / operator selection).
+                logger.warning(
+                    "[%s] BLE config manifest unreadable (%s); using schema-5 default",
+                    self.id, manifest_exc,
+                )
+                manifest = self._synthesise_usb_manifest()
+            self._apply_manifest(manifest)
         except BaseException as exc:  # noqa: BLE001 - surfaced to connect()
             self._connect_error = exc
             self._ready_event.set()
