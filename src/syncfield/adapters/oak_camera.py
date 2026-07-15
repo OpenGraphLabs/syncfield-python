@@ -393,13 +393,14 @@ class OakCameraStream(StreamBase):
         self._thread: threading.Thread | None = None
         self._imu_thread: threading.Thread | None = None
         # Host-side preview decoder (only used when rgb_preview_from_h264): a
-        # dedicated thread decodes the newest RGB keyframe so the capture thread
-        # never pays H.264 decode cost.
+        # dedicated thread decodes the RGB H.264 so the capture thread never pays
+        # decode cost. While IDLE it feeds a persistent decoder every packet for
+        # a smooth ~15 fps framing view; while RECORDING it decodes only the
+        # newest keyframe (~6 fps) to keep CPU/heat off the capture window.
         self._preview_decode_thread: threading.Thread | None = None
-        self._preview_keyframe: bytes | None = None
-        self._preview_keyframe_lock = threading.Lock()
+        self._preview_packets: deque[bytes] = deque(maxlen=90)
+        self._preview_lock = threading.Lock()
         self._preview_wake = threading.Event()
-        self._last_preview_keyframe_ns = 0
         self._stop_event = threading.Event()
         self._frame_lock = threading.Lock()
         self._latest_frame: Any = None
@@ -1043,7 +1044,7 @@ class OakCameraStream(StreamBase):
         if recorder.is_primary:
             self._observe_recording_path_frame(capture_ns)
             if self._rgb_preview_from_h264:
-                self._maybe_stash_preview_keyframe(data, capture_ns)
+                self._feed_preview_packet(data)
         if not self._recording:
             return
 
@@ -1102,63 +1103,126 @@ class OakCameraStream(StreamBase):
         with self._health_lock:
             self._recording_path_timestamps_ns.append(capture_ns)
 
-    def _maybe_stash_preview_keyframe(self, data: bytes, capture_ns: int) -> None:
-        """Hand the newest RGB IDR keyframe to the decode thread (H.264 preview
-        mode only). Throttled to ~6 fps, and it only stashes bytes + wakes the
-        thread — the decode itself runs on ``_preview_decode_loop`` so the
-        capture thread's drain never pays decode cost. Each stashed blob is a
-        self-contained access unit (SPS + PPS + IDR) so it decodes standalone.
+    #: Preview store cadence per state (ns between _latest_frame updates).
+    _PREVIEW_IDLE_INTERVAL_NS = 66_000_000  # ~15 fps smooth framing view
+    _PREVIEW_RECORDING_INTERVAL_NS = 150_000_000  # ~6 fps, keyframe-only
+
+    def _feed_preview_packet(self, data: bytes) -> None:
+        """Hand one primary RGB H.264 packet to the decode thread (H.264 preview
+        mode only). Cheap: bounded append under a lock + wake — the decode itself
+        runs on ``_preview_decode_loop`` so the capture drain never pays decode
+        cost. The deque is capped, so if the decoder falls behind it drops the
+        oldest packets and resyncs at the next keyframe rather than growing.
         """
-        if capture_ns - self._last_preview_keyframe_ns < 150_000_000:
-            return
-        if not _contains_h264_nal_type(data, 5):
-            return
-        parameter_sets = self._rgb.parameter_sets()
-        if not parameter_sets:
-            return
-        blob = data if _contains_h264_parameter_sets(data) else parameter_sets + data
-        self._last_preview_keyframe_ns = capture_ns
-        with self._preview_keyframe_lock:
-            self._preview_keyframe = blob
+        with self._preview_lock:
+            self._preview_packets.append(data)
         self._preview_wake.set()
 
     def _preview_decode_loop(self) -> None:
-        """Decode the latest stashed RGB keyframe into the preview frame.
+        """Turn the RGB H.264 packets into preview frames off the capture thread.
 
-        Idles on ``_preview_wake`` until a new keyframe arrives, so it burns no
-        CPU between the ~6 fps keyframes. Each keyframe is an IDR access unit and
-        decodes without inter-frame state, so dropping intermediate ones is fine.
+        Two modes, chosen by capture state so decode CPU never loads the
+        recording window:
+
+        * IDLE (framing): feed EVERY packet to a persistent decoder and store the
+          newest frame at ~15 fps — a smooth view for aiming the camera.
+        * RECORDING: decode only the newest keyframe standalone at ~6 fps — cheap,
+          so the extra CPU/heat stays out of the capture window.
         """
+        codec: Any = None  # persistent decoder, live only in IDLE mode
+        last_store_ns = 0
         while not self._stop_event.is_set():
             if not self._preview_wake.wait(timeout=0.5):
                 continue
             self._preview_wake.clear()
             if self._stop_event.is_set():
                 break
-            with self._preview_keyframe_lock:
-                blob = self._preview_keyframe
-                self._preview_keyframe = None
-            if not blob:
+            with self._preview_lock:
+                packets = tuple(self._preview_packets)
+                self._preview_packets.clear()
+            if not packets:
                 continue
-            frame = self._decode_keyframe_to_bgr(blob)
+            now = time.monotonic_ns()
+            if self._recording:
+                codec = None  # drop persistent state; re-init cleanly when idle resumes
+                if now - last_store_ns < self._PREVIEW_RECORDING_INTERVAL_NS:
+                    continue
+                frame = self._decode_newest_keyframe(packets)
+            else:
+                if codec is None:
+                    codec = self._new_h264_decoder()
+                if now - last_store_ns < self._PREVIEW_IDLE_INTERVAL_NS:
+                    # Still decode to keep the persistent decoder's state current,
+                    # just don't store this frame yet.
+                    self._decode_stream(codec, packets)
+                    continue
+                frame = self._decode_stream(codec, packets)
             if frame is not None:
+                last_store_ns = now
                 with self._frame_lock:
                     self._latest_frame = frame
+
+    @staticmethod
+    def _new_h264_decoder() -> Any:
+        """A fresh persistent H.264 decode context, or None if PyAV is absent."""
+        try:
+            import av  # type: ignore[import-not-found]
+
+            return av.CodecContext.create("h264", "r")
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _decode_stream(self, codec: Any, packets: tuple[bytes, ...]) -> Any:
+        """Feed *packets* in order to the persistent *codec*, returning the newest
+        decoded BGR frame (preview-sized) or None. Best-effort: a P-frame before
+        the decoder has seen a keyframe just yields nothing until the next IDR —
+        never raises into the capture path.
+        """
+        if codec is None:
+            return None
+        latest = None
+        width, height = self._preview_resolution
+        try:
+            for data in packets:
+                for packet in codec.parse(data):
+                    for frame in codec.decode(packet):
+                        latest = frame
+        except Exception:  # noqa: BLE001
+            logger.debug("OAK %s: preview stream decode hiccup", self.id)
+            return None
+        if latest is None:
+            return None
+        try:
+            return latest.reformat(width=width, height=height, format="bgr24").to_ndarray()
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _decode_newest_keyframe(self, packets: tuple[bytes, ...]) -> Any:
+        """Decode the newest self-contained IDR keyframe in *packets* to a
+        preview-sized BGR ndarray, or None. Standalone (SPS + PPS + IDR) so it
+        needs no carried decoder state — cheap for the recording window."""
+        parameter_sets = self._rgb.parameter_sets()
+        if not parameter_sets:
+            return None
+        for data in reversed(packets):
+            if not _contains_h264_nal_type(data, 5):
+                continue
+            blob = data if _contains_h264_parameter_sets(data) else parameter_sets + data
+            return self._decode_keyframe_to_bgr(blob)
+        return None
 
     def _decode_keyframe_to_bgr(self, blob: bytes) -> Any:
         """Decode one standalone H.264 IDR access unit to a preview-sized BGR
         ndarray. Best-effort: any failure (PyAV missing, undecodable bytes)
         returns ``None`` so the preview endpoint serves its placeholder — it
-        never raises into capture. A fresh codec context per call keeps decodes
-        independent (no carried state) at the ~6 fps this runs.
+        never raises into capture. A fresh codec context keeps the decode
+        independent of any carried state.
         """
-        try:
-            import av  # type: ignore[import-not-found]
-        except Exception:  # noqa: BLE001
+        codec = self._new_h264_decoder()
+        if codec is None:
             return None
         try:
             width, height = self._preview_resolution
-            codec = av.CodecContext.create("h264", "r")
             for packet in codec.parse(blob):
                 for frame in codec.decode(packet):
                     return frame.reformat(
