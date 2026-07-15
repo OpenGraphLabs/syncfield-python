@@ -560,32 +560,20 @@ def test_v3_pipeline_disables_mono_preview_outputs(
     assert stream._right.queue is not None
 
 
-def test_decode_keyframe_to_bgr_is_best_effort_on_undecodable_bytes(
-    oak_camera_module: Any,
-    tmp_path,
-) -> None:
-    """The host-side preview decoder never raises into capture: undecodable
-    bytes (or a missing PyAV) return None so the endpoint serves its
-    placeholder."""
-    stream = oak_camera_module.OakCameraStream("oak_pro", tmp_path)
-    assert stream._decode_keyframe_to_bgr(b"\x00\x00\x00\x01not-a-real-frame") is None
-
-
 def test_preview_decode_paths_are_best_effort_and_never_raise(
     oak_camera_module: Any,
     tmp_path,
 ) -> None:
-    """Feeding packets and decoding the newest keyframe never raises into the
-    capture thread — undecodable input yields None (placeholder shown)."""
+    """Feeding packets and decoding them never raises into the capture thread —
+    undecodable input yields None so the endpoint serves its placeholder."""
     stream = oak_camera_module.OakCameraStream("oak_pro", tmp_path)
-    # Cheap append; must not raise even before any keyframe has arrived.
+    # Cheap append; must not raise even before a decoder exists.
     stream._feed_preview_packet(b"\x00\x00\x00\x01garbage")
     assert len(stream._preview_packets) == 1
-    # An IDR NAL (0x65 -> type 5) is present but no parameter sets learned yet,
-    # so it declines rather than mis-decoding — and never raises.
-    assert stream._decode_newest_keyframe((b"\x00\x00\x00\x01\x65garbage",)) is None
-    # No keyframe in the batch -> None.
-    assert stream._decode_newest_keyframe((b"\x00\x00\x00\x01\x41p-frame",)) is None
+    # Stream decode with no live decoder returns None, never raises.
+    assert stream._decode_stream(None, (b"\x00\x00\x00\x01garbage",)) is None
+    # Undecodable bytes through a real (best-effort) decoder still yield None.
+    assert stream._decode_stream(stream._new_h264_decoder(), (b"\x00\x00\x00\x01x",)) is None
 
 
 def test_connected_socket_names_and_imu_detection(oak_camera_module: Any) -> None:
