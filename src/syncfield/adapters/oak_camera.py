@@ -1150,9 +1150,11 @@ class OakCameraStream(StreamBase):
             with self._frame_lock:
                 self._latest_frame = frame
 
-    #: Cap _latest_frame updates to ~12 fps — the UI serves no faster, so churning
-    #: the reformat/ndarray at the full 30 fps decode rate is wasted work.
-    _PREVIEW_STORE_INTERVAL_NS = 80_000_000
+    #: Cap _latest_frame updates to ~30 fps. The decoder already runs at the full
+    #: capture rate (it must, to keep P-frame state), and the Pi has CPU headroom
+    #: (~54% idle), so storing every decoded frame gives a smooth preview at
+    #: negligible extra cost — the reformat/ndarray is the only per-frame work.
+    _PREVIEW_STORE_INTERVAL_NS = 33_000_000
 
     @staticmethod
     def _new_h264_decoder() -> Any:
