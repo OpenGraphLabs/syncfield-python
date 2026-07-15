@@ -1115,17 +1115,17 @@ class OakCameraStream(StreamBase):
         self._preview_wake.set()
 
     def _preview_decode_loop(self) -> None:
-        """Turn the RGB H.264 packets into preview frames off the capture thread.
+        """Decode ONLY the newest keyframe per wake, off the capture thread.
 
-        Feeds every packet to a persistent decoder for a smooth preview in BOTH
-        idle and recording. Capture is not Pi-CPU-bound — the OAK does the ISP and
-        H.264 encode on-device, so the Pi only drains already-encoded bytes; the
-        software decode runs on this dedicated thread (libav releases the GIL) on
-        a spare core and cannot starve the capture drain. Best-effort throughout:
-        a decode hiccup or missing PyAV just leaves the last frame on screen and
-        never raises into the capture path.
+        The Pi 5 has NO hardware H.264 decoder, so decoding every frame (30 fps
+        1280x800 in software) pegged a full core and made the whole kiosk sluggish
+        (measured: agent ~108% CPU, load ~5 on 4 cores). Each keyframe is a
+        self-contained IDR that decodes with no carried state, so decoding just
+        the newest one per round costs a fraction of that — the preview updates at
+        the encoder's keyframe cadence (~6 fps), smooth enough to frame the shot
+        and check quality while keeping the app snappy. Best-effort: a decode
+        hiccup or missing PyAV leaves the last frame and never raises into capture.
         """
-        codec: Any = None
         while not self._stop_event.is_set():
             if not self._preview_wake.wait(timeout=0.5):
                 continue
@@ -1137,47 +1137,24 @@ class OakCameraStream(StreamBase):
                 self._preview_packets.clear()
             if not packets:
                 continue
-            if codec is None:
-                codec = self._new_h264_decoder()
-            frame = self._decode_stream(codec, packets)
+            frame = self._decode_newest_keyframe(packets)
             if frame is not None:
                 with self._frame_lock:
                     self._latest_frame = frame
 
-    @staticmethod
-    def _new_h264_decoder() -> Any:
-        """A fresh persistent H.264 decode context, or None if PyAV is absent."""
-        try:
-            import av  # type: ignore[import-not-found]
-
-            return av.CodecContext.create("h264", "r")
-        except Exception:  # noqa: BLE001
+    def _decode_newest_keyframe(self, packets: tuple[bytes, ...]) -> Any:
+        """Decode the newest self-contained IDR keyframe in *packets* to a
+        preview-sized BGR ndarray, or None. Standalone (SPS + PPS + IDR) so it
+        needs no carried decoder state — cheap enough to run on every round."""
+        parameter_sets = self._rgb.parameter_sets()
+        if not parameter_sets:
             return None
-
-    def _decode_stream(self, codec: Any, packets: tuple[bytes, ...]) -> Any:
-        """Feed *packets* in order to the persistent *codec*, returning the newest
-        decoded BGR frame (preview-sized) or None. Best-effort: a P-frame before
-        the decoder has seen a keyframe just yields nothing until the next IDR —
-        never raises into the capture path.
-        """
-        if codec is None:
-            return None
-        latest = None
-        width, height = self._preview_resolution
-        try:
-            for data in packets:
-                for packet in codec.parse(data):
-                    for frame in codec.decode(packet):
-                        latest = frame
-        except Exception:  # noqa: BLE001
-            logger.debug("OAK %s: preview stream decode hiccup", self.id)
-            return None
-        if latest is None:
-            return None
-        try:
-            return latest.reformat(width=width, height=height, format="bgr24").to_ndarray()
-        except Exception:  # noqa: BLE001
-            return None
+        for data in reversed(packets):
+            if not _contains_h264_nal_type(data, 5):
+                continue
+            blob = data if _contains_h264_parameter_sets(data) else parameter_sets + data
+            return self._decode_keyframe_to_bgr(blob)
+        return None
 
     def _decode_keyframe_to_bgr(self, blob: bytes) -> Any:
         """Decode one standalone H.264 IDR access unit to a preview-sized BGR
@@ -1186,11 +1163,13 @@ class OakCameraStream(StreamBase):
         never raises into capture. A fresh codec context keeps the decode
         independent of any carried state.
         """
-        codec = self._new_h264_decoder()
-        if codec is None:
+        try:
+            import av  # type: ignore[import-not-found]
+        except Exception:  # noqa: BLE001
             return None
         try:
             width, height = self._preview_resolution
+            codec = av.CodecContext.create("h264", "r")
             for packet in codec.parse(blob):
                 for frame in codec.decode(packet):
                     return frame.reformat(
