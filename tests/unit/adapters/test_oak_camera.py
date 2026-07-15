@@ -575,17 +575,16 @@ def test_preview_decode_paths_are_best_effort_and_never_raise(
     oak_camera_module: Any,
     tmp_path,
 ) -> None:
-    """Feeding packets and both decode paths (idle stream / recording keyframe)
-    never raise into the capture thread — undecodable input yields None."""
+    """Feeding packets and decoding them never raises into the capture thread —
+    undecodable input yields None so the endpoint serves its placeholder."""
     stream = oak_camera_module.OakCameraStream("oak_pro", tmp_path)
     # Cheap append; must not raise even before a decoder exists.
     stream._feed_preview_packet(b"\x00\x00\x00\x01garbage")
     assert len(stream._preview_packets) == 1
-    # Recording path: an IDR NAL (0x65 -> type 5) is present but no parameter
-    # sets have been learned yet, so it declines rather than mis-decoding.
-    assert stream._decode_newest_keyframe((b"\x00\x00\x00\x01\x65garbage",)) is None
-    # Idle path with no live decoder returns None, never raises.
+    # Stream decode with no live decoder returns None, never raises.
     assert stream._decode_stream(None, (b"\x00\x00\x00\x01garbage",)) is None
+    # Undecodable bytes through a real (best-effort) decoder still yield None.
+    assert stream._decode_stream(stream._new_h264_decoder(), (b"\x00\x00\x00\x01x",)) is None
 
 
 def test_connected_socket_names_and_imu_detection(oak_camera_module: Any) -> None:

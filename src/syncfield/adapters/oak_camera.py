@@ -1103,10 +1103,6 @@ class OakCameraStream(StreamBase):
         with self._health_lock:
             self._recording_path_timestamps_ns.append(capture_ns)
 
-    #: Preview store cadence per state (ns between _latest_frame updates).
-    _PREVIEW_IDLE_INTERVAL_NS = 66_000_000  # ~15 fps smooth framing view
-    _PREVIEW_RECORDING_INTERVAL_NS = 150_000_000  # ~6 fps, keyframe-only
-
     def _feed_preview_packet(self, data: bytes) -> None:
         """Hand one primary RGB H.264 packet to the decode thread (H.264 preview
         mode only). Cheap: bounded append under a lock + wake — the decode itself
@@ -1121,16 +1117,15 @@ class OakCameraStream(StreamBase):
     def _preview_decode_loop(self) -> None:
         """Turn the RGB H.264 packets into preview frames off the capture thread.
 
-        Two modes, chosen by capture state so decode CPU never loads the
-        recording window:
-
-        * IDLE (framing): feed EVERY packet to a persistent decoder and store the
-          newest frame at ~15 fps — a smooth view for aiming the camera.
-        * RECORDING: decode only the newest keyframe standalone at ~6 fps — cheap,
-          so the extra CPU/heat stays out of the capture window.
+        Feeds every packet to a persistent decoder for a smooth preview in BOTH
+        idle and recording. Capture is not Pi-CPU-bound — the OAK does the ISP and
+        H.264 encode on-device, so the Pi only drains already-encoded bytes; the
+        software decode runs on this dedicated thread (libav releases the GIL) on
+        a spare core and cannot starve the capture drain. Best-effort throughout:
+        a decode hiccup or missing PyAV just leaves the last frame on screen and
+        never raises into the capture path.
         """
-        codec: Any = None  # persistent decoder, live only in IDLE mode
-        last_store_ns = 0
+        codec: Any = None
         while not self._stop_event.is_set():
             if not self._preview_wake.wait(timeout=0.5):
                 continue
@@ -1142,23 +1137,10 @@ class OakCameraStream(StreamBase):
                 self._preview_packets.clear()
             if not packets:
                 continue
-            now = time.monotonic_ns()
-            if self._recording:
-                codec = None  # drop persistent state; re-init cleanly when idle resumes
-                if now - last_store_ns < self._PREVIEW_RECORDING_INTERVAL_NS:
-                    continue
-                frame = self._decode_newest_keyframe(packets)
-            else:
-                if codec is None:
-                    codec = self._new_h264_decoder()
-                if now - last_store_ns < self._PREVIEW_IDLE_INTERVAL_NS:
-                    # Still decode to keep the persistent decoder's state current,
-                    # just don't store this frame yet.
-                    self._decode_stream(codec, packets)
-                    continue
-                frame = self._decode_stream(codec, packets)
+            if codec is None:
+                codec = self._new_h264_decoder()
+            frame = self._decode_stream(codec, packets)
             if frame is not None:
-                last_store_ns = now
                 with self._frame_lock:
                     self._latest_frame = frame
 
@@ -1196,20 +1178,6 @@ class OakCameraStream(StreamBase):
             return latest.reformat(width=width, height=height, format="bgr24").to_ndarray()
         except Exception:  # noqa: BLE001
             return None
-
-    def _decode_newest_keyframe(self, packets: tuple[bytes, ...]) -> Any:
-        """Decode the newest self-contained IDR keyframe in *packets* to a
-        preview-sized BGR ndarray, or None. Standalone (SPS + PPS + IDR) so it
-        needs no carried decoder state — cheap for the recording window."""
-        parameter_sets = self._rgb.parameter_sets()
-        if not parameter_sets:
-            return None
-        for data in reversed(packets):
-            if not _contains_h264_nal_type(data, 5):
-                continue
-            blob = data if _contains_h264_parameter_sets(data) else parameter_sets + data
-            return self._decode_keyframe_to_bgr(blob)
-        return None
 
     def _decode_keyframe_to_bgr(self, blob: bytes) -> Any:
         """Decode one standalone H.264 IDR access unit to a preview-sized BGR
