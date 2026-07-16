@@ -332,6 +332,50 @@ class TestRecording:
         assert artifacts[0].stream_id == "oglo.imu"
         assert artifacts[0].frame_count == 3
 
+    def test_second_recording_in_one_session_reports_only_its_own_samples(
+        self, oglo_module, tmp_path
+    ):
+        """Consecutive recordings without a reconnect (the kiosk's normal duty
+        cycle) must each report their OWN window. The taxel counter was only
+        reset at connect(), so a 6-cycle stress run reported tactile
+        measured_hz of 100 -> 200 -> ... -> 500 Hz (cumulative frames over a
+        per-episode duration) and window-2+ SampleEvents carried frame_number
+        continuing from the previous episode."""
+        s = oglo_module.OgloTactileStream("oglo", address="addr", output_dir=tmp_path)
+        _apply_default_manifest(s)
+        s._thread = MagicMock()  # reads as connected: start_recording won't re-connect
+        clock = SessionClock(
+            sync_point=SyncPoint.create_now("h"),
+            recording_armed_ns=1_000_000,
+        )
+
+        s._output_dir = tmp_path / "ep1"
+        s._output_dir.mkdir()
+        s.start_recording(clock)
+        s._dispatch_notification_for_test(_default_packet())
+        first = s.stop_recording()
+        assert first.frame_count == 3
+
+        got = []
+        s.on_sample(got.append)
+        s._output_dir = tmp_path / "ep2"
+        s._output_dir.mkdir()
+        s.start_recording(clock)
+        s._dispatch_notification_for_test(
+            _build_packet(
+                [
+                    (30_000, _ramp(), (1, 2, 3, -4, -5, -6)),
+                    (40_000, _ramp(), (7, 8, 9, -10, -11, -12)),
+                    (50_000, _ramp(), (13, 14, 15, -16, -17, -18)),
+                ],
+                seq_base=1003,
+            )
+        )
+        second = s.stop_recording()
+
+        assert second.frame_count == 3  # NOT 6 — window 2 counts only itself
+        assert got[0].frame_number == 0  # rows restart at 0 per episode
+
     def test_calibration_file_written_for_authoritative_side(self, oglo_module, tmp_path):
         from syncfield.oglo_calibration import OGLO_CALIBRATION_SCHEMA
 

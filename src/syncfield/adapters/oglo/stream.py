@@ -309,6 +309,15 @@ class OgloTactileStream(StreamBase):
         self._write_calibration_file()
         self._open_imu_writer()
         self._imu_frame_count = 0
+        # Reset the taxel window state too — these were only reset at
+        # connect(), so every consecutive recording in one session (the
+        # kiosk's normal duty cycle) reported a CUMULATIVE frame_count
+        # (measured_hz 100 -> 200 -> ... over a 6-episode stress run) and
+        # emitted SampleEvents whose frame_number continued from the
+        # previous episode instead of restarting at 0.
+        self._frame_count = 0
+        self._first_at = None
+        self._last_at = None
         self._begin_recording_window(session_clock)
         self._recording = True
 
