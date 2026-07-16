@@ -567,8 +567,11 @@ def test_preview_decode_paths_are_best_effort_and_never_raise(
     """Feeding packets and decoding them never raises into the capture thread —
     undecodable input yields None so the endpoint serves its placeholder."""
     stream = oak_camera_module.OakCameraStream("oak_pro", tmp_path)
-    # Cheap append; must not raise even before a decoder exists.
+    # Non-keyframe input is dropped without raising, even before a decoder
+    # exists; a keyframe-bearing packet appends (the feed is IDR-only).
     stream._feed_preview_packet(b"\x00\x00\x00\x01garbage")
+    assert len(stream._preview_packets) == 0
+    stream._feed_preview_packet(b"\x00\x00\x00\x01\x65idr")
     assert len(stream._preview_packets) == 1
     # Stream decode with no live decoder returns None, never raises.
     assert stream._decode_stream(None, (b"\x00\x00\x00\x01garbage",)) is None
@@ -951,3 +954,123 @@ def test_sample_event_falls_back_to_channels_for_legacy_syncfield(
     )
 
     assert event.channels == {"device_timestamp_ns": 42_000_000_000}
+
+
+# ---------------------------------------------------------------------------
+# Annex-B scan hot path. _annex_b_start_codes runs on every encoded packet of
+# every camera (16 Mbit/s continuously on the Pi 5 kiosk), so its behaviour is
+# pinned here against a reference implementation before any speed work.
+# ---------------------------------------------------------------------------
+
+
+def _reference_start_codes(data: bytes) -> tuple[tuple[int, int], ...]:
+    """The original byte-at-a-time scan, kept verbatim as the behavioural
+    reference for the production implementation."""
+    starts: list[tuple[int, int]] = []
+    i = 0
+    size = len(data)
+    while i + 3 <= size:
+        if i + 4 <= size and data[i : i + 4] == b"\x00\x00\x00\x01":
+            starts.append((i, i + 4))
+            i += 4
+            continue
+        if data[i : i + 3] == b"\x00\x00\x01":
+            starts.append((i, i + 3))
+            i += 3
+            continue
+        i += 1
+    return tuple(starts)
+
+
+def test_annex_b_start_codes_edge_cases(oak_camera_module: Any) -> None:
+    f = oak_camera_module._annex_b_start_codes
+    assert f(b"") == ()
+    assert f(b"\x00\x00") == ()
+    assert f(b"junk with no start codes") == ()
+    # 3-byte and 4-byte codes mixed, garbage between and at both ends.
+    assert f(b"xx\x00\x00\x01A\x00\x00\x00\x01B\x00\x00\x01") == ((2, 5), (6, 10), (11, 14))
+    # Adjacent codes (empty NAL between them).
+    assert f(b"\x00\x00\x01\x00\x00\x01A") == ((0, 3), (3, 6))
+    # A 4-byte code is one code, not a zero plus a 3-byte code.
+    assert f(b"\x00\x00\x00\x01") == ((0, 4),)
+    # A run of zeros absorbs exactly one leading zero into the start code.
+    assert f(b"\x00\x00\x00\x00\x00\x01x") == ((2, 6),)
+
+
+def test_annex_b_start_codes_matches_reference_on_random_streams(
+    oak_camera_module: Any,
+) -> None:
+    import random
+
+    rng = random.Random(42)
+    # Zero-heavy alphabet to hammer the start-code edge cases.
+    alphabet = b"\x00\x00\x00\x01\x01ab"
+    for _ in range(500):
+        blob = bytes(rng.choice(alphabet) for _ in range(rng.randint(0, 80)))
+        assert oak_camera_module._annex_b_start_codes(blob) == _reference_start_codes(blob), blob
+
+
+# ---------------------------------------------------------------------------
+# Parameter-set latch: the OAK's SPS/PPS cannot change within one pipeline, so
+# after both are captured the per-packet NAL scan must stop (it was pure-Python
+# work on every packet, 24/7).
+# ---------------------------------------------------------------------------
+
+
+def test_parameter_sets_latch_after_first_capture(oak_camera_module: Any) -> None:
+    rec = oak_camera_module._H264Recorder(label="rgb")
+    rec.remember_parameter_sets(b"\x00\x00\x00\x01\x67sps1\x00\x00\x01\x68pps1")
+    first = rec.parameter_sets()
+    assert first  # both captured
+
+    rec.remember_parameter_sets(b"\x00\x00\x00\x01\x67sps2\x00\x00\x01\x68pps2")
+    assert rec.parameter_sets() == first  # latched — no rescan, no replace
+
+
+def test_parameter_sets_accumulate_across_packets_until_latched(
+    oak_camera_module: Any,
+) -> None:
+    rec = oak_camera_module._H264Recorder(label="rgb")
+    rec.remember_parameter_sets(b"\x00\x00\x00\x01\x67sps")
+    assert rec.parameter_sets() == b""  # PPS still missing
+    rec.remember_parameter_sets(b"\x00\x00\x01\x68pps")
+    assert rec.parameter_sets() == b"\x00\x00\x00\x01\x67sps\x00\x00\x01\x68pps"
+
+
+# ---------------------------------------------------------------------------
+# H.264 preview feed: keyframe-only. Decoding every packet cost most of a Pi 5
+# core continuously; with the encoder's 5-frame keyframe period an IDR-only
+# feed still gives a ~6 fps framing view for a fraction of the decode CPU.
+# ---------------------------------------------------------------------------
+
+
+_SPS_PPS = b"\x00\x00\x00\x01\x67sps\x00\x00\x01\x68pps"
+_IDR = b"\x00\x00\x00\x01\x65idr"
+_P_FRAME = b"\x00\x00\x00\x01\x61pframe"
+
+
+def test_h264_preview_feed_is_keyframe_only(oak_camera_module: Any, tmp_path) -> None:
+    stream = oak_camera_module.OakCameraStream(
+        "oak", tmp_path, rgb_preview_from_h264=True
+    )
+
+    stream._handle_camera_packet(stream._rgb, _Packet(_SPS_PPS + _P_FRAME))
+    assert len(stream._preview_packets) == 0  # P-frame: never fed
+
+    stream._handle_camera_packet(stream._rgb, _Packet(_SPS_PPS + _IDR))
+    assert len(stream._preview_packets) == 1  # keyframe: fed as-is
+    assert stream._preview_packets[-1] == _SPS_PPS + _IDR
+
+
+def test_h264_preview_feed_prepends_latched_parameter_sets(
+    oak_camera_module: Any, tmp_path
+) -> None:
+    stream = oak_camera_module.OakCameraStream(
+        "oak", tmp_path, rgb_preview_from_h264=True
+    )
+    # Latch SPS/PPS from an earlier packet, then feed a bare IDR: the preview
+    # decoder may have joined mid-stream, so the latched sets are prepended.
+    stream._handle_camera_packet(stream._rgb, _Packet(_SPS_PPS + _P_FRAME))
+    stream._handle_camera_packet(stream._rgb, _Packet(_IDR))
+    assert len(stream._preview_packets) == 1
+    assert stream._preview_packets[-1] == _SPS_PPS + _IDR

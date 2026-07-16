@@ -148,6 +148,11 @@ class _H264Recorder:
         return (len(recent) - 1) / span_s if span_s > 0 else 0.0
 
     def remember_parameter_sets(self, data: bytes) -> None:
+        # Latched: the encoder's SPS/PPS cannot change within one pipeline, and
+        # this is called for every packet — without the latch it was a NAL scan
+        # of the full bitstream, 24/7.
+        if self.sps is not None and self.pps is not None:
+            return
         for nal_type, nal in _iter_h264_annex_b_nalus(data):
             if nal_type == 7:
                 self.sps = nal
@@ -1104,12 +1109,22 @@ class OakCameraStream(StreamBase):
             self._recording_path_timestamps_ns.append(capture_ns)
 
     def _feed_preview_packet(self, data: bytes) -> None:
-        """Hand one primary RGB H.264 packet to the decode thread (H.264 preview
-        mode only). Cheap: bounded append under a lock + wake — the decode itself
-        runs on ``_preview_decode_loop`` so the capture drain never pays decode
-        cost. The deque is capped, so if the decoder falls behind it drops the
-        oldest packets and resyncs at the next keyframe rather than growing.
+        """Hand one primary RGB H.264 *keyframe* to the decode thread (H.264
+        preview mode only). Keyframe-only, always: feeding every packet meant
+        the decode thread software-decoded the full 30 fps bitstream around the
+        clock, which cost most of a Pi 5 core on its own. With the encoder's
+        5-frame keyframe period (``_configure_h264_encoder_for_segmented_
+        recording``) an IDR-only feed still refreshes the framing view ~6x/s
+        for roughly a fifth of that. A bare IDR gets the latched SPS/PPS
+        prepended so the persistent decoder can sync even when it joined
+        mid-stream (repeated parameter sets are legal and routine in streams).
+        Cheap for the capture drain either way: a C-speed NAL scan, a bounded
+        append under a lock, a wake.
         """
+        if not _contains_h264_nal_type(data, 5):
+            return
+        if not _contains_h264_parameter_sets(data):
+            data = self._rgb.parameter_sets() + data
         with self._preview_lock:
             self._preview_packets.append(data)
         self._preview_wake.set()
@@ -1536,17 +1551,16 @@ def _iter_h264_annex_b_nalus(data: bytes) -> tuple[tuple[int, bytes], ...]:
 
 
 def _annex_b_start_codes(data: bytes) -> tuple[tuple[int, int], ...]:
+    # bytes.find, not a per-byte Python loop: this runs against every encoded
+    # packet of every camera (16 Mbit/s continuously on the Pi 5 kiosk), where
+    # the per-byte scan alone cost a fifth of a core. A 00 00 01 preceded by a
+    # zero is the 4-byte form; the zero run absorbs exactly one leading zero.
     starts: list[tuple[int, int]] = []
-    i = 0
-    size = len(data)
-    while i + 3 <= size:
-        if i + 4 <= size and data[i : i + 4] == b"\x00\x00\x00\x01":
-            starts.append((i, i + 4))
-            i += 4
-            continue
-        if data[i : i + 3] == b"\x00\x00\x01":
+    i = data.find(b"\x00\x00\x01")
+    while i != -1:
+        if i > 0 and data[i - 1] == 0:
+            starts.append((i - 1, i + 3))
+        else:
             starts.append((i, i + 3))
-            i += 3
-            continue
-        i += 1
+        i = data.find(b"\x00\x00\x01", i + 3)
     return tuple(starts)
