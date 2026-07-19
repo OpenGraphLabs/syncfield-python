@@ -326,6 +326,13 @@ class OakCameraStream(StreamBase):
     fail an otherwise-good RGB recording — they downgrade the finalization
     status to ``"partial"`` naming the losses. For the RGB + optional-depth
     minimal adapter, use :class:`OakRgbDepthStream` instead.
+
+    IR illumination (``ir_flood_intensity`` / ``ir_dot_projector_intensity``,
+    default off) drives the board's flood LED / laser dot-projector so the
+    IR-capable mono cameras light up retroreflective IR markers — the mono
+    footage becomes the IR capture (there is no separate IR sensor). Applied
+    best-effort on connect; the settings are recorded in the calibration
+    sidecar.
     """
 
     #: Discovery metadata (registered via ``syncfield.discovery``).
@@ -345,6 +352,8 @@ class OakCameraStream(StreamBase):
         mono_fps: int = 30,
         mono_bitrate_kbps: int = 4_000,
         imu_rate_hz: int = 400,
+        ir_flood_intensity: float = 0.0,
+        ir_dot_projector_intensity: float = 0.0,
         enable_mono: bool = True,
         enable_imu: bool = True,
         enable_mono_preview: bool = True,
@@ -372,6 +381,18 @@ class OakCameraStream(StreamBase):
         self._mono_fps = int(mono_fps)
         self._mono_bitrate_bps = int(mono_bitrate_kbps) * 1000
         self._imu_rate_hz = int(imu_rate_hz)
+        # IR illumination. The OAK-D Pro has no separate IR image sensor: its
+        # mono cameras (CAM_B/CAM_C, OV9282, no IR-cut filter) ARE the
+        # IR-capable ones. Driving the flood illuminator makes retroreflective
+        # IR markers show up as bright blobs in the mono capture we already
+        # record — that IS the "IR footage". Default 0.0 keeps both emitters
+        # OFF, so behaviour is unchanged for every existing consumer. The laser
+        # dot-projector is a separate emitter (active-stereo speckle pattern)
+        # kept independently controllable and off by default, because its
+        # pattern would corrupt uniform marker blobs. Clamped to the DepthAI
+        # driver's normalized [0, 1] intensity range.
+        self._ir_flood_intensity = _clamp01(ir_flood_intensity)
+        self._ir_dot_projector_intensity = _clamp01(ir_dot_projector_intensity)
         self._enable_mono = enable_mono
         self._enable_imu = enable_imu
         # Preview outputs are extra ISP downscales on the cameras — see the
@@ -792,6 +813,7 @@ class OakCameraStream(StreamBase):
         self._device = device
         self._rgb.queue = device.getOutputQueue(name="h264", maxSize=30, blocking=False)
         self._q_preview = device.getOutputQueue(name="preview", maxSize=4, blocking=False)
+        self._apply_ir_illumination(device)
         logger.info(
             "OAK %s: legacy DepthAI (v2) API detected; mono/IMU capture requires v3 — "
             "recording RGB only",
@@ -811,6 +833,60 @@ class OakCameraStream(StreamBase):
             )
         pipeline.start()
         self._pipeline = pipeline
+        self._apply_ir_illumination(self._device)
+
+    def _apply_ir_illumination(self, device: Any) -> dict[str, Any]:
+        """Drive the OAK's IR emitters and record what was applied.
+
+        On the OAK-D Pro the mono cameras (CAM_B/CAM_C) are the only IR-capable
+        sensors, so switching on the flood illuminator makes retroreflective IR
+        markers appear as bright blobs in the mono capture we already record.
+        Applied on ``connect()`` so IR is on for both live preview and
+        recording, and re-applied automatically on reconnect.
+
+        Best-effort + feature-detected, exactly like :func:`_apply_frame_sync`:
+        a board or DepthAI build without the IR drivers (or one that declines
+        the request by returning ``False``) is logged and skipped — never
+        fatal. The applied settings are folded into the calibration sidecar
+        (``{id}.calibration.json``) so every recording self-documents its IR
+        state. Returns the applied-settings dict.
+        """
+        applied: dict[str, Any] = {
+            "flood_intensity": self._ir_flood_intensity,
+            "dot_projector_intensity": self._ir_dot_projector_intensity,
+            "flood_applied": False,
+            "dot_projector_applied": False,
+        }
+        for intensity, setter_name, applied_key in (
+            (self._ir_flood_intensity, "setIrFloodLightIntensity", "flood_applied"),
+            (
+                self._ir_dot_projector_intensity,
+                "setIrLaserDotProjectorIntensity",
+                "dot_projector_applied",
+            ),
+        ):
+            if intensity <= 0.0:
+                continue
+            setter = getattr(device, setter_name, None)
+            if not callable(setter):
+                logger.info(
+                    "OAK %s: %s unavailable on this board/build; IR emitter left off",
+                    self.id,
+                    setter_name,
+                )
+                continue
+            try:
+                ok = bool(setter(float(intensity)))
+            except Exception as exc:  # noqa: BLE001
+                logger.info("OAK %s: %s(%.2f) failed: %s", self.id, setter_name, intensity, exc)
+                continue
+            applied[applied_key] = ok
+            (logger.info if ok else logger.warning)(
+                "OAK %s: %s(%.2f) -> %s", self.id, setter_name, intensity, ok
+            )
+        if self._calibration is not None:
+            self._calibration["ir_illumination"] = applied
+        return applied
 
     def _build_legacy_pipeline(self) -> Any:
         pipeline = dai.Pipeline()
@@ -1205,6 +1281,11 @@ class OakCameraStream(StreamBase):
             return latest.reformat(width=width, height=height, format="bgr24").to_ndarray()
         except Exception:  # noqa: BLE001
             return None
+
+
+def _clamp01(value: float) -> float:
+    """Clamp to the DepthAI IR driver's normalized [0.0, 1.0] intensity range."""
+    return max(0.0, min(1.0, float(value)))
 
 
 def _apply_frame_sync(cam: Any, role: str, stream_id: str, socket_name: str) -> None:

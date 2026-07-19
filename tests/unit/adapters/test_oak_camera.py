@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import importlib
 import io
 import json
-import sys
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -1074,3 +1072,141 @@ def test_h264_preview_feed_prepends_latched_parameter_sets(
     stream._handle_camera_packet(stream._rgb, _Packet(_IDR))
     assert len(stream._preview_packets) == 1
     assert stream._preview_packets[-1] == _SPS_PPS + _IDR
+
+
+# ---------------------------------------------------------------------------
+# IR illumination. The OAK-D Pro has no separate IR image sensor: its mono
+# cameras (CAM_B/CAM_C) ARE the IR-capable ones. Driving the flood illuminator
+# makes retroreflective IR markers show up in the mono capture we already
+# record. Default intensity 0.0 = emitters off = unchanged behaviour. Applied
+# best-effort + feature-detected, exactly like FSYNC.
+# ---------------------------------------------------------------------------
+
+
+class _FakeIrDevice:
+    """Device double that records IR setter calls and echoes a chosen result."""
+
+    def __init__(self, *, flood_result: bool = True, dot_result: bool = True) -> None:
+        self.flood_calls: list[float] = []
+        self.dot_calls: list[float] = []
+        self._flood_result = flood_result
+        self._dot_result = dot_result
+
+    def setIrFloodLightIntensity(self, intensity: float, mask: int = -1) -> bool:
+        self.flood_calls.append(intensity)
+        return self._flood_result
+
+    def setIrLaserDotProjectorIntensity(self, intensity: float, mask: int = -1) -> bool:
+        self.dot_calls.append(intensity)
+        return self._dot_result
+
+
+def test_ir_intensities_clamp_to_unit_range(oak_camera_module: Any, tmp_path) -> None:
+    over = oak_camera_module.OakCameraStream(
+        "oak", tmp_path, ir_flood_intensity=1.7, ir_dot_projector_intensity=42.0
+    )
+    assert over._ir_flood_intensity == 1.0
+    assert over._ir_dot_projector_intensity == 1.0
+
+    under = oak_camera_module.OakCameraStream(
+        "oak", tmp_path, ir_flood_intensity=-3.0, ir_dot_projector_intensity=-0.1
+    )
+    assert under._ir_flood_intensity == 0.0
+    assert under._ir_dot_projector_intensity == 0.0
+
+
+def test_ir_defaults_off_so_behaviour_is_unchanged(
+    oak_camera_module: Any, tmp_path
+) -> None:
+    stream = oak_camera_module.OakCameraStream("oak", tmp_path)
+    assert stream._ir_flood_intensity == 0.0
+    assert stream._ir_dot_projector_intensity == 0.0
+
+    device = _FakeIrDevice()
+    applied = stream._apply_ir_illumination(device)
+
+    # Emitters off → no setter is touched at all.
+    assert device.flood_calls == []
+    assert device.dot_calls == []
+    assert applied["flood_applied"] is False
+    assert applied["dot_projector_applied"] is False
+
+
+def test_ir_flood_drives_setter_and_records_settings(
+    oak_camera_module: Any, tmp_path
+) -> None:
+    stream = oak_camera_module.OakCameraStream("oak", tmp_path, ir_flood_intensity=0.8)
+    stream._calibration = {"schema": "syncfield.oak_calibration.v1"}
+    device = _FakeIrDevice()
+
+    applied = stream._apply_ir_illumination(device)
+
+    assert device.flood_calls == [0.8]
+    assert device.dot_calls == []  # dot projector left off by default
+    assert applied == {
+        "flood_intensity": 0.8,
+        "dot_projector_intensity": 0.0,
+        "flood_applied": True,
+        "dot_projector_applied": False,
+    }
+    # Folded into the calibration sidecar so the recording self-documents its IR.
+    assert stream._calibration["ir_illumination"] == applied
+
+
+def test_ir_dot_projector_drives_its_own_setter(
+    oak_camera_module: Any, tmp_path
+) -> None:
+    stream = oak_camera_module.OakCameraStream(
+        "oak", tmp_path, ir_flood_intensity=0.5, ir_dot_projector_intensity=0.3
+    )
+    device = _FakeIrDevice()
+
+    applied = stream._apply_ir_illumination(device)
+
+    assert device.flood_calls == [0.5]
+    assert device.dot_calls == [0.3]
+    assert applied["flood_applied"] is True
+    assert applied["dot_projector_applied"] is True
+
+
+def test_ir_feature_detected_when_setter_absent(
+    oak_camera_module: Any, tmp_path
+) -> None:
+    """A board / DepthAI build without the IR drivers must not raise — it logs
+    and leaves the emitter off, exactly like the FSYNC fallback."""
+
+    class _BareDevice:
+        pass
+
+    stream = oak_camera_module.OakCameraStream("oak", tmp_path, ir_flood_intensity=0.8)
+    applied = stream._apply_ir_illumination(_BareDevice())  # no setters at all
+    assert applied["flood_applied"] is False
+
+
+def test_ir_apply_survives_setter_raising_and_returning_false(
+    oak_camera_module: Any, tmp_path
+) -> None:
+    class _RaisingDevice:
+        def setIrFloodLightIntensity(self, intensity: float, mask: int = -1) -> bool:
+            raise RuntimeError("driver busy")
+
+    stream = oak_camera_module.OakCameraStream("oak", tmp_path, ir_flood_intensity=0.8)
+    # A raising setter is caught, not propagated into connect().
+    assert stream._apply_ir_illumination(_RaisingDevice())["flood_applied"] is False
+
+    # A setter that returns False (board declined) is reported as not-applied.
+    declined = _FakeIrDevice(flood_result=False)
+    result = stream._apply_ir_illumination(declined)
+    assert declined.flood_calls == [0.8]
+    assert result["flood_applied"] is False
+
+
+def test_ir_apply_without_calibration_does_not_raise(
+    oak_camera_module: Any, tmp_path
+) -> None:
+    stream = oak_camera_module.OakCameraStream("oak", tmp_path, ir_flood_intensity=0.8)
+    assert stream._calibration is None
+    # No calibration read (RGB-only / legacy board): apply still works, no fold.
+    applied = stream._apply_ir_illumination(_FakeIrDevice())
+    assert applied["flood_applied"] is True
+    assert stream._calibration is None
