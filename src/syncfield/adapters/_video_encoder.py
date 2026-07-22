@@ -112,6 +112,43 @@ class VideoEncoder:
             raise flush_error
 
 
+#: Formats the v4l2 demuxer selects via ``input_format`` rather than
+#: ``pixel_format`` (compressed streams, not raw pixel layouts).
+_COMPRESSED_INPUT_FORMATS = ("mjpeg", "h264")
+
+
+def _uvc_input_options(
+    width: int,
+    height: int,
+    fps: float,
+    pixel_format: Optional[str],
+    *,
+    platform: str = sys.platform,
+) -> dict:
+    """The ffmpeg open-options dict for a live UVC input.
+
+    ffmpeg's v4l2 demuxer selects compressed formats (mjpeg/h264) via
+    ``input_format``; ``pixel_format`` only matches raw formats there, so a
+    compressed request routed through it is silently ignored and the camera
+    falls back to raw YUYV — which at 1080p30 exceeds USB bandwidth and drops
+    frames. avfoundation/dshow take everything via ``pixel_format``.
+    """
+    options = {
+        "video_size": f"{int(width)}x{int(height)}",
+        "framerate": str(int(round(fps))),
+        "fflags": "nobuffer+flush_packets",
+        "flags": "low_delay",
+        "analyzeduration": "0",
+        "max_delay": "0",
+    }
+    if pixel_format is not None:
+        if platform.startswith("linux") and pixel_format in _COMPRESSED_INPUT_FORMATS:
+            options["input_format"] = pixel_format
+        else:
+            options["pixel_format"] = pixel_format
+    return options
+
+
 def open_uvc_input(
     *,
     device_index: int,
@@ -177,16 +214,7 @@ def open_uvc_input(
     may not land in the first packet), which costs more than the
     milliseconds its default value adds.
     """
-    options = {
-        "video_size": f"{int(width)}x{int(height)}",
-        "framerate": str(int(round(fps))),
-        "fflags": "nobuffer+flush_packets",
-        "flags": "low_delay",
-        "analyzeduration": "0",
-        "max_delay": "0",
-    }
-    if pixel_format is not None:
-        options["pixel_format"] = pixel_format
+    options = _uvc_input_options(width, height, fps, pixel_format)
 
     if sys.platform == "darwin":
         url = str(int(device_index))
