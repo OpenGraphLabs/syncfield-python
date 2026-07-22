@@ -45,3 +45,32 @@ def test_geometry_and_low_latency_options_present():
     assert opts["video_size"] == "1920x1080"
     assert opts["framerate"] == "30"
     assert opts["fflags"] == "nobuffer+flush_packets"
+
+
+def test_software_encoder_options_tuned_for_realtime():
+    from syncfield.adapters._video_encoder import _encoder_options
+
+    opts = _encoder_options("libx264")
+    # Realtime capture, not offline transcode: medium preset measured ~5 fps
+    # at 1080p30 on a Pi 5 (two concurrent encoders), dropping 5 of every 6
+    # frames. ultrafast+zerolatency holds 30.
+    assert opts == {"preset": "ultrafast", "tune": "zerolatency", "crf": "23"}
+
+
+def test_hardware_encoder_gets_no_x264_options():
+    from syncfield.adapters._video_encoder import _encoder_options
+
+    assert _encoder_options("h264_videotoolbox") == {}
+
+
+def test_libx264_encode_smoke_with_options(tmp_path):
+    import numpy as np
+
+    from syncfield.adapters._video_encoder import VideoEncoder
+
+    enc = VideoEncoder.open(tmp_path / "t.mp4", width=320, height=240, fps=30.0, codec="libx264")
+    frame = np.zeros((240, 320, 3), dtype=np.uint8)
+    for _ in range(10):
+        enc.write(frame)
+    enc.close()
+    assert (tmp_path / "t.mp4").stat().st_size > 0

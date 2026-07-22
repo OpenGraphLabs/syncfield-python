@@ -30,6 +30,21 @@ except ImportError as exc:  # pragma: no cover - exercised via sys.modules patch
     ) from exc
 
 
+def _encoder_options(codec: str) -> dict:
+    """Per-codec encoder options for LIVE capture.
+
+    libx264's default preset (medium) is an offline-transcode trade-off: on a
+    Raspberry Pi 5 it managed ~5 fps per 1080p30 stream with two concurrent
+    encoders, silently dropping 5 of every 6 frames. This is a realtime
+    recorder — spend bits, not milliseconds: ultrafast + zerolatency holds
+    30 fps; crf 23 keeps files reasonable. Hardware encoders
+    (h264_videotoolbox) have their own rate control and take no x264 options.
+    """
+    if codec == "libx264":
+        return {"preset": "ultrafast", "tune": "zerolatency", "crf": "23"}
+    return {}
+
+
 def _pick_h264_encoder() -> str:
     """Return the best H.264 encoder name available in this FFmpeg build."""
     for candidate in ("h264_videotoolbox", "libx264"):
@@ -68,7 +83,9 @@ class VideoEncoder:
         """Open ``path`` for writing and configure the H.264 stream."""
         chosen_codec = codec or _pick_h264_encoder()
         container = av.open(str(path), mode="w")
-        stream = container.add_stream(chosen_codec, rate=int(round(fps)))
+        stream = container.add_stream(
+            chosen_codec, rate=int(round(fps)), options=_encoder_options(chosen_codec)
+        )
         stream.width = int(width)
         stream.height = int(height)
         stream.pix_fmt = "yuv420p"
