@@ -64,9 +64,17 @@ def test_hardware_encoder_gets_no_x264_options():
 
 
 def test_libx264_encode_smoke_with_options(tmp_path):
+    import importlib
+    import sys
+
     import numpy as np
 
-    from syncfield.adapters._video_encoder import VideoEncoder
+    # Other tests in this directory reimport _video_encoder against a FAKE
+    # ``av`` (conftest._install_fake_av) and leave that module object cached.
+    # Evict and reimport so this smoke exercises the real encoder.
+    sys.modules.pop("syncfield.adapters._video_encoder", None)
+    ve = importlib.import_module("syncfield.adapters._video_encoder")
+    VideoEncoder = ve.VideoEncoder
 
     enc = VideoEncoder.open(tmp_path / "t.mp4", width=320, height=240, fps=30.0, codec="libx264")
     frame = np.zeros((240, 320, 3), dtype=np.uint8)
