@@ -4,20 +4,17 @@ build-backend = "hatchling.build"
 
 [project]
 name = "syncfield"
-version = "0.6.0"
+version = "0.7.0"
 description = "Multi-modal capture orchestration framework with precision sync for Physical AI data collection"
 readme = "README.md"
 license = "Apache-2.0"
-requires-python = ">=3.9"
+requires-python = ">=3.12"
 authors = [{ name = "OpenGraph Labs" }]
 keywords = ["synchronization", "timestamp", "multi-camera", "robotics", "data-collection", "physical-ai"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.9",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Topic :: Scientific/Engineering",

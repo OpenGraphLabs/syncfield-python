@@ -42,7 +42,8 @@ def test_full_session_produces_valid_core_artifacts(tmp_path: Path):
 
     report = session.stop()
 
-    out = session.output_dir
+    out = session.last_episode_dir
+    assert out is not None
 
     # --- sync_point.json --------------------------------------------------
     sp = json.loads((out / "sync_point.json").read_text())
@@ -73,8 +74,8 @@ def test_full_session_produces_valid_core_artifacts(tmp_path: Path):
     ]
     transitions = [l for l in log_lines if l["kind"] == "state_transition"]
     edges = [(t["from"], t["to"]) for t in transitions]
-    assert ("idle", "preparing") in edges
-    assert ("preparing", "recording") in edges
+    assert ("preparing", "countdown") in edges
+    assert ("countdown", "recording") in edges
     assert ("recording", "stopping") in edges
     assert ("stopping", "stopped") in edges
 
@@ -95,24 +96,29 @@ def test_silent_session_omits_chirp_fields(tmp_path: Path):
     session.add(FakeStream("cam", provides_audio_track=True))
     session.start()
     session.stop()
-    sp = json.loads((session.output_dir / "sync_point.json").read_text())
+    assert session.last_episode_dir is not None
+    sp = json.loads((session.last_episode_dir / "sync_point.json").read_text())
     assert "chirp_start_ns" not in sp
     assert "chirp_stop_ns" not in sp
     assert "chirp_spec" not in sp
 
 
-def test_no_audio_stream_single_host_session_works_without_chirp(tmp_path: Path):
+def test_no_audio_stream_single_host_session_still_emits_chirp(tmp_path: Path):
     session = SessionOrchestrator(
         host_id="rig_solo",
         output_dir=tmp_path,
         sync_tone=SyncToneConfig.default(),  # enabled by default
+        enable_host_audio=False,
     )
-    # No audio-capable stream → chirp is skipped silently with an INFO log
+    # The host can still emit the synchronization chirp for external cameras
+    # even when this process does not record a local audio stream.
     session.add(FakeStream("imu_only"))
     session.start()
     session.stop()
-    sp = json.loads((session.output_dir / "sync_point.json").read_text())
-    assert "chirp_start_ns" not in sp
+    assert session.last_episode_dir is not None
+    sp = json.loads((session.last_episode_dir / "sync_point.json").read_text())
+    assert "chirp_start_ns" in sp
+    assert "chirp_stop_ns" in sp
     # Session still completes cleanly
-    manifest = json.loads((session.output_dir / "manifest.json").read_text())
+    manifest = json.loads((session.last_episode_dir / "manifest.json").read_text())
     assert manifest["streams"]["imu_only"]["status"] == "completed"

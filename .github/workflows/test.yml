@@ -11,29 +11,26 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.9", "3.10", "3.11", "3.12"]
+        python-version: ["3.12", "3.13"]
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Set up Node (for viewer frontend)
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
-          node-version: "20"
+          node-version: "22"
+          cache: "yarn"
+          cache-dependency-path: src/syncfield/viewer/frontend/yarn.lock
 
       - name: Build viewer frontend
         working-directory: src/syncfield/viewer/frontend
         run: |
-          # Same lockfile-regeneration dance as publish.yml: optional
-          # platform-specific deps (e.g. rollup's @rollup/rollup-linux-*)
-          # aren't re-resolved when a macOS-generated lockfile runs on
-          # Ubuntu. Regenerating from package.json on CI works.
-          rm -f package-lock.json
-          npm install --no-audit --no-fund
-          npm run build
+          yarn install --frozen-lockfile
+          yarn build
 
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
 
