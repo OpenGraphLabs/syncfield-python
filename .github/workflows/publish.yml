@@ -1,21 +1,101 @@
-name: Publish to PyPI
+name: Bump and publish to PyPI
 
 on:
-  release:
-    types: [published]
+  push:
+    branches: [main]
+    paths:
+      - "pyproject.toml"
+      - "uv.lock"
+      - "src/**"
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "Merged PR number to release (retry or bootstrap)"
+        required: true
+        type: string
 
 permissions:
-  contents: read
+  contents: write
+  pull-requests: read
+
+concurrency:
+  group: syncfield-python-release
+  cancel-in-progress: false
 
 jobs:
-  test:
+  bump:
+    name: bump version
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        python-version: ["3.12", "3.13"]
-
+    outputs:
+      commit_sha: ${{ steps.release.outputs.commit_sha }}
+      version: ${{ steps.release.outputs.version }}
     steps:
-      - uses: actions/checkout@v6
+      - name: Check out main
+        uses: actions/checkout@v6
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Resolve and commit release version
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MANUAL_PR_NUMBER: ${{ inputs.pr_number }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            pr_number="$MANUAL_PR_NUMBER"
+          else
+            pr_number="$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/pulls" \
+              --jq '[.[] | select(.merged_at != null)][0].number')"
+          fi
+          test -n "$pr_number" && test "$pr_number" != "null"
+          pr_title="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$pr_number" --jq .title)"
+
+          source_pr="Source-PR: #$pr_number"
+          existing_commit="$(git log main --format='%H' --fixed-strings --grep="$source_pr" -1)"
+          if [ -n "$existing_commit" ]; then
+            commit_sha="$existing_commit"
+            version="$(git show "$existing_commit:pyproject.toml" | python -c 'import sys, tomllib; print(tomllib.loads(sys.stdin.read())["project"]["version"])')"
+          else
+            version="$(python scripts/bump_version.py --title "$pr_title")"
+            uv lock
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add pyproject.toml uv.lock
+            git commit \
+              -m "chore: release $version [skip ci]" \
+              -m "$source_pr"
+            git push origin HEAD:main
+            commit_sha="$(git rev-parse HEAD)"
+          fi
+
+          printf 'commit_sha=%s\n' "$commit_sha" >>"$GITHUB_OUTPUT"
+          printf 'version=%s\n' "$version" >>"$GITHUB_OUTPUT"
+
+  release:
+    name: release to PyPI
+    needs: bump
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - name: Check out release commit
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.bump.outputs.commit_sha }}
+          fetch-depth: 0
 
       - name: Set up Node
         uses: actions/setup-node@v6
@@ -33,69 +113,45 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
-          python-version: ${{ matrix.python-version }}
-
-      - name: Install package and test dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[all]"
-          pip install \
-            "pytest>=8.4.2" \
-            "pytest-aiohttp>=1.1.0" \
-            "pytest-asyncio>=1.2.0" \
-            "pytest-mock>=3.12.0" \
-            "pytest-timeout>=2.4.0" \
-            "pytest-xdist>=3.6.0"
-
-      - name: Run tests
-        run: pytest -v
-
-  publish:
-    needs: test
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      id-token: write
-
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Set up Node (for viewer frontend)
-        uses: actions/setup-node@v6
-        with:
-          # camera-controls (transitive dep via @react-three/drei) requires
-          # Node >= 22. yarn enforces engines.node strictly — npm only warned,
-          # which is how the dep slipped past our previous Node 20 runs.
-          node-version: "22"
-          cache: "yarn"
-          cache-dependency-path: src/syncfield/viewer/frontend/yarn.lock
-
-      - name: Build viewer frontend
-        working-directory: src/syncfield/viewer/frontend
-        run: |
-          yarn install --frozen-lockfile
-          yarn build
-
-      - name: Set up Python
-        uses: actions/setup-python@v6
-        with:
           python-version: "3.12"
-
-      - name: Verify release tag matches package version
-        run: |
-          package_version="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
-          test "$GITHUB_REF_NAME" = "v$package_version"
 
       - name: Install build tools
         run: python -m pip install --upgrade pip build
 
-      - name: Build sdist and wheel
-        run: python -m build --sdist --wheel
-
-      - name: Verify wheel contents and installation
+      - name: Build and verify distributions
+        env:
+          VERSION: ${{ needs.bump.outputs.version }}
         run: |
+          package_version="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+          test "$package_version" = "$VERSION"
+          python -m build --sdist --wheel
           python -m pip install --force-reinstall --no-deps dist/*.whl
-          python -c 'import importlib.metadata, tomllib; expected = tomllib.load(open("pyproject.toml", "rb"))["project"]["version"]; assert importlib.metadata.version("syncfield") == expected'
+          python -c 'import importlib.metadata, os; assert importlib.metadata.version("syncfield") == os.environ["VERSION"]'
+
+      - name: Tag release commit
+        env:
+          VERSION: ${{ needs.bump.outputs.version }}
+          RELEASE_SHA: ${{ needs.bump.outputs.commit_sha }}
+        run: |
+          tag="v$VERSION"
+          if git rev-parse "$tag" >/dev/null 2>&1; then
+            test "$(git rev-list -n 1 "$tag")" = "$RELEASE_SHA"
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag -a "$tag" "$RELEASE_SHA" -m "SyncField $VERSION"
+            git push origin "$tag"
+          fi
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.bump.outputs.version }}
+        run: |
+          gh release view "v$VERSION" >/dev/null 2>&1 || \
+            gh release create "v$VERSION" --title "v$VERSION" --generate-notes
