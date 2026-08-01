@@ -253,6 +253,7 @@ def test_isolated_remux_runs_the_same_remuxer_in_a_child_process(
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(_video_encoder.subprocess, "run", fake_run)
+    monkeypatch.setattr(_video_encoder.shutil, "which", lambda name: None)
     source = tmp_path / "segment.h264"
     destination = tmp_path / "segment.mp4"
 
