@@ -591,20 +591,30 @@ def create_default_player(sample_rate: int = 44100) -> ChirpPlayer:
     """Return the best available :class:`ChirpPlayer` for this environment.
 
     Returns a :class:`SoundDeviceChirpPlayer` when ``sounddevice`` is
-    importable, else a :class:`SilentChirpPlayer`. Import errors are
-    logged at WARNING — never raised — so the SDK stays usable on
-    headless machines with no audio output, but interactive users see
-    the explicit "install ``syncfield[audio]`` to hear chirps" hint
-    instead of silently wondering why nothing beeps.
+    importable and a default output device is available, else a
+    :class:`SilentChirpPlayer`. Detection errors are logged at WARNING —
+    never raised — so the SDK stays usable on headless machines.
     """
     try:
-        import sounddevice  # noqa: F401
+        import sounddevice
     except (ImportError, OSError) as exc:
         logger.warning(
             "sounddevice failed to load (%s). The 3/2/1 countdown and "
             "start/stop chirps will be SILENT. sounddevice ships with "
             "syncfield by default; on Linux you may need the system "
             "PortAudio package: `apt install libportaudio2`.",
+            exc,
+        )
+        return SilentChirpPlayer()
+
+    try:
+        device_info = sounddevice.query_devices(kind="output")
+        if not device_info or device_info.get("max_output_channels", 0) <= 0:
+            raise RuntimeError("no default audio output device")
+    except Exception as exc:  # noqa: BLE001 - backend defines PortAudioError
+        logger.warning(
+            "audio output unavailable (%s). The 3/2/1 countdown and "
+            "start/stop chirps will be SILENT.",
             exc,
         )
         return SilentChirpPlayer()

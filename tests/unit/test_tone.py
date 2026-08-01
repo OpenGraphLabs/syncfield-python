@@ -243,8 +243,15 @@ class TestSoundDeviceChirpPlayer:
 class TestCreateDefaultPlayer:
     def test_returns_sounddevice_backend_when_import_succeeds(self):
         fake_sd = MagicMock()
+        fake_sd.query_devices.return_value = {"max_output_channels": 2}
         with patch.dict(sys.modules, {"sounddevice": fake_sd}):
             assert isinstance(create_default_player(), SoundDeviceChirpPlayer)
+
+    def test_returns_silent_backend_without_output_device(self):
+        fake_sd = MagicMock()
+        fake_sd.query_devices.side_effect = RuntimeError("no output device")
+        with patch.dict(sys.modules, {"sounddevice": fake_sd}):
+            assert isinstance(create_default_player(), SilentChirpPlayer)
 
     def test_returns_silent_backend_when_import_fails(self):
         # Patch sounddevice to None — import raises ImportError
