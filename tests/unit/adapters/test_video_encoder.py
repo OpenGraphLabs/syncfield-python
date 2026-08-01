@@ -69,7 +69,9 @@ def fake_av(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     return SimpleNamespace(av=av, container=container, stream=stream, packet=packet)
 
 
-def test_open_creates_output_container(tmp_path: Path, fake_av: SimpleNamespace) -> None:
+def test_open_creates_output_container(
+    tmp_path: Path, fake_av: SimpleNamespace
+) -> None:
     from syncfield.adapters._video_encoder import VideoEncoder
 
     out = tmp_path / "clip.mp4"
@@ -90,7 +92,9 @@ def test_open_creates_output_container(tmp_path: Path, fake_av: SimpleNamespace)
     enc.close()
 
 
-def test_write_encodes_and_muxes_one_frame(tmp_path: Path, fake_av: SimpleNamespace) -> None:
+def test_write_encodes_and_muxes_one_frame(
+    tmp_path: Path, fake_av: SimpleNamespace
+) -> None:
     from syncfield.adapters._video_encoder import VideoEncoder
 
     enc = VideoEncoder.open(tmp_path / "clip.mp4", width=64, height=48, fps=30.0)
@@ -135,9 +139,11 @@ def test_close_propagates_flush_error_but_closes_container(
 
     # Make the flush (encode(None)) raise.
     fake_av.stream.encode = MagicMock(
-        side_effect=lambda frame: (_ for _ in ()).throw(RuntimeError("flush failed"))
-        if frame is None
-        else [fake_av.packet]
+        side_effect=lambda frame: (
+            (_ for _ in ()).throw(RuntimeError("flush failed"))
+            if frame is None
+            else [fake_av.packet]
+        )
     )
 
     with pytest.raises(RuntimeError, match="flush failed"):
@@ -183,9 +189,7 @@ def test_open_uvc_input_linux(
     monkeypatch.setattr(_video_encoder.sys, "platform", "linux")
     fake_av.av.open.return_value = MagicMock(name="InputContainer")
 
-    _video_encoder.open_uvc_input(
-        device_index=2, width=1280, height=720, fps=30.0
-    )
+    _video_encoder.open_uvc_input(device_index=2, width=1280, height=720, fps=30.0)
 
     args, kwargs = fake_av.av.open.call_args
     assert args[0] == "/dev/video2"
@@ -221,9 +225,7 @@ def test_open_uvc_input_windows_requires_device_name(
     monkeypatch.setattr(_video_encoder.sys, "platform", "win32")
 
     with pytest.raises(ValueError, match="device_name"):
-        _video_encoder.open_uvc_input(
-            device_index=0, width=1280, height=720, fps=30.0
-        )
+        _video_encoder.open_uvc_input(device_index=0, width=1280, height=720, fps=30.0)
 
 
 def test_open_uvc_input_unsupported_platform(
@@ -234,6 +236,81 @@ def test_open_uvc_input_unsupported_platform(
     monkeypatch.setattr(_video_encoder.sys, "platform", "freebsd13")
 
     with pytest.raises(RuntimeError, match="Unsupported platform"):
-        _video_encoder.open_uvc_input(
-            device_index=0, width=1280, height=720, fps=30.0
+        _video_encoder.open_uvc_input(device_index=0, width=1280, height=720, fps=30.0)
+
+
+def test_isolated_remux_runs_the_same_remuxer_in_a_child_process(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fake_av: SimpleNamespace,
+) -> None:
+    from syncfield.adapters import _video_encoder
+
+    calls: list[tuple[list[str], dict]] = []
+
+    def fake_run(argv: list[str], **kwargs):
+        calls.append((argv, kwargs))
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(_video_encoder.subprocess, "run", fake_run)
+    source = tmp_path / "segment.h264"
+    destination = tmp_path / "segment.mp4"
+
+    _video_encoder.remux_h264_to_mp4_isolated(
+        source, destination, fps=30.0, timeout_s=123
+    )
+
+    argv, kwargs = calls[0]
+    assert argv[0] == sys.executable
+    assert argv[-3:] == [str(source), str(destination), "30.0"]
+    assert "remux_h264_to_mp4" in argv[2]
+    assert kwargs["timeout"] == 123
+
+
+def test_isolated_remux_removes_partial_output_on_worker_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fake_av: SimpleNamespace,
+) -> None:
+    from syncfield.adapters import _video_encoder
+
+    destination = tmp_path / "partial.mp4"
+    destination.write_bytes(b"partial")
+    monkeypatch.setattr(
+        _video_encoder.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=7, stdout="", stderr="broken container"
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="broken container"):
+        _video_encoder.remux_h264_to_mp4_isolated(
+            tmp_path / "segment.h264", destination, fps=30.0
         )
+    assert not destination.exists()
+
+
+def test_isolated_remux_uses_idle_io_priority_on_linux(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fake_av: SimpleNamespace,
+) -> None:
+    from syncfield.adapters import _video_encoder
+
+    calls: list[list[str]] = []
+    monkeypatch.setattr(_video_encoder.sys, "platform", "linux")
+    monkeypatch.setattr(_video_encoder.shutil, "which", lambda name: "/usr/bin/ionice")
+    monkeypatch.setattr(
+        _video_encoder.subprocess,
+        "run",
+        lambda argv, **kwargs: (
+            calls.append(argv) or SimpleNamespace(returncode=0, stdout="", stderr="")
+        ),
+    )
+
+    _video_encoder.remux_h264_to_mp4_isolated(
+        tmp_path / "segment.h264", tmp_path / "segment.mp4", fps=30.0
+    )
+
+    assert calls[0][:3] == ["/usr/bin/ionice", "-c", "3"]

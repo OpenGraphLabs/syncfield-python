@@ -49,6 +49,7 @@ implement the protocol from scratch; both paths are equally well supported.
 from __future__ import annotations
 
 import dataclasses
+from pathlib import Path
 from typing import Callable, List, Optional, Protocol, Tuple, runtime_checkable
 
 from syncfield.clock import SessionClock
@@ -174,6 +175,27 @@ class Stream(Protocol):
     def reconnect(self) -> None: ...
     def on_sample(self, callback: SampleCallback) -> None: ...
     def on_health(self, callback: HealthCallback) -> None: ...
+
+
+@runtime_checkable
+class SegmentRotatableStream(Protocol):
+    """Optional two-phase contract for loss-bounded file segmentation.
+
+    ``prepare`` opens every writer needed by the next segment without
+    touching the current writers. ``commit`` performs the short writer swap;
+    expensive container finalization happens after that swap, so the capture
+    transport remains live. A prepare failure can therefore be aborted
+    without putting modalities in different episode directories.
+    """
+
+    def prepare_segment_rotation(self, next_output_dir: Path) -> None: ...
+    def commit_segment_rotation(
+        self,
+        boundary_monotonic_ns: int,
+        swap_persistence: Callable[[], None] | None = None,
+        next_session_clock: SessionClock | None = None,
+    ) -> FinalizationReport: ...
+    def abort_segment_rotation(self) -> None: ...
 
 
 class StreamBase:

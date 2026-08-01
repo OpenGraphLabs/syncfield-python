@@ -21,7 +21,9 @@ def oak_camera_module() -> Any:
     return oak_camera
 
 
-def test_h264_annex_b_parser_finds_parameter_sets_and_idr(oak_camera_module: Any) -> None:
+def test_h264_annex_b_parser_finds_parameter_sets_and_idr(
+    oak_camera_module: Any,
+) -> None:
     data = b"\x00\x00\x00\x01\x67sps\x00\x00\x01\x68pps\x00\x00\x00\x01\x65idr"
 
     assert oak_camera_module._iter_h264_annex_b_nalus(data) == (
@@ -149,6 +151,91 @@ def test_aux_camera_packet_gates_on_keyframe_and_writes_timestamps_row(
     assert stream._frame_count == 0
 
 
+def test_h264_recorder_primes_next_segment_with_latest_decodable_gop(
+    oak_camera_module: Any,
+) -> None:
+    source = oak_camera_module._H264Recorder(label="rgb", is_primary=True)
+    source.file = io.BytesIO()
+    source.sps = b"\x00\x00\x00\x01\x67sps"
+    source.pps = b"\x00\x00\x00\x01\x68pps"
+    idr = b"\x00\x00\x00\x01\x65idr"
+    pframe = b"\x00\x00\x00\x01\x61p"
+    assert source.write_frame(idr, 100, 1_000)
+    assert source.write_frame(pframe, 133, 1_033)
+
+    target = oak_camera_module._H264Recorder(label="rgb", is_primary=True)
+    target.file = io.BytesIO()
+    target.sps = source.sps
+    target.pps = source.pps
+
+    copied = target.prime_from_latest_gop(source)
+
+    assert [(capture_ns, device_ns) for _, capture_ns, device_ns in copied] == [
+        (100, 1_000),
+        (133, 1_033),
+    ]
+    assert target.frame_count == 2
+    assert b"idr" in target.file.getvalue()
+    assert target.file.getvalue().endswith(pframe)
+
+
+def test_segment_rotation_replays_rgb_overlap_timestamps_after_writer_swap(
+    oak_camera_module: Any,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    stream = oak_camera_module.OakCameraStream("oak", first)
+    monkeypatch.setattr(stream, "connect", lambda: None)
+    stream._left.queue = _EmptyQueue()
+    stream._right.queue = _EmptyQueue()
+    stream._imu.queue = _EmptyQueue()
+    stream.start_recording(_FakeSessionClock())
+
+    idr = b"\x00\x00\x00\x01\x67sps\x00\x00\x01\x68pps\x00\x00\x01\x65idr"
+    pframe = b"\x00\x00\x00\x01\x61p"
+    for recorder in (stream._rgb, stream._left, stream._right):
+        recorder.remember_parameter_sets(idr)
+        assert recorder.write_frame(idr, 100, 1_000)
+        assert recorder.write_frame(pframe, 133, 1_033)
+
+    stream.prepare_segment_rotation(second)
+    monkeypatch.setattr(
+        stream,
+        "_finalize_recorder_set",
+        lambda *_args, **_kwargs: (SimpleNamespace(status="completed"), ()),
+    )
+    events: list[Any] = []
+    stream.on_sample(events.append)
+    swaps: list[bool] = []
+
+    stream.commit_segment_rotation(
+        150,
+        lambda: swaps.append(True),
+        _FakeSessionClock(),
+    )
+
+    assert swaps == [True]
+    assert stream._rgb.frame_count == 2
+    assert stream._left.frame_count == 2
+    assert stream._right.frame_count == 2
+    assert [(event.frame_number, event.capture_ns) for event in events] == [
+        (0, 100),
+        (1, 133),
+    ]
+    stream._left.timestamps_file.flush()
+    left_rows = [
+        json.loads(line)
+        for line in (second / "oak.left.timestamps.jsonl").read_text().splitlines()
+    ]
+    assert [row["capture_ns"] for row in left_rows] == [100, 133]
+    for recorder in (stream._rgb, stream._left, stream._right):
+        recorder.close_files()
+    stream._imu.close_file()
+
+
 class _ImuReport:
     def __init__(self, x: float, y: float, z: float, ts_s: float) -> None:
         self.x = x
@@ -263,7 +350,9 @@ def test_stop_recording_remuxes_each_recorded_camera(
         remuxed.append((Path(src).name, Path(dst).name, fps))
         Path(dst).write_bytes(b"mp4")
 
-    stream = oak_camera_module.OakCameraStream("oak_pro", tmp_path, rgb_fps=30, mono_fps=30)
+    stream = oak_camera_module.OakCameraStream(
+        "oak_pro", tmp_path, rgb_fps=30, mono_fps=30
+    )
     monkeypatch.setattr(oak_camera_module, "remux_h264_to_mp4", fake_remux)
     monkeypatch.setattr(stream, "connect", lambda: None)
 
@@ -291,6 +380,41 @@ def test_stop_recording_remuxes_each_recorded_camera(
     stream.disconnect()
 
 
+def test_segment_finalization_isolates_all_video_remuxes_from_live_capture(
+    oak_camera_module: Any,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    isolated: list[str] = []
+
+    def fake_isolated(src, dst, *, fps: float) -> None:
+        isolated.append(Path(src).name)
+        Path(dst).write_bytes(b"mp4")
+
+    monkeypatch.setattr(oak_camera_module, "remux_h264_to_mp4_isolated", fake_isolated)
+    stream = oak_camera_module.OakCameraStream("oak", tmp_path)
+    monkeypatch.setattr(stream, "connect", lambda: None)
+    stream._left.queue = _EmptyQueue()
+    stream._right.queue = _EmptyQueue()
+    stream.start_recording(_FakeSessionClock())
+    stream._handle_camera_packet(stream._rgb, _Packet())
+    stream._handle_camera_packet(stream._left, _Packet())
+    stream._handle_camera_packet(stream._right, _Packet())
+
+    report, _ = stream._finalize_recorder_set(
+        stream._rgb,
+        stream._left,
+        stream._right,
+        stream._imu,
+        capture_error=None,
+        recording_anchor=None,
+        isolated_remux=True,
+    )
+
+    assert report.status == "completed"
+    assert sorted(isolated) == ["oak.h264", "oak.left.h264", "oak.right.h264"]
+
+
 def test_stop_recording_still_fails_when_rgb_has_no_frames(
     oak_camera_module: Any,
     tmp_path,
@@ -311,8 +435,14 @@ class _FakeQueue:
 
 
 class _FakeOutput:
+    def __init__(self) -> None:
+        self.linked_to: list[Any] = []
+
     def createOutputQueue(self, *args: Any, **kwargs: Any) -> _FakeQueue:
         return _FakeQueue()
+
+    def link(self, target: Any) -> None:
+        self.linked_to.append(target)
 
 
 class _FakeCameraControl:
@@ -355,6 +485,21 @@ class _FakeEncoderNode:
         self.bitrate_kbps = value
 
 
+class _FakeImageManipConfig:
+    def __init__(self) -> None:
+        self.frame_type: Any = None
+
+    def setFrameType(self, value: Any) -> None:
+        self.frame_type = value
+
+
+class _FakeImageManipNode:
+    def __init__(self) -> None:
+        self.initialConfig = _FakeImageManipConfig()
+        self.inputImage = object()
+        self.out = _FakeOutput()
+
+
 class _FakeImuNode:
     def __init__(self) -> None:
         self.enable_calls: list[tuple[Any, int]] = []
@@ -388,11 +533,18 @@ def _fake_dai_v3() -> SimpleNamespace:
         node=SimpleNamespace(
             Camera=_FakeCameraNode,
             VideoEncoder=_FakeEncoderNode,
+            ImageManip=_FakeImageManipNode,
             IMU=_FakeImuNode,
         ),
         CameraBoardSocket=sockets,
-        ImgFrame=SimpleNamespace(Type=SimpleNamespace(NV12="NV12", BGR888p="BGR888p")),
-        VideoEncoderProperties=SimpleNamespace(Profile=SimpleNamespace(H264_MAIN="H264_MAIN")),
+        ImgFrame=SimpleNamespace(
+            Type=SimpleNamespace(
+                NV12="NV12", GRAY8="GRAY8", BGR888p="BGR888p"
+            )
+        ),
+        VideoEncoderProperties=SimpleNamespace(
+            Profile=SimpleNamespace(H264_MAIN="H264_MAIN")
+        ),
         CameraControl=SimpleNamespace(
             FrameSyncMode=SimpleNamespace(OUTPUT="OUTPUT", INPUT="INPUT", OFF="OFF")
         ),
@@ -407,7 +559,8 @@ def _fake_dai_v3() -> SimpleNamespace:
 class _FakeDeviceFull:
     def getConnectedCameraFeatures(self):
         return [
-            SimpleNamespace(socket=SimpleNamespace(name=n)) for n in ("CAM_A", "CAM_B", "CAM_C")
+            SimpleNamespace(socket=SimpleNamespace(name=n))
+            for n in ("CAM_A", "CAM_B", "CAM_C")
         ]
 
     def getConnectedIMU(self) -> str:
@@ -420,6 +573,11 @@ class _FakeDeviceRgbOnly:
 
     def getConnectedIMU(self) -> str:
         return ""
+
+
+class _FakeDeviceBmi270(_FakeDeviceFull):
+    def getConnectedIMU(self) -> str:
+        return "BMI270"
 
 
 def test_v3_pipeline_builds_all_streams_on_full_device(
@@ -439,7 +597,7 @@ def test_v3_pipeline_builds_all_streams_on_full_device(
     assert stream._q_preview is not None
 
 
-def test_v3_pipeline_requests_640p_mono_30fps_and_400p_rgb_and_combined_imu_enable(
+def test_v3_pipeline_requests_560p_mono_30fps_and_400p_rgb_and_combined_imu_enable(
     oak_camera_module: Any,
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
@@ -453,18 +611,37 @@ def test_v3_pipeline_requests_640p_mono_30fps_and_400p_rgb_and_combined_imu_enab
     imus = [n for n in pipeline.nodes if isinstance(n, _FakeImuNode)]
     by_socket = {c.built_socket: c for c in cams}
     assert set(by_socket) == {"CAM_A", "CAM_B", "CAM_C"}
-    # 30 fps is the priority → mono 1024x640 (640p, native 16:10) so all three
-    # streams sustain a clean 30 fps (0 drops, measured) on RVC2; RGB is held at
-    # the SAME 30 fps (matched rates keep the ISP interleave regular — a
-    # mismatched RGB rate makes the monos jitter). 720p mono tops out at 24 fps
-    # on this chip. See the module docstring for the full bandwidth findings.
+    # 30 fps is the priority → mono 896x560 (native 16:10) is the highest
+    # measured resolution that sustains 30.0 fps after GRAY8 -> NV12 conversion.
+    # RGB is held at the same 30 fps to keep the ISP interleave regular.
     assert ((640, 400), "NV12", 30.0) in by_socket["CAM_A"].requested
-    assert ((1024, 640), "NV12", 30.0) in by_socket["CAM_B"].requested
-    assert ((1024, 640), "NV12", 30.0) in by_socket["CAM_C"].requested
+    # OV9282 must originate as native GRAY8, then two ImageManip nodes convert
+    # it to encoder-compatible NV12. Asking the mono Camera for NV12 is black.
+    assert ((896, 560), "GRAY8", 30.0) in by_socket["CAM_B"].requested
+    assert ((896, 560), "GRAY8", 30.0) in by_socket["CAM_C"].requested
+    manips = [n for n in pipeline.nodes if isinstance(n, _FakeImageManipNode)]
+    assert len(manips) == 2
+    assert all(n.initialConfig.frame_type == "NV12" for n in manips)
     # IMU must be enabled with ONE combined call (separate enables degrade
     # BNO086 sync output to ~52 Hz — measured on hardware).
     assert len(imus) == 1
     assert imus[0].enable_calls == [(["ACC_RAW", "GYRO_RAW", "ROT_VEC"], 400)]
+
+
+def test_v3_pipeline_uses_raw_only_imu_outputs_for_bmi270(
+    oak_camera_module: Any,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(oak_camera_module, "dai", _fake_dai_v3())
+    stream = oak_camera_module.OakCameraStream("oak_d", tmp_path)
+
+    pipeline = stream._build_v3_pipeline(_FakeDeviceBmi270())
+
+    imus = [n for n in pipeline.nodes if isinstance(n, _FakeImuNode)]
+    assert len(imus) == 1
+    assert imus[0].enable_calls == [(["ACC_RAW", "GYRO_RAW"], 400)]
+    assert stream._imu_rotation_vector_enabled is False
 
 
 def test_v3_pipeline_degrades_to_rgb_only_without_stereo_or_imu(
@@ -500,14 +677,32 @@ def test_v3_pipeline_enables_hardware_frame_sync_across_the_stereo_triplet(
     sensors expose the shutter together — measured ~0.02 ms residual vs
     ~4.6 ms free-running."""
     monkeypatch.setattr(oak_camera_module, "dai", _fake_dai_v3())
-    stream = oak_camera_module.OakCameraStream("oak_pro", tmp_path)
+    stream = oak_camera_module.OakCameraStream(
+        "oak_pro", tmp_path, enable_hardware_frame_sync=True
+    )
 
     pipeline = stream._build_v3_pipeline(_FakeDeviceFull())
 
-    by_socket = {c.built_socket: c for c in pipeline.nodes if isinstance(c, _FakeCameraNode)}
+    by_socket = {
+        c.built_socket: c for c in pipeline.nodes if isinstance(c, _FakeCameraNode)
+    }
     assert by_socket["CAM_A"].initialControl.frame_sync_mode == "OUTPUT"
     assert by_socket["CAM_B"].initialControl.frame_sync_mode == "INPUT"
     assert by_socket["CAM_C"].initialControl.frame_sync_mode == "INPUT"
+
+
+def test_v3_pipeline_defaults_to_free_run_to_protect_unwired_oak_monos(
+    oak_camera_module: Any,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(oak_camera_module, "dai", _fake_dai_v3())
+    stream = oak_camera_module.OakCameraStream("oak_s2", tmp_path)
+
+    pipeline = stream._build_v3_pipeline(_FakeDeviceFull())
+
+    cameras = [n for n in pipeline.nodes if isinstance(n, _FakeCameraNode)]
+    assert all(c.initialControl.frame_sync_mode is None for c in cameras)
 
 
 def test_v3_pipeline_rgb_preview_from_h264_skips_isp_preview_output(
@@ -519,12 +714,16 @@ def test_v3_pipeline_rgb_preview_from_h264_skips_isp_preview_output(
     decoded host-side from the encode stream, so the busiest camera does single
     ISP duty and the recording keeps the full ISP budget (all three at 30 fps)."""
     monkeypatch.setattr(oak_camera_module, "dai", _fake_dai_v3())
-    stream = oak_camera_module.OakCameraStream("oak_pro", tmp_path, rgb_preview_from_h264=True)
+    stream = oak_camera_module.OakCameraStream(
+        "oak_pro", tmp_path, rgb_preview_from_h264=True
+    )
 
     pipeline = stream._build_v3_pipeline(_FakeDeviceFull())
 
     assert stream._q_preview is None
-    by_socket = {c.built_socket: c for c in pipeline.nodes if isinstance(c, _FakeCameraNode)}
+    by_socket = {
+        c.built_socket: c for c in pipeline.nodes if isinstance(c, _FakeCameraNode)
+    }
     formats = [fmt for _, fmt, _ in by_socket["CAM_A"].requested]
     assert "BGR888p" not in formats  # no preview downscale on CAM_A
     assert "NV12" in formats  # encode output still present
@@ -543,16 +742,20 @@ def test_v3_pipeline_disables_mono_preview_outputs(
     """enable_mono_preview=False builds no mono preview downscales (a kiosk that
     only shows the RGB view never uses them), freeing ISP budget for capture."""
     monkeypatch.setattr(oak_camera_module, "dai", _fake_dai_v3())
-    stream = oak_camera_module.OakCameraStream("oak_pro", tmp_path, enable_mono_preview=False)
+    stream = oak_camera_module.OakCameraStream(
+        "oak_pro", tmp_path, enable_mono_preview=False
+    )
 
     pipeline = stream._build_v3_pipeline(_FakeDeviceFull())
 
     assert stream._substream_preview_queues == {}
-    by_socket = {c.built_socket: c for c in pipeline.nodes if isinstance(c, _FakeCameraNode)}
+    by_socket = {
+        c.built_socket: c for c in pipeline.nodes if isinstance(c, _FakeCameraNode)
+    }
     for socket in ("CAM_B", "CAM_C"):
         formats = [fmt for _, fmt, _ in by_socket[socket].requested]
         assert "BGR888p" not in formats
-        assert "NV12" in formats
+        assert "GRAY8" in formats
     # Mono recording queues still built.
     assert stream._left.queue is not None
     assert stream._right.queue is not None
@@ -574,7 +777,10 @@ def test_preview_decode_paths_are_best_effort_and_never_raise(
     # Stream decode with no live decoder returns None, never raises.
     assert stream._decode_stream(None, (b"\x00\x00\x00\x01garbage",)) is None
     # Undecodable bytes through a real (best-effort) decoder still yield None.
-    assert stream._decode_stream(stream._new_h264_decoder(), (b"\x00\x00\x00\x01x",)) is None
+    assert (
+        stream._decode_stream(stream._new_h264_decoder(), (b"\x00\x00\x00\x01x",))
+        is None
+    )
 
 
 def test_connected_socket_names_and_imu_detection(oak_camera_module: Any) -> None:
@@ -606,6 +812,9 @@ def test_connected_socket_names_and_imu_detection(oak_camera_module: Any) -> Non
     assert oak_camera_module._connected_imu_name(Device()) == "BNO086"
     assert oak_camera_module._connected_socket_names(BareDevice()) is None
     assert oak_camera_module._connected_imu_name(BareDevice()) == ""
+    assert oak_camera_module._imu_supports_rotation_vector("BNO086") is True
+    assert oak_camera_module._imu_supports_rotation_vector("BMI270") is False
+    assert oak_camera_module._imu_supports_rotation_vector("future-imu") is False
 
 
 def test_substreams_reflect_built_queues(oak_camera_module: Any, tmp_path) -> None:
@@ -918,7 +1127,7 @@ def test_v3_pipeline_builds_mono_preview_queues(
     cams = [n for n in pipeline.nodes if isinstance(n, _FakeCameraNode)]
     by_socket = {c.built_socket: c for c in cams}
     # Monos now request the encoder feed AND a small BGR preview.
-    assert ((1024, 640), "NV12", 30.0) in by_socket["CAM_B"].requested
+    assert ((896, 560), "GRAY8", 30.0) in by_socket["CAM_B"].requested
     assert ((320, 200), "BGR888p", 10.0) in by_socket["CAM_B"].requested
     assert ((320, 200), "BGR888p", 10.0) in by_socket["CAM_C"].requested
     assert set(stream._substream_preview_queues) == {"oak_pro.left", "oak_pro.right"}
@@ -986,7 +1195,11 @@ def test_annex_b_start_codes_edge_cases(oak_camera_module: Any) -> None:
     assert f(b"\x00\x00") == ()
     assert f(b"junk with no start codes") == ()
     # 3-byte and 4-byte codes mixed, garbage between and at both ends.
-    assert f(b"xx\x00\x00\x01A\x00\x00\x00\x01B\x00\x00\x01") == ((2, 5), (6, 10), (11, 14))
+    assert f(b"xx\x00\x00\x01A\x00\x00\x00\x01B\x00\x00\x01") == (
+        (2, 5),
+        (6, 10),
+        (11, 14),
+    )
     # Adjacent codes (empty NAL between them).
     assert f(b"\x00\x00\x01\x00\x00\x01A") == ((0, 3), (3, 6))
     # A 4-byte code is one code, not a zero plus a 3-byte code.
@@ -1005,7 +1218,9 @@ def test_annex_b_start_codes_matches_reference_on_random_streams(
     alphabet = b"\x00\x00\x00\x01\x01ab"
     for _ in range(500):
         blob = bytes(rng.choice(alphabet) for _ in range(rng.randint(0, 80)))
-        assert oak_camera_module._annex_b_start_codes(blob) == _reference_start_codes(blob), blob
+        assert oak_camera_module._annex_b_start_codes(blob) == _reference_start_codes(
+            blob
+        ), blob
 
 
 # ---------------------------------------------------------------------------

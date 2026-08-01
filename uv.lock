@@ -1265,7 +1265,7 @@ requires-dist = [
     { name = "bleak", marker = "extra == 'ble'", specifier = ">=0.21" },
     { name = "bleak", marker = "extra == 'camera'", specifier = ">=0.21" },
     { name = "depthai", marker = "extra == 'all'", specifier = ">=3.0.0" },
-    { name = "depthai", marker = "extra == 'oak'", specifier = ">=3.0.0" },
+    { name = "depthai", marker = "extra == 'oak'", specifier = ">=2.30" },
     { name = "fastapi", specifier = ">=0.104.0" },
     { name = "fastapi", marker = "extra == 'multihost'", specifier = ">=0.104.0" },
     { name = "httpx", marker = "extra == 'all'", specifier = ">=0.25.0" },

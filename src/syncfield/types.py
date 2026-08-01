@@ -622,3 +622,14 @@ class SessionReport:
     chirp_stop_source: str | None = None
     session_id: str | None = None
     role: str | None = None
+
+
+@dataclass(frozen=True)
+class SegmentRotationReport:
+    """Result of sealing one directory while capture continues in the next."""
+
+    sealed_episode_dir: Path
+    next_episode_dir: Path
+    boundary_monotonic_ns: int
+    finalizations: tuple[FinalizationReport, ...]
+    artifacts_by_stream: dict[str, tuple[Any, ...]] = field(default_factory=dict)

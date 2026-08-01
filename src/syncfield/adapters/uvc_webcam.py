@@ -170,6 +170,12 @@ class UVCWebcamStream(StreamBase):
         # SampleEvents. ``connect()`` leaves this False so the preview
         # phase stays write-free; ``start_recording()`` flips it True.
         self._recording = False
+        # Serializes a single frame write against segment writer swaps.  The
+        # lock is held only for one encode/write operation; encoder close and
+        # container finalization always happen after releasing it.
+        self._recording_lock = threading.Lock()
+        self._prepared_encoder: Any = None
+        self._prepared_file_path: Path | None = None
 
         # Live preview support — the viewer reads ``latest_frame`` for
         # the stream card thumbnail. ``_frame_lock`` protects the
@@ -350,13 +356,79 @@ class UVCWebcamStream(StreamBase):
         self._last_at = None
         self._prev_capture_ns = None
         self._intervals_ns = []
-        self._encoder = VideoEncoder.open(
-            self._file_path,
-            width=self._width,
-            height=self._height,
-            fps=self._fps,
+        encoder = self._open_recording_encoder(self._file_path)
+        with self._recording_lock:
+            self._encoder = encoder
+            self._recording = True
+
+    def _open_recording_encoder(self, path: Path) -> Any:
+        return VideoEncoder.open(
+            path, width=self._width, height=self._height, fps=self._fps
         )
-        self._recording = True
+
+    def prepare_segment_rotation(self, next_output_dir: Path) -> None:
+        """Open the next encoder without disturbing the active segment."""
+        next_output_dir.mkdir(parents=True, exist_ok=True)
+        next_path = next_output_dir / f"{self._output_stem}.mp4"
+        encoder = self._open_recording_encoder(next_path)
+        self._prepared_encoder = encoder
+        self._prepared_file_path = next_path
+        if self._calibration is not None:
+            write_calibration_file(next_output_dir, self._output_stem, self._calibration)
+
+    def abort_segment_rotation(self) -> None:
+        encoder, self._prepared_encoder = self._prepared_encoder, None
+        self._prepared_file_path = None
+        if encoder is not None:
+            encoder.close()
+
+    def commit_segment_rotation(
+        self,
+        boundary_monotonic_ns: int,
+        swap_persistence: Any = None,
+        next_session_clock: SessionClock | None = None,
+    ) -> FinalizationReport:
+        """Swap encoders between frames, then close the sealed encoder."""
+        if self._prepared_encoder is None or self._prepared_file_path is None:
+            raise RuntimeError(f"[{self.id}] segment rotation was not prepared")
+        with self._recording_lock:
+            old_anchor = self._recording_anchor()
+            old_encoder = self._encoder
+            old_path = self._file_path
+            old_count = self._frame_count
+            old_first = self._first_at
+            old_last = self._last_at
+            old_intervals = self._intervals_ns
+            self._encoder = self._prepared_encoder
+            self._file_path = self._prepared_file_path
+            self._output_dir = self._file_path.parent
+            self._prepared_encoder = None
+            self._prepared_file_path = None
+            self._frame_count = 0
+            self._first_at = None
+            self._last_at = None
+            self._prev_capture_ns = None
+            self._intervals_ns = []
+            if swap_persistence is not None:
+                swap_persistence()
+            if next_session_clock is not None:
+                self._begin_recording_window(next_session_clock)
+        if old_encoder is not None:
+            old_encoder.close()
+        jitter_p95, jitter_p99 = compute_jitter_percentiles(old_intervals)
+        return FinalizationReport(
+            stream_id=self.id,
+            status="completed" if old_count > 0 else "failed",
+            frame_count=old_count,
+            file_path=old_path if old_count > 0 else None,
+            first_sample_at_ns=old_first,
+            last_sample_at_ns=old_last,
+            health_events=list(self._collected_health),
+            error=None if old_count > 0 else "No frames arrived during segment.",
+            jitter_p95_ns=jitter_p95,
+            jitter_p99_ns=jitter_p99,
+            recording_anchor=old_anchor,
+        )
 
     def _write_calibration_file(self) -> None:
         """Write ``{stem}.calibration.json`` if this camera has a calibration."""
@@ -366,10 +438,11 @@ class UVCWebcamStream(StreamBase):
 
     def stop_recording(self) -> FinalizationReport:
         """Flip recording off, close the encoder, emit the report."""
-        self._recording = False
-        if self._encoder is not None:
-            self._encoder.close()
-            self._encoder = None
+        with self._recording_lock:
+            self._recording = False
+            encoder, self._encoder = self._encoder, None
+        if encoder is not None:
+            encoder.close()
         jitter_p95, jitter_p99 = compute_jitter_percentiles(self._intervals_ns)
         return FinalizationReport(
             stream_id=self.id,
@@ -515,30 +588,9 @@ class UVCWebcamStream(StreamBase):
                 last_frame_monotonic = time.monotonic()
                 silent_restarts = 0
                 frame_bgr, capture_ns = item
-                if self._recording:
-                    # UVC has no device clock — pass None for device_ns.
-                    self._observe_first_frame(capture_ns, None)
-                    if self._prev_capture_ns is not None:
-                        self._intervals_ns.append(capture_ns - self._prev_capture_ns)
-                    self._prev_capture_ns = capture_ns
-
                 with self._frame_lock:
                     self._latest_frame = frame_bgr
-
-                if self._recording:
-                    if self._first_at is None:
-                        self._first_at = capture_ns
-                    self._last_at = capture_ns
-                    self._frame_count += 1
-                    if self._encoder is not None:
-                        self._encoder.write(frame_bgr)
-                    self._emit_sample(
-                        SampleEvent(
-                            stream_id=self.id,
-                            frame_number=self._frame_count - 1,
-                            capture_ns=capture_ns,
-                        )
-                    )
+                self._record_decoded_frame(frame_bgr, capture_ns)
         except Exception as exc:  # noqa: BLE001 - surface as health, don't crash the thread
             self._emit_health(
                 HealthEvent(
@@ -578,32 +630,12 @@ class UVCWebcamStream(StreamBase):
             try:
                 frame = next(frame_iter)
                 capture_ns = time.monotonic_ns()
-                if self._recording:
-                    # UVC has no device clock — pass None for device_ns.
-                    self._observe_first_frame(capture_ns, None)
-                    if self._prev_capture_ns is not None:
-                        self._intervals_ns.append(capture_ns - self._prev_capture_ns)
-                    self._prev_capture_ns = capture_ns
-
                 frame_bgr = frame.to_ndarray(format="bgr24")
 
                 with self._frame_lock:
                     self._latest_frame = frame_bgr
 
-                if self._recording:
-                    if self._first_at is None:
-                        self._first_at = capture_ns
-                    self._last_at = capture_ns
-                    self._frame_count += 1
-                    if self._encoder is not None:
-                        self._encoder.write(frame_bgr)
-                    self._emit_sample(
-                        SampleEvent(
-                            stream_id=self.id,
-                            frame_number=self._frame_count - 1,
-                            capture_ns=capture_ns,
-                        )
-                    )
+                self._record_decoded_frame(frame_bgr, capture_ns)
             except StopIteration:
                 # The decode generator ended cleanly. For a live capture
                 # device this means the container was closed / the device
@@ -679,29 +711,33 @@ class UVCWebcamStream(StreamBase):
                 continue
             consecutive_failures = 0
 
-            if self._recording:
-                self._observe_first_frame(capture_ns, None)
-                if self._prev_capture_ns is not None:
-                    self._intervals_ns.append(capture_ns - self._prev_capture_ns)
-                self._prev_capture_ns = capture_ns
-
             with self._frame_lock:
                 self._latest_frame = frame_bgr
+            self._record_decoded_frame(frame_bgr, capture_ns)
 
-            if self._recording:
-                if self._first_at is None:
-                    self._first_at = capture_ns
-                self._last_at = capture_ns
-                self._frame_count += 1
-                if self._encoder is not None:
-                    self._encoder.write(frame_bgr)
-                self._emit_sample(
-                    SampleEvent(
-                        stream_id=self.id,
-                        frame_number=self._frame_count - 1,
-                        capture_ns=capture_ns,
-                    )
+    def _record_decoded_frame(self, frame_bgr: Any, capture_ns: int) -> None:
+        """Write one decoded frame under the segment-swap critical section."""
+        with self._recording_lock:
+            if not self._recording:
+                return
+            self._observe_first_frame(capture_ns, None)
+            if self._prev_capture_ns is not None:
+                self._intervals_ns.append(capture_ns - self._prev_capture_ns)
+            self._prev_capture_ns = capture_ns
+            if self._first_at is None:
+                self._first_at = capture_ns
+            self._last_at = capture_ns
+            frame_number = self._frame_count
+            self._frame_count += 1
+            if self._encoder is not None:
+                self._encoder.write(frame_bgr)
+            self._emit_sample(
+                SampleEvent(
+                    stream_id=self.id,
+                    frame_number=frame_number,
+                    capture_ns=capture_ns,
                 )
+            )
 
     # ------------------------------------------------------------------
     # Live preview

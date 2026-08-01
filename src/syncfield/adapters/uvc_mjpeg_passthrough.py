@@ -144,20 +144,12 @@ class MJPEGPassthroughStream(UVCWebcamStream):
         ``stop_recording`` closes ``self._encoder`` duck-typed, so the
         muxer slots straight in.
         """
-        self._begin_recording_window(session_clock)
-        if self._thread is None or not self._thread.is_alive():
-            self.connect()
-        self._output_dir.mkdir(parents=True, exist_ok=True)
-        self._write_calibration_file()
-        self._frame_count = 0
-        self._first_at = None
-        self._last_at = None
-        self._prev_capture_ns = None
-        self._intervals_ns = []
-        self._encoder = PassthroughWriter.open(
-            self._file_path, template_stream=self._input.streams.video[0]
+        super().start_recording(session_clock)
+
+    def _open_recording_encoder(self, path: Path) -> Any:
+        return PassthroughWriter.open(
+            path, template_stream=self._input.streams.video[0]
         )
-        self._recording = True
 
     # -- capture loop -------------------------------------------------------
 
@@ -183,26 +175,29 @@ class MJPEGPassthroughStream(UVCWebcamStream):
                     continue
                 capture_ns = time.monotonic_ns()
 
-                if self._recording:
-                    self._observe_first_frame(capture_ns, None)
-                    if self._prev_capture_ns is not None:
-                        self._intervals_ns.append(capture_ns - self._prev_capture_ns)
-                    self._prev_capture_ns = capture_ns
+                with self._recording_lock:
+                    recording = self._recording
+                    if recording:
+                        self._observe_first_frame(capture_ns, None)
+                        if self._prev_capture_ns is not None:
+                            self._intervals_ns.append(capture_ns - self._prev_capture_ns)
+                        self._prev_capture_ns = capture_ns
 
-                    if self._first_at is None:
-                        self._first_at = capture_ns
-                    self._last_at = capture_ns
-                    self._frame_count += 1
-                    writer = self._encoder
-                    if writer is not None:
-                        writer.write_packet(packet, capture_ns)
-                    self._emit_sample(
-                        SampleEvent(
-                            stream_id=self.id,
-                            frame_number=self._frame_count - 1,
-                            capture_ns=capture_ns,
+                        if self._first_at is None:
+                            self._first_at = capture_ns
+                        self._last_at = capture_ns
+                        frame_number = self._frame_count
+                        self._frame_count += 1
+                        writer = self._encoder
+                        if writer is not None:
+                            writer.write_packet(packet, capture_ns)
+                        self._emit_sample(
+                            SampleEvent(
+                                stream_id=self.id,
+                                frame_number=frame_number,
+                                capture_ns=capture_ns,
+                            )
                         )
-                    )
 
                 self._maybe_decode_preview(packet)
             except StopIteration:

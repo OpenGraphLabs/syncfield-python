@@ -88,7 +88,7 @@ from syncfield.multihost.advertiser import SessionAdvertiser
 from syncfield.multihost.browser import SessionBrowser
 from syncfield.multihost.types import SessionAnnouncement
 from syncfield.roles import FollowerRole, LeaderRole
-from syncfield.stream import Stream
+from syncfield.stream import SegmentRotatableStream, Stream
 from syncfield.supervision import ReconnectPolicy, StreamSupervisor
 from syncfield.tone import ChirpPlayer, SyncToneConfig, create_default_player
 from syncfield.types import (
@@ -98,6 +98,7 @@ from syncfield.types import (
     HealthEvent,
     HealthEventKind,
     SampleEvent,
+    SegmentRotationReport,
     SensorSample,
     SessionReport,
     SessionState,
@@ -442,6 +443,7 @@ class SessionOrchestrator:
         # ``write()`` against a closed writer.
         self._sample_writers: Dict[str, SampleWriter] = {}
         self._sample_handler_active: Dict[str, List[bool]] = {}
+        self._sample_writer_lock = threading.Lock()
 
         # Health telemetry — constructed once per orchestrator instance,
         # started/stopped alongside each recording cycle.
@@ -556,6 +558,11 @@ class SessionOrchestrator:
         diagnostics). We log at WARNING so operators still see what
         went wrong if cleanup hit a snag.
         """
+        # ``concurrent.futures`` shuts down its global thread machinery before
+        # normal ``atexit`` handlers run. Mark this path explicitly so a
+        # last-chance recording stop never tries to create a ThreadPoolExecutor
+        # after that shutdown has begun.
+        self._atexit_teardown = True
         try:
             state = self._state
         except Exception:
@@ -2213,6 +2220,241 @@ class SessionOrchestrator:
             # and streams are live.
             self._maybe_update_advert_recording()
 
+    def rotate_recording_segment(
+        self,
+        on_segment_opened: Callable[[Path, SyncPoint], None] | None = None,
+    ) -> SegmentRotationReport:
+        """Seal the active episode and continue capture in a fresh directory.
+
+        Every stream must implement :class:`SegmentRotatableStream`. All next
+        writers are opened first; a prepare failure closes them and leaves the
+        current segment untouched. During commit, each adapter swaps its media
+        writer and the orchestrator's matching timestamp/sensor writer under
+        the same per-frame critical section. Container close/remux then runs on
+        the detached writers while new samples continue to land.
+        """
+        with self._lock:
+            if self._state is not SessionState.RECORDING:
+                raise RuntimeError(
+                    "rotate_recording_segment() requires RECORDING state; "
+                    f"current state is {self._state.value}"
+                )
+            streams = list(self._connected_streams)
+            unsupported = [s.id for s in streams if not isinstance(s, SegmentRotatableStream)]
+            if unsupported:
+                raise RuntimeError(
+                    "segment rotation unsupported by stream(s): " + ", ".join(unsupported)
+                )
+
+            sealed_dir = self._output_dir
+            sealed_sync_point = self._sync_point
+            sealed_chirp_start = self._chirp_start
+            sealed_chirp_stop = self._chirp_stop
+            assert sealed_sync_point is not None
+            next_dir = self._compute_initial_output_dir()
+            next_dir.mkdir(parents=True, exist_ok=False)
+            prepared_writers: dict[str, SampleWriter] = {}
+            try:
+                for stream in streams:
+                    writer = self._new_sample_writer(stream, next_dir)
+                    writer.open()
+                    prepared_writers[stream.id] = writer
+                with ThreadPoolExecutor(
+                    max_workers=max(1, len(streams)),
+                    thread_name_prefix="sf-segment-prepare",
+                ) as pool:
+                    futures = {
+                        pool.submit(stream.prepare_segment_rotation, next_dir): stream
+                        for stream in streams
+                    }
+                    first_error: BaseException | None = None
+                    for future, stream in futures.items():
+                        try:
+                            future.result()
+                        except BaseException as exc:  # noqa: BLE001
+                            if first_error is None:
+                                first_error = exc
+                    if first_error is not None:
+                        raise first_error
+            except BaseException:
+                # Abort every stream, including the one whose prepare raised:
+                # it may have opened some (but not all) next-segment handles
+                # before surfacing the error. The contract requires abort to be
+                # idempotent precisely for this rollback path.
+                for stream in streams:
+                    try:
+                        stream.abort_segment_rotation()
+                    except Exception:
+                        logger.exception("segment abort failed for %s", stream.id)
+                for writer in prepared_writers.values():
+                    try:
+                        writer.close()
+                    except Exception:
+                        pass
+                import shutil
+
+                shutil.rmtree(next_dir, ignore_errors=True)
+                raise
+
+            boundary_ns = time.monotonic_ns()
+            next_sync_point = SyncPoint.create_now(self._host_id)
+            next_session_clock = SessionClock(
+                sync_point=next_sync_point, recording_armed_ns=boundary_ns
+            )
+            old_writers: dict[str, SampleWriter] = {}
+            swapped_ids: set[str] = set()
+            swap_condition = threading.Condition()
+
+            def _swap_persistence(stream_id: str) -> None:
+                with self._sample_writer_lock:
+                    old = self._sample_writers.get(stream_id)
+                    if old is None:
+                        raise RuntimeError(f"missing active sample writer for {stream_id}")
+                    old_writers[stream_id] = old
+                    self._sample_writers[stream_id] = prepared_writers.pop(stream_id)
+                with swap_condition:
+                    swapped_ids.add(stream_id)
+                    swap_condition.notify_all()
+
+            reports_by_id: dict[str, FinalizationReport] = {}
+            artifacts_by_stream: dict[str, tuple[Any, ...]] = {}
+            commit_error: BaseException | None = None
+
+            def _commit(stream: SegmentRotatableStream) -> FinalizationReport:
+                return stream.commit_segment_rotation(
+                    boundary_ns,
+                    lambda: _swap_persistence(stream.id),
+                    next_session_clock,
+                )
+
+            with ThreadPoolExecutor(
+                max_workers=max(1, len(streams)),
+                thread_name_prefix="sf-segment-commit",
+            ) as pool:
+                futures = {pool.submit(_commit, stream): stream for stream in streams}
+
+                # commit() calls _swap_persistence inside the adapter's
+                # per-frame critical section, then may spend a long time
+                # closing/remuxing the detached segment. Arm the next
+                # directory as soon as EVERY swap has happened; otherwise an
+                # 80-second remux window would have live bytes but no sync
+                # point/recovery callback.
+                with swap_condition:
+                    while len(swapped_ids) < len(streams):
+                        if any(
+                            future.done() and future.exception() is not None
+                            for future in futures
+                        ):
+                            break
+                        swap_condition.wait(timeout=0.05)
+
+                all_swapped = len(swapped_ids) == len(streams)
+                if all_swapped:
+                    # Bound incident/log state to the same raw segment. Close
+                    # open incidents into the sealed log before switching.
+                    self.health.stop()
+                    if self._log_writer is not None:
+                        self._log_writer.log_event(
+                            {
+                                "kind": "segment_sealed",
+                                "at_ns": boundary_ns,
+                                "next_episode_dir": str(next_dir),
+                            }
+                        )
+                        self._log_writer.close()
+
+                    # Old persistence handles are no longer reachable by
+                    # callbacks once every stream signalled its atomic swap.
+                    for writer in old_writers.values():
+                        try:
+                            writer.close()
+                        except Exception:
+                            logger.exception("closing sealed segment writer failed")
+
+                    self._last_episode_dir = sealed_dir
+                    self._output_dir = next_dir
+                    self._episode_dir_created = True
+                    self._sync_point = next_sync_point
+                    self._session_clock = next_session_clock
+                    self._chirp_start = None
+                    self._chirp_stop = None
+                    self._rebind_stream_output_dirs()
+                    write_sync_point(next_sync_point, next_dir)
+                    self._log_writer = SessionLogWriter(next_dir)
+                    self._log_writer.open()
+                    self._log_writer.log_event(
+                        {
+                            "kind": "segment_opened",
+                            "at_ns": boundary_ns,
+                            "previous_episode_dir": str(sealed_dir),
+                        }
+                    )
+                    self.health.start()
+                    if on_segment_opened is not None:
+                        try:
+                            on_segment_opened(next_dir, next_sync_point)
+                        except BaseException as exc:  # noqa: BLE001
+                            logger.exception("segment-opened callback failed")
+                            if commit_error is None:
+                                commit_error = exc
+
+                for future, stream in futures.items():
+                    try:
+                        reports_by_id[stream.id] = future.result()
+                        getter = getattr(stream, "recorded_artifacts", None)
+                        if callable(getter):
+                            artifacts_by_stream[stream.id] = tuple(getter())
+                    except BaseException as exc:  # noqa: BLE001
+                        logger.exception("segment commit failed for %s", stream.id)
+                        if commit_error is None:
+                            commit_error = exc
+
+            if commit_error is not None:
+                for stream in streams:
+                    try:
+                        stream.abort_segment_rotation()
+                    except Exception:
+                        logger.exception("post-commit abort failed for %s", stream.id)
+
+            # On the normal path old writers were closed immediately after the
+            # swap. This cleanup covers a partial/failed commit.
+            for writer in old_writers.values():
+                try:
+                    writer.close()
+                except Exception:
+                    logger.exception("closing sealed segment writer failed")
+            for writer in prepared_writers.values():
+                try:
+                    writer.close()
+                except Exception:
+                    pass
+
+            ordered_reports = tuple(
+                reports_by_id[s.id] for s in streams if s.id in reports_by_id
+            )
+            self._persist_session_artifacts(
+                list(ordered_reports),
+                output_dir=sealed_dir,
+                sync_point=sealed_sync_point,
+                use_current_chirps=False,
+                chirp_start=sealed_chirp_start,
+                chirp_stop=sealed_chirp_stop,
+            )
+
+            if commit_error is not None:
+                # A commit failure is ambiguous (the adapter may have swapped
+                # before finalization failed). Surface it so the host policy can
+                # perform a protective stop; never silently continue mixed data.
+                raise RuntimeError("segment commit failed; protective stop required") from commit_error
+
+            return SegmentRotationReport(
+                sealed_episode_dir=sealed_dir,
+                next_episode_dir=next_dir,
+                boundary_monotonic_ns=boundary_ns,
+                finalizations=ordered_reports,
+                artifacts_by_stream=artifacts_by_stream,
+            )
+
     # ------------------------------------------------------------------
     # Lifecycle — stop
     # ------------------------------------------------------------------
@@ -2465,15 +2707,18 @@ class SessionOrchestrator:
 
         Stream exceptions are converted to failed reports so that one
         broken stream cannot prevent the session from reaching a clean
-        ``STOPPED`` state. All finalize work for one stream happens
-        before moving on to the next.
+        ``STOPPED`` state. Stop is fanned out concurrently: an adapter may do
+        expensive container finalization after dropping its recording flag,
+        and running that serially used to leave later sensor streams writing
+        for the entire video remux (80 seconds after a 30-minute OAK capture).
+        Result ordering remains identical to ``_connected_streams``.
         """
-        finalizations: List[FinalizationReport] = []
-        for stream in self._connected_streams:
+
+        def _finalize_one(stream: Stream) -> FinalizationReport:
             try:
-                report = stream.stop_recording()
+                return stream.stop_recording()
             except Exception as exc:
-                report = FinalizationReport(
+                return FinalizationReport(
                     stream_id=stream.id,
                     status="failed",
                     frame_count=0,
@@ -2483,12 +2728,29 @@ class SessionOrchestrator:
                     health_events=[],
                     error=str(exc),
                 )
-            finalizations.append(report)
-        # Close persistence writers AFTER every adapter's capture loop
-        # has observed ``_recording = False`` via ``stop_recording()``.
-        # Doing it in this order means no sample writes race the
-        # file-close path even on adapters that queue events between
-        # the flag flip and the thread join.
+            finally:
+                # Live-capable sensors keep emitting preview samples after
+                # stop_recording() returns. Close this stream's persistence
+                # gate now; waiting for a slow video remux to finish appended
+                # minutes of post-stop tactile rows to otherwise valid files.
+                self._close_sample_writer(stream.id)
+
+        streams = list(self._connected_streams)
+        if streams and not getattr(self, "_atexit_teardown", False):
+            with ThreadPoolExecutor(
+                max_workers=len(streams),
+                thread_name_prefix="sf-stop-rec",
+            ) as pool:
+                futures = [pool.submit(_finalize_one, stream) for stream in streams]
+                finalizations = [future.result() for future in futures]
+        elif streams:
+            # ThreadPoolExecutor rejects new work during interpreter teardown.
+            # The atexit safety path still has to stop hardware, so degrade to
+            # sequential finalization only in that exceptional phase.
+            finalizations = [_finalize_one(stream) for stream in streams]
+        else:
+            finalizations = []
+        # Defensive cleanup for writers whose stream never entered the fan-out.
         self._close_sample_writers()
         return finalizations
 
@@ -2517,24 +2779,17 @@ class SessionOrchestrator:
         writer.
         """
         for stream in self._connected_streams:
-            writer: SampleWriter
-            # Name the timestamps/sensor file after ``output_name`` (the alias),
-            # matching the MP4 + calibration, so all of a stream's artifacts —
-            # and its manifest key below — share one consistent name.
-            output_name = getattr(stream, "output_name", None) or stream.id
-            if stream.kind == "sensor":
-                writer = SensorWriter(output_name, self._output_dir)
-            else:
-                writer = StreamWriter(output_name, self._output_dir)
+            writer = self._new_sample_writer(stream, self._output_dir)
             writer.open()
             active: List[bool] = [True]
-            stream.on_sample(self._make_sample_handler(writer, active))
-            self._sample_writers[stream.id] = writer
-            self._sample_handler_active[stream.id] = active
+            stream.on_sample(self._make_sample_handler(stream.id, active))
+            with self._sample_writer_lock:
+                self._sample_writers[stream.id] = writer
+                self._sample_handler_active[stream.id] = active
 
     def _make_sample_handler(
         self,
-        writer: SampleWriter,
+        stream_id: str,
         active: List[bool],
     ) -> Callable[[SampleEvent], None]:
         """Build the ``on_sample`` callback that persists events.
@@ -2547,40 +2802,42 @@ class SessionOrchestrator:
         host_id = self._host_id
 
         def _handle(event: SampleEvent) -> None:
-            if not active[0]:
-                return
             try:
-                clock_domain = event.clock_domain or host_id
-                if isinstance(writer, SensorWriter):
-                    writer.write(
-                        SensorSample(
-                            frame_number=event.frame_number,
-                            capture_ns=event.capture_ns,
-                            channels=event.channels or {},
-                            clock_source="host_monotonic",
-                            clock_domain=clock_domain,
-                            uncertainty_ns=event.uncertainty_ns,
-                            device_timestamp_ns=event.device_ns,
+                # Keep lookup + write in one critical section. Rotation swaps
+                # this stream's writer under the same lock while the adapter's
+                # per-frame lock is held, so a frame and its timestamp row can
+                # never land in different segment directories.
+                with self._sample_writer_lock:
+                    if not active[0]:
+                        return
+                    writer = self._sample_writers.get(stream_id)
+                    if writer is None:
+                        return
+                    clock_domain = event.clock_domain or host_id
+                    if isinstance(writer, SensorWriter):
+                        writer.write(
+                            SensorSample(
+                                frame_number=event.frame_number,
+                                capture_ns=event.capture_ns,
+                                channels=event.channels or {},
+                                clock_source="host_monotonic",
+                                clock_domain=clock_domain,
+                                uncertainty_ns=event.uncertainty_ns,
+                                device_timestamp_ns=event.device_ns,
+                            )
                         )
-                    )
-                else:
-                    # Video streams use the FrameTimestamp schema —
-                    # which intentionally has no `channels` field.
-                    # Adapter-specific scalars (e.g. quest_native_ns
-                    # for Quest cameras) are forwarded as ``extras``
-                    # so they land as top-level keys in the JSONL row
-                    # alongside frame_number / capture_ns / etc.
-                    writer.write(
-                        FrameTimestamp(
-                            frame_number=event.frame_number,
-                            capture_ns=event.capture_ns,
-                            clock_source="host_monotonic",
-                            clock_domain=clock_domain,
-                            uncertainty_ns=event.uncertainty_ns,
-                            extras=dict(event.channels) if event.channels else {},
-                            device_timestamp_ns=event.device_ns,
+                    else:
+                        writer.write(
+                            FrameTimestamp(
+                                frame_number=event.frame_number,
+                                capture_ns=event.capture_ns,
+                                clock_source="host_monotonic",
+                                clock_domain=clock_domain,
+                                uncertainty_ns=event.uncertainty_ns,
+                                extras=dict(event.channels) if event.channels else {},
+                                device_timestamp_ns=event.device_ns,
+                            )
                         )
-                    )
             except Exception as exc:  # pragma: no cover - best-effort
                 logger.warning(
                     "sample writer for %s raised %s: %s",
@@ -2591,6 +2848,33 @@ class SessionOrchestrator:
 
         return _handle
 
+    @staticmethod
+    def _new_sample_writer(stream: Stream, output_dir: Path) -> SampleWriter:
+        output_name = getattr(stream, "output_name", None) or stream.id
+        if stream.kind == "sensor":
+            return SensorWriter(output_name, output_dir)
+        return StreamWriter(output_name, output_dir)
+
+    def _close_sample_writer(self, stream_id: str) -> None:
+        """Deactivate and close one stream writer after that stream stops."""
+
+        with self._sample_writer_lock:
+            active = self._sample_handler_active.pop(stream_id, None)
+            writer = self._sample_writers.pop(stream_id, None)
+            if active is not None:
+                active[0] = False
+        if writer is None:
+            return
+        try:
+            writer.close()
+        except Exception as exc:  # pragma: no cover - best-effort
+            logger.warning(
+                "closing sample writer for %s raised %s: %s",
+                stream_id,
+                type(exc).__name__,
+                exc,
+            )
+
     def _close_sample_writers(self) -> None:
         """Flush and close every per-stream sample writer.
 
@@ -2600,9 +2884,13 @@ class SessionOrchestrator:
         file handles. Swallows per-writer close errors so a single
         broken file cannot block the rest of the teardown.
         """
-        for active in self._sample_handler_active.values():
-            active[0] = False
-        for stream_id, writer in self._sample_writers.items():
+        with self._sample_writer_lock:
+            for active in self._sample_handler_active.values():
+                active[0] = False
+            writers = list(self._sample_writers.items())
+            self._sample_writers.clear()
+            self._sample_handler_active.clear()
+        for stream_id, writer in writers:
             try:
                 writer.close()
             except Exception as exc:  # pragma: no cover - best-effort
@@ -2612,12 +2900,16 @@ class SessionOrchestrator:
                     type(exc).__name__,
                     exc,
                 )
-        self._sample_writers.clear()
-        self._sample_handler_active.clear()
 
     def _persist_session_artifacts(
         self,
         finalizations: List[FinalizationReport],
+        *,
+        output_dir: Path | None = None,
+        sync_point: SyncPoint | None = None,
+        use_current_chirps: bool = True,
+        chirp_start: ChirpEmission | None = None,
+        chirp_stop: ChirpEmission | None = None,
     ) -> None:
         """Write ``sync_point.json`` and ``manifest.json``.
 
@@ -2635,7 +2927,11 @@ class SessionOrchestrator:
         ``leader_host_id`` are written for both leader and follower
         so the sync core can reconstruct the host relationship.
         """
-        assert self._sync_point is not None  # guaranteed by state check
+        target_dir = output_dir or self._output_dir
+        target_sync_point = sync_point or self._sync_point
+        assert target_sync_point is not None  # guaranteed by state check
+        start_emission = self._chirp_start if use_current_chirps else chirp_start
+        stop_emission = self._chirp_stop if use_current_chirps else chirp_stop
 
         role_str = self._role.kind if self._role is not None else None
         leader_host_id: Optional[str] = None
@@ -2643,22 +2939,22 @@ class SessionOrchestrator:
             leader_host_id = self._observed_leader.host_id
 
         chirp_spec = (
-            self._sync_tone.start_chirp if self._chirp_start is not None else None
+            self._sync_tone.start_chirp if start_emission is not None else None
         )
         write_sync_point(
-            self._sync_point,
-            self._output_dir,
+            target_sync_point,
+            target_dir,
             chirp_start_ns=(
-                self._chirp_start.best_ns if self._chirp_start is not None else None
+                start_emission.best_ns if start_emission is not None else None
             ),
             chirp_stop_ns=(
-                self._chirp_stop.best_ns if self._chirp_stop is not None else None
+                stop_emission.best_ns if stop_emission is not None else None
             ),
             chirp_start_source=(
-                self._chirp_start.source if self._chirp_start is not None else None
+                start_emission.source if start_emission is not None else None
             ),
             chirp_stop_source=(
-                self._chirp_stop.source if self._chirp_stop is not None else None
+                stop_emission.source if stop_emission is not None else None
             ),
             chirp_spec=chirp_spec,
             session_id=self.session_id,
@@ -2699,7 +2995,7 @@ class SessionOrchestrator:
         write_manifest(
             self._host_id,
             streams_dict,
-            self._output_dir,
+            target_dir,
             session_id=self.session_id,
             role=role_str,
             leader_host_id=leader_host_id,

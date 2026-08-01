@@ -61,7 +61,7 @@ from syncfield.calibration import (
     CameraCalibration,
     write_calibration_file,
 )
-from syncfield.stream import Stream, StreamBase
+from syncfield.stream import SegmentRotatableStream, Stream, StreamBase
 from syncfield.supervision import ReconnectPolicy, StreamSupervisor
 from syncfield.tone import ChirpSpec, SyncToneConfig
 from syncfield.types import (
@@ -71,6 +71,7 @@ from syncfield.types import (
     HealthEvent,
     HealthEventKind,
     SampleEvent,
+    SegmentRotationReport,
     SessionReport,
     SessionState,
     StreamCapabilities,
@@ -86,10 +87,12 @@ __all__ = [
     "SessionClock",
     "SessionState",
     "SessionReport",
+    "SegmentRotationReport",
     "FinalizationReport",
     # Stream SPI + capabilities
     "Stream",
     "StreamBase",
+    "SegmentRotatableStream",
     "StreamCapabilities",
     "StreamKind",
     "SampleEvent",
