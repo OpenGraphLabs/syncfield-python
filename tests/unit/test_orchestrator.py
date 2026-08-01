@@ -3,16 +3,18 @@
 from __future__ import annotations
 
 import json
+import threading
 from typing import TYPE_CHECKING
 from unittest.mock import MagicMock
 
 import pytest
 
+import syncfield.orchestrator as orchestrator_module
 from syncfield.clock import SessionClock
 from syncfield.orchestrator import SessionOrchestrator
 from syncfield.testing import FakeStream
 from syncfield.tone import ChirpPlayer, ChirpSpec, SyncToneConfig
-from syncfield.types import ChirpEmission, HealthEventKind, SessionState
+from syncfield.types import ChirpEmission, FinalizationReport, HealthEventKind, SessionState
 
 if TYPE_CHECKING:
     from syncfield.multihost.types import SessionAnnouncement
@@ -140,6 +142,118 @@ class _DeviceKeyedFakeStream(FakeStream):
     @property
     def device_key(self):
         return self._device_key
+
+
+class _RotatableFakeStream(FakeStream):
+    def __init__(self, id: str, *, fail_prepare: bool = False):
+        super().__init__(id)
+        self.fail_prepare = fail_prepare
+        self.prepared_dir = None
+        self.finalize_gate = None
+
+    def prepare_segment_rotation(self, next_output_dir):
+        if self.fail_prepare:
+            raise RuntimeError("prepared writer failed")
+        self.prepared_dir = next_output_dir
+
+    def abort_segment_rotation(self):
+        self.prepared_dir = None
+
+    def commit_segment_rotation(
+        self, boundary_monotonic_ns, swap_persistence=None, next_session_clock=None
+    ):
+        assert self.prepared_dir is not None
+        report = FinalizationReport(
+            stream_id=self.id,
+            status="completed",
+            frame_count=self._frame_count,
+            file_path=None,
+            first_sample_at_ns=self._first_at,
+            last_sample_at_ns=self._last_at,
+            health_events=[],
+            error=None,
+        )
+        self._frame_count = 0
+        self._first_at = None
+        self._last_at = None
+        if swap_persistence is not None:
+            swap_persistence()
+        if self.finalize_gate is not None:
+            self.finalize_gate.wait(timeout=2)
+        self.prepared_dir = None
+        return report
+
+
+class TestSegmentRotation:
+    def test_seals_and_continues_without_crossing_timestamp_rows(self, tmp_path):
+        session = _session(tmp_path)
+        stream = _RotatableFakeStream("sensor")
+        session.add(stream)
+        session.start()
+        first_dir = session.output_dir
+        stream.push_sample(0, 100)
+
+        rotated = session.rotate_recording_segment()
+        stream.push_sample(0, 200)
+        session.stop()
+
+        first_rows = [
+            json.loads(line)
+            for line in (first_dir / "sensor.timestamps.jsonl").read_text().splitlines()
+        ]
+        second_rows = [
+            json.loads(line)
+            for line in (rotated.next_episode_dir / "sensor.timestamps.jsonl")
+            .read_text()
+            .splitlines()
+        ]
+        assert [row["capture_ns"] for row in first_rows] == [100]
+        assert [row["capture_ns"] for row in second_rows] == [200]
+        assert rotated.sealed_episode_dir == first_dir
+        assert rotated.finalizations[0].frame_count == 1
+
+    def test_prepare_failure_leaves_active_segment_writable(self, tmp_path):
+        session = _session(tmp_path)
+        stream = _RotatableFakeStream("sensor", fail_prepare=True)
+        session.add(stream)
+        session.start()
+        active_dir = session.output_dir
+        stream.push_sample(0, 100)
+
+        with pytest.raises(RuntimeError, match="prepared writer failed"):
+            session.rotate_recording_segment()
+        stream.push_sample(1, 200)
+        session.stop()
+
+        rows = [
+            json.loads(line)
+            for line in (active_dir / "sensor.timestamps.jsonl").read_text().splitlines()
+        ]
+        assert [row["capture_ns"] for row in rows] == [100, 200]
+
+    def test_next_segment_is_armed_before_slow_finalization_finishes(self, tmp_path):
+        session = _session(tmp_path)
+        stream = _RotatableFakeStream("sensor")
+        stream.finalize_gate = threading.Event()
+        session.add(stream)
+        session.start()
+        opened = threading.Event()
+        opened_dir = []
+
+        def on_opened(path, _sync_point):
+            opened_dir.append(path)
+            opened.set()
+
+        worker = threading.Thread(
+            target=lambda: session.rotate_recording_segment(on_opened), daemon=True
+        )
+        worker.start()
+        assert opened.wait(timeout=1), "next segment metadata waited for finalization"
+        assert worker.is_alive(), "test stream should still be finalizing the sealed segment"
+        assert (opened_dir[0] / "sync_point.json").is_file()
+        stream.finalize_gate.set()
+        worker.join(timeout=2)
+        assert not worker.is_alive()
 
 
 class TestAdd:
@@ -464,6 +578,81 @@ class TestStop:
         session.stop()
         assert fs1.stop_calls == 1
         assert fs2.stop_calls == 1
+
+    def test_stop_recording_is_fanned_out_concurrently(self, tmp_path):
+        """A slow video finalizer must not extend another sensor's capture."""
+        barrier = threading.Barrier(2, timeout=1.0)
+
+        class BarrierStopStream(FakeStream):
+            def stop_recording(self):
+                barrier.wait()
+                return super().stop_recording()
+
+        session = _session(tmp_path)
+        session.add(BarrierStopStream("video"))
+        session.add(BarrierStopStream("sensor"))
+        session.start()
+        report = session.stop()
+
+        assert [item.stream_id for item in report.finalizations] == ["video", "sensor"]
+        assert all(item.status == "completed" for item in report.finalizations)
+
+    def test_fast_sensor_writer_closes_before_slow_video_finalizer(self, tmp_path):
+        """Live tactile samples after stop must not leak in during video remux."""
+        sensor_stopped = threading.Event()
+        release_video = threading.Event()
+
+        class SlowVideo(FakeStream):
+            def stop_recording(self):
+                assert sensor_stopped.wait(timeout=1.0)
+                assert release_video.wait(timeout=1.0)
+                return super().stop_recording()
+
+        class LiveSensor(FakeStream):
+            def stop_recording(self):
+                report = super().stop_recording()
+                sensor_stopped.set()
+                return report
+
+        session = _session(tmp_path)
+        video = SlowVideo("video")
+        sensor = LiveSensor("sensor")
+        session.add(video)
+        session.add(sensor)
+        session.start()
+        sensor.push_sample(0, 100)
+
+        result = []
+        stop_thread = threading.Thread(target=lambda: result.append(session.stop()))
+        stop_thread.start()
+        assert sensor_stopped.wait(timeout=1.0)
+        sensor.push_sample(1, 200)  # live preview event after sensor stop
+        release_video.set()
+        stop_thread.join(timeout=2.0)
+
+        sensor_path = session.last_episode_dir / "sensor.timestamps.jsonl"
+        rows = [json.loads(line) for line in sensor_path.read_text().splitlines()]
+        assert [row["capture_ns"] for row in rows] == [100]
+        assert result
+
+    def test_atexit_stop_does_not_create_thread_pool(self, tmp_path, monkeypatch):
+        """Interpreter teardown must use the executor-free safety path."""
+
+        class RejectingExecutor:
+            def __init__(self, *args, **kwargs):
+                raise AssertionError("thread pool created during atexit teardown")
+
+        session = _session(tmp_path)
+        session.add(FakeStream("video"))
+        session.add(FakeStream("sensor"))
+        session.start()
+        session._atexit_teardown = True
+        monkeypatch.setattr(orchestrator_module, "ThreadPoolExecutor", RejectingExecutor)
+
+        report = session.stop()
+
+        assert [item.stream_id for item in report.finalizations] == ["video", "sensor"]
+        assert all(item.status == "completed" for item in report.finalizations)
 
     def test_stop_collects_finalization_reports(self, tmp_path):
         session = _session(tmp_path)

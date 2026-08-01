@@ -40,10 +40,13 @@ dependencies = [
 
 [project.optional-dependencies]
 ble = ["bleak>=0.21", "pyserial>=3.5"]  # pyserial: OGLO USB CDC wired transport
-# OakCameraStream uses depthai v3 for the pipeline and PyAV for the MP4
-# writer (also via _video_encoder, hence numpy). Install `syncfield[oak]`
-# for the full OAK capture path.
-oak = ["depthai>=3.0.0", "av>=12.0.0", "numpy>=1.21"]
+# OakCameraStream supports both DepthAI major lines and picks the pipeline
+# path from the installed version: depthai 2.x uses the legacy API with
+# DIRECT mono GRAY8 encoding (full native mono resolution, no ImageManip
+# ceiling — preferred on RVC2 boards), depthai 3.x uses the v3 API (required
+# for RVC4). PyAV writes the MP4s (also via _video_encoder, hence numpy).
+# Install `syncfield[oak]` for the full OAK capture path.
+oak = ["depthai>=2.30", "av>=12.0.0", "numpy>=1.21"]
 # mDNS-based multi-host session rendezvous (syncfield.multihost). Required
 # only when you want a leader/follower session discovered automatically
 # on the local network — single-host sessions do not need this.
@@ -99,6 +102,15 @@ exclude = [
 testpaths = ["tests"]
 pythonpath = ["src"]
 asyncio_mode = "auto"
+# The suite is dominated by wall-clock waits (reconnect backoffs, health
+# timers, mDNS fallbacks), not CPU: serially it runs ~50 minutes, under xdist
+# it completes in ~40 seconds with an identical failure set (measured
+# 2026-08-01, 1247 passed). Parallel is therefore the default everywhere —
+# use `-p no:xdist` only when debugging a single test interactively.
+# The per-test timeout converts any hung network/IO test into a visible
+# failure instead of a stuck CI job.
+addopts = ["-n", "auto"]
+timeout = 120
 markers = [
     "hardware: tests that require physical hardware (cameras, BLE devices)",
     "slow: integration tests that touch real IO (mDNS sockets, filesystem, etc.)",

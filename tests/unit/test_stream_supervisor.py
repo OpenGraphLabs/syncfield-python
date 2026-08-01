@@ -113,6 +113,7 @@ class TestStallDetection:
         sup, rec, clock = _supervisor(stall_grace_s=2.0)
         sup.register("oglo", target_hz=100.0)
         sup.note_connected("oglo")
+        sup.set_recording(True)
         sup.note_sample("oglo", clock())
         clock.advance(3.0)  # exceeds the 2s stall grace
         sup.tick()
@@ -122,6 +123,7 @@ class TestStallDetection:
         sup, rec, clock = _supervisor(stall_grace_s=2.0)
         sup.register("oglo", target_hz=100.0)
         sup.note_connected("oglo")
+        sup.set_recording(True)
         sup.note_sample("oglo", clock())
         clock.advance(3.0)
         sup.tick()
@@ -140,6 +142,7 @@ class TestStallDetection:
         sup, rec, clock = _supervisor(stall_grace_s=2.0)
         sup.register("oglo", target_hz=100.0)
         sup.note_connected("oglo")
+        sup.set_recording(True)
         sup.note_sample("oglo", clock())
         clock.advance(3.0)
         sup.tick()
@@ -148,10 +151,20 @@ class TestStallDetection:
         sup.note_sample("oglo", clock())
         assert sup.status("oglo").state is StreamConnectionState.CONNECTED
 
-    def test_connected_but_never_streamed_stalls_after_no_data_grace(self):
+    def test_preview_phase_without_samples_does_not_stall(self):
         sup, rec, clock = _supervisor(no_data_grace_s=30.0)
         sup.register("cam", target_hz=30.0)
         sup.note_connected("cam")  # no sample ever
+        clock.advance(31.0)
+        sup.tick()
+        assert sup.status("cam").state is StreamConnectionState.CONNECTED
+
+    def test_recording_but_never_streamed_stalls_after_no_data_grace(self):
+        sup, rec, clock = _supervisor(no_data_grace_s=30.0)
+        sup.register("cam", target_hz=30.0)
+        sup.note_connected("cam")
+        clock.advance(300.0)  # a long preview must not consume record grace
+        sup.set_recording(True)
         clock.advance(31.0)
         sup.tick()
         assert sup.status("cam").state is StreamConnectionState.STALLED
@@ -289,8 +302,14 @@ class TestStallEscalation:
             max_attempts=3, initial_backoff_s=0.0, reconnect_on_stall=True
         )
         sup, rec, clock = _supervisor(policy=policy, stall_grace_s=2.0)
-        sup.register("oglo", target_hz=100.0, is_removable=True)
+        sup.register(
+            "oglo",
+            target_hz=100.0,
+            is_removable=True,
+            supports_recording_reconnect=True,
+        )
         sup.note_connected("oglo")
+        sup.set_recording(True)
         sup.note_sample("oglo", clock())
         clock.advance(3.0)
         sup.tick()  # -> STALLED, and because reconnect_on_stall, escalates
@@ -301,6 +320,7 @@ class TestStallEscalation:
         sup, rec, clock = _supervisor(policy=policy, stall_grace_s=2.0)
         sup.register("oglo", target_hz=100.0, is_removable=True)
         sup.note_connected("oglo")
+        sup.set_recording(True)
         sup.note_sample("oglo", clock())
         clock.advance(3.0)
         sup.tick()

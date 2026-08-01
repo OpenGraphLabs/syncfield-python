@@ -25,7 +25,10 @@ import pytest
 
 av = pytest.importorskip("av")
 
-from syncfield.adapters._video_encoder import remux_h264_to_mp4
+from syncfield.adapters._video_encoder import (
+    remux_h264_to_mp4,
+    remux_h264_to_mp4_isolated,
+)
 
 
 pytestmark = pytest.mark.skipif(
@@ -82,11 +85,10 @@ def test_remux_round_trip_produces_playable_mp4(tmp_path: Path) -> None:
     assert mp4_path.exists(), "remux did not produce an mp4 file"
     assert mp4_path.stat().st_size > 0, "remuxed mp4 is empty"
 
-    # Re-open the MP4 and count demuxed packets. libx264 may emit a
-    # slightly different frame count than the nominal n_frames (SPS/PPS,
-    # B-frames, encoder flush behaviour), so we just require that at
-    # least half survived — enough to prove the mux succeeded and the
-    # bitstream is parseable.
+    # Re-open the MP4 and verify both frame count and timebase. In particular,
+    # raw H.264 packet.duration arrives in the demuxer's timebase and must be
+    # overwritten along with PTS/DTS; otherwise the final packet alone adds
+    # ~1.3 s to every 30 fps clip.
     container = av.open(str(mp4_path), mode="r")
     try:
         video_stream = container.streams.video[0]
@@ -97,9 +99,24 @@ def test_remux_round_trip_produces_playable_mp4(tmp_path: Path) -> None:
             for packet in container.demux(video_stream)
             if packet.dts is not None
         )
+        duration_s = float(video_stream.duration * video_stream.time_base)
     finally:
         container.close()
 
-    assert demuxed >= n_frames // 2, (
-        f"remuxed mp4 demuxed only {demuxed} packets from {n_frames} input frames"
-    )
+    assert demuxed == n_frames
+    assert duration_s == pytest.approx(n_frames / fps, abs=1 / fps)
+
+
+def test_isolated_remux_worker_produces_playable_mp4(tmp_path: Path) -> None:
+    h264_path = tmp_path / "sample.h264"
+    mp4_path = tmp_path / "sample.mp4"
+    _write_fake_h264(h264_path, width=160, height=120, fps=30, n_frames=15)
+
+    remux_h264_to_mp4_isolated(h264_path, mp4_path, fps=30.0)
+
+    container = av.open(str(mp4_path), mode="r")
+    try:
+        stream = container.streams.video[0]
+        assert sum(1 for packet in container.demux(stream) if packet.dts is not None) == 15
+    finally:
+        container.close()

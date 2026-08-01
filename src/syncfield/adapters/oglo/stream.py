@@ -212,12 +212,15 @@ class OgloTactileStream(StreamBase):
 
         # Recording state — primary taxel stream.
         self._recording = False
+        self._recording_lock = threading.RLock()
         self._frame_count = 0
         self._first_at: Optional[int] = None
         self._last_at: Optional[int] = None
 
         # Derived wrist-IMU substream.
         self._imu_writer: Optional[SensorWriter] = None
+        self._prepared_imu_writer: Optional[SensorWriter] = None
+        self._prepared_output_dir: Optional[Path] = None
         self._imu_lock = threading.Lock()
         self._imu_frame_count = 0
         self._imu_path = self._output_dir / f"{id}.imu.jsonl"
@@ -349,8 +352,9 @@ class OgloTactileStream(StreamBase):
         The BLE session stays live so the viewer plot keeps updating and the
         operator can record again without rescanning.
         """
-        self._recording = False
-        self._close_imu_writer()
+        with self._recording_lock:
+            self._recording = False
+            self._close_imu_writer()
         return FinalizationReport(
             stream_id=self.id,
             status="completed",
@@ -361,6 +365,83 @@ class OgloTactileStream(StreamBase):
             health_events=list(self._collected_health),
             error=None,
             recording_anchor=self._recording_anchor(),
+        )
+
+    def prepare_segment_rotation(self, next_output_dir: Path) -> None:
+        next_output_dir.mkdir(parents=True, exist_ok=True)
+        writer = SensorWriter(f"{self.id}.imu", next_output_dir)
+        writer.open()
+        self._prepared_imu_writer = writer
+        self._prepared_output_dir = next_output_dir
+
+        from syncfield.oglo_calibration import oglo_side_document
+
+        doc = oglo_side_document(self._calibration, self._hand)
+        if doc is not None:
+            (next_output_dir / f"{self.id}.calibration.json").write_text(
+                json.dumps(doc, indent=2), encoding="utf-8"
+            )
+
+    def abort_segment_rotation(self) -> None:
+        writer, self._prepared_imu_writer = self._prepared_imu_writer, None
+        self._prepared_output_dir = None
+        if writer is not None:
+            writer.close()
+
+    def commit_segment_rotation(
+        self,
+        boundary_monotonic_ns: int,
+        swap_persistence: Any = None,
+        next_session_clock: SessionClock | None = None,
+    ) -> FinalizationReport:
+        if self._prepared_imu_writer is None or self._prepared_output_dir is None:
+            raise RuntimeError(f"[{self.id}] segment rotation was not prepared")
+        with self._recording_lock:
+            old_anchor = self._recording_anchor()
+            with self._imu_lock:
+                old_writer = self._imu_writer
+                old_imu_path = self._imu_path
+                old_imu_count = self._imu_frame_count
+                self._imu_writer = self._prepared_imu_writer
+                self._output_dir = self._prepared_output_dir
+                self._imu_path = self._output_dir / f"{self.id}.imu.jsonl"
+                self._prepared_imu_writer = None
+                self._prepared_output_dir = None
+                self._imu_frame_count = 0
+            old_count = self._frame_count
+            old_first = self._first_at
+            old_last = self._last_at
+            self._frame_count = 0
+            self._first_at = None
+            self._last_at = None
+            if swap_persistence is not None:
+                swap_persistence()
+            if next_session_clock is not None:
+                self._begin_recording_window(next_session_clock)
+        if old_writer is not None:
+            old_writer.close()
+        self._recorded_artifacts = (
+            (
+                OgloArtifact(
+                    stream_id=f"{self.id}.imu",
+                    kind="sensor",
+                    path=old_imu_path,
+                    frame_count=old_imu_count,
+                ),
+            )
+            if old_imu_count > 0
+            else ()
+        )
+        return FinalizationReport(
+            stream_id=self.id,
+            status="completed" if old_count > 0 else "failed",
+            frame_count=old_count,
+            file_path=None,
+            first_sample_at_ns=old_first,
+            last_sample_at_ns=old_last,
+            health_events=list(self._collected_health),
+            error=None if old_count > 0 else "No tactile samples arrived during segment.",
+            recording_anchor=old_anchor,
         )
 
     def disconnect(self) -> None:
@@ -684,28 +765,29 @@ class OgloTactileStream(StreamBase):
         device_ns = sample.device_ns
         channels = {labels[i]: int(v) for i, v in enumerate(sample.taxels)}
 
-        if self._recording:
-            self._observe_first_frame(recv_ns, device_ns)
-            if self._first_at is None:
-                self._first_at = recv_ns
-            self._last_at = recv_ns
-            self._frame_count += 1
-            frame_number = self._frame_count - 1
-        else:
-            frame_number = -1
+        with self._recording_lock:
+            if self._recording:
+                self._observe_first_frame(recv_ns, device_ns)
+                if self._first_at is None:
+                    self._first_at = recv_ns
+                self._last_at = recv_ns
+                self._frame_count += 1
+                frame_number = self._frame_count - 1
+            else:
+                frame_number = -1
 
-        self._emit_sample(
-            SampleEvent(
-                stream_id=self.id,
-                frame_number=frame_number,
-                capture_ns=recv_ns,
-                channels=channels,
-                uncertainty_ns=500_000,
-                device_ns=device_ns,
+            self._emit_sample(
+                SampleEvent(
+                    stream_id=self.id,
+                    frame_number=frame_number,
+                    capture_ns=recv_ns,
+                    channels=channels,
+                    uncertainty_ns=500_000,
+                    device_ns=device_ns,
+                )
             )
-        )
-        if sample.imu is not None:
-            self._handle_imu(sample.imu, recv_ns, device_ns)
+            if sample.imu is not None:
+                self._handle_imu(sample.imu, recv_ns, device_ns)
 
     def _handle_payload(self, payload: bytes) -> None:
         """Decode one packed12 v5 packet into taxel + IMU samples."""
@@ -736,29 +818,29 @@ class OgloTactileStream(StreamBase):
             device_ns = sample.device_ns
             channels = {labels[i]: int(v) for i, v in enumerate(sample.taxels)}
 
-            if self._recording:
-                self._observe_first_frame(recv_ns, device_ns)
-                if self._first_at is None:
-                    self._first_at = recv_ns
-                self._last_at = recv_ns
-                self._frame_count += 1
-                frame_number = self._frame_count - 1
-            else:
-                frame_number = -1
+            with self._recording_lock:
+                if self._recording:
+                    self._observe_first_frame(recv_ns, device_ns)
+                    if self._first_at is None:
+                        self._first_at = recv_ns
+                    self._last_at = recv_ns
+                    self._frame_count += 1
+                    frame_number = self._frame_count - 1
+                else:
+                    frame_number = -1
 
-            self._emit_sample(
-                SampleEvent(
-                    stream_id=self.id,
-                    frame_number=frame_number,
-                    capture_ns=recv_ns,
-                    channels=channels,
-                    uncertainty_ns=500_000,  # ~0.5 ms device-clock precision
-                    device_ns=device_ns,
+                self._emit_sample(
+                    SampleEvent(
+                        stream_id=self.id,
+                        frame_number=frame_number,
+                        capture_ns=recv_ns,
+                        channels=channels,
+                        uncertainty_ns=500_000,  # ~0.5 ms device-clock precision
+                        device_ns=device_ns,
+                    )
                 )
-            )
-
-            if sample.imu is not None:
-                self._handle_imu(sample.imu, recv_ns, device_ns)
+                if sample.imu is not None:
+                    self._handle_imu(sample.imu, recv_ns, device_ns)
 
     def _handle_imu(
         self,
@@ -771,23 +853,24 @@ class OgloTactileStream(StreamBase):
             self._imu_recent_ns.append(recv_ns)
         channels = {name: int(v) for name, v in zip(IMU_CHANNELS, imu)}
 
-        if self._recording:
-            frame_number = self._imu_frame_count
-            self._imu_frame_count += 1
-            with self._imu_lock:
-                writer = self._imu_writer
-                if writer is not None:
-                    writer.write(
-                        SensorSample(
-                            frame_number=frame_number,
-                            capture_ns=recv_ns,
-                            channels=channels,
-                            uncertainty_ns=500_000,
-                            device_timestamp_ns=device_ns,
+        with self._recording_lock:
+            if self._recording:
+                frame_number = self._imu_frame_count
+                self._imu_frame_count += 1
+                with self._imu_lock:
+                    writer = self._imu_writer
+                    if writer is not None:
+                        writer.write(
+                            SensorSample(
+                                frame_number=frame_number,
+                                capture_ns=recv_ns,
+                                channels=channels,
+                                uncertainty_ns=500_000,
+                                device_timestamp_ns=device_ns,
+                            )
                         )
-                    )
-        else:
-            frame_number = -1
+            else:
+                frame_number = -1
 
         self._emit_substream_sample(
             SampleEvent(

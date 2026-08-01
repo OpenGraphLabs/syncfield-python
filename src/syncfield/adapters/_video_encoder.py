@@ -15,6 +15,8 @@ All frames are assumed to be BGR24 (numpy ``uint8``, shape
 
 from __future__ import annotations
 
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 from typing import Optional
@@ -363,8 +365,79 @@ def remux_h264_to_mp4(
             packet.pts = pts
             packet.dts = pts
             packet.time_base = time_base
+            # The raw H.264 demuxer supplies duration in its own stream
+            # timebase (typically 40,000 at 1/1,200,000 for 30 fps). PyAV does
+            # not rescale that field when packet.time_base is replaced. Leaving
+            # it untouched therefore makes only the final sample 1.333 s long,
+            # so a 12 s / 357-frame OAK capture plays as 13.2 s. Set duration
+            # in the same synthesized timebase as PTS/DTS.
+            packet.duration = frame_duration
             pts += frame_duration
             output_container.mux(packet)
     finally:
         input_container.close()
         output_container.close()
+
+
+def remux_h264_to_mp4_isolated(
+    h264_path: str | Path,
+    mp4_path: str | Path,
+    *,
+    fps: float,
+    timeout_s: float = 900.0,
+) -> None:
+    """Run copy-remux in a child process so live capture keeps the GIL.
+
+    PyAV's raw H.264 demux loop can monopolize the interpreter for long
+    stretches on a Raspberry Pi when wrapping a 30-minute file. OAK capture
+    queues are drained by Python threads; performing that loop in-process
+    caused the *next* live segment to lose seconds of frames while the sealed
+    segment was being wrapped. A child process provides an actual scheduling
+    boundary while preserving the exact same remux implementation and MP4
+    contract.
+
+    This is intended for segment rotation, where another recording is live.
+    Ordinary final stop can continue to use :func:`remux_h264_to_mp4` directly.
+    """
+    source = Path(h264_path)
+    destination = Path(mp4_path)
+    worker = (
+        "import os,sys; "
+        "\ntry: os.nice(10)"
+        "\nexcept (AttributeError, OSError): pass"
+        "\nfrom syncfield.adapters._video_encoder import remux_h264_to_mp4; "
+        "remux_h264_to_mp4(sys.argv[1], sys.argv[2], fps=float(sys.argv[3]))"
+    )
+    command = [
+        sys.executable,
+        "-c",
+        worker,
+        str(source),
+        str(destination),
+        str(float(fps)),
+    ]
+    # On the Pi, remux reads and rewrites several GB on the same microSD that
+    # is accepting the next live segment. Idle-class I/O guarantees capture
+    # writes win; macOS/Windows simply use the child-process GIL isolation.
+    ionice = shutil.which("ionice") if sys.platform.startswith("linux") else None
+    if ionice is not None:
+        command = [ionice, "-c", "3", *command]
+    try:
+        proc = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+        )
+    except subprocess.TimeoutExpired as exc:
+        destination.unlink(missing_ok=True)
+        raise TimeoutError(
+            f"isolated H.264 remux exceeded {timeout_s:.0f}s: {source.name}"
+        ) from exc
+    if proc.returncode != 0:
+        destination.unlink(missing_ok=True)
+        detail = (proc.stderr or proc.stdout or "worker exited without detail").strip()
+        raise RuntimeError(
+            f"isolated H.264 remux failed for {source.name}: {detail[-500:]}"
+        )

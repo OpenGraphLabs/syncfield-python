@@ -183,6 +183,17 @@ class StreamSupervisor:
 
     def set_recording(self, is_recording: bool) -> None:
         with self._lock:
+            if is_recording and not self._recording:
+                # Stream samples belong to recording windows; CONNECTED is a
+                # preview/armed phase where an adapter may legitimately emit
+                # none (the Stream contract explicitly allows latest_frame
+                # instead). Start the no-data grace at the recording edge,
+                # never at an arbitrarily old device-connect timestamp.
+                now = self.now()
+                for rec in self._streams.values():
+                    if rec.state is StreamConnectionState.CONNECTED:
+                        rec.connected_at_ns = now
+                        rec.last_sample_ns = None
             self._recording = is_recording
 
     # -- lifecycle notes -------------------------------------------------
@@ -344,7 +355,8 @@ class StreamSupervisor:
     ) -> None:
         # Liveness: only rate-declaring streams opt into stall monitoring.
         if (
-            rec.state is StreamConnectionState.CONNECTED
+            self._recording
+            and rec.state is StreamConnectionState.CONNECTED
             and rec.target_hz is not None
         ):
             if rec.last_sample_ns is None:

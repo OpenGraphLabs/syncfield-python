@@ -2048,6 +2048,15 @@ wheels = [
 ]
 
 [[package]]
+name = "pyserial"
+version = "3.5"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/1e/7d/ae3f0a63f41e4d2f6cb66a5b57197850f919f59e558159a4dd3a818f5082/pyserial-3.5.tar.gz", hash = "sha256:3c77e014170dfffbd816e6ffc205e9842efb10be9f58ec16d3e8675b4925cddb", size = 159125, upload-time = "2020-11-23T03:59:15.045Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/07/bc/587a445451b253b285629263eb51c2d8e9bcea4fc97826266d186f96f558/pyserial-3.5-py2.py3-none-any.whl", hash = "sha256:c4451db6ba391ca6ca299fb3ec7bae67a5c55dde170964c7a14ceefec02f2cf0", size = 90585, upload-time = "2020-11-23T03:59:13.41Z" },
+]
+
+[[package]]
 name = "pytest"
 version = "8.4.2"
 source = { registry = "https://pypi.org/simple" }
@@ -2359,6 +2368,7 @@ all = [
 ble = [
     { name = "bleak", version = "1.1.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.10'" },
     { name = "bleak", version = "3.0.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.10'" },
+    { name = "pyserial" },
 ]
 camera = [
     { name = "aiohttp" },
@@ -2406,7 +2416,7 @@ requires-dist = [
     { name = "bleak", marker = "extra == 'ble'", specifier = ">=0.21" },
     { name = "bleak", marker = "extra == 'camera'", specifier = ">=0.21" },
     { name = "depthai", marker = "extra == 'all'", specifier = ">=3.0.0" },
-    { name = "depthai", marker = "extra == 'oak'", specifier = ">=3.0.0" },
+    { name = "depthai", marker = "extra == 'oak'", specifier = ">=2.30" },
     { name = "fastapi", specifier = ">=0.104.0" },
     { name = "fastapi", marker = "extra == 'multihost'", specifier = ">=0.104.0" },
     { name = "httpx", marker = "extra == 'all'", specifier = ">=0.25.0" },
@@ -2415,6 +2425,7 @@ requires-dist = [
     { name = "numpy", specifier = ">=1.21" },
     { name = "numpy", marker = "extra == 'oak'", specifier = ">=1.21" },
     { name = "pillow", specifier = ">=10.0.0" },
+    { name = "pyserial", marker = "extra == 'ble'", specifier = ">=3.5" },
     { name = "sounddevice", specifier = ">=0.4.6" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.24.0" },
     { name = "uvicorn", extras = ["standard"], marker = "extra == 'multihost'", specifier = ">=0.24.0" },
