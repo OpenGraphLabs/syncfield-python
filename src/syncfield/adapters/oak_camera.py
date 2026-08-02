@@ -1246,6 +1246,20 @@ class OakCameraStream(StreamBase):
                 mono.setBoardSocket(socket)
                 mono.setResolution(mono_enum)
                 mono.setFps(float(self._mono_fps))
+                # Cap mono auto-exposure: AE otherwise stretches toward the
+                # full 33 ms frame time indoors, which (a) smears fast head
+                # motion and (b) makes the exposure-dependent part of the
+                # frame timestamp wander by tens of ms — a constant VIO
+                # image_delay cannot track that, and downstream OKVIS2
+                # diverges under motion (measured on ep 8653d9d4). 8 ms keeps
+                # the wander under ~4 ms; AE compensates with gain.
+                try:
+                    mono.initialControl.setAutoExposureLimit(8000)
+                except Exception:  # noqa: BLE001
+                    logger.info(
+                        "OAK %s: setAutoExposureLimit unavailable; mono AE uncapped",
+                        self.id,
+                    )
                 if self._enable_hardware_frame_sync:
                     _apply_frame_sync(mono, "INPUT", self.id, socket_name)
                 # Direct GRAY8 encode: firmware converts to NV12 internally
@@ -1891,9 +1905,12 @@ def _build_calibration_summary(
     device_section: dict[str, Any] = {}
     for key, getter_name in (
         ("device_id", "getDeviceId"),
+        ("device_id", "getMxId"),  # v2 spelling; first successful getter wins
         ("name", "getDeviceName"),
         ("product", "getProductName"),
     ):
+        if key in device_section:
+            continue
         try:
             getter = getattr(device, getter_name, None)
             if callable(getter):
