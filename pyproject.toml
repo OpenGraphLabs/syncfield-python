@@ -23,7 +23,7 @@ classifiers = [
 # Default install ships the canonical first-run stack: a UVC webcam adapter,
 # the browser viewer, and the sounddevice-backed chirp / countdown player
 # (so the 3/2/1 ticks and start/stop chirps are audible out of the box).
-# Heavier / platform-specific adapters (BLE, OAK, off-host cameras,
+# Heavier / platform-specific adapters (BLE, OAK, OVISION, off-host cameras,
 # multi-host control plane) stay opt-in via the optional-dependencies
 # block below.
 dependencies = [
@@ -44,6 +44,9 @@ ble = ["bleak>=0.21", "pyserial>=3.5"]  # pyserial: OGLO USB CDC wired transport
 # for RVC4). PyAV writes the MP4s (also via _video_encoder, hence numpy).
 # Install `syncfield[oak]` for the full OAK capture path.
 oak = ["depthai>=2.30", "av>=12.0.0", "numpy>=1.21"]
+# OVISION per-unit flash calibration is a Kalibr YAML payload read through
+# the Linux UVC Extension Unit. Video/metadata parsing remains dependency-free.
+ovision = ["PyYAML>=6.0"]
 # mDNS-based multi-host session rendezvous (syncfield.multihost). Required
 # only when you want a leader/follower session discovered automatically
 # on the local network — single-host sessions do not need this.
@@ -70,6 +73,7 @@ all = [
     "depthai>=3.0.0",
     "zeroconf>=0.130",
     "httpx>=0.25.0",
+    "PyYAML>=6.0",
 ]
 
 [project.urls]
