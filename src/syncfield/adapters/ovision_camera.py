@@ -317,7 +317,11 @@ class OvisionCameraStream(StreamBase):
                             self._capture_error = (
                                 f"invalid OVISION live metadata: {exc}"
                             )
-                    self._queue_preview(encoded, is_keyframe)
+                # Preview decoding is a separate, bounded 2 fps daemon path.
+                # Keep it live during recording too: this only swaps an encoded
+                # keyframe reference here; decode/JPEG work never runs on the
+                # capture or writer thread and recorded packets stay untouched.
+                self._queue_preview(encoded, is_keyframe)
         except Exception as exc:  # noqa: BLE001
             self._capture_error = f"{type(exc).__name__}: {exc}"
             self._emit_health(HealthEvent(
