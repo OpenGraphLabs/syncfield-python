@@ -39,6 +39,7 @@ def test_schema6_manifest_controls_side_aware_taxel_labels(stream_module, tmp_pa
 
 def test_each_modality_has_independent_drop_detection(stream_module, tmp_path):
     stream = make_stream(stream_module, tmp_path)
+    stream._recording = True
     stream._handle_usb_packet(UsbTaggedPacket(TAG_TYPE_TACTILE, 10, 1, tuple(range(80))))
     stream._handle_usb_packet(UsbTaggedPacket(TAG_TYPE_IMU, 20, 1, tuple(range(6))))
     stream._handle_usb_packet(UsbTaggedPacket(TAG_TYPE_TACTILE, 12, 2, tuple(range(80))))
@@ -46,6 +47,14 @@ def test_each_modality_has_independent_drop_detection(stream_module, tmp_path):
     drops = [e for e in stream._collected_health if e.kind.value == "drop"]
     assert {e.data["modality"] for e in drops} == {"tactile", "imu"}
     assert all(e.data["missing"] == 1 for e in drops)
+
+
+def test_idle_sequence_gaps_do_not_pollute_recording_health(stream_module, tmp_path):
+    stream = make_stream(stream_module, tmp_path)
+    stream._handle_usb_packet(UsbTaggedPacket(TAG_TYPE_TACTILE, 10, 1, tuple(range(80))))
+    stream._handle_usb_packet(UsbTaggedPacket(TAG_TYPE_TACTILE, 12, 2, tuple(range(80))))
+
+    assert not [e for e in stream._collected_health if e.kind.value == "drop"]
 
 
 def test_substream_contract_includes_500hz_imu_and_125hz_mag(stream_module, tmp_path):

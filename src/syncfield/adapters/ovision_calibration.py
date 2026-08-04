@@ -1,8 +1,9 @@
 """Read and validate per-unit OVISION calibration over the Linux UVC XU.
 
-This is a narrow implementation of HAMPO's V3 customer protocol.  It exposes
-only read-only calibration and output-mode queries; firmware recovery and
-control mutation deliberately remain outside the capture adapter.
+This is a narrow implementation of HAMPO's V3 customer protocol.  It owns the
+low-level XU transport plus read-only calibration and output-mode queries.
+Production image controls live separately in :mod:`ovision_controls`; firmware
+recovery remains outside the capture adapter.
 """
 
 from __future__ import annotations

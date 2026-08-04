@@ -21,6 +21,10 @@ import av  # type: ignore[import-not-found]
 
 from syncfield.adapters._video_encoder import compute_jitter_percentiles
 from syncfield.adapters.ovision_calibration import OvisionCalibration, read_ovision_calibration
+from syncfield.adapters.ovision_controls import (
+    OvisionCaptureProfile,
+    configure_ovision_capture_profile,
+)
 from syncfield.adapters.ovision_metadata import (
     OvisionFrameMetadata,
     OvisionMetadataError,
@@ -120,6 +124,7 @@ class OvisionCameraStream(StreamBase):
         self._sinks: _SidecarSinks | None = None
         self._prepared: tuple[Path, PassthroughWriter, _SidecarSinks] | None = None
         self._calibration: OvisionCalibration | None = None
+        self._capture_profile: OvisionCaptureProfile | None = None
         self._calibration_document: dict[str, Any] | None = None
         self._thread: threading.Thread | None = None
         self._writer_thread: threading.Thread | None = None
@@ -180,7 +185,15 @@ class OvisionCameraStream(StreamBase):
             raise RuntimeError(
                 f"OVISION must use INTERNAL stereo FSYNC, got {calibration.output_mode}"
             )
+        capture_profile = configure_ovision_capture_profile(self._video_device)
+        logger.info(
+            "OVISION production image profile: exposure=%dus gain=%.3fx bitrate=%dkbps",
+            capture_profile.exposure_time_us,
+            capture_profile.gain_multiplier,
+            capture_profile.bitrate_kbps,
+        )
         document = calibration.capture_document(usb_serial=self._usb_serial)
+        document["capture_profile"] = capture_profile.capture_document()
         options = {
             "video_size": f"{self._width}x{self._height}",
             "framerate": str(int(round(self._fps))),
@@ -197,6 +210,7 @@ class OvisionCameraStream(StreamBase):
             self._input = None
             raise RuntimeError("OVISION did not negotiate 3840x1080 H.264")
         self._calibration = calibration
+        self._capture_profile = capture_profile
         self._calibration_document = document
 
     def connect(self) -> None:
