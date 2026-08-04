@@ -1,4 +1,4 @@
-"""OGLO 0.9.3 schema-6 USB adapter.
+"""OGLO 0.9.3+ schema-6 USB adapter.
 
 Production capture is wired-only and uses ``STREAM TAG ON``. Tactile, IMU and
 magnetometer packets have independent device timestamps and sequence counters;
@@ -8,7 +8,7 @@ the primary 80-taxel stream is orchestrator-written while the 500 Hz IMU and
 Design highlights:
 
 The connect handshake stops every legacy stream mode, reads ``GET CONFIG``,
-requires firmware 0.9.3/schema 6 and the expected hand, then waits for a valid
+requires firmware >=0.9.3/schema 6 and the expected hand, then waits for a valid
 TAG packet before reporting ready. Per-modality sequence gaps are health events.
 
 Requires the optional ``ble`` extra::
@@ -34,7 +34,7 @@ except ImportError as exc:  # pragma: no cover
     raise ImportError("OgloTactileStream requires the syncfield ble extra") from exc
 
 from syncfield.adapters.oglo.selection import GloveCandidate, select_glove
-from syncfield.adapters.oglo.manifest import OgloDeviceManifest
+from syncfield.adapters.oglo.manifest import OgloDeviceManifest, is_supported_firmware
 from syncfield.adapters.oglo.packet import OgloProtocolError, parse_v5
 from syncfield.adapters.oglo.usb_packet import (
     QUIET_COMMANDS,
@@ -144,7 +144,7 @@ class OgloTactileStream(StreamBase):
                 produces_file=False,
             ),
         )
-        # Firmware 0.9.3 production capture is USB CDC only.
+        # Firmware 0.9.3+ production capture is USB CDC only.
         self._serial_port = serial_port.strip() if isinstance(serial_port, str) and serial_port.strip() else None
         if self._serial_port is None:
             raise ValueError(
@@ -679,9 +679,10 @@ class OgloTactileStream(StreamBase):
                     continue
                 if line.startswith(b"#CONFIG "):
                     manifest = OgloDeviceManifest.from_json(line[len(b"#CONFIG "):].strip())
-                    if not manifest.fw_rev.startswith("0.9.3"):
+                    if not is_supported_firmware(manifest.fw_rev):
                         raise OgloProtocolError(
-                            f"OGLO wired capture requires firmware 0.9.3, got {manifest.fw_rev!r}"
+                            "OGLO wired capture requires stable firmware >=0.9.3 "
+                            f"with schema 6, got {manifest.fw_rev!r}"
                         )
                     if self._hand in ("left", "right") and manifest.side != self._hand:
                         raise OgloProtocolError(

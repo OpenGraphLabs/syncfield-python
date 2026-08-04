@@ -1,4 +1,4 @@
-"""OGLO 0.9.3 schema-6 wired tactile/inertial adapter.
+"""OGLO 0.9.3+ schema-6 wired tactile/inertial adapter.
 
 Public surface:
 

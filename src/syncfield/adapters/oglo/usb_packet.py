@@ -1,4 +1,4 @@
-"""OGLO firmware 0.9.3 schema-6 USB tagged-stream parser.
+"""OGLO firmware 0.9.3+ schema-6 USB tagged-stream parser.
 
 Each modality is independently framed and timestamped::
 

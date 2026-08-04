@@ -8,7 +8,7 @@ supported; anything else raises :class:`~syncfield.adapters.oglo.packet.OgloProt
 
 The firmware keeps this JSON lean (< 512 B); unknown keys are ignored, and the
 wire *format* is detected from the notify header flags byte, never from here.
-Emitted keys (``FW_REV 0.9.3``): ``device``, ``schema_ver``, ``serial``,
+Emitted keys (``FW_REV 0.9.3+``): ``device``, ``schema_ver``, ``serial``,
 ``side``, ``hw_rev``, ``fw_rev``, ``rate_hz``, ``samples_per_packet``,
 ``adc_bits``, ``stream_mode``, ``values_per_sample``, ``sample_order``,
 ``sample_shape``, ``channels`` (5 side-aware finger names), ``device_id``,
@@ -18,6 +18,7 @@ Emitted keys (``FW_REV 0.9.3``): ``device``, ``schema_ver``, ``serial``,
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, Tuple
 
@@ -26,10 +27,31 @@ from syncfield.adapters.oglo.packet import (
     OgloProtocolError,
 )
 
-__all__ = ["OgloDeviceManifest", "SUPPORTED_SCHEMA_VER"]
+__all__ = [
+    "MIN_SUPPORTED_FW_REV",
+    "OgloDeviceManifest",
+    "SUPPORTED_SCHEMA_VER",
+    "is_supported_firmware",
+]
 
 #: The only production config schema this adapter supports.
 SUPPORTED_SCHEMA_VER = 6
+
+# Tagged USB first shipped in 0.9.3. Later patch releases keep schema 6 and
+# the same wire contract; the current production golden is 0.9.8.
+MIN_SUPPORTED_FW_REV = (0, 9, 3)
+_FW_REV_PATTERN = re.compile(r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$")
+
+
+def is_supported_firmware(value: str) -> bool:
+    """Whether *value* is a stable schema-6 TAG firmware release.
+
+    Fail closed on malformed/prerelease labels. Wire compatibility is anchored
+    by ``schema_ver == 6``; the minimum rejects pre-TAG Rev-D firmware while
+    allowing validated patch releases such as the 0.9.8 golden image.
+    """
+    match = _FW_REV_PATTERN.fullmatch(value.strip())
+    return bool(match and tuple(int(part) for part in match.groups()) >= MIN_SUPPORTED_FW_REV)
 
 #: Firmware default matrix shape: 5 fingers x 4 rows x 4 cols.
 _DEFAULT_SAMPLE_SHAPE: Tuple[int, int, int] = (5, 4, 4)

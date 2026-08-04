@@ -1,4 +1,4 @@
-"""OGLO 0.9.3 schema-6 USB transport driven by fake serial."""
+"""OGLO 0.9.3+ schema-6 USB transport driven by fake serial."""
 
 import importlib
 import json
@@ -97,6 +97,27 @@ def test_connect_validates_config_and_enables_tag(oglo_usb):
     assert fake.closed
 
 
+def test_connect_accepts_current_0_9_8_golden(oglo_usb, monkeypatch):
+    module, _ = oglo_usb
+    original = _FakeSerial.readline
+
+    def current(self):
+        cfg = {
+            "device": "oglo", "schema_ver": 6, "side": "left",
+            "fw_rev": "0.9.8", "hw_rev": "RDR02_FLEX5_REV_D_TIA",
+        }
+        return b"#CONFIG " + json.dumps(cfg).encode() + b"\n"
+
+    monkeypatch.setattr(_FakeSerial, "readline", current)
+    stream = module.OgloTactileStream(
+        "tactile_left", serial_port="/dev/ttyACM1", hand="left"
+    )
+    stream.connect()
+    assert stream._manifest.fw_rev == "0.9.8"
+    stream.disconnect()
+    monkeypatch.setattr(_FakeSerial, "readline", original)
+
+
 def test_recording_persists_independent_tactile_imu_mag(oglo_usb, tmp_path):
     module, holder = oglo_usb
     stream = module.OgloTactileStream(
@@ -130,3 +151,18 @@ def test_rejects_wrong_firmware(oglo_usb, monkeypatch):
     with pytest.raises(Exception, match="0.9.3"):
         module.OgloTactileStream("x", serial_port="/dev/ttyACM1", hand="left").connect()
     monkeypatch.setattr(_FakeSerial, "readline", original)
+
+
+@pytest.mark.parametrize("fw_rev", ["", "0.9.3-rc1", "v0.9.8", "0.9"])
+def test_rejects_malformed_or_prerelease_firmware(oglo_usb, monkeypatch, fw_rev):
+    module, _ = oglo_usb
+
+    def invalid(self):
+        cfg = {"device": "oglo", "schema_ver": 6, "side": "left", "fw_rev": fw_rev}
+        return b"#CONFIG " + json.dumps(cfg).encode() + b"\n"
+
+    monkeypatch.setattr(_FakeSerial, "readline", invalid)
+    with pytest.raises(Exception, match=">=0.9.3"):
+        module.OgloTactileStream(
+            "x", serial_port="/dev/ttyACM1", hand="left"
+        ).connect()
