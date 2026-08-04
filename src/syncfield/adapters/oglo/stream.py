@@ -260,8 +260,15 @@ class OgloTactileStream(StreamBase):
         self._frame_count = 0
         self._first_at = None
         self._last_at = None
-        self._begin_recording_window(session_clock)
-        self._recording = True
+        # TAG sequence counters run while the live preview is connected.  Gaps
+        # from CDC bring-up or an earlier idle window are not recording loss and
+        # must never leak into the next episode's quality report.  Establish a
+        # fresh per-modality baseline atomically with the recording transition;
+        # the first packet in the window becomes that baseline.
+        with self._recording_lock:
+            self._next_expected_seq = {}
+            self._begin_recording_window(session_clock)
+            self._recording = True
 
     def _write_calibration_file(self) -> None:
         """Write ``{id}.calibration.json`` for this glove's authoritative side.
@@ -932,9 +939,12 @@ class OgloTactileStream(StreamBase):
         ))
 
     def _detect_drop(self, modality: str, seq_base: int, count: int, recv_ns: int) -> None:
-        """Emit a DROP health event on a gap in the device sequence counter."""
-        expected = self._next_expected_seq.get(modality)
-        if expected is not None and seq_base > expected:
+        """Emit recording-window DROP events from the device sequence counter."""
+        with self._recording_lock:
+            expected = self._next_expected_seq.get(modality)
+            recording = self._recording
+            self._next_expected_seq[modality] = seq_base + count
+        if recording and expected is not None and seq_base > expected:
             missing = seq_base - expected
             self._emit_health(
                 HealthEvent(
@@ -945,7 +955,6 @@ class OgloTactileStream(StreamBase):
                     data={"missing": missing, "seq_base": seq_base, "modality": modality},
                 )
             )
-        self._next_expected_seq[modality] = seq_base + count
 
     # ------------------------------------------------------------------
     # Discovery

@@ -141,6 +141,33 @@ def test_recording_persists_independent_tactile_imu_mag(oglo_usb, tmp_path):
     assert {a.stream_id for a in stream.recorded_artifacts()} == {"tactile_left.imu", "tactile_left.mag"}
 
 
+def test_drop_detection_is_scoped_to_recording_window(oglo_usb, tmp_path):
+    module, _ = oglo_usb
+    stream = module.OgloTactileStream(
+        "tactile_left", serial_port="/dev/ttyACM1", hand="left", output_dir=tmp_path
+    )
+    health = []
+    stream.on_health(health.append)
+    stream.connect()
+
+    # CDC startup/idle discontinuities are outside the sellable capture.
+    stream._detect_drop("tactile", 10, 1, 1_000)
+    stream._detect_drop("tactile", 100_000, 1, 2_000)
+    assert health == []
+
+    stream.start_recording(
+        SessionClock(sync_point=SyncPoint.create_now("pi5"), recording_armed_ns=1_000_000)
+    )
+    # start_recording resets the idle baseline; only an in-window gap is loss.
+    stream._detect_drop("tactile", 200_000, 1, 3_000)
+    stream._detect_drop("tactile", 200_002, 1, 4_000)
+    stream.stop_recording()
+    stream.disconnect()
+
+    assert len(health) == 1
+    assert health[0].data == {"missing": 1, "seq_base": 200_002, "modality": "tactile"}
+
+
 def test_rejects_wrong_firmware(oglo_usb, monkeypatch):
     module, _ = oglo_usb
     original = _FakeSerial.readline
