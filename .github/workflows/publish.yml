@@ -59,23 +59,33 @@ jobs:
             pr_number="$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/pulls" \
               --jq '[.[] | select(.merged_at != null)][0].number')"
           fi
-          test -n "$pr_number" && test "$pr_number" != "null"
-          pr_title="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$pr_number" --jq .title)"
+          if [ -n "$pr_number" ] && [ "$pr_number" != "null" ]; then
+            release_title="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$pr_number" --jq .title)"
+            source_marker="Source-PR: #$pr_number"
+          elif [ "$GITHUB_EVENT_NAME" = "push" ]; then
+            # Direct pushes to main are an explicitly supported emergency and
+            # hardware-bring-up path. Preserve the same idempotency guarantee
+            # as merged PRs without requiring a synthetic PR number.
+            release_title="$(git log -1 --format=%s "$GITHUB_SHA")"
+            source_marker="Source-Commit: $GITHUB_SHA"
+          else
+            echo "workflow_dispatch requires a merged PR number" >&2
+            exit 1
+          fi
 
-          source_pr="Source-PR: #$pr_number"
-          existing_commit="$(git log main --format='%H' --fixed-strings --grep="$source_pr" -1)"
+          existing_commit="$(git log main --format='%H' --fixed-strings --grep="$source_marker" -1)"
           if [ -n "$existing_commit" ]; then
             commit_sha="$existing_commit"
             version="$(git show "$existing_commit:pyproject.toml" | python -c 'import sys, tomllib; print(tomllib.loads(sys.stdin.read())["project"]["version"])')"
           else
-            version="$(python scripts/bump_version.py --title "$pr_title")"
+            version="$(python scripts/bump_version.py --title "$release_title")"
             uv lock
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git add pyproject.toml uv.lock
             git commit \
               -m "chore: release $version [skip ci]" \
-              -m "$source_pr"
+              -m "$source_marker"
             git push origin HEAD:main
             commit_sha="$(git rev-parse HEAD)"
           fi
