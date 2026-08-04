@@ -1,32 +1,11 @@
-"""Pure parser for the OGLO USB CDC-ACM binary frame (``STREAM BIN ON``).
+"""OGLO firmware 0.9.3 schema-6 USB tagged-stream parser.
 
-Separate from the BLE ``packed12_v5`` parser (``packet.py``) because the wire
-format is genuinely different: the USB frame carries **16-bit** taxels (not
-BLE's 12-bit packed pairs), a 2-byte magic, one sample per frame (not a batch),
-and a 17-byte IMU block that additionally carries fused roll/pitch. Firmware
-source of truth: ``oglo-hardware/firmware/OGLO-MT-RDR-02/oglo_rdr02_ble.ino``
-(``writeSerialBinaryFrame`` / ``putImuBlock``).
+Each modality is independently framed and timestamped::
 
-Wire format (little-endian), one frame per sample, ~92 Hz over USB CDC::
+    A5 5A | type:u8 | payload_len:u16le | seq:u32le | t_us:u32le | payload
 
-    +0    u8[2]   magic         0xAA 0x55
-    +2    u32     ts_us         device micros() (wraps ~71 min)
-    +6    80 x u16 taxels       raw 12-bit ADC in a 16-bit field (0..4095),
-                                finger,row,col order — same order as BLE
-    +166  8 x i16 imu           roll_cdeg, pitch_cdeg, ax, ay, az, gx, gy, gz
-    +182  u8      ok            1 = IMU sample valid
-    = 183 bytes
-
-The decoded sample reuses ``packet.OgloSample`` so everything downstream (the
-stream adapter's ``_handle_payload``, drop detection, the writer) is transport-
-agnostic: ``OgloSample.imu`` is the same 6-axis raw ``(ax..gz)`` tuple the BLE
-path produces. The USB-only fused ``(roll_cdeg, pitch_cdeg)`` is exposed on the
-richer ``UsbFrame`` for callers that want it, and dropped when narrowing to an
-``OgloSample``.
-
-No ``pyserial``/``asyncio`` dependency — the reader owns the socket; this
-module only turns bytes into samples, so the wire format is unit-testable in
-isolation, exactly like ``packet.py``.
+The parser deliberately accepts only the production v6 payload sizes.  A bad
+header is discarded up to the next magic; a partial frame remains buffered.
 """
 
 from __future__ import annotations
@@ -35,112 +14,101 @@ import struct
 from dataclasses import dataclass
 from typing import Iterator, Tuple
 
-from syncfield.adapters.oglo.packet import (
-    DEFAULT_VALUES_PER_SAMPLE,
-    OgloProtocolError,
-    OgloSample,
-)
+from syncfield.adapters.oglo.packet import OgloProtocolError
 
 __all__ = [
-    "USB_MAGIC",
-    "USB_FRAME_LEN",
-    "UsbFrame",
-    "parse_usb_frame",
-    "iter_usb_frames",
+    "TAG_MAGIC",
+    "TAG_HEADER_LEN",
+    "TAG_TYPE_TACTILE",
+    "TAG_TYPE_IMU",
+    "TAG_TYPE_MAG",
+    "UsbTaggedPacket",
+    "parse_usb_packet",
+    "iter_usb_packets",
     "STREAM_ON_COMMAND",
     "STREAM_OFF_COMMAND",
+    "QUIET_COMMANDS",
 ]
 
-#: Frame delimiter — the firmware writes this as the first two bytes.
-USB_MAGIC = b"\xAA\x55"
+TAG_MAGIC = b"\xA5\x5A"
+TAG_HEADER_LEN = 13
+TAG_TYPE_TACTILE = 1
+TAG_TYPE_IMU = 2
+TAG_TYPE_MAG = 3
 
-#: 2 (magic) + 4 (ts_us) + 80*2 (taxels) + 8*2 (imu) + 1 (ok).
-_TAXEL_OFF = 6
-_IMU_OFF = _TAXEL_OFF + DEFAULT_VALUES_PER_SAMPLE * 2  # 166
-USB_FRAME_LEN = _IMU_OFF + 8 * 2 + 1  # 183
+_PAYLOAD_LENGTHS = {TAG_TYPE_TACTILE: 160, TAG_TYPE_IMU: 12, TAG_TYPE_MAG: 6}
+_STRUCTS = {
+    TAG_TYPE_TACTILE: struct.Struct("<80H"),
+    TAG_TYPE_IMU: struct.Struct("<6h"),
+    TAG_TYPE_MAG: struct.Struct("<3h"),
+}
 
-#: The firmware commands that gate the binary stream (see the .ino command
-#: parser). Newline-terminated; send STREAM_ON after clearing any partial line.
-STREAM_ON_COMMAND = b"STREAM BIN ON\n"
-STREAM_OFF_COMMAND = b"STREAM BIN OFF\n"
-
-_TAXEL_STRUCT = struct.Struct(f"<{DEFAULT_VALUES_PER_SAMPLE}H")
-_IMU_STRUCT = struct.Struct("<8h")  # roll, pitch, ax, ay, az, gx, gy, gz
+STREAM_ON_COMMAND = b"STREAM TAG ON\n"
+STREAM_OFF_COMMAND = b"STREAM TAG OFF\n"
+QUIET_COMMANDS = b"\nSTREAM TAG OFF\nSTREAM BIN OFF\nSTREAM TAXEL OFF\n"
 
 
 @dataclass(frozen=True)
-class UsbFrame:
-    """One decoded USB binary frame — richer than ``OgloSample`` (adds fused
-    roll/pitch and the IMU-valid flag the USB firmware sends)."""
-
+class UsbTaggedPacket:
+    stream_type: int
+    seq: int
     device_us: int
-    taxels: Tuple[int, ...]
-    imu_raw: Tuple[int, int, int, int, int, int]  # ax, ay, az, gx, gy, gz
-    roll_cdeg: int
-    pitch_cdeg: int
-    imu_ok: bool
+    values: Tuple[int, ...]
 
-    def to_sample(self, seq: int) -> OgloSample:
-        """Narrow to the transport-agnostic ``OgloSample``. ``seq`` is supplied
-        by the caller because the USB frame carries no global sequence number
-        (unlike BLE's ``seq_base``); the reader counts frames instead."""
-        return OgloSample(
-            seq=seq,
-            device_us=self.device_us,
-            taxels=self.taxels,
-            imu=self.imu_raw if self.imu_ok else None,
+    @property
+    def modality(self) -> str:
+        return {TAG_TYPE_TACTILE: "tactile", TAG_TYPE_IMU: "imu", TAG_TYPE_MAG: "mag"}[self.stream_type]
+
+    @property
+    def device_ns(self) -> int:
+        return self.device_us * 1_000
+
+
+def parse_usb_packet(frame: bytes) -> UsbTaggedPacket:
+    if len(frame) < TAG_HEADER_LEN:
+        raise OgloProtocolError(f"USB tag frame shorter than {TAG_HEADER_LEN} bytes")
+    if frame[:2] != TAG_MAGIC:
+        raise OgloProtocolError(f"bad USB tag magic: {frame[:2].hex()}")
+    stream_type = frame[2]
+    payload_len = struct.unpack_from("<H", frame, 3)[0]
+    expected_len = _PAYLOAD_LENGTHS.get(stream_type)
+    if expected_len is None:
+        raise OgloProtocolError(f"unknown USB tag stream type {stream_type}")
+    if payload_len != expected_len:
+        raise OgloProtocolError(
+            f"USB tag {stream_type} payload must be {expected_len} bytes, got {payload_len}"
         )
+    if len(frame) != TAG_HEADER_LEN + payload_len:
+        raise OgloProtocolError(
+            f"USB tag frame must be {TAG_HEADER_LEN + payload_len} bytes, got {len(frame)}"
+        )
+    seq, device_us = struct.unpack_from("<II", frame, 5)
+    values = _STRUCTS[stream_type].unpack_from(frame, TAG_HEADER_LEN)
+    return UsbTaggedPacket(stream_type, seq, device_us, values)
 
 
-def parse_usb_frame(frame: bytes) -> UsbFrame:
-    """Parse one 183-byte frame (magic included). Raises ``OgloProtocolError``
-    on a wrong length or bad magic — the reader resyncs on the next magic."""
-    if len(frame) != USB_FRAME_LEN:
-        raise OgloProtocolError(f"USB frame must be {USB_FRAME_LEN} bytes, got {len(frame)}")
-    if frame[:2] != USB_MAGIC:
-        raise OgloProtocolError(f"bad USB frame magic: {frame[:2].hex()}")
-
-    (device_us,) = struct.unpack_from("<I", frame, 2)
-    taxels = _TAXEL_STRUCT.unpack_from(frame, _TAXEL_OFF)
-    roll, pitch, ax, ay, az, gx, gy, gz = _IMU_STRUCT.unpack_from(frame, _IMU_OFF)
-    ok = frame[USB_FRAME_LEN - 1] != 0
-
-    return UsbFrame(
-        device_us=device_us,
-        taxels=taxels,
-        imu_raw=(ax, ay, az, gx, gy, gz),
-        roll_cdeg=roll,
-        pitch_cdeg=pitch,
-        imu_ok=ok,
-    )
-
-
-def iter_usb_frames(buffer: bytes) -> Tuple[Iterator[UsbFrame], bytes]:
-    """Extract every complete frame from a rolling byte buffer.
-
-    Resynchronises on the ``0xAA 0x55`` magic, so a partial write, a leftover
-    ``#HB`` text line, or a dropped byte costs at most one frame rather than
-    desyncing the stream. Returns ``(frames, leftover)`` where *leftover* is the
-    tail to prepend to the next read. A frame whose magic is present but whose
-    body is malformed is skipped (its magic consumed) so a single bad frame
-    cannot wedge the reader.
-    """
-    frames = []
+def iter_usb_packets(buffer: bytes) -> tuple[Iterator[UsbTaggedPacket], bytes]:
+    packets: list[UsbTaggedPacket] = []
     view = buffer
     while True:
-        idx = view.find(USB_MAGIC)
+        idx = view.find(TAG_MAGIC)
         if idx < 0:
-            # No magic at all — keep only a trailing partial magic byte.
-            tail = view[-1:] if view[-1:] == USB_MAGIC[:1] else b""
-            return iter(frames), tail
-        if len(view) - idx < USB_FRAME_LEN:
-            # Magic found but frame not fully arrived yet — keep from the magic.
-            return iter(frames), view[idx:]
-        candidate = view[idx : idx + USB_FRAME_LEN]
+            tail = view[-1:] if view.endswith(TAG_MAGIC[:1]) else b""
+            return iter(packets), tail
+        view = view[idx:]
+        if len(view) < TAG_HEADER_LEN:
+            return iter(packets), view
+        stream_type = view[2]
+        payload_len = struct.unpack_from("<H", view, 3)[0]
+        expected_len = _PAYLOAD_LENGTHS.get(stream_type)
+        if expected_len is None or payload_len != expected_len:
+            view = view[2:]
+            continue
+        frame_len = TAG_HEADER_LEN + payload_len
+        if len(view) < frame_len:
+            return iter(packets), view
         try:
-            frames.append(parse_usb_frame(candidate))
-            view = view[idx + USB_FRAME_LEN :]
+            packets.append(parse_usb_packet(view[:frame_len]))
+            view = view[frame_len:]
         except OgloProtocolError:
-            # Bad body — drop just this magic and rescan from the next byte.
-            view = view[idx + len(USB_MAGIC) :]
-
+            view = view[2:]

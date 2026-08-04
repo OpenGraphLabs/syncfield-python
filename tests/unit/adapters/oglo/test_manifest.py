@@ -1,4 +1,4 @@
-"""Unit tests for the OGLO schema-5 config manifest parser."""
+"""Unit tests for the OGLO schema-6 config manifest parser."""
 
 from __future__ import annotations
 
@@ -13,11 +13,11 @@ from syncfield.adapters.oglo.packet import OgloProtocolError
 def _manifest(**overrides) -> str:
     base = {
         "device": "oglo",
-        "schema_ver": 5,
+        "schema_ver": 6,
         "serial": "OGLO-0001",
         "side": "right",
-        "fw_rev": "0.7.1-cfgfit",
-        "rate_hz": 100,
+        "fw_rev": "0.9.3",
+        "rate_hz": 250,
         "values_per_sample": 80,
         "sample_order": "finger,row,col",
         "sample_shape": [5, 4, 4],
@@ -28,16 +28,16 @@ def _manifest(**overrides) -> str:
     return json.dumps(base)
 
 
-def test_parse_full_schema5_manifest():
+def test_parse_full_schema6_manifest():
     m = OgloDeviceManifest.from_json(_manifest())
     assert m.device == "oglo"
     assert m.side == "right"
-    assert m.schema_ver == 5
-    assert m.rate_hz == 100
+    assert m.schema_ver == 6
+    assert m.rate_hz == 250
     assert m.values_per_sample == 80
     assert m.sample_shape == (5, 4, 4)
     assert m.finger_labels == ("thumb", "index", "middle", "ring", "pinky")
-    assert m.fw_rev == "0.7.1-cfgfit"
+    assert m.fw_rev == "0.9.3"
 
 
 def test_accepts_bytes():
@@ -97,9 +97,9 @@ def test_unknown_keys_ignored():
 
 
 def test_defaults_when_fields_absent():
-    m = OgloDeviceManifest.from_json(json.dumps({"schema_ver": 5}))
+    m = OgloDeviceManifest.from_json(json.dumps({"schema_ver": 6}))
     assert m.side == "unknown"
-    assert m.rate_hz == 100
+    assert m.rate_hz == 250
     assert m.values_per_sample == 80
     assert m.sample_shape == (5, 4, 4)
     # Unknown side falls back to the right-hand canonical order.

@@ -3,12 +3,12 @@
 The glove exposes a small JSON manifest on the config characteristic
 (``4652535f-424c-4500-0002-000000000001``). The host reads it once at connect
 to learn the wire geometry (taxel count, matrix shape, side-aware finger
-order) and to hard-validate the protocol version. Only ``schema_ver == 5`` is
+order) and to hard-validate the protocol version. Only ``schema_ver == 6`` is
 supported; anything else raises :class:`~syncfield.adapters.oglo.packet.OgloProtocolError`.
 
 The firmware keeps this JSON lean (< 512 B); unknown keys are ignored, and the
 wire *format* is detected from the notify header flags byte, never from here.
-Emitted keys (``FW_REV 0.7.1-cfgfit``): ``device``, ``schema_ver``, ``serial``,
+Emitted keys (``FW_REV 0.9.3``): ``device``, ``schema_ver``, ``serial``,
 ``side``, ``hw_rev``, ``fw_rev``, ``rate_hz``, ``samples_per_packet``,
 ``adc_bits``, ``stream_mode``, ``values_per_sample``, ``sample_order``,
 ``sample_shape``, ``channels`` (5 side-aware finger names), ``device_id``,
@@ -28,8 +28,8 @@ from syncfield.adapters.oglo.packet import (
 
 __all__ = ["OgloDeviceManifest", "SUPPORTED_SCHEMA_VER"]
 
-#: The only config schema this adapter supports.
-SUPPORTED_SCHEMA_VER = 5
+#: The only production config schema this adapter supports.
+SUPPORTED_SCHEMA_VER = 6
 
 #: Firmware default matrix shape: 5 fingers x 4 rows x 4 cols.
 _DEFAULT_SAMPLE_SHAPE: Tuple[int, int, int] = (5, 4, 4)
@@ -43,13 +43,13 @@ _CANONICAL_FINGERS_LEFT: Tuple[str, ...] = ("pinky", "ring", "middle", "index", 
 
 @dataclass(frozen=True)
 class OgloDeviceManifest:
-    """Validated view of the glove's schema-5 config manifest.
+    """Validated view of the glove's schema-6 config manifest.
 
     Attributes:
         device: Device model string (e.g. ``"oglo"``).
         side: ``"left"`` | ``"right"`` | ``"unknown"`` — authoritative hand.
-        schema_ver: Config schema version (always 5 here — validated).
-        rate_hz: Nominal sample rate (default 100).
+        schema_ver: Config schema version (always 6 here — validated).
+        rate_hz: Nominal tactile sample rate (default 250).
         values_per_sample: Taxel count per sample (default 80).
         sample_shape: ``(fingers, rows, cols)`` matrix shape (default 5,4,4).
         finger_labels: Side-aware finger names, one per finger.
@@ -75,7 +75,7 @@ class OgloDeviceManifest:
 
         Raises:
             OgloProtocolError: The bytes are not valid JSON, or
-                ``schema_ver != 5``.
+                ``schema_ver != 6``.
         """
         if isinstance(raw, (bytes, bytearray)):
             text = bytes(raw).decode("utf-8", errors="replace")
@@ -105,7 +105,7 @@ class OgloDeviceManifest:
             device=str(data.get("device") or "oglo"),
             side=side,
             schema_ver=SUPPORTED_SCHEMA_VER,
-            rate_hz=int(data.get("rate_hz") or 100),
+            rate_hz=int(data.get("rate_hz") or 250),
             values_per_sample=values_per_sample,
             sample_shape=shape,
             finger_labels=labels,
