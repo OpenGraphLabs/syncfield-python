@@ -24,6 +24,13 @@ def packet(kind: int, seq: int = 7, t_us: int = 1234, values=()) -> bytes:
     return TAG_MAGIC + bytes([kind]) + struct.pack("<HII", len(payload), seq, t_us) + payload
 
 
+def packed_tactile_packet(values, seq: int = 7, t_us: int = 1234) -> bytes:
+    payload = bytearray()
+    for a, b in zip(values[0::2], values[1::2]):
+        payload.extend((a >> 4, ((a & 0x0F) << 4) | (b >> 8), b & 0xFF))
+    return TAG_MAGIC + bytes([TAG_TYPE_TACTILE]) + struct.pack("<HII", len(payload), seq, t_us) + payload
+
+
 @pytest.mark.parametrize("kind,count", [(1, 80), (2, 6), (3, 3)])
 def test_decodes_each_independent_modality(kind, count):
     p = parse_usb_packet(packet(kind, seq=42, t_us=2_000_000, values=range(count)))
@@ -31,6 +38,13 @@ def test_decodes_each_independent_modality(kind, count):
     assert p.seq == 42
     assert p.device_ns == 2_000_000_000
     assert p.values == tuple(range(count))
+
+
+def test_decodes_0_9_9_packed12_tactile():
+    values = tuple((i * 51) & 0xFFF for i in range(80))
+    p = parse_usb_packet(packed_tactile_packet(values, seq=99))
+    assert p.seq == 99
+    assert p.values == values
 
 
 def test_rejects_unknown_type_and_wrong_length():

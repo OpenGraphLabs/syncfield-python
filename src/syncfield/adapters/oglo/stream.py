@@ -70,6 +70,11 @@ CONFIG_CHAR_UUID = "4652535f-424c-4500-0002-000000000001"
 #: Per-sample IMU channel order (raw i16 LSB), matching the firmware layout.
 IMU_CHANNELS = ("ax", "ay", "az", "gx", "gy", "gz")
 MAG_CHANNELS = ("mx", "my", "mz")
+# A recording chunk is capped at 30 minutes. Even at the 1 kHz verified IMU
+# ceiling it cannot legitimately jump by one million samples between adjacent
+# packets. Larger modular deltas mean the byte-stream parser found an embedded
+# A5 5A inside a damaged payload, not a real device counter.
+_MAX_PLAUSIBLE_SEQUENCE_GAP = 1_000_000
 
 
 def _manifest_bytes_are_valid_json(raw: bytes) -> bool:
@@ -774,7 +779,8 @@ class OgloTactileStream(StreamBase):
     def _handle_usb_packet(self, packet: UsbTaggedPacket) -> None:
         """Route one independently timestamped schema-6 TAG packet."""
         recv_ns = time.monotonic_ns()
-        self._detect_drop(packet.modality, packet.seq, 1, recv_ns)
+        if not self._detect_drop(packet.modality, packet.seq, 1, recv_ns):
+            return
         if packet.stream_type == TAG_TYPE_IMU:
             self._handle_imu(packet.values, recv_ns, packet.device_ns)
             return
@@ -831,7 +837,8 @@ class OgloTactileStream(StreamBase):
             )
             return
 
-        self._detect_drop("tactile", packet.seq_base, packet.count, recv_ns)
+        if not self._detect_drop("tactile", packet.seq_base, packet.count, recv_ns):
+            return
 
         labels = self._channel_labels
         for sample in packet.samples:
@@ -938,14 +945,40 @@ class OgloTactileStream(StreamBase):
             device_ns=device_ns,
         ))
 
-    def _detect_drop(self, modality: str, seq_base: int, count: int, recv_ns: int) -> None:
-        """Emit recording-window DROP events from the device sequence counter."""
+    def _detect_drop(self, modality: str, seq_base: int, count: int, recv_ns: int) -> bool:
+        """Validate sequence continuity and report genuine in-window loss.
+
+        Returns ``False`` for an impossible modular jump so a false header found
+        inside a damaged payload cannot enter a tactile/IMU/mag data file.
+        """
         with self._recording_lock:
             expected = self._next_expected_seq.get(modality)
             recording = self._recording
-            self._next_expected_seq[modality] = seq_base + count
-        if recording and expected is not None and seq_base > expected:
-            missing = seq_base - expected
+            if expected is None:
+                self._next_expected_seq[modality] = (seq_base + count) & 0xFFFFFFFF
+                return True
+            missing = (seq_base - expected) & 0xFFFFFFFF
+            corrupt = missing >= _MAX_PLAUSIBLE_SEQUENCE_GAP
+            if not corrupt:
+                self._next_expected_seq[modality] = (seq_base + count) & 0xFFFFFFFF
+        if corrupt:
+            if recording:
+                self._emit_health(HealthEvent(
+                    stream_id=self.id,
+                    kind=HealthEventKind.WARNING,
+                    at_ns=recv_ns,
+                    detail=(
+                        f"discarded corrupt {modality} TAG frame "
+                        f"(impossible seq {seq_base}, expected {expected})"
+                    ),
+                    data={
+                        "seq_base": seq_base,
+                        "expected_seq": expected,
+                        "modality": modality,
+                    },
+                ))
+            return False
+        if recording and missing:
             self._emit_health(
                 HealthEvent(
                     stream_id=self.id,
@@ -955,6 +988,7 @@ class OgloTactileStream(StreamBase):
                     data={"missing": missing, "seq_base": seq_base, "modality": modality},
                 )
             )
+        return True
 
     # ------------------------------------------------------------------
     # Discovery

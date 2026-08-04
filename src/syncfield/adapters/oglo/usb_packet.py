@@ -14,7 +14,7 @@ import struct
 from dataclasses import dataclass
 from typing import Iterator, Tuple
 
-from syncfield.adapters.oglo.packet import OgloProtocolError
+from syncfield.adapters.oglo.packet import OgloProtocolError, unpack_taxels12
 
 __all__ = [
     "TAG_MAGIC",
@@ -36,7 +36,14 @@ TAG_TYPE_TACTILE = 1
 TAG_TYPE_IMU = 2
 TAG_TYPE_MAG = 3
 
-_PAYLOAD_LENGTHS = {TAG_TYPE_TACTILE: 160, TAG_TYPE_IMU: 12, TAG_TYPE_MAG: 6}
+_PAYLOAD_LENGTHS = {
+    # 0.9.9+ uses native packed12 (120 B) to leave USB endpoint headroom.
+    # Accept the earlier schema-6 widened form too so a rolling firmware update
+    # cannot break collection while one glove is still on 0.9.8.
+    TAG_TYPE_TACTILE: (120, 160),
+    TAG_TYPE_IMU: (12,),
+    TAG_TYPE_MAG: (6,),
+}
 _STRUCTS = {
     TAG_TYPE_TACTILE: struct.Struct("<80H"),
     TAG_TYPE_IMU: struct.Struct("<6h"),
@@ -71,19 +78,22 @@ def parse_usb_packet(frame: bytes) -> UsbTaggedPacket:
         raise OgloProtocolError(f"bad USB tag magic: {frame[:2].hex()}")
     stream_type = frame[2]
     payload_len = struct.unpack_from("<H", frame, 3)[0]
-    expected_len = _PAYLOAD_LENGTHS.get(stream_type)
-    if expected_len is None:
+    expected_lengths = _PAYLOAD_LENGTHS.get(stream_type)
+    if expected_lengths is None:
         raise OgloProtocolError(f"unknown USB tag stream type {stream_type}")
-    if payload_len != expected_len:
+    if payload_len not in expected_lengths:
         raise OgloProtocolError(
-            f"USB tag {stream_type} payload must be {expected_len} bytes, got {payload_len}"
+            f"USB tag {stream_type} payload must be one of {expected_lengths} bytes, got {payload_len}"
         )
     if len(frame) != TAG_HEADER_LEN + payload_len:
         raise OgloProtocolError(
             f"USB tag frame must be {TAG_HEADER_LEN + payload_len} bytes, got {len(frame)}"
         )
     seq, device_us = struct.unpack_from("<II", frame, 5)
-    values = _STRUCTS[stream_type].unpack_from(frame, TAG_HEADER_LEN)
+    if stream_type == TAG_TYPE_TACTILE and payload_len == 120:
+        values = unpack_taxels12(frame[TAG_HEADER_LEN:], 80)
+    else:
+        values = _STRUCTS[stream_type].unpack_from(frame, TAG_HEADER_LEN)
     return UsbTaggedPacket(stream_type, seq, device_us, values)
 
 
@@ -100,8 +110,8 @@ def iter_usb_packets(buffer: bytes) -> tuple[Iterator[UsbTaggedPacket], bytes]:
             return iter(packets), view
         stream_type = view[2]
         payload_len = struct.unpack_from("<H", view, 3)[0]
-        expected_len = _PAYLOAD_LENGTHS.get(stream_type)
-        if expected_len is None or payload_len != expected_len:
+        expected_lengths = _PAYLOAD_LENGTHS.get(stream_type)
+        if expected_lengths is None or payload_len not in expected_lengths:
             view = view[2:]
             continue
         frame_len = TAG_HEADER_LEN + payload_len

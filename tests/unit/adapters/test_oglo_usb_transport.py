@@ -168,6 +168,39 @@ def test_drop_detection_is_scoped_to_recording_window(oglo_usb, tmp_path):
     assert health[0].data == {"missing": 1, "seq_base": 200_002, "modality": "tactile"}
 
 
+def test_impossible_sequence_jump_is_discarded_without_poisoning_baseline(oglo_usb):
+    module, _ = oglo_usb
+    stream = module.OgloTactileStream(
+        "tactile_left", serial_port="/dev/ttyACM1", hand="left"
+    )
+    health = []
+    stream.on_health(health.append)
+    stream._recording = True
+
+    assert stream._detect_drop("imu", 100, 1, 1_000)
+    assert not stream._detect_drop("imu", 0xFFF00000, 1, 2_000)
+    assert stream._detect_drop("imu", 101, 1, 3_000)
+
+    assert len(health) == 1
+    assert health[0].kind.value == "warning"
+    assert "discarded corrupt imu TAG frame" in health[0].detail
+    assert stream._next_expected_seq["imu"] == 102
+
+
+def test_sequence_wrap_is_continuous(oglo_usb):
+    module, _ = oglo_usb
+    stream = module.OgloTactileStream(
+        "tactile_left", serial_port="/dev/ttyACM1", hand="left"
+    )
+    health = []
+    stream.on_health(health.append)
+    stream._recording = True
+
+    assert stream._detect_drop("imu", 0xFFFFFFFF, 1, 1_000)
+    assert stream._detect_drop("imu", 0, 1, 2_000)
+    assert health == []
+
+
 def test_rejects_wrong_firmware(oglo_usb, monkeypatch):
     module, _ = oglo_usb
     original = _FakeSerial.readline
