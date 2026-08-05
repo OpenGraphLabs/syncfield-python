@@ -76,6 +76,17 @@ MAG_CHANNELS = ("mx", "my", "mz")
 # A5 5A inside a damaged payload, not a real device counter.
 _MAX_PLAUSIBLE_SEQUENCE_GAP = 1_000_000
 
+# Keep the USB reader independent from filesystem tail latency. At the default
+# rates a 4096-sample queue covers 8.2 s of IMU, 16.4 s of tactile and 32.8 s
+# of magnetometer traffic per file. The writer flushes at most every 100 ms,
+# reducing the six dual-glove files from ~1750 flushes/s to roughly 60 without
+# changing their JSONL schema or ordering.
+_OGLO_SENSOR_WRITER_OPTIONS = {
+    "queue_capacity": 4096,
+    "batch_size": 256,
+    "flush_interval_s": 0.1,
+}
+
 
 def _manifest_bytes_are_valid_json(raw: bytes) -> bool:
     try:
@@ -128,6 +139,9 @@ class OgloTactileStream(StreamBase):
     # Class-level hints for ``syncfield.discovery``.
     _discovery_kind = "sensor"
     _discovery_adapter_type = "oglo_tactile"
+    # SessionOrchestrator reads this opt-in hint when it creates the primary
+    # tactile writer. Other SyncField sensors retain the synchronous default.
+    sensor_writer_options = _OGLO_SENSOR_WRITER_OPTIONS
 
     def __init__(
         self,
@@ -321,10 +335,10 @@ class OgloTactileStream(StreamBase):
 
     def prepare_segment_rotation(self, next_output_dir: Path) -> None:
         next_output_dir.mkdir(parents=True, exist_ok=True)
-        writer = SensorWriter(f"{self.id}.imu", next_output_dir)
+        writer = self._new_sensor_writer(f"{self.id}.imu", next_output_dir)
         writer.open()
         self._prepared_imu_writer = writer
-        mag_writer = SensorWriter(f"{self.id}.mag", next_output_dir)
+        mag_writer = self._new_sensor_writer(f"{self.id}.mag", next_output_dir)
         mag_writer.open()
         self._prepared_mag_writer = mag_writer
         self._prepared_output_dir = next_output_dir
@@ -449,6 +463,20 @@ class OgloTactileStream(StreamBase):
         """
         return self._recorded_artifacts
 
+    def persistence_snapshot(self) -> dict[str, dict[str, int]]:
+        """Expose derived-writer queue pressure without touching capture I/O."""
+
+        with self._imu_lock:
+            writers = {
+                f"{self.id}.imu": self._imu_writer,
+                f"{self.id}.mag": self._mag_writer,
+            }
+        return {
+            stream_id: writer.metrics_snapshot()
+            for stream_id, writer in writers.items()
+            if writer is not None
+        }
+
     def on_substream_sample(self, callback: Callable[[Any], None]) -> None:
         """Register a callback for derived-substream (wrist IMU) samples.
 
@@ -499,15 +527,19 @@ class OgloTactileStream(StreamBase):
 
     def _open_imu_writer(self) -> None:
         with self._imu_lock:
-            writer = SensorWriter(f"{self.id}.imu", self._output_dir)
+            writer = self._new_sensor_writer(f"{self.id}.imu", self._output_dir)
             writer.open()
             self._imu_writer = writer
 
     def _open_mag_writer(self) -> None:
         with self._imu_lock:
-            writer = SensorWriter(f"{self.id}.mag", self._output_dir)
+            writer = self._new_sensor_writer(f"{self.id}.mag", self._output_dir)
             writer.open()
             self._mag_writer = writer
+
+    @staticmethod
+    def _new_sensor_writer(stream_id: str, output_dir: Path) -> SensorWriter:
+        return SensorWriter(stream_id, output_dir, **_OGLO_SENSOR_WRITER_OPTIONS)
 
     def _close_imu_writer(self) -> None:
         with self._imu_lock:

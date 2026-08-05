@@ -1,6 +1,8 @@
 """Tests for syncfield.writer."""
 
 import json
+import threading
+import time
 from pathlib import Path
 
 import syncfield as sf
@@ -162,6 +164,60 @@ def test_sensor_writer_raises_if_not_open(tmp_path: Path):
         assert False, "should have raised"
     except RuntimeError:
         pass
+
+
+def test_buffered_sensor_writer_drains_in_order_on_close(tmp_path: Path):
+    w = SensorWriter(
+        "fast_sensor",
+        tmp_path,
+        queue_capacity=64,
+        batch_size=16,
+        flush_interval_s=0.01,
+    )
+    w.open()
+    for i in range(50):
+        w.write(SensorSample(frame_number=i, capture_ns=i, channels={"v": i}))
+    w.close()
+
+    rows = [json.loads(line) for line in (tmp_path / "fast_sensor.jsonl").read_text().splitlines()]
+    assert [row["frame_number"] for row in rows] == list(range(50))
+    stats = w.metrics_snapshot()
+    assert stats["samples_enqueued_total"] == 50
+    assert stats["samples_written_total"] == 50
+    assert stats["enqueue_failures_total"] == 0
+    assert stats["batches_written_total"] < 50
+
+
+def test_buffered_sensor_writer_keeps_producer_off_slow_disk(tmp_path: Path):
+    entered = threading.Event()
+    release = threading.Event()
+
+    class SlowFirstBatchWriter(SensorWriter):
+        def _write_batch(self, samples):
+            if not entered.is_set():
+                entered.set()
+                assert release.wait(1)
+            super()._write_batch(samples)
+
+    w = SlowFirstBatchWriter(
+        "slow_disk",
+        tmp_path,
+        queue_capacity=128,
+        batch_size=1,
+        flush_interval_s=0.01,
+    )
+    w.open()
+    w.write(SensorSample(frame_number=0, capture_ns=0, channels={"v": 0}))
+    assert entered.wait(1)
+
+    started = time.monotonic()
+    for i in range(1, 65):
+        w.write(SensorSample(frame_number=i, capture_ns=i, channels={"v": i}))
+    assert time.monotonic() - started < 0.1
+
+    release.set()
+    w.close()
+    assert len((tmp_path / "slow_disk.jsonl").read_text().splitlines()) == 65
 
 
 def test_write_manifest(tmp_path: Path):

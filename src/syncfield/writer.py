@@ -20,6 +20,9 @@ Two helpers produce the session-level JSON artifacts:
 from __future__ import annotations
 
 import json
+import queue
+import threading
+import time
 from importlib.metadata import version as _pkg_version
 from pathlib import Path
 from typing import IO, Any, Optional
@@ -70,20 +73,55 @@ class StreamWriter:
             self._handle = None
 
 
+_SENSOR_WRITER_STOP = object()
+
+
 class SensorWriter:
     """Writes ``SensorSample`` entries to a per-stream JSONL file.
 
-    Each call to :meth:`write` appends one JSON line and flushes immediately
-    so that sensor data is persisted even if the process crashes mid-recording.
+    The default mode preserves the original synchronous contract: each call to
+    :meth:`write` appends one JSON line and flushes immediately. High-rate
+    adapters may opt into ``queue_capacity`` to move JSON encoding and batched
+    flushes onto a dedicated writer thread. That keeps a slow filesystem from
+    applying back-pressure to a hardware receive loop while leaving every
+    existing caller unchanged.
 
     Output file: ``{stream_id}.jsonl``
     """
 
-    def __init__(self, stream_id: str, output_dir: Path) -> None:
+    def __init__(
+        self,
+        stream_id: str,
+        output_dir: Path,
+        *,
+        queue_capacity: int = 0,
+        batch_size: int = 1,
+        flush_interval_s: float = 0.1,
+    ) -> None:
+        if queue_capacity < 0:
+            raise ValueError("queue_capacity must be non-negative")
+        if batch_size < 1:
+            raise ValueError("batch_size must be positive")
+        if flush_interval_s <= 0:
+            raise ValueError("flush_interval_s must be positive")
         self._stream_id = stream_id
         self._path = output_dir / f"{stream_id}.jsonl"
         self._handle: IO[str] | None = None
         self._count = 0
+        self._written_count = 0
+        self._batch_count = 0
+        self._enqueue_failures = 0
+        self._queue_high_watermark = 0
+        self._queue_capacity = queue_capacity
+        self._batch_size = batch_size
+        self._flush_interval_s = flush_interval_s
+        self._queue: queue.Queue[SensorSample | object] | None = (
+            queue.Queue(maxsize=queue_capacity) if queue_capacity else None
+        )
+        self._worker: threading.Thread | None = None
+        self._worker_error: BaseException | None = None
+        self._closing = False
+        self._metrics_lock = threading.Lock()
 
     @property
     def count(self) -> int:
@@ -93,20 +131,145 @@ class SensorWriter:
     def path(self) -> Path:
         return self._path
 
+    @property
+    def buffered(self) -> bool:
+        return self._queue is not None
+
     def open(self) -> None:
+        if self._handle is not None:
+            raise RuntimeError(f"SensorWriter for '{self._stream_id}' is already open")
         self._handle = open(self._path, "w")
+        self._closing = False
+        self._worker_error = None
+        if self._queue is not None:
+            self._worker = threading.Thread(
+                target=self._run_buffered_writer,
+                name=f"sensor-writer-{self._stream_id}",
+                daemon=True,
+            )
+            self._worker.start()
 
     def write(self, sample: SensorSample) -> None:
         if self._handle is None:
             raise RuntimeError(f"SensorWriter for '{self._stream_id}' is not open")
-        self._handle.write(json.dumps(sample.to_dict(), separators=(",", ":")) + "\n")
-        self._handle.flush()
-        self._count += 1
+        if self._closing:
+            raise RuntimeError(f"SensorWriter for '{self._stream_id}' is closing")
+        self._raise_worker_error()
+        if self._queue is None:
+            self._write_batch((sample,))
+            with self._metrics_lock:
+                self._count += 1
+            return
+
+        try:
+            self._queue.put_nowait(sample)
+        except queue.Full as exc:
+            with self._metrics_lock:
+                self._enqueue_failures += 1
+            raise BufferError(
+                f"SensorWriter queue for '{self._stream_id}' is full "
+                f"({self._queue_capacity} samples)"
+            ) from exc
+        depth = self._queue.qsize()
+        with self._metrics_lock:
+            self._count += 1
+            self._queue_high_watermark = max(self._queue_high_watermark, depth)
+
+    def metrics_snapshot(self) -> dict[str, int]:
+        """Return bounded live counters suitable for host telemetry."""
+
+        with self._metrics_lock:
+            count = self._count
+            written = self._written_count
+            batches = self._batch_count
+            failures = self._enqueue_failures
+            high_watermark = self._queue_high_watermark
+        return {
+            "queue_depth": self._queue.qsize() if self._queue is not None else 0,
+            "queue_capacity": self._queue_capacity,
+            "queue_high_watermark": high_watermark,
+            "samples_enqueued_total": count,
+            "samples_written_total": written,
+            "batches_written_total": batches,
+            "enqueue_failures_total": failures,
+        }
+
+    def _write_batch(self, samples: tuple[SensorSample, ...] | list[SensorSample]) -> None:
+        handle = self._handle
+        if handle is None:
+            raise RuntimeError(f"SensorWriter for '{self._stream_id}' is not open")
+        payload = "".join(
+            json.dumps(sample.to_dict(), separators=(",", ":")) + "\n"
+            for sample in samples
+        )
+        handle.write(payload)
+        handle.flush()
+        with self._metrics_lock:
+            self._written_count += len(samples)
+            self._batch_count += 1
+
+    def _run_buffered_writer(self) -> None:
+        assert self._queue is not None
+        pending: list[SensorSample] = []
+        deadline = time.monotonic() + self._flush_interval_s
+        try:
+            while True:
+                timeout = max(0.0, deadline - time.monotonic())
+                try:
+                    item = self._queue.get(timeout=timeout)
+                except queue.Empty:
+                    item = None
+
+                if item is _SENSOR_WRITER_STOP:
+                    if pending:
+                        self._write_batch(pending)
+                    return
+                if isinstance(item, SensorSample):
+                    pending.append(item)
+
+                now = time.monotonic()
+                if pending and (
+                    len(pending) >= self._batch_size or now >= deadline
+                ):
+                    self._write_batch(pending)
+                    pending = []
+                    deadline = now + self._flush_interval_s
+                elif not pending and now >= deadline:
+                    deadline = now + self._flush_interval_s
+        except BaseException as exc:  # surfaced on the producer and close paths
+            self._worker_error = exc
+
+    def _raise_worker_error(self) -> None:
+        if self._worker_error is not None:
+            raise RuntimeError(
+                f"SensorWriter worker for '{self._stream_id}' failed"
+            ) from self._worker_error
 
     def close(self) -> None:
-        if self._handle is not None:
-            self._handle.close()
+        handle = self._handle
+        if handle is None:
+            return
+        self._closing = True
+        worker = self._worker
+        if self._queue is not None and worker is not None and worker.is_alive():
+            while worker.is_alive():
+                try:
+                    self._queue.put(_SENSOR_WRITER_STOP, timeout=0.1)
+                    break
+                except queue.Full:
+                    continue
+            worker.join()
+        error = self._worker_error
+        try:
+            handle.flush()
+        finally:
+            handle.close()
             self._handle = None
+            self._worker = None
+        if error is not None:
+            raise RuntimeError(
+                f"SensorWriter worker for '{self._stream_id}' failed"
+            ) from error
 
 
 class SessionLogWriter:

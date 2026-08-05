@@ -64,6 +64,25 @@ def test_substream_contract_includes_500hz_imu_and_125hz_mag(stream_module, tmp_
     ]
 
 
+def test_oglo_opts_into_buffered_sensor_persistence(stream_module, tmp_path):
+    stream = make_stream(stream_module, tmp_path)
+    assert stream.sensor_writer_options == {
+        "queue_capacity": 4096,
+        "batch_size": 256,
+        "flush_interval_s": 0.1,
+    }
+
+    stream._open_imu_writer()
+    stream._open_mag_writer()
+    try:
+        snapshot = stream.persistence_snapshot()
+        assert snapshot["tactile_left.imu"]["queue_capacity"] == 4096
+        assert snapshot["tactile_left.mag"]["queue_capacity"] == 4096
+    finally:
+        stream._close_imu_writer()
+        stream._close_mag_writer()
+
+
 def test_mag_callback_uses_its_own_timestamp_and_sequence(stream_module, tmp_path):
     stream = make_stream(stream_module, tmp_path)
     events = []

@@ -1600,6 +1600,64 @@ class TestSamplePersistence:
         assert lines[0]["channels"] == {"ax": 0.1, "ay": -9.8}
         assert lines[1]["frame_number"] == 1
 
+    def test_sensor_stream_can_opt_into_buffered_persistence(self, tmp_path):
+        from syncfield.stream import StreamBase
+        from syncfield.types import (
+            FinalizationReport as _FR,
+            SampleEvent as _SE,
+            StreamCapabilities as _SC,
+        )
+
+        class _BufferedSensor(StreamBase):
+            sensor_writer_options = {
+                "queue_capacity": 32,
+                "batch_size": 8,
+                "flush_interval_s": 0.01,
+            }
+
+            def __init__(self):
+                super().__init__(id="fast", kind="sensor", capabilities=_SC())
+
+            def prepare(self):
+                pass
+
+            def start(self, clock):
+                pass
+
+            def stop(self):
+                return _FR(
+                    stream_id=self.id,
+                    status="completed",
+                    frame_count=0,
+                    file_path=None,
+                    first_sample_at_ns=None,
+                    last_sample_at_ns=None,
+                    health_events=[],
+                    error=None,
+                )
+
+            def push(self, frame_number):
+                self._emit_sample(_SE(
+                    stream_id=self.id,
+                    frame_number=frame_number,
+                    capture_ns=frame_number,
+                    channels={"v": frame_number},
+                ))
+
+        session = _session(tmp_path)
+        sensor = _BufferedSensor()
+        session.add(sensor)
+        session.start(countdown_s=0)
+        for i in range(20):
+            sensor.push(i)
+        live = session.persistence_snapshot()["fast"]
+        assert live["queue_capacity"] == 32
+        assert live["samples_enqueued_total"] == 20
+        session.stop()
+
+        rows = (session.last_episode_dir / "fast.jsonl").read_text().splitlines()
+        assert len(rows) == 20
+
     def test_sensor_stream_writes_device_ns_outside_channels(self, tmp_path):
         from syncfield.stream import StreamBase
         from syncfield.types import (

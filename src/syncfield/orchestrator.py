@@ -2852,8 +2852,37 @@ class SessionOrchestrator:
     def _new_sample_writer(stream: Stream, output_dir: Path) -> SampleWriter:
         output_name = getattr(stream, "output_name", None) or stream.id
         if stream.kind == "sensor":
-            return SensorWriter(output_name, output_dir)
+            options = dict(getattr(stream, "sensor_writer_options", {}) or {})
+            return SensorWriter(output_name, output_dir, **options)
         return StreamWriter(output_name, output_dir)
+
+    def persistence_snapshot(self) -> dict[str, dict[str, int]]:
+        """Return non-blocking sensor-writer queue metrics for host telemetry.
+
+        The primary writer map is protected only while references are copied;
+        individual snapshots happen after releasing the rotation lock. Adapter
+        substreams (for example OGLO IMU and magnetometer) are then merged via
+        their optional public snapshot hook.
+        """
+
+        with self._sample_writer_lock:
+            primary = tuple(self._sample_writers.items())
+        snapshot = {
+            stream_id: writer.metrics_snapshot()
+            for stream_id, writer in primary
+            if isinstance(writer, SensorWriter)
+        }
+        for stream in tuple(self._connected_streams):
+            getter = getattr(stream, "persistence_snapshot", None)
+            if not callable(getter):
+                continue
+            try:
+                snapshot.update(getter())
+            except Exception:
+                logger.debug(
+                    "persistence snapshot failed for %s", stream.id, exc_info=True
+                )
+        return snapshot
 
     def _close_sample_writer(self, stream_id: str) -> None:
         """Deactivate and close one stream writer after that stream stops."""
