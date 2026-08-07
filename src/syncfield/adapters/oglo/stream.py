@@ -88,6 +88,24 @@ _OGLO_SENSOR_WRITER_OPTIONS = {
 }
 
 
+def _open_usb_cdc(serial_module: Any, port: str, *, timeout: float) -> Any:
+    """Open a native ESP32-S3 CDC port without pulsing its reset lines.
+
+    ``pyserial.Serial(port, ...)`` opens immediately with DTR/RTS asserted by
+    default.  On the XIAO ESP32-S3 those control-line transitions can reset or
+    re-enumerate the native USB device, leaving the just-opened file descriptor
+    attached to a stale CDC endpoint.  Configure the lines while the handle is
+    still closed, then open it once.  This is also the sequence used by OGLO's
+    production firmware tools.
+    """
+    ser = serial_module.Serial(port=None, baudrate=115200, timeout=timeout)
+    ser.dtr = False
+    ser.rts = False
+    ser.port = port
+    ser.open()
+    return ser
+
+
 def _manifest_bytes_are_valid_json(raw: bytes) -> bool:
     try:
         json.loads(raw)
@@ -747,7 +765,7 @@ class OgloTactileStream(StreamBase):
         try:
             import serial  # lazy: only the wired path needs pyserial
 
-            ser = serial.Serial(self._serial_port, 115200, timeout=0.1)
+            ser = _open_usb_cdc(serial, self._serial_port, timeout=0.1)
             self._serial = ser
             time.sleep(0.2)
             manifest = self._read_usb_manifest(ser)

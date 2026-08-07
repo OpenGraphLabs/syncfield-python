@@ -25,10 +25,18 @@ def tag(kind: int, seq: int, t_us: int, values=None) -> bytes:
 
 
 class _FakeSerial:
-    def __init__(self, port, baud, timeout=0.1):
+    def __init__(self, port=None, baudrate=115200, timeout=0.1):
         self.port, self.writes, self.closed = port, [], False
+        self.baudrate = baudrate
+        self.timeout = timeout
+        self.dtr = True
+        self.rts = True
+        self.opened_with = None
         self._lock = threading.Lock()
         self._to_read = tag(TAG_TYPE_TACTILE, 0, 1000)
+
+    def open(self):
+        self.opened_with = (self.dtr, self.rts)
 
     def feed(self, data):
         with self._lock:
@@ -64,8 +72,8 @@ class _FakeSerial:
 def oglo_usb(monkeypatch):
     monkeypatch.setitem(sys.modules, "bleak", MagicMock())
     holder = {}
-    def ctor(port, baud, timeout=0.1):
-        holder["serial"] = _FakeSerial(port, baud, timeout); return holder["serial"]
+    def ctor(port=None, baudrate=115200, timeout=0.1):
+        holder["serial"] = _FakeSerial(port, baudrate, timeout); return holder["serial"]
     monkeypatch.setitem(sys.modules, "serial", SimpleNamespace(Serial=ctor))
     for name in ("syncfield.adapters.oglo", "syncfield.adapters.oglo.stream"):
         sys.modules.pop(name, None)
@@ -88,6 +96,7 @@ def test_connect_validates_config_and_enables_tag(oglo_usb):
     stream.on_sample(samples.append)
     stream.connect()
     fake = holder["serial"]
+    assert fake.opened_with == (False, False)
     assert stream._manifest.schema_ver == 6
     assert any(b"GET CONFIG" in write for write in fake.writes)
     assert any(b"STREAM TAG ON" in write for write in fake.writes)
