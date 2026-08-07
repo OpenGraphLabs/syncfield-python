@@ -98,11 +98,22 @@ def _open_usb_cdc(serial_module: Any, port: str, *, timeout: float) -> Any:
     still closed, then open it once.  This is also the sequence used by OGLO's
     production firmware tools.
     """
-    ser = serial_module.Serial(port=None, baudrate=115200, timeout=timeout)
+    # ``dtr=False``/``rts=False`` still makes pyserial issue TIOCMBIC during
+    # open; ESP32-S3 native CDC returns EPROTO for that ioctl.  Temporarily
+    # mark both lines as flow-controlled so pyserial skips both modem-control
+    # ioctls, then disable RTS/CTS in termios before the first write.
+    ser = serial_module.Serial(
+        port=None,
+        baudrate=115200,
+        timeout=timeout,
+        dsrdtr=True,
+        rtscts=True,
+    )
     ser.dtr = False
     ser.rts = False
     ser.port = port
     ser.open()
+    ser.rtscts = False
     return ser
 
 
