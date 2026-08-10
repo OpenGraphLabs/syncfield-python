@@ -3,14 +3,16 @@
 Field reality (ogpi-005, 2026-08-10): ESD/EMI from a gloved operator drops the
 CDC device off the bus for ~1 s and the kernel re-enumerates it immediately.
 Before reconnect existed, that one-second blip killed the reader thread and the
-episode silently lost every remaining tactile sample. These tests drive the
-reader with fake serials that die mid-stream and assert the stream resumes on
-the same (stable by-id) path, records the outage as health events, and still
-fails loud when the link never returns.
+episode silently lost every remaining tactile sample.
+
+The reconnect hot path skips the GET CONFIG handshake — identity is pinned by
+the stable ``/dev/serial/by-id`` path, which embeds the USB serial — and proves
+adoption with actual TAG packets instead, so the data gap stays near the USB
+re-enumeration floor. A device that is back but mute (wedged ESP32-S3 CDC
+stack) gets one kernel USB reset mid-window.
 """
 
 import importlib
-import json
 import struct
 import sys
 import threading
@@ -35,9 +37,13 @@ class _SerialError(Exception):
 
 
 class _FakeSerial:
-    """Streams queued TAG packets, then optionally dies like a USB unplug."""
+    """Streams queued TAG packets, then optionally dies like a USB unplug.
 
-    def __init__(self, port):
+    ``stream_on_gated=True`` models a glove whose MCU rebooted during the
+    outage: it stays silent until the host writes STREAM TAG ON.
+    """
+
+    def __init__(self, port, *, stream_on_gated=False):
         self.port, self.writes, self.closed = port, [], False
         self.dtr = True
         self.rts = True
@@ -47,6 +53,7 @@ class _FakeSerial:
         self._lock = threading.Lock()
         self._to_read = b""
         self._dead = False
+        self._gated = stream_on_gated
         self.fail_open = False
 
     def open(self):
@@ -62,6 +69,9 @@ class _FakeSerial:
         with self._lock:
             self._dead = True
 
+    def _stream_enabled(self):
+        return any(b"STREAM TAG ON" in w for w in self.writes)
+
     def reset_input_buffer(self):
         pass
 
@@ -72,24 +82,26 @@ class _FakeSerial:
     def flush(self):
         pass
 
-    def readline(self):
-        cfg = {
-            "device": "oglo", "schema_ver": 6, "side": "left",
-            "serial": "OGLO-TEST-L", "fw_rev": "0.9.3", "rate_hz": 250,
-        }
-        return b"#CONFIG " + json.dumps(cfg).encode() + b"\n"
-
     def read(self, n):
         with self._lock:
             if self._dead:
                 raise _SerialError(
                     "device reports readiness to read but returned no data"
                 )
-            if self._to_read:
+            if self._to_read and (not self._gated or self._stream_enabled()):
                 out, self._to_read = self._to_read[:n], self._to_read[n:]
                 return out
         time.sleep(0.002)
         return b""
+
+    def readline(self):
+        import json
+
+        cfg = {
+            "device": "oglo", "schema_ver": 6, "side": "left",
+            "serial": "OGLO-TEST-L", "fw_rev": "0.9.3", "rate_hz": 250,
+        }
+        return b"#CONFIG " + json.dumps(cfg).encode() + b"\n"
 
     def close(self):
         self.closed = True
@@ -125,19 +137,15 @@ def _clock():
     return SessionClock(sync_point=SyncPoint.create_now("pi5"), recording_armed_ns=1_000_000)
 
 
-def _wait(predicate, timeout_s=3.0):
+def _wait(predicate, timeout_s=4.0):
     deadline = time.monotonic() + timeout_s
     while not predicate() and time.monotonic() < deadline:
         time.sleep(0.005)
     assert predicate(), "condition not met in time"
 
 
-def test_reader_reconnects_after_link_loss_and_stream_resumes(oglo_usb, tmp_path):
-    module, holder = oglo_usb
-    first, second = _FakeSerial("p"), _FakeSerial("p")
+def _connected_recording_stream(module, holder, tmp_path, first):
     first.feed(tag(TAG_TYPE_TACTILE, 0, 1_000))
-    holder["queue"] = [first, second]
-
     stream = module.OgloTactileStream(
         "tactile_left", serial_port="/dev/serial/by-id/oglo-left", hand="left",
         output_dir=tmp_path,
@@ -146,20 +154,30 @@ def test_reader_reconnects_after_link_loss_and_stream_resumes(oglo_usb, tmp_path
     stream.on_health(health.append)
     stream.connect()
     stream.start_recording(_clock())
-
     first.feed(tag(TAG_TYPE_TACTILE, 1, 2_000))
     _wait(lambda: stream._frame_count >= 1)
+    return stream, health
 
-    first.kill()  # EMI blip: tty torn down mid-recording
+
+def test_still_streaming_glove_is_adopted_without_any_handshake(oglo_usb, tmp_path):
+    """MCU survived the blip: TAG frames flow the moment the port reopens.
+    No GET CONFIG round-trip may appear on the new handle — every avoided
+    handshake second is 250 lost tactile samples."""
+    module, holder = oglo_usb
+    first, second = _FakeSerial("p"), _FakeSerial("p")
     second.feed(tag(TAG_TYPE_TACTILE, 500, 60_000))
-    _wait(lambda: stream._frame_count >= 2, timeout_s=5.0)
+    holder["queue"] = [first, second]
+
+    stream, health = _connected_recording_stream(module, holder, tmp_path, first)
+    first.kill()
+    _wait(lambda: stream._frame_count >= 2)
 
     assert stream._thread.is_alive(), "reader must survive a link blip"
-    assert any(b"STREAM TAG ON" in w for w in second.writes), (
-        "reconnect must re-enable TAG mode on the new handle"
+    assert not any(b"GET CONFIG" in w for w in second.writes), (
+        "reconnect hot path must not spend time on a config handshake"
     )
     kinds = [h.kind for h in health]
-    assert HealthEventKind.WARNING in kinds, "link loss must be recorded"
+    assert HealthEventKind.WARNING in kinds
     assert any("reconnect" in h.detail.lower() for h in health)
 
     report = stream.stop_recording()
@@ -167,26 +185,32 @@ def test_reader_reconnects_after_link_loss_and_stream_resumes(oglo_usb, tmp_path
     assert report.frame_count == 2
 
 
+def test_rebooted_glove_gets_a_stream_on_nudge(oglo_usb, tmp_path):
+    """MCU rebooted during the outage: silent until STREAM TAG ON."""
+    module, holder = oglo_usb
+    first = _FakeSerial("p")
+    second = _FakeSerial("p", stream_on_gated=True)
+    second.feed(tag(TAG_TYPE_TACTILE, 3, 9_000))
+    holder["queue"] = [first, second]
+
+    stream, _health = _connected_recording_stream(module, holder, tmp_path, first)
+    first.kill()
+    _wait(lambda: stream._frame_count >= 2)
+
+    assert any(b"STREAM TAG ON" in w for w in second.writes)
+    stream.stop_recording()
+    stream.disconnect()
+
+
 def test_reconnect_reports_outage_as_estimated_drop(oglo_usb, tmp_path):
     module, holder = oglo_usb
     first, second = _FakeSerial("p"), _FakeSerial("p")
+    second.feed(tag(TAG_TYPE_TACTILE, 7, 9_000))
     holder["queue"] = [first, second]
 
-    stream = module.OgloTactileStream(
-        "tactile_left", serial_port="/dev/serial/by-id/oglo-left", hand="left",
-        output_dir=tmp_path,
-    )
-    health = []
-    stream.on_health(health.append)
-    first.feed(tag(TAG_TYPE_TACTILE, 0, 1_000))
-    stream.connect()
-    stream.start_recording(_clock())
-    first.feed(tag(TAG_TYPE_TACTILE, 1, 2_000))
-    _wait(lambda: stream._frame_count >= 1)
-
+    stream, health = _connected_recording_stream(module, holder, tmp_path, first)
     first.kill()
-    second.feed(tag(TAG_TYPE_TACTILE, 7, 9_000))
-    _wait(lambda: stream._frame_count >= 2, timeout_s=5.0)
+    _wait(lambda: stream._frame_count >= 2)
     stream.stop_recording()
     stream.disconnect()
 
@@ -197,25 +221,24 @@ def test_reconnect_reports_outage_as_estimated_drop(oglo_usb, tmp_path):
 
 
 def test_reconnect_resets_seq_baseline_so_reboot_does_not_poison_stream(oglo_usb, tmp_path):
-    """A glove that rebooted restarts seq near 0. Without a baseline reset the
+    """A rebooted glove restarts seq near 0. Without a baseline reset the
     corrupt-frame guard would discard every packet after reconnect, forever."""
     module, holder = oglo_usb
     first, second = _FakeSerial("p"), _FakeSerial("p")
+    second.feed(tag(TAG_TYPE_TACTILE, 3, 9_000))
     holder["queue"] = [first, second]
 
+    first.feed(tag(TAG_TYPE_TACTILE, 0x7FFF0000, 500))
     stream = module.OgloTactileStream(
         "tactile_left", serial_port="/dev/serial/by-id/oglo-left", hand="left",
         output_dir=tmp_path,
     )
-    first.feed(tag(TAG_TYPE_TACTILE, 0x7FFF0000, 500))
     stream.connect()
     stream.start_recording(_clock())
-    # High seq before the outage; near-zero after (device rebooted).
     first.feed(tag(TAG_TYPE_TACTILE, 0x7FFF0001, 1_000))
     _wait(lambda: stream._frame_count >= 1)
     first.kill()
-    second.feed(tag(TAG_TYPE_TACTILE, 3, 2_000))
-    _wait(lambda: stream._frame_count >= 2, timeout_s=5.0)
+    _wait(lambda: stream._frame_count >= 2)
     stream.stop_recording()
     stream.disconnect()
     assert stream._frame_count == 2
@@ -246,7 +269,7 @@ def test_reconnect_gives_up_after_window_and_thread_exits(oglo_usb, tmp_path, mo
     sys.modules["serial"].Serial = dead_ctor
 
     first.kill()
-    _wait(lambda: not stream._thread.is_alive(), timeout_s=5.0)
+    _wait(lambda: not stream._thread.is_alive())
 
     errors = [h for h in health if h.kind is HealthEventKind.ERROR]
     assert errors, "an exhausted reconnect window must fail loud"
@@ -254,39 +277,37 @@ def test_reconnect_gives_up_after_window_and_thread_exits(oglo_usb, tmp_path, mo
     stream.disconnect()
 
 
-def test_reconnect_refuses_a_different_glove_on_the_same_path(oglo_usb, tmp_path, monkeypatch):
-    """by-id paths make this near-impossible, but a wrong glove must never be
-    silently adopted mid-episode — that would interleave two devices' data."""
+def test_present_but_mute_device_escalates_to_one_usb_reset(oglo_usb, tmp_path, monkeypatch):
+    """The wedge case: enumerated, port opens, firmware mute. Three real
+    occurrences on ogpi-005 (2026-08-10); a kernel USBDEVFS_RESET revived the
+    glove every time where logical replugging did not — so the reconnect loop
+    fires exactly one reset per outage once the device is present but silent."""
     module, holder = oglo_usb
-    monkeypatch.setattr(module.stream, "_RECONNECT_WINDOW_S", 0.6)
+    monkeypatch.setattr(module.stream, "_RECONNECT_WINDOW_S", 1.2)
     monkeypatch.setattr(module.stream, "_RECONNECT_RETRY_INTERVAL_S", 0.05)
+    monkeypatch.setattr(module.stream, "_RECONNECT_ATTEMPT_DEADLINE_S", 0.15)
+    monkeypatch.setattr(module.stream, "_RECONNECT_STREAM_ON_AFTER_S", 0.05)
+    monkeypatch.setattr(module.stream, "_RECONNECT_USB_RESET_AFTER_S", 0.3)
+    monkeypatch.setattr(module.stream.os.path, "exists", lambda _p: True)
+    resets = []
+    monkeypatch.setattr(
+        module.stream, "_usb_device_reset",
+        lambda port, stream_id="": resets.append(port) or True,
+    )
 
     first = _FakeSerial("p")
-    holder["queue"] = [first]
-
-    def wrong_ctor(port=None, baudrate=115200, timeout=0.1, dsrdtr=False, rtscts=False):
-        fake = _FakeSerial(port)
-        cfg = {
-            "device": "oglo", "schema_ver": 6, "side": "left",
-            "serial": "OGLO-OTHER", "fw_rev": "0.9.3", "rate_hz": 250,
-        }
-        fake.readline = lambda: b"#CONFIG " + json.dumps(cfg).encode() + b"\n"
-        fake.feed(tag(TAG_TYPE_TACTILE, 1, 2_000))
-        return fake
+    first.feed(tag(TAG_TYPE_TACTILE, 0, 1_000))
+    holder["queue"] = [first]  # every later open yields a fresh, mute fake
 
     stream = module.OgloTactileStream(
         "tactile_left", serial_port="/dev/serial/by-id/oglo-left", hand="left",
         output_dir=tmp_path,
     )
-    first.feed(tag(TAG_TYPE_TACTILE, 0, 1_000))
     stream.connect()
-    stream.start_recording(_clock())
-    first.feed(tag(TAG_TYPE_TACTILE, 1, 2_000))
-    _wait(lambda: stream._frame_count >= 1)
-
-    # From now on every open lands on a different glove claiming the path.
-    sys.modules["serial"].Serial = wrong_ctor
     first.kill()
-    _wait(lambda: not stream._thread.is_alive(), timeout_s=5.0)
-    assert stream._frame_count == 1, "no sample from the impostor may be recorded"
+    _wait(lambda: not stream._thread.is_alive())
+
+    assert resets == ["/dev/serial/by-id/oglo-left"], (
+        "exactly one USB reset per outage"
+    )
     stream.disconnect()

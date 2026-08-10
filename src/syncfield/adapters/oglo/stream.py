@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import threading
 import time
 from collections import deque
@@ -80,12 +81,59 @@ _MAX_PLAUSIBLE_SEQUENCE_GAP = 1_000_000
 # (EMI?)", observed on ogpi-005 2026-08-10); the device re-enumerates within
 # ~1 s and a stable by-id serial path points at the revived port. The reader
 # retries the same path for this window before failing loud — long enough for
-# several enumeration cycles (a freshly re-enumerated ESP32-S3 can bounce once
-# more on its first open; 8.9 s observed end-to-end on ogpi-005), short enough
-# that the host notices a genuinely severed cable and protective-stops the
-# recording.
+# several enumeration cycles plus one USB-reset escalation, short enough that
+# a genuinely severed cable still protective-stops the recording quickly.
+#
+# The reconnect hot path deliberately skips the GET CONFIG round-trip: the
+# by-id path embeds the USB serial, so the device answering on that path IS
+# this glove, and every avoided handshake second is 250 lost tactile samples.
+# Adoption is proven by actual TAG packets instead: a glove whose MCU stayed
+# up is still streaming and talks the moment the port opens; a rebooted one
+# sits idle until nudged with STREAM TAG ON after a short silence.
 _RECONNECT_WINDOW_S = 15.0
-_RECONNECT_RETRY_INTERVAL_S = 0.25
+_RECONNECT_RETRY_INTERVAL_S = 0.15
+_RECONNECT_STREAM_ON_AFTER_S = 0.4
+_RECONNECT_ATTEMPT_DEADLINE_S = 1.6
+# An ESP32-S3 CDC stack can wedge outright: still enumerated, port opens,
+# firmware mute (three occurrences on ogpi-005, 2026-08-10 — a bus reset
+# during active TAG streaming reliably reproduces it). A kernel USBDEVFS_RESET
+# forces re-enumeration and revived the glove every time where logical
+# replugging did not. Escalate once per outage after this much silence: past
+# two adoption attempts (~1.6 s each) and any legitimate enumeration, so a
+# healthy blip is never reset, while a wedge self-heals in ~4 s end-to-end.
+_RECONNECT_USB_RESET_AFTER_S = 3.0
+_USBDEVFS_RESET = (ord("U") << 8) | 20
+
+
+def _usb_device_reset(serial_port: str, *, stream_id: str = "") -> bool:
+    """Best-effort kernel-level reset of the USB device behind *serial_port*.
+
+    Resolves the tty's sysfs device to its bus/device numbers and issues
+    USBDEVFS_RESET on the usbfs node. Needs write access to /dev/bus/usb/…
+    (the kiosk installer ships a udev rule granting it to ``dialout``).
+    Never raises — the reconnect loop just keeps retrying either way.
+    """
+    try:
+        import fcntl
+
+        tty_name = Path(os.path.realpath(serial_port)).name
+        interface_dir = Path(os.path.realpath(f"/sys/class/tty/{tty_name}/device"))
+        device_dir = interface_dir.parent
+        busnum = int((device_dir / "busnum").read_text())
+        devnum = int((device_dir / "devnum").read_text())
+        node = f"/dev/bus/usb/{busnum:03d}/{devnum:03d}"
+        fd = os.open(node, os.O_WRONLY)
+        try:
+            fcntl.ioctl(fd, _USBDEVFS_RESET, 0)
+        finally:
+            os.close(fd)
+    except Exception as exc:  # noqa: BLE001 - strictly best-effort
+        logger.warning(
+            "[%s] USB device reset failed for %s: %s", stream_id, serial_port, exc
+        )
+        return False
+    logger.warning("[%s] issued USB device reset for %s", stream_id, serial_port)
+    return True
 
 # Keep the USB reader independent from filesystem tail latency. At the default
 # rates a 4096-sample queue covers 8.2 s of IMU, 16.4 s of tactile and 32.8 s
@@ -830,13 +878,19 @@ class OgloTactileStream(StreamBase):
                         self.id,
                         exc_info=True,
                     )
-                    ser = self._usb_reconnect()
-                    if ser is None:
+                    reconnected = self._usb_reconnect()
+                    if reconnected is None:
                         raise OgloProtocolError(
                             "USB link lost and reconnect did not succeed "
                             f"within {_RECONNECT_WINDOW_S:.0f}s"
                         )
-                    buffer = b""
+                    # Bytes read while proving the stream are real samples —
+                    # parse them now; waiting for the next chunk would hold
+                    # them hostage on a quiet link.
+                    ser, buffer = reconnected
+                    packets, buffer = iter_usb_packets(buffer)
+                    for packet in packets:
+                        self._handle_usb_packet(packet)
                     continue
                 if not chunk:
                     if not ready and time.monotonic() >= ready_deadline:
@@ -873,16 +927,55 @@ class OgloTactileStream(StreamBase):
                     pass
             self._serial = None
 
-    def _usb_reconnect(self) -> Any:
+    def _try_adopt_reconnected(self, ser: Any) -> bytes | None:
+        """Prove a fresh handle carries a live TAG stream; return its bytes.
+
+        Identity needs no handshake here: the stable by-id path embeds the
+        USB serial, so whatever answers on that path is this glove. A glove
+        whose MCU stayed up through the link blip is still in TAG mode and
+        talks immediately; a rebooted one is idle and gets one STREAM TAG ON
+        nudge after a short silence. Returns every byte read (real samples —
+        the caller seeds its parse buffer with them), or ``None`` when this
+        attempt's deadline passes without a valid packet.
+        """
+        buffer = b""
+        nudged = False
+        started = time.monotonic()
+        while not self._stop_event.is_set():
+            elapsed = time.monotonic() - started
+            if elapsed >= _RECONNECT_ATTEMPT_DEADLINE_S:
+                return None
+            if not nudged and not buffer and elapsed >= _RECONNECT_STREAM_ON_AFTER_S:
+                nudged = True
+                try:
+                    ser.write(STREAM_ON_COMMAND)
+                    ser.flush()
+                except Exception:
+                    return None
+            try:
+                chunk = ser.read(4096)
+            except Exception:
+                return None
+            if not chunk:
+                continue
+            buffer += chunk
+            packets, _remainder = iter_usb_packets(buffer)
+            if packets:
+                return buffer
+            if len(buffer) > 65_536:
+                return None  # a flood that never frames is not a TAG stream
+        return None
+
+    def _usb_reconnect(self) -> "tuple[Any, bytes] | None":
         """Reopen the stable serial path after a link drop and resume TAG mode.
 
-        Returns the new serial handle, or ``None`` once the bounded window is
-        exhausted (or a stop was requested). The glove's identity is
-        re-validated before adoption — the side via ``_read_usb_manifest`` and
-        the firmware serial here — so a different device appearing on the same
-        path can never be interleaved into a running episode. The sequence
+        Returns ``(handle, seed_bytes)`` on success, or ``None`` once the
+        bounded window is exhausted (or a stop was requested). The sequence
         baseline is reset because a rebooted glove restarts its counters; the
         outage itself is reported explicitly instead, as an estimated DROP.
+        A device that is back on the bus but stays mute (wedged ESP32-S3 CDC
+        stack) gets one kernel USB reset mid-window — the remedy that revived
+        every wedged glove on ogpi-005 where logical replugging did not.
         """
         outage_started = time.monotonic()
         old = self._serial
@@ -900,22 +993,19 @@ class OgloTactileStream(StreamBase):
         ))
         import serial as serial_module
 
-        known_serial = self._manifest.serial if self._manifest is not None else ""
-        deadline = time.monotonic() + _RECONNECT_WINDOW_S
+        reset_attempted = False
+        deadline = outage_started + _RECONNECT_WINDOW_S
         while not self._stop_event.is_set() and time.monotonic() < deadline:
+            if (
+                not reset_attempted
+                and time.monotonic() - outage_started >= _RECONNECT_USB_RESET_AFTER_S
+                and os.path.exists(self._serial_port)
+            ):
+                reset_attempted = True
+                _usb_device_reset(self._serial_port, stream_id=self.id)
             ser = None
             try:
                 ser = _open_usb_cdc(serial_module, self._serial_port, timeout=0.1)
-                manifest = self._read_usb_manifest(ser)
-                if known_serial and manifest.serial and manifest.serial != known_serial:
-                    raise OgloProtocolError(
-                        f"different glove on {self._serial_port}: "
-                        f"{manifest.serial!r} != {known_serial!r}"
-                    )
-                self._apply_manifest(manifest)
-                ser.reset_input_buffer()
-                ser.write(STREAM_ON_COMMAND)
-                ser.flush()
             except Exception:
                 if ser is not None:
                     try:
@@ -923,6 +1013,13 @@ class OgloTactileStream(StreamBase):
                     except Exception:
                         pass
                 self._stop_event.wait(_RECONNECT_RETRY_INTERVAL_S)
+                continue
+            seed = self._try_adopt_reconnected(ser)
+            if seed is None:
+                try:
+                    ser.close()
+                except Exception:
+                    pass
                 continue
             self._serial = ser
             with self._recording_lock:
@@ -960,7 +1057,7 @@ class OgloTactileStream(StreamBase):
                         "modality": "tactile",
                     },
                 ))
-            return ser
+            return ser, seed
         return None
 
     def _handle_usb_packet(self, packet: UsbTaggedPacket) -> None:
