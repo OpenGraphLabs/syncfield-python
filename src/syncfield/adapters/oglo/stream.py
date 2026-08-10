@@ -76,6 +76,17 @@ MAG_CHANNELS = ("mx", "my", "mz")
 # A5 5A inside a damaged payload, not a real device counter.
 _MAX_PLAUSIBLE_SEQUENCE_GAP = 1_000_000
 
+# ESD/EMI can bounce the CDC device off the bus (kernel: "disabled by hub
+# (EMI?)", observed on ogpi-005 2026-08-10); the device re-enumerates within
+# ~1 s and a stable by-id serial path points at the revived port. The reader
+# retries the same path for this window before failing loud — long enough for
+# several enumeration cycles (a freshly re-enumerated ESP32-S3 can bounce once
+# more on its first open; 8.9 s observed end-to-end on ogpi-005), short enough
+# that the host notices a genuinely severed cable and protective-stops the
+# recording.
+_RECONNECT_WINDOW_S = 15.0
+_RECONNECT_RETRY_INTERVAL_S = 0.25
+
 # Keep the USB reader independent from filesystem tail latency. At the default
 # rates a 4096-sample queue covers 8.2 s of IMU, 16.4 s of tactile and 32.8 s
 # of magnetometer traffic per file. The writer flushes at most every 100 ms,
@@ -742,11 +753,11 @@ class OgloTactileStream(StreamBase):
         time.sleep(0.25)
         ser.reset_input_buffer()
         deadline = time.monotonic() + 6.0
-        while time.monotonic() < deadline:
+        while time.monotonic() < deadline and not self._stop_event.is_set():
             ser.write(b"GET CONFIG\n")
             ser.flush()
             attempt_end = min(deadline, time.monotonic() + 1.0)
-            while time.monotonic() < attempt_end:
+            while time.monotonic() < attempt_end and not self._stop_event.is_set():
                 line = ser.readline()
                 if not line:
                     continue
@@ -771,6 +782,13 @@ class OgloTactileStream(StreamBase):
         stream is live (or ``_connect_error`` on failure), then loop until
         ``_stop_event``. Each decoded frame goes through ``_handle_usb_frame``,
         which feeds the same ``_emit_sample``/``_handle_imu`` path as BLE.
+
+        A read failure after the stream went ready is treated as a transient
+        USB link drop (ESD/EMI bounces the device off the bus for ~1 s) and
+        handed to :meth:`_usb_reconnect`; the thread only dies once that
+        bounded window is exhausted, so the host's device-liveness view stays
+        True across a recovered blip and turns False exactly when recovery is
+        no longer possible.
         """
         ser = None
         try:
@@ -792,6 +810,7 @@ class OgloTactileStream(StreamBase):
                     ser.close()
                 except Exception:
                     pass
+            self._serial = None
             return
 
         buffer = b""
@@ -802,8 +821,23 @@ class OgloTactileStream(StreamBase):
                 try:
                     chunk = ser.read(4096)
                 except Exception:
-                    logger.exception("[%s] USB read failed", self.id)
-                    break
+                    if not ready:
+                        raise OgloProtocolError(
+                            "OGLO TAG stream stopped before the first packet"
+                        )
+                    logger.warning(
+                        "[%s] USB read failed; attempting reconnect",
+                        self.id,
+                        exc_info=True,
+                    )
+                    ser = self._usb_reconnect()
+                    if ser is None:
+                        raise OgloProtocolError(
+                            "USB link lost and reconnect did not succeed "
+                            f"within {_RECONNECT_WINDOW_S:.0f}s"
+                        )
+                    buffer = b""
+                    continue
                 if not chunk:
                     if not ready and time.monotonic() >= ready_deadline:
                         raise OgloProtocolError("OGLO TAG stream produced no valid packet")
@@ -829,13 +863,105 @@ class OgloTactileStream(StreamBase):
                     detail=f"USB TAG reader failed: {exc}",
                 ))
         finally:
+            ser = self._serial
+            if ser is not None:
+                try:
+                    ser.write(STREAM_OFF_COMMAND)
+                    ser.flush()
+                    ser.close()
+                except Exception:
+                    pass
+            self._serial = None
+
+    def _usb_reconnect(self) -> Any:
+        """Reopen the stable serial path after a link drop and resume TAG mode.
+
+        Returns the new serial handle, or ``None`` once the bounded window is
+        exhausted (or a stop was requested). The glove's identity is
+        re-validated before adoption — the side via ``_read_usb_manifest`` and
+        the firmware serial here — so a different device appearing on the same
+        path can never be interleaved into a running episode. The sequence
+        baseline is reset because a rebooted glove restarts its counters; the
+        outage itself is reported explicitly instead, as an estimated DROP.
+        """
+        outage_started = time.monotonic()
+        old = self._serial
+        self._serial = None
+        if old is not None:
             try:
-                ser.write(STREAM_OFF_COMMAND)
-                ser.flush()
-                ser.close()
+                old.close()
             except Exception:
                 pass
-            self._serial = None
+        self._emit_health(HealthEvent(
+            stream_id=self.id,
+            kind=HealthEventKind.WARNING,
+            at_ns=time.monotonic_ns(),
+            detail=f"USB link lost; reconnecting on {self._serial_port}",
+        ))
+        import serial as serial_module
+
+        known_serial = self._manifest.serial if self._manifest is not None else ""
+        deadline = time.monotonic() + _RECONNECT_WINDOW_S
+        while not self._stop_event.is_set() and time.monotonic() < deadline:
+            ser = None
+            try:
+                ser = _open_usb_cdc(serial_module, self._serial_port, timeout=0.1)
+                manifest = self._read_usb_manifest(ser)
+                if known_serial and manifest.serial and manifest.serial != known_serial:
+                    raise OgloProtocolError(
+                        f"different glove on {self._serial_port}: "
+                        f"{manifest.serial!r} != {known_serial!r}"
+                    )
+                self._apply_manifest(manifest)
+                ser.reset_input_buffer()
+                ser.write(STREAM_ON_COMMAND)
+                ser.flush()
+            except Exception:
+                if ser is not None:
+                    try:
+                        ser.close()
+                    except Exception:
+                        pass
+                self._stop_event.wait(_RECONNECT_RETRY_INTERVAL_S)
+                continue
+            self._serial = ser
+            with self._recording_lock:
+                # A rebooted device restarts its counters near zero; a stale
+                # baseline would make the corrupt-frame guard discard every
+                # packet after reconnect, forever.
+                self._next_expected_seq = {}
+                recording = self._recording
+            outage_ms = int((time.monotonic() - outage_started) * 1000)
+            logger.warning(
+                "[%s] USB link reconnected after %d ms", self.id, outage_ms
+            )
+            self._emit_health(HealthEvent(
+                stream_id=self.id,
+                kind=HealthEventKind.WARNING,
+                at_ns=time.monotonic_ns(),
+                detail=f"USB link reconnected after {outage_ms} ms",
+                data={"outage_ms": outage_ms},
+            ))
+            if recording:
+                rate_hz = self._manifest.rate_hz if self._manifest is not None else 250
+                estimated = max(0, round(outage_ms / 1000 * rate_hz))
+                self._emit_health(HealthEvent(
+                    stream_id=self.id,
+                    kind=HealthEventKind.DROP,
+                    at_ns=time.monotonic_ns(),
+                    detail=(
+                        f"lost ~{estimated} tactile samples during "
+                        f"{outage_ms} ms USB outage (estimated)"
+                    ),
+                    data={
+                        "missing": estimated,
+                        "outage_ms": outage_ms,
+                        "estimated": True,
+                        "modality": "tactile",
+                    },
+                ))
+            return ser
+        return None
 
     def _handle_usb_packet(self, packet: UsbTaggedPacket) -> None:
         """Route one independently timestamped schema-6 TAG packet."""
