@@ -896,6 +896,7 @@ class OgloTactileStream(StreamBase):
             packets, buffer = iter_usb_packets(buffer)
             for packet in packets:
                 self._handle_usb_packet(packet)
+            # Adoption already proved a real packet arrived on this handle.
             last_packet_at = time.monotonic()
 
         try:
@@ -917,14 +918,21 @@ class OgloTactileStream(StreamBase):
                 if chunk:
                     buffer += chunk
                     packets, buffer = iter_usb_packets(buffer)
+                    handled = 0
                     for packet in packets:
                         if not ready:
                             ready = True
                             self._ready_event.set()
                         self._handle_usb_packet(packet)
-                    if packets:
-                        # Only framed packets count as liveness: a port
-                        # dribbling bytes that never frame is not delivering.
+                        handled += 1
+                    if handled:
+                        # Only framed packets count as liveness, and the count
+                        # must come from the iteration: `iter_usb_packets`
+                        # returns an ITERATOR, and an empty iterator is still
+                        # truthy, so `if packets:` refreshed liveness on every
+                        # read. A stopped glove keeps emitting `#HB …`
+                        # heartbeat text forever, so that made the watchdog
+                        # permanently blind (ogpi-005 bench, 2026-08-12).
                         last_packet_at = time.monotonic()
                 elif not ready and time.monotonic() >= ready_deadline:
                     raise OgloProtocolError("OGLO TAG stream produced no valid packet")
@@ -1005,7 +1013,14 @@ class OgloTactileStream(StreamBase):
                 continue
             buffer += chunk
             packets, _remainder = iter_usb_packets(buffer)
-            if packets:
+            # `next(..., None)` — NOT `if packets:`. iter_usb_packets returns
+            # an ITERATOR, and an empty iterator is truthy, so the old check
+            # adopted any handle that produced a single byte. A stopped glove
+            # keeps emitting `#HB …` heartbeat text, so reconnect reported
+            # success on a link carrying no samples at all: that is how
+            # ogpi-007 logged "USB link reconnected after 8443 ms" and then
+            # recorded 36 minutes of nothing (2026-08-12).
+            if next(packets, None) is not None:
                 return buffer
             if len(buffer) > 65_536:
                 return None  # a flood that never frames is not a TAG stream

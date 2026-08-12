@@ -242,3 +242,70 @@ def test_healthy_stream_is_never_interrupted(oglo_usb, tmp_path, monkeypatch):
     assert len(holder["created"]) == 1, "no reconnect may be attempted"
     stream.stop_recording()
     stream.disconnect()
+
+
+class _ChatteringSerial(_FakeSerial):
+    """A glove that has stopped TAG streaming but keeps talking.
+
+    This is what the real firmware does: told to stop, it emits `#HB t_us=…`
+    heartbeat lines forever. Fakes that returned b"" hid the bug that let
+    ogpi-007 record 36 minutes of nothing — the reader saw bytes and a
+    perpetually-truthy packet iterator, so it believed data was flowing.
+    """
+
+    _HEARTBEAT = b"#HB t_us=26826757 f0=772 f1=603 f2=687 scan_us=2795 ble=0 imu_ok=1\r\n"
+
+    def read(self, n):
+        with self._lock:
+            if self._to_read:
+                out, self._to_read = self._to_read[:n], self._to_read[n:]
+                return out
+        time.sleep(0.02)
+        return self._HEARTBEAT
+
+
+def test_heartbeat_chatter_is_not_mistaken_for_data(oglo_usb, tmp_path, monkeypatch):
+    """Bytes are not samples. A stream emitting only heartbeat text is dead
+    and must trip the watchdog exactly like a mute port."""
+    module, holder = oglo_usb
+    monkeypatch.setattr(module.stream, "_STREAM_SILENCE_TIMEOUT_S", 0.4)
+    monkeypatch.setattr(module.stream, "_RECONNECT_WINDOW_S", 0.6)
+    monkeypatch.setattr(module.stream, "_RECONNECT_RETRY_INTERVAL_S", 0.05)
+    monkeypatch.setattr(module.stream, "_RECONNECT_ATTEMPT_DEADLINE_S", 0.2)
+
+    first = _ChatteringSerial("p")
+    first.feed(tag(0, 1_000))
+    holder["queue"] = [first]  # replacements chatter too, so recovery fails
+
+    stream = module.OgloTactileStream(
+        "tactile_right", serial_port="/dev/serial/by-id/oglo-right", hand="right",
+        output_dir=tmp_path,
+    )
+    health = []
+    stream.on_health(health.append)
+    stream.connect()
+    stream.start_recording(_clock())
+
+    _wait(lambda: not stream._thread.is_alive())
+    assert any(h.kind is HealthEventKind.ERROR for h in health)
+    stream.disconnect()
+
+
+def test_adoption_requires_a_real_packet_not_just_bytes(oglo_usb, tmp_path, monkeypatch):
+    """The ogpi-007 root cause: `iter_usb_packets` returns an iterator, and an
+    empty iterator is still truthy, so adoption "succeeded" on a link that had
+    delivered nothing. Reconnect then reported success and the episode
+    recorded one hand for 36 minutes."""
+    module, holder = oglo_usb
+
+    chatter = _ChatteringSerial("p")
+    stream = module.OgloTactileStream(
+        "tactile_right", serial_port="/dev/serial/by-id/oglo-right", hand="right",
+        output_dir=tmp_path,
+    )
+    monkeypatch.setattr(module.stream, "_RECONNECT_ATTEMPT_DEADLINE_S", 0.3)
+    monkeypatch.setattr(module.stream, "_RECONNECT_STREAM_ON_AFTER_S", 0.05)
+
+    assert stream._try_adopt_reconnected(chatter) is None, (
+        "a port that only chatters must never be adopted as a live stream"
+    )
