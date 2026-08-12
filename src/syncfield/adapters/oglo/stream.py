@@ -92,6 +92,15 @@ _MAX_PLAUSIBLE_SEQUENCE_GAP = 1_000_000
 # sits idle until nudged with STREAM TAG ON after a short silence.
 _RECONNECT_WINDOW_S = 15.0
 _RECONNECT_RETRY_INTERVAL_S = 0.15
+# A ready TAG stream delivers 250 Hz tactile plus 500 Hz IMU, so silence this
+# long is never normal — it is a dead link that simply has not raised. Nothing
+# used to measure it: on ogpi-007 (2026-08-12) a glove went quiet 24 minutes
+# into a session, the reader spun on empty reads for another 36 minutes, and
+# because the thread stayed alive the host's protective stop never fired. The
+# episode kept "recording" one hand. Well above any legitimate gap (rotation
+# does not pause the device) and well under the host's own 25 s backstop, so
+# the adapter always gets first crack at recovery.
+_STREAM_SILENCE_TIMEOUT_S = 5.0
 _RECONNECT_STREAM_ON_AFTER_S = 0.4
 _RECONNECT_ATTEMPT_DEADLINE_S = 1.6
 # An ESP32-S3 CDC stack can wedge outright: still enumerated, port opens,
@@ -864,6 +873,31 @@ class OgloTactileStream(StreamBase):
         buffer = b""
         ready = False
         ready_deadline = time.monotonic() + 3.0
+        last_packet_at = time.monotonic()
+
+        def recover_or_die(reason: str) -> None:
+            """Re-establish the link, or raise so the thread exits.
+
+            Thread death is what the host watches to protective-stop a
+            recording, so an unrecoverable link must never leave this loop
+            spinning quietly.
+            """
+            nonlocal ser, buffer, last_packet_at
+            reconnected = self._usb_reconnect(reason=reason)
+            if reconnected is None:
+                raise OgloProtocolError(
+                    f"{reason} and reconnect did not succeed "
+                    f"within {_RECONNECT_WINDOW_S:.0f}s"
+                )
+            # Bytes read while proving the stream are real samples — parse
+            # them now; waiting for the next chunk would hold them hostage
+            # on a quiet link.
+            ser, buffer = reconnected
+            packets, buffer = iter_usb_packets(buffer)
+            for packet in packets:
+                self._handle_usb_packet(packet)
+            last_packet_at = time.monotonic()
+
         try:
             while not self._stop_event.is_set():
                 try:
@@ -878,31 +912,30 @@ class OgloTactileStream(StreamBase):
                         self.id,
                         exc_info=True,
                     )
-                    reconnected = self._usb_reconnect()
-                    if reconnected is None:
-                        raise OgloProtocolError(
-                            "USB link lost and reconnect did not succeed "
-                            f"within {_RECONNECT_WINDOW_S:.0f}s"
-                        )
-                    # Bytes read while proving the stream are real samples —
-                    # parse them now; waiting for the next chunk would hold
-                    # them hostage on a quiet link.
-                    ser, buffer = reconnected
+                    recover_or_die("USB read failed")
+                    continue
+                if chunk:
+                    buffer += chunk
                     packets, buffer = iter_usb_packets(buffer)
                     for packet in packets:
+                        if not ready:
+                            ready = True
+                            self._ready_event.set()
                         self._handle_usb_packet(packet)
-                    continue
-                if not chunk:
-                    if not ready and time.monotonic() >= ready_deadline:
-                        raise OgloProtocolError("OGLO TAG stream produced no valid packet")
-                    continue
-                buffer += chunk
-                packets, buffer = iter_usb_packets(buffer)
-                for packet in packets:
-                    if not ready:
-                        ready = True
-                        self._ready_event.set()
-                    self._handle_usb_packet(packet)
+                    if packets:
+                        # Only framed packets count as liveness: a port
+                        # dribbling bytes that never frame is not delivering.
+                        last_packet_at = time.monotonic()
+                elif not ready and time.monotonic() >= ready_deadline:
+                    raise OgloProtocolError("OGLO TAG stream produced no valid packet")
+                silent_s = time.monotonic() - last_packet_at
+                if ready and silent_s > _STREAM_SILENCE_TIMEOUT_S:
+                    logger.warning(
+                        "[%s] no TAG packet for %.1fs; attempting reconnect",
+                        self.id,
+                        silent_s,
+                    )
+                    recover_or_die(f"no TAG packet for {silent_s:.1f}s")
             if not ready:
                 raise OgloProtocolError("OGLO TAG stream stopped before the first packet")
         except BaseException as exc:  # noqa: BLE001 - surfaced to connect/health
@@ -938,6 +971,18 @@ class OgloTactileStream(StreamBase):
         the caller seeds its parse buffer with them), or ``None`` when this
         attempt's deadline passes without a valid packet.
         """
+        # Assert TAG mode unconditionally, before reading a single byte. A
+        # glove that re-enumerated boots idle and will never speak again
+        # unless told to; the old code only nudged when the read buffer was
+        # still empty, so one stray byte could leave the device parked while
+        # adoption still succeeded on whatever was already in flight. The
+        # command is idempotent for a glove that is already streaming.
+        try:
+            ser.write(STREAM_ON_COMMAND)
+            ser.flush()
+        except Exception:
+            return None
+
         buffer = b""
         nudged = False
         started = time.monotonic()
@@ -966,7 +1011,7 @@ class OgloTactileStream(StreamBase):
                 return None  # a flood that never frames is not a TAG stream
         return None
 
-    def _usb_reconnect(self) -> "tuple[Any, bytes] | None":
+    def _usb_reconnect(self, reason: str = "USB link lost") -> "tuple[Any, bytes] | None":
         """Reopen the stable serial path after a link drop and resume TAG mode.
 
         Returns ``(handle, seed_bytes)`` on success, or ``None`` once the
@@ -989,7 +1034,7 @@ class OgloTactileStream(StreamBase):
             stream_id=self.id,
             kind=HealthEventKind.WARNING,
             at_ns=time.monotonic_ns(),
-            detail=f"USB link lost; reconnecting on {self._serial_port}",
+            detail=f"{reason}; reconnecting on {self._serial_port}",
         ))
         import serial as serial_module
 
