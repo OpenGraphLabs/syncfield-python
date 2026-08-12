@@ -2353,15 +2353,27 @@ class SessionOrchestrator:
                     # Bound incident/log state to the same raw segment. Close
                     # open incidents into the sealed log before switching.
                     self.health.stop()
-                    if self._log_writer is not None:
-                        self._log_writer.log_event(
+                    # Open the replacement BEFORE retiring the sealed writer,
+                    # and publish it with one atomic assignment. Reader threads
+                    # call _on_stream_health without this lock, so any gap where
+                    # self._log_writer is non-None but closed is a live race —
+                    # and rotation is exactly when streams emit sequence-gap
+                    # health events. On ogpi-006 (2026-08-12) that race killed
+                    # the OGLO reader thread at both 30-minute boundaries.
+                    next_log_writer = SessionLogWriter(next_dir)
+                    next_log_writer.open()
+                    sealed_log_writer = self._log_writer
+                    if sealed_log_writer is not None:
+                        sealed_log_writer.log_event(
                             {
                                 "kind": "segment_sealed",
                                 "at_ns": boundary_ns,
                                 "next_episode_dir": str(next_dir),
                             }
                         )
-                        self._log_writer.close()
+                    self._log_writer = next_log_writer
+                    if sealed_log_writer is not None:
+                        sealed_log_writer.close()
 
                     # Old persistence handles are no longer reachable by
                     # callbacks once every stream signalled its atomic swap.
@@ -2380,8 +2392,6 @@ class SessionOrchestrator:
                     self._chirp_stop = None
                     self._rebind_stream_output_dirs()
                     write_sync_point(next_sync_point, next_dir)
-                    self._log_writer = SessionLogWriter(next_dir)
-                    self._log_writer.open()
                     self._log_writer.log_event(
                         {
                             "kind": "segment_opened",
@@ -3074,6 +3084,31 @@ class SessionOrchestrator:
             }
         )
 
+    def _log_health_safely(self, event: HealthEvent) -> None:
+        """Write a health event to the session log without ever raising.
+
+        This runs on the adapter's reader thread, so anything that escapes
+        here propagates through ``_emit_health`` and kills capture. On
+        ogpi-006 (2026-08-12) that is exactly what ended both 30-minute
+        recordings: rotation left ``_log_writer`` non-None but closed for a
+        few milliseconds, a sequence-gap event from the rotation itself landed
+        in that window, and ``RuntimeError: SessionLogWriter is not open``
+        took the OGLO reader thread with it. Logging is observability; the
+        event still reaches the incident tracker and the stream's
+        FinalizationReport, so nothing is lost by degrading to a warning.
+        """
+        writer = self._log_writer
+        if writer is None:
+            return
+        try:
+            writer.log_health(event)
+        except Exception:
+            logger.warning(
+                "session log write failed for a %s health event; continuing",
+                event.stream_id,
+                exc_info=True,
+            )
+
     def _on_stream_health(self, event: HealthEvent) -> None:
         """Forward a stream-reported health event into the session log.
 
@@ -3082,8 +3117,7 @@ class SessionOrchestrator:
         and surface later in the :class:`FinalizationReport` so nothing
         is lost.
         """
-        if self._log_writer is not None:
-            self._log_writer.log_health(event)
+        self._log_health_safely(event)
         self.health.observe_health(event.stream_id, event)
         # A fatal capture-loop death arrives as an ERROR event. Route it into
         # the supervisor so it can drive bounded reconnect — but only when the
@@ -3236,8 +3270,7 @@ class SessionOrchestrator:
         """
         if not self._reconnect_policy.enabled:
             return
-        if self._log_writer is not None:
-            self._log_writer.log_health(event)
+        self._log_health_safely(event)
         self.health.observe_health(event.stream_id, event)
 
     def _enqueue_reconnect(self, stream_id: str) -> None:

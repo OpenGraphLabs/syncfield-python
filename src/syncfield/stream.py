@@ -49,6 +49,7 @@ implement the protocol from scratch; both paths are equally well supported.
 from __future__ import annotations
 
 import dataclasses
+import logging
 from pathlib import Path
 from typing import Callable, List, Optional, Protocol, Tuple, runtime_checkable
 
@@ -63,6 +64,8 @@ from syncfield.types import (
     StreamKind,
 )
 
+
+logger = logging.getLogger(__name__)
 
 SampleCallback = Callable[[SampleEvent], None]
 HealthCallback = Callable[[HealthEvent], None]
@@ -309,7 +312,21 @@ class StreamBase:
             event = dataclasses.replace(event, severity=severity_for_kind(event.kind))
         self._collected_health.append(event)
         for cb in self._health_callbacks:
-            cb(event)
+            # Callback isolation, as `_emit_substream_sample` already does for
+            # samples: this runs on the adapter's capture thread, so a raising
+            # consumer would take capture down with it. One did — a session-log
+            # write during segment rotation — and it ended two 30-minute
+            # recordings on ogpi-006 (2026-08-12). The event is already in
+            # `_collected_health`, so the FinalizationReport stays truthful
+            # even when a consumer fails.
+            try:
+                cb(event)
+            except Exception:  # noqa: BLE001 - consumer isolation
+                logger.warning(
+                    "[%s] health callback failed; continuing capture",
+                    self.id,
+                    exc_info=True,
+                )
 
     # ------------------------------------------------------------------
     # Intra-host sync anchor
