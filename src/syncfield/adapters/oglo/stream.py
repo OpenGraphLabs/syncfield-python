@@ -7,9 +7,10 @@ the primary 80-taxel stream is orchestrator-written while the 500 Hz IMU and
 
 Design highlights:
 
-The connect handshake stops every legacy stream mode, reads ``GET CONFIG``,
-requires firmware >=0.9.3/schema 6 and the expected hand, then waits for a valid
-TAG packet before reporting ready. Per-modality sequence gaps are health events.
+The connect handshake stops every legacy stream mode, reads ``GET CONFIG`` and
+``GET IDENT``, requires firmware >=0.9.3/schema 6 and the expected hand, then
+waits for a valid TAG packet before reporting ready. Identity failure is logged
+but does not gate capture; per-modality sequence gaps are health events.
 
 Requires the optional ``ble`` extra::
 
@@ -85,12 +86,10 @@ _MAX_PLAUSIBLE_SEQUENCE_GAP = 1_000_000
 # several enumeration cycles plus one USB-reset escalation, short enough that
 # a genuinely severed cable still protective-stops the recording quickly.
 #
-# The reconnect hot path deliberately skips the GET CONFIG round-trip: the
-# by-id path embeds the USB serial, so the device answering on that path IS
-# this glove, and every avoided handshake second is 250 lost tactile samples.
-# Adoption is proven by actual TAG packets instead: a glove whose MCU stayed
-# up is still streaming and talks the moment the port opens; a rebooted one
-# sits idle until nudged with STREAM TAG ON after a short silence.
+# The reconnect hot path still skips the large GET CONFIG round-trip, but a
+# bounded GET IDENT probe records the MCU and flash-journal boot identity before
+# TAG mode resumes. Adoption remains gated on an actual TAG packet: identity is
+# evidence about the board that answered, not proof that its sensor stream works.
 _RECONNECT_WINDOW_S = 15.0
 _RECONNECT_RETRY_INTERVAL_S = 0.15
 # A ready TAG stream delivers 250 Hz tactile plus 500 Hz IMU, so silence this
@@ -115,6 +114,83 @@ _RECONNECT_USB_RESET_AFTER_S = 3.0
 _USBDEVFS_RESET = (ord("U") << 8) | 20
 _USB_EVIDENCE_PREFIX = "OGLO_USB_EVIDENCE "
 _USB_INCIDENT_HISTORY_LIMIT = 16
+_USB_IDENT_COMMAND = b"GET IDENT\n"
+_USB_IDENT_PREFIX = b"#IDENT "
+_USB_IDENT_PROBE_TIMEOUT_S = 0.75
+_USB_IDENT_MAX_LINE_BYTES = 4096
+
+
+@dataclass(frozen=True)
+class _UsbIdentityProbe:
+    identity: dict[str, Any] | None
+    failure_class: str | None = None
+
+
+@dataclass(frozen=True)
+class _UsbAdoption:
+    seed: bytes | None
+    identity_probe: _UsbIdentityProbe
+
+
+def _parse_usb_identity(raw: bytes) -> dict[str, Any]:
+    """Validate and allowlist one firmware ``#IDENT`` JSON object."""
+
+    try:
+        decoded = json.loads(raw)
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise OgloProtocolError("malformed OGLO USB identity JSON") from exc
+    if not isinstance(decoded, dict):
+        raise OgloProtocolError("OGLO USB identity must be a JSON object")
+
+    def required_string(field: str, *, max_chars: int = 256) -> str:
+        value = decoded.get(field)
+        if not isinstance(value, str) or not value or len(value) > max_chars:
+            raise OgloProtocolError(f"OGLO USB identity has invalid {field}")
+        return value
+
+    def required_int(field: str) -> int:
+        value = decoded.get(field)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise OgloProtocolError(f"OGLO USB identity has invalid {field}")
+        return value
+
+    def required_bool(field: str) -> bool:
+        value = decoded.get(field)
+        if not isinstance(value, bool):
+            raise OgloProtocolError(f"OGLO USB identity has invalid {field}")
+        return value
+
+    application_sha256 = required_string("application_sha256", max_chars=64)
+    if len(application_sha256) != 64 or any(
+        char not in "0123456789abcdef" for char in application_sha256
+    ):
+        raise OgloProtocolError("OGLO USB identity has invalid application_sha256")
+
+    identity: dict[str, Any] = {
+        "mcu_boot_id": required_string("mcu_boot_id", max_chars=128),
+        "boot_count": required_int("boot_count"),
+        "reset_reason": required_string("reset_reason", max_chars=64),
+        "fw_rev": required_string("fw_rev", max_chars=64),
+        "hw_rev": required_string("hw_rev", max_chars=128),
+        "serial": required_string("serial", max_chars=128),
+        "application_sha256": application_sha256,
+        "uptime_ms": required_int("uptime_ms"),
+        "wedge_recoveries": required_int("wedge_recoveries"),
+        "wedge_last_stall_ms": required_int("wedge_last_stall_ms"),
+        "wedge_guard": required_bool("wedge_guard"),
+        "journal_ready": required_bool("journal_ready"),
+    }
+    if identity["journal_ready"]:
+        journal_boot_id = required_string("journal_boot_id", max_chars=16)
+        if len(journal_boot_id) != 16 or any(
+            char not in "0123456789abcdef" for char in journal_boot_id
+        ):
+            raise OgloProtocolError("OGLO USB identity has invalid journal_boot_id")
+        identity["journal_boot_id"] = journal_boot_id
+        identity["journal_boot_counter"] = required_int("journal_boot_counter")
+    else:
+        identity["journal_error"] = required_string("journal_error", max_chars=128)
+    return identity
 
 
 def _usb_device_reset(serial_port: str, *, stream_id: str = "") -> bool:
@@ -322,6 +398,10 @@ class OgloTactileStream(StreamBase):
         self._usb_read_history: deque[tuple[int, int, str, int | None]] = deque(
             maxlen=_USB_INCIDENT_HISTORY_LIMIT
         )
+        # The ID is allocated with the identity baseline, before an outage
+        # exists. If the link later fails, every host action and the after probe
+        # reuse it. A successful after probe is also the next outage's baseline.
+        self._pending_outage_id: str | None = None
 
     # ------------------------------------------------------------------
     # Stream SPI — 4-phase lifecycle
@@ -347,6 +427,7 @@ class OgloTactileStream(StreamBase):
         self._next_expected_seq = {}
         self._connect_error = None
         self._manifest = None
+        self._pending_outage_id = None
         self._ready_event.clear()
         self._stop_event.clear()
 
@@ -822,6 +903,81 @@ class OgloTactileStream(StreamBase):
         except Exception:  # noqa: BLE001 - diagnostics must never affect capture
             logger.debug("[%s] failed to encode USB evidence log", self.id, exc_info=True)
 
+    def _read_usb_identity(
+        self,
+        ser: Any,
+        *,
+        quiesce_stream: bool,
+    ) -> _UsbIdentityProbe:
+        """Return a bounded, payload-free MCU identity probe result."""
+
+        try:
+            if quiesce_stream:
+                ser.write(QUIET_COMMANDS)
+                ser.flush()
+            ser.reset_input_buffer()
+            ser.write(_USB_IDENT_COMMAND)
+            ser.flush()
+            deadline = time.monotonic() + _USB_IDENT_PROBE_TIMEOUT_S
+            while time.monotonic() < deadline and not self._stop_event.is_set():
+                line = ser.readline()
+                if not line:
+                    continue
+                if len(line) > _USB_IDENT_MAX_LINE_BYTES:
+                    return _UsbIdentityProbe(None, "malformed")
+                ident_at = line.find(_USB_IDENT_PREFIX)
+                if ident_at >= 0:
+                    try:
+                        identity = _parse_usb_identity(
+                            line[ident_at + len(_USB_IDENT_PREFIX):].strip()
+                        )
+                    except OgloProtocolError:
+                        return _UsbIdentityProbe(None, "malformed")
+                    return _UsbIdentityProbe(identity)
+                if line.startswith((b"#ERR", b"#UNKNOWN")):
+                    return _UsbIdentityProbe(None, "unsupported")
+                if line.startswith(b"#CONFIG "):
+                    return _UsbIdentityProbe(None, "unexpected_response")
+        except Exception:  # noqa: BLE001 - evidence must not block capture
+            return _UsbIdentityProbe(None, "io_error")
+        return _UsbIdentityProbe(None, "aborted" if self._stop_event.is_set() else "timeout")
+
+    def _log_identity_probe(
+        self,
+        *,
+        phase: str,
+        outage_id: str,
+        probe: _UsbIdentityProbe,
+        connection_adopted: bool | None = None,
+    ) -> None:
+        fields: dict[str, Any] = {
+            "phase": phase,
+            "outage_id": outage_id,
+        }
+        if connection_adopted is not None:
+            fields["connection_adopted"] = connection_adopted
+        if probe.identity is None:
+            self._log_usb_evidence(
+                "identity_probe_failed",
+                level=logging.WARNING,
+                failure_class=probe.failure_class or "unknown",
+                **fields,
+            )
+            return
+        self._log_usb_evidence(
+            f"identity_{phase}",
+            **fields,
+            **probe.identity,
+        )
+
+    def _start_identity_epoch(self, probe: _UsbIdentityProbe) -> None:
+        self._pending_outage_id = str(uuid4())
+        self._log_identity_probe(
+            phase="before",
+            outage_id=self._pending_outage_id,
+            probe=probe,
+        )
+
     def _record_usb_read(
         self,
         *,
@@ -933,6 +1089,9 @@ class OgloTactileStream(StreamBase):
             time.sleep(0.2)
             manifest = self._read_usb_manifest(ser)
             self._apply_manifest(manifest)
+            self._start_identity_epoch(
+                self._read_usb_identity(ser, quiesce_stream=False)
+            )
             ser.reset_input_buffer()
             ser.write(STREAM_ON_COMMAND)
             ser.flush()
@@ -960,7 +1119,14 @@ class OgloTactileStream(StreamBase):
             spinning quietly.
             """
             nonlocal ser, buffer, last_packet_at
-            outage_id = str(uuid4())
+            outage_id = self._pending_outage_id or str(uuid4())
+            if self._pending_outage_id is None:
+                self._pending_outage_id = outage_id
+                self._log_identity_probe(
+                    phase="before",
+                    outage_id=outage_id,
+                    probe=_UsbIdentityProbe(None, "baseline_unavailable"),
+                )
             self._log_usb_evidence(
                 "outage_observed",
                 level=logging.WARNING,
@@ -1078,17 +1244,16 @@ class OgloTactileStream(StreamBase):
                     pass
             self._serial = None
 
-    def _try_adopt_reconnected(self, ser: Any) -> bytes | None:
-        """Prove a fresh handle carries a live TAG stream; return its bytes.
+    def _try_adopt_reconnected(self, ser: Any) -> _UsbAdoption:
+        """Probe identity, then prove a fresh handle carries live TAG data.
 
-        Identity needs no handshake here: the stable by-id path embeds the
-        USB serial, so whatever answers on that path is this glove. A glove
-        whose MCU stayed up through the link blip is still in TAG mode and
-        talks immediately; a rebooted one is idle and gets one STREAM TAG ON
-        nudge after a short silence. Returns every byte read (real samples —
-        the caller seeds its parse buffer with them), or ``None`` when this
-        attempt's deadline passes without a valid packet.
+        The stable by-id path identifies the physical glove. GET IDENT adds the
+        boot/reset identity needed to explain the outage, while a valid TAG
+        packet remains the only adoption proof. The identity probe is bounded
+        and non-gating: old firmware or a malformed response is recorded later
+        as an evidence gap, then the existing reconnect policy continues.
         """
+        identity_probe = self._read_usb_identity(ser, quiesce_stream=True)
         # Assert TAG mode unconditionally, before reading a single byte. A
         # glove that re-enumerated boots idle and will never speak again
         # unless told to; the old code only nudged when the read buffer was
@@ -1099,7 +1264,7 @@ class OgloTactileStream(StreamBase):
             ser.write(STREAM_ON_COMMAND)
             ser.flush()
         except Exception:
-            return None
+            return _UsbAdoption(None, identity_probe)
 
         buffer = b""
         nudged = False
@@ -1107,14 +1272,14 @@ class OgloTactileStream(StreamBase):
         while not self._stop_event.is_set():
             elapsed = time.monotonic() - started
             if elapsed >= _RECONNECT_ATTEMPT_DEADLINE_S:
-                return None
+                return _UsbAdoption(None, identity_probe)
             if not nudged and not buffer and elapsed >= _RECONNECT_STREAM_ON_AFTER_S:
                 nudged = True
                 try:
                     ser.write(STREAM_ON_COMMAND)
                     ser.flush()
                 except Exception:
-                    return None
+                    return _UsbAdoption(None, identity_probe)
             read_started_ns = time.monotonic_ns()
             try:
                 chunk = ser.read(4096)
@@ -1125,7 +1290,7 @@ class OgloTactileStream(StreamBase):
                     diagnostic="read_exception",
                     exception=exc,
                 )
-                return None
+                return _UsbAdoption(None, identity_probe)
             if not chunk:
                 self._record_usb_read(
                     started_ns=read_started_ns,
@@ -1153,10 +1318,11 @@ class OgloTactileStream(StreamBase):
                 ),
             )
             if packet_found:
-                return buffer
+                return _UsbAdoption(buffer, identity_probe)
             if len(buffer) > 65_536:
-                return None  # a flood that never frames is not a TAG stream
-        return None
+                # A flood that never frames is not a TAG stream.
+                return _UsbAdoption(None, identity_probe)
+        return _UsbAdoption(None, identity_probe)
 
     def _usb_reconnect(
         self,
@@ -1196,6 +1362,7 @@ class OgloTactileStream(StreamBase):
         open_failures = 0
         adoption_failures = 0
         last_errno: int | None = None
+        last_identity_probe = _UsbIdentityProbe(None, "no_reconnected_handle")
 
         def reconnect_summary() -> dict[str, Any]:
             summary: dict[str, Any] = {
@@ -1249,8 +1416,9 @@ class OgloTactileStream(StreamBase):
                         pass
                 self._stop_event.wait(_RECONNECT_RETRY_INTERVAL_S)
                 continue
-            seed = self._try_adopt_reconnected(ser)
-            if seed is None:
+            adoption = self._try_adopt_reconnected(ser)
+            last_identity_probe = adoption.identity_probe
+            if adoption.seed is None:
                 adoption_failures += 1
                 try:
                     ser.close()
@@ -1299,6 +1467,12 @@ class OgloTactileStream(StreamBase):
                     "loss_estimate_method": "outage_duration_x_nominal_rate",
                     "loss_modality": "tactile",
                 }
+            self._log_identity_probe(
+                phase="after",
+                outage_id=outage_id,
+                probe=adoption.identity_probe,
+                connection_adopted=True,
+            )
             self._log_usb_evidence(
                 "recovery_result",
                 level=logging.WARNING,
@@ -1313,7 +1487,18 @@ class OgloTactileStream(StreamBase):
                 reconnect_summary=reconnect_summary(),
                 **loss_fields,
             )
-            return ser, seed
+            # The recovered board is now the authoritative baseline for the
+            # next incident, even when its identity probe failed. Preallocating
+            # the next ID lets that failure be explicit before any outage.
+            self._start_identity_epoch(adoption.identity_probe)
+            return ser, adoption.seed
+        self._log_identity_probe(
+            phase="after",
+            outage_id=outage_id,
+            probe=last_identity_probe,
+            connection_adopted=False,
+        )
+        self._pending_outage_id = None
         self._log_usb_evidence(
             "recovery_result",
             level=logging.ERROR,
