@@ -23,13 +23,16 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from syncfield.adapters.oglo.usb_packet import TAG_MAGIC, TAG_TYPE_TACTILE
+from syncfield.adapters.oglo.usb_packet import TAG_MAGIC, TAG_TYPE_IMU, TAG_TYPE_TACTILE
 from syncfield.clock import SessionClock
 from syncfield.types import HealthEventKind, SyncPoint
 
 
-def tag(kind: int, seq: int, t_us: int) -> bytes:
-    payload = struct.pack("<80H", *range(80))
+def tag(kind: int, seq: int, t_us: int, values=None) -> bytes:
+    if kind == TAG_TYPE_IMU:
+        payload = struct.pack("<6h", *(values or (0, 0, 4096, 0, 0, 0)))
+    else:
+        payload = struct.pack("<80H", *(values or range(80)))
     return TAG_MAGIC + bytes([kind]) + struct.pack("<HII", len(payload), seq, t_us) + payload
 
 
@@ -259,6 +262,75 @@ def test_still_streaming_glove_records_same_identity_across_outage(
     report = stream.stop_recording()
     stream.disconnect()
     assert report.frame_count == 2
+
+
+def test_outage_records_recent_imu_peak_as_evidence_not_cause(
+    oglo_usb, tmp_path, monkeypatch
+):
+    module, holder = oglo_usb
+    first, second = _FakeSerial("p"), _FakeSerial("p")
+    second.feed(tag(TAG_TYPE_TACTILE, 500, 60_000))
+    holder["queue"] = [first, second]
+    messages = []
+    monkeypatch.setattr(
+        module.stream.logger,
+        "log",
+        lambda _level, template, *args: messages.append(template % args),
+    )
+
+    stream, _health = _connected_recording_stream(module, holder, tmp_path, first)
+    first.feed(
+        tag(TAG_TYPE_IMU, 0, 2_500, (0, 0, 4096, 0, 0, 0))
+        + tag(TAG_TYPE_IMU, 1, 3_000, (12_000, 0, 4096, 0, 0, 0))
+    )
+    _wait(lambda: len(stream._pre_outage_accel) == 2)
+    first.kill()
+    _wait(lambda: stream._frame_count >= 2)
+
+    records = _usb_evidence_records(messages, module)
+    outage = next(event for event in records if event["event_type"] == "outage_observed")
+    imu = outage["pre_outage_imu"]
+    assert imu["status"] == "observed"
+    assert imu["window_ms"] == 5_000
+    assert imu["sample_count"] == 2
+    assert 3_000 <= imu["peak_resultant_mg"] <= 3_200
+    assert imu["peak_axis_saturated"] is False
+    assert imu["accelerometer_full_scale_g"] == 8
+    assert imu["classification"] == "evidence_only_not_cause"
+    assert not stream._pre_outage_accel
+
+    stream.stop_recording()
+    stream.disconnect()
+
+
+def test_outage_marks_pre_outage_imu_unavailable_when_no_sample_arrived(
+    oglo_usb, tmp_path, monkeypatch
+):
+    module, holder = oglo_usb
+    first, second = _FakeSerial("p"), _FakeSerial("p")
+    second.feed(tag(TAG_TYPE_TACTILE, 500, 60_000))
+    holder["queue"] = [first, second]
+    messages = []
+    monkeypatch.setattr(
+        module.stream.logger,
+        "log",
+        lambda _level, template, *args: messages.append(template % args),
+    )
+
+    stream, _health = _connected_recording_stream(module, holder, tmp_path, first)
+    first.kill()
+    _wait(lambda: stream._frame_count >= 2)
+
+    records = _usb_evidence_records(messages, module)
+    outage = next(event for event in records if event["event_type"] == "outage_observed")
+    assert outage["pre_outage_imu"] == {
+        "reason": "no_recent_imu_sample",
+        "status": "unavailable",
+        "window_ms": 5_000,
+    }
+
+    stream.stop_recording()
+    stream.disconnect()
 
 
 def test_rebooted_glove_gets_a_stream_on_nudge(oglo_usb, tmp_path, monkeypatch):

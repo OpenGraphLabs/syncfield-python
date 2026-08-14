@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import threading
 import time
@@ -118,6 +119,15 @@ _USB_IDENT_COMMAND = b"GET IDENT\n"
 _USB_IDENT_PREFIX = b"#IDENT "
 _USB_IDENT_PROBE_TIMEOUT_S = 0.75
 _USB_IDENT_MAX_LINE_BYTES = 4096
+# The on-board ICM-42688P/TDK accelerometer is configured for +/-8 g in the
+# matching firmware. Keep a short, bounded host-side window so a complete MCU
+# power loss cannot erase the motion immediately preceding a USB outage. This
+# is correlation evidence, not a cause classifier: gravity contributes roughly
+# 1,000 mg and a cable tug, impact, or ordinary hand motion can look alike.
+_PRE_OUTAGE_IMU_WINDOW_NS = 5_000_000_000
+_PRE_OUTAGE_IMU_MAX_SAMPLES = 3_000
+_IMU_ACCEL_SCALE_MG_PER_LSB = 0.244
+_IMU_ACCEL_FULL_SCALE_G = 8
 
 
 @dataclass(frozen=True)
@@ -388,6 +398,9 @@ class OgloTactileStream(StreamBase):
         self._substream_callbacks: list[Callable[[Any], None]] = []
         self._imu_recent_ns: deque[int] = deque(maxlen=120)
         self._mag_recent_ns: deque[int] = deque(maxlen=120)
+        self._pre_outage_accel: deque[tuple[int, int, bool]] = deque(
+            maxlen=_PRE_OUTAGE_IMU_MAX_SAMPLES
+        )
         self._imu_recent_lock = threading.Lock()
 
         # Drop detection across packets (seq_base continuity).
@@ -428,6 +441,8 @@ class OgloTactileStream(StreamBase):
         self._connect_error = None
         self._manifest = None
         self._pending_outage_id = None
+        with self._imu_recent_lock:
+            self._pre_outage_accel.clear()
         self._ready_event.clear()
         self._stop_event.clear()
 
@@ -1022,6 +1037,54 @@ class OgloTactileStream(StreamBase):
             projection.append(item)
         return projection
 
+    def _take_pre_outage_imu_projection(self, outage_at_ns: int) -> dict[str, Any]:
+        """Drain and summarize recent acceleration without retaining samples.
+
+        The evidence stays metadata-only: only a count, peak magnitude, age,
+        and saturation bit are logged. Raw IMU samples remain in the normal
+        sensor artifact when recording is active.
+        """
+
+        cutoff_ns = outage_at_ns - _PRE_OUTAGE_IMU_WINDOW_NS
+        with self._imu_recent_lock:
+            recent = [
+                sample
+                for sample in self._pre_outage_accel
+                if sample[0] >= cutoff_ns
+            ]
+            self._pre_outage_accel.clear()
+
+        window_ms = _PRE_OUTAGE_IMU_WINDOW_NS // 1_000_000
+        if not recent:
+            return {
+                "status": "unavailable",
+                "window_ms": window_ms,
+                "reason": "no_recent_imu_sample",
+            }
+
+        peak_at_ns, peak_norm_sq, peak_saturated = max(
+            recent, key=lambda sample: sample[1]
+        )
+        latest_at_ns = recent[-1][0]
+        return {
+            "status": "observed",
+            "window_ms": window_ms,
+            "sample_count": len(recent),
+            "latest_sample_age_ms": max(
+                0, (outage_at_ns - latest_at_ns) // 1_000_000
+            ),
+            "peak_sample_age_ms": max(
+                0, (outage_at_ns - peak_at_ns) // 1_000_000
+            ),
+            "peak_resultant_mg": round(
+                math.sqrt(peak_norm_sq) * _IMU_ACCEL_SCALE_MG_PER_LSB
+            ),
+            "peak_axis_saturated": peak_saturated,
+            "accelerometer_full_scale_g": _IMU_ACCEL_FULL_SCALE_G,
+            "scale_mg_per_lsb": _IMU_ACCEL_SCALE_MG_PER_LSB,
+            "classification": "evidence_only_not_cause",
+        }
+
     # ------------------------------------------------------------------
     # Payload decoding (unit-testable without asyncio / bleak)
     # ------------------------------------------------------------------
@@ -1119,6 +1182,7 @@ class OgloTactileStream(StreamBase):
             spinning quietly.
             """
             nonlocal ser, buffer, last_packet_at
+            outage_at_ns = time.monotonic_ns()
             outage_id = self._pending_outage_id or str(uuid4())
             if self._pending_outage_id is None:
                 self._pending_outage_id = outage_id
@@ -1133,6 +1197,7 @@ class OgloTactileStream(StreamBase):
                 outage_id=outage_id,
                 reason=reason,
                 read_spans=self._usb_read_history_projection(),
+                pre_outage_imu=self._take_pre_outage_imu_projection(outage_at_ns),
             )
             reconnected = self._usb_reconnect(
                 reason=reason,
@@ -1612,8 +1677,12 @@ class OgloTactileStream(StreamBase):
         device_ns: int,
     ) -> None:
         """Fan a wrist-IMU sample out to the live handler + substream file."""
+        ax, ay, az = imu[:3]
+        accel_norm_sq = ax * ax + ay * ay + az * az
+        accel_saturated = any(abs(axis) >= 32_767 for axis in (ax, ay, az))
         with self._imu_recent_lock:
             self._imu_recent_ns.append(recv_ns)
+            self._pre_outage_accel.append((recv_ns, accel_norm_sq, accel_saturated))
         channels = {name: int(v) for name, v in zip(IMU_CHANNELS, imu)}
 
         with self._recording_lock:
