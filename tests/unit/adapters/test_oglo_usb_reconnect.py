@@ -13,6 +13,7 @@ stack) gets one kernel USB reset mid-window.
 """
 
 import importlib
+import json
 import struct
 import sys
 import threading
@@ -142,6 +143,15 @@ def _wait(predicate, timeout_s=4.0):
     while not predicate() and time.monotonic() < deadline:
         time.sleep(0.005)
     assert predicate(), "condition not met in time"
+
+
+def _usb_evidence_records(messages, module):
+    prefix = module.stream._USB_EVIDENCE_PREFIX
+    return [
+        json.loads(message[len(prefix):])
+        for message in messages
+        if message.startswith(prefix)
+    ]
 
 
 def _connected_recording_stream(module, holder, tmp_path, first):
@@ -277,7 +287,9 @@ def test_reconnect_gives_up_after_window_and_thread_exits(oglo_usb, tmp_path, mo
     stream.disconnect()
 
 
-def test_present_but_mute_device_escalates_to_one_usb_reset(oglo_usb, tmp_path, monkeypatch):
+def test_present_but_mute_device_escalates_to_one_usb_reset(
+    oglo_usb, tmp_path, monkeypatch
+):
     """The wedge case: enumerated, port opens, firmware mute. Three real
     occurrences on ogpi-005 (2026-08-10); a kernel USBDEVFS_RESET revived the
     glove every time where logical replugging did not — so the reconnect loop
@@ -293,6 +305,12 @@ def test_present_but_mute_device_escalates_to_one_usb_reset(oglo_usb, tmp_path, 
     monkeypatch.setattr(
         module.stream, "_usb_device_reset",
         lambda port, stream_id="": resets.append(port) or True,
+    )
+    messages = []
+    monkeypatch.setattr(
+        module.stream.logger,
+        "log",
+        lambda _level, template, *args: messages.append(template % args),
     )
 
     first = _FakeSerial("p")
@@ -310,4 +328,99 @@ def test_present_but_mute_device_escalates_to_one_usb_reset(oglo_usb, tmp_path, 
     assert resets == ["/dev/serial/by-id/oglo-left"], (
         "exactly one USB reset per outage"
     )
+    records = _usb_evidence_records(messages, module)
+    event_types = [event["event_type"] for event in records]
+    assert "usb_reset_requested" in event_types
+    assert "usb_reset_result" in event_types
+    assert "recovery_result" in event_types
+    assert not any(event_type.startswith("reader_") for event_type in event_types)
+    incident_records = [event for event in records if "outage_id" in event]
+    assert len({event["outage_id"] for event in incident_records}) == 1
+    assert all("parent_event_id" not in event for event in records)
+    recovery = next(
+        event for event in records if event["event_type"] == "recovery_result"
+    )
+    assert recovery["reconnect_summary"]["attempts"] >= 1
+    assert recovery["reconnect_summary"]["adoption_failures"] >= 1
+    assert recovery["reconnect_summary"]["reset_attempted"] is True
+    assert recovery["reconnect_summary"]["reset_outcome"] == "succeeded"
+    assert "reconnect_spans" not in recovery
     stream.disconnect()
+
+
+def test_usb_flight_log_is_bounded_metadata_only(oglo_usb, tmp_path, monkeypatch):
+    module, _holder = oglo_usb
+    stream = module.OgloTactileStream(
+        "tactile_left",
+        serial_port="/dev/serial/by-id/oglo-left",
+        hand="left",
+        output_dir=tmp_path,
+    )
+
+    for index in range(70):
+        stream._record_usb_read(
+            started_ns=index,
+            byte_count=index,
+            diagnostic="valid_frame",
+        )
+
+    assert len(stream._usb_read_history) == 16
+    assert all(isinstance(entry, tuple) for entry in stream._usb_read_history)
+    projection = stream._usb_read_history_projection()
+    assert len(projection) == 16
+    assert projection[0]["byte_count"] == 54
+    assert set(projection[0]) == {"duration_us", "byte_count", "classification"}
+
+    messages = []
+    monkeypatch.setattr(
+        module.stream.logger,
+        "log",
+        lambda _level, template, *args: messages.append(template % args),
+    )
+    stream._log_usb_evidence(
+        "outage_observed",
+        outage_id="outage-test",
+        read_spans=projection,
+    )
+
+    records = _usb_evidence_records(messages, module)
+    assert records[-1]["event_type"] == "outage_observed"
+    assert records[-1]["outage_id"] == "outage-test"
+    for redundant in (
+        "event_id",
+        "origin_seq",
+        "source_monotonic_ns",
+        "source_realtime_ns",
+        "host_boot_id",
+        "invocation_id",
+        "parent_event_id",
+        "schema",
+        "raw_payload",
+    ):
+        assert redundant not in records[-1]
+
+
+def test_usb_read_history_keeps_only_real_errno(oglo_usb, tmp_path):
+    module, _holder = oglo_usb
+    stream = module.OgloTactileStream(
+        "tactile_left",
+        serial_port="/dev/serial/by-id/oglo-left",
+        hand="left",
+        output_dir=tmp_path,
+    )
+    stream._record_usb_read(
+        started_ns=1,
+        byte_count=0,
+        diagnostic="read_exception",
+        exception=OSError(5, "x" * 800),
+    )
+    stream._record_usb_read(
+        started_ns=2,
+        byte_count=0,
+        diagnostic="zero_byte_read",
+    )
+
+    projection = stream._usb_read_history_projection()
+    assert projection[0]["errno"] == 5
+    assert "errno" not in projection[1]
+    assert all("exception_message" not in item for item in projection)
