@@ -44,7 +44,6 @@ class _SerialError(Exception):
 def _identity(
     *,
     mcu_boot_id="00112233445566778899aabbccddeeff",
-    journal_boot_id="0123456789abcdef",
     journal_boot_counter=7,
     reset_reason="poweron",
 ):
@@ -63,7 +62,6 @@ def _identity(
         "wedge_guard": False,
         "journal_ready": True,
         "journal_boot_counter": journal_boot_counter,
-        "journal_boot_id": journal_boot_id,
     }
 
 
@@ -255,8 +253,15 @@ def test_still_streaming_glove_records_same_identity_across_outage(
     )
     assert before["stream_id"] == after["stream_id"] == "tactile_left"
     assert before["mcu_boot_id"] == after["mcu_boot_id"]
-    assert before["journal_boot_id"] == after["journal_boot_id"]
+    assert before["journal_boot_counter"] == after["journal_boot_counter"]
     assert after["connection_adopted"] is True
+    incident_records = [event for event in records if "outage_id" in event]
+    assert {event["outage_id"] for event in incident_records} == {
+        outage["outage_id"]
+    }
+    assert sum(
+        event["event_type"] == "identity_before" for event in incident_records
+    ) == 1
     kinds = [h.kind for h in health]
     assert HealthEventKind.WARNING in kinds
     assert any("reconnect" in h.detail.lower() for h in health)
@@ -264,75 +269,6 @@ def test_still_streaming_glove_records_same_identity_across_outage(
     report = stream.stop_recording()
     stream.disconnect()
     assert report.frame_count == 2
-
-
-def test_outage_records_recent_imu_peak_as_evidence_not_cause(
-    oglo_usb, tmp_path, monkeypatch
-):
-    module, holder = oglo_usb
-    first, second = _FakeSerial("p"), _FakeSerial("p")
-    second.feed(tag(TAG_TYPE_TACTILE, 500, 60_000))
-    holder["queue"] = [first, second]
-    messages = []
-    monkeypatch.setattr(
-        module.stream.logger,
-        "log",
-        lambda _level, template, *args: messages.append(template % args),
-    )
-
-    stream, _health = _connected_recording_stream(module, holder, tmp_path, first)
-    first.feed(
-        tag(TAG_TYPE_IMU, 0, 2_500, (0, 0, 4096, 0, 0, 0))
-        + tag(TAG_TYPE_IMU, 1, 3_000, (12_000, 0, 4096, 0, 0, 0))
-    )
-    _wait(lambda: len(stream._pre_outage_accel) == 2)
-    first.kill()
-    _wait(lambda: stream._frame_count >= 2)
-
-    records = _usb_evidence_records(messages, module)
-    outage = next(event for event in records if event["event_type"] == "outage_observed")
-    imu = outage["pre_outage_imu"]
-    assert imu["status"] == "observed"
-    assert imu["window_ms"] == 5_000
-    assert imu["sample_count"] == 2
-    assert 3_000 <= imu["peak_resultant_mg"] <= 3_200
-    assert imu["peak_axis_saturated"] is False
-    assert imu["accelerometer_full_scale_g"] == 8
-    assert imu["classification"] == "evidence_only_not_cause"
-    assert not stream._pre_outage_accel
-
-    stream.stop_recording()
-    stream.disconnect()
-
-
-def test_outage_marks_pre_outage_imu_unavailable_when_no_sample_arrived(
-    oglo_usb, tmp_path, monkeypatch
-):
-    module, holder = oglo_usb
-    first, second = _FakeSerial("p"), _FakeSerial("p")
-    second.feed(tag(TAG_TYPE_TACTILE, 500, 60_000))
-    holder["queue"] = [first, second]
-    messages = []
-    monkeypatch.setattr(
-        module.stream.logger,
-        "log",
-        lambda _level, template, *args: messages.append(template % args),
-    )
-
-    stream, _health = _connected_recording_stream(module, holder, tmp_path, first)
-    first.kill()
-    _wait(lambda: stream._frame_count >= 2)
-
-    records = _usb_evidence_records(messages, module)
-    outage = next(event for event in records if event["event_type"] == "outage_observed")
-    assert outage["pre_outage_imu"] == {
-        "reason": "no_recent_imu_sample",
-        "status": "unavailable",
-        "window_ms": 5_000,
-    }
-
-    stream.stop_recording()
-    stream.disconnect()
 
 
 def test_rebooted_glove_gets_a_stream_on_nudge(oglo_usb, tmp_path, monkeypatch):
@@ -344,7 +280,6 @@ def test_rebooted_glove_gets_a_stream_on_nudge(oglo_usb, tmp_path, monkeypatch):
         stream_on_gated=True,
         identity=_identity(
             mcu_boot_id="ffeeddccbbaa99887766554433221100",
-            journal_boot_id="fedcba9876543210",
             journal_boot_counter=8,
             reset_reason="software",
         ),
@@ -372,7 +307,6 @@ def test_rebooted_glove_gets_a_stream_on_nudge(oglo_usb, tmp_path, monkeypatch):
         and event["outage_id"] == outage["outage_id"]
     )
     assert after["mcu_boot_id"] == "ffeeddccbbaa99887766554433221100"
-    assert after["journal_boot_id"] == "fedcba9876543210"
     assert after["journal_boot_counter"] == 8
     assert after["reset_reason"] == "software"
     assert after["application_sha256"] == "ab" * 32
@@ -380,7 +314,7 @@ def test_rebooted_glove_gets_a_stream_on_nudge(oglo_usb, tmp_path, monkeypatch):
     stream.disconnect()
 
 
-def test_initial_identity_probe_failure_is_explicit_and_non_gating(
+def test_initial_identity_probe_failure_is_non_gating_and_deferred_until_outage(
     oglo_usb, tmp_path, monkeypatch
 ):
     module, holder = oglo_usb
@@ -402,12 +336,7 @@ def test_initial_identity_probe_failure_is_explicit_and_non_gating(
     )
     stream.connect()
     records = _usb_evidence_records(messages, module)
-    failure = next(
-        event for event in records if event["event_type"] == "identity_probe_failed"
-    )
-    assert failure["phase"] == "before"
-    assert failure["failure_class"] == "unsupported"
-    assert failure["outage_id"]
+    assert records == []
     assert stream._thread.is_alive()
     stream.disconnect()
 
@@ -478,7 +407,6 @@ def test_identity_parser_accepts_the_hand_flashed_0913_legacy_shape(oglo_usb):
     identity.pop("application_sha256")
     identity.pop("journal_ready")
     identity.pop("journal_boot_counter")
-    identity.pop("journal_boot_id")
     identity["fw_rev"] = "0.9.13"
 
     parsed = module.stream._parse_usb_identity(json.dumps(identity).encode())
@@ -650,7 +578,9 @@ def test_present_but_mute_device_escalates_to_one_usb_reset(
     stream.disconnect()
 
 
-def test_usb_flight_log_is_bounded_metadata_only(oglo_usb, tmp_path, monkeypatch):
+def test_usb_read_summary_preserves_last_valid_frame_through_long_silence(
+    oglo_usb, tmp_path, monkeypatch
+):
     module, _holder = oglo_usb
     stream = module.OgloTactileStream(
         "tactile_left",
@@ -659,19 +589,24 @@ def test_usb_flight_log_is_bounded_metadata_only(oglo_usb, tmp_path, monkeypatch
         output_dir=tmp_path,
     )
 
-    for index in range(70):
+    valid_started_ns = time.monotonic_ns()
+    stream._record_usb_read(
+        started_ns=valid_started_ns,
+        byte_count=192,
+        diagnostic="valid_frame",
+    )
+    for _ in range(70):
         stream._record_usb_read(
-            started_ns=index,
-            byte_count=index,
-            diagnostic="valid_frame",
+            started_ns=time.monotonic_ns(),
+            byte_count=0,
+            diagnostic="zero_byte_read",
         )
 
-    assert len(stream._usb_read_history) == 16
-    assert all(isinstance(entry, tuple) for entry in stream._usb_read_history)
-    projection = stream._usb_read_history_projection()
-    assert len(projection) == 16
-    assert projection[0]["byte_count"] == 54
-    assert set(projection[0]) == {"duration_us", "byte_count", "classification"}
+    projection = stream._usb_read_summary(time.monotonic_ns())
+    assert projection["consecutive_zero_reads"] == 70
+    assert projection["last_valid_frame_age_ms"] >= 0
+    assert projection["last_nonzero_read"]["byte_count"] == 192
+    assert projection["last_nonzero_read"]["classification"] == "valid_frame"
 
     messages = []
     monkeypatch.setattr(
@@ -682,7 +617,7 @@ def test_usb_flight_log_is_bounded_metadata_only(oglo_usb, tmp_path, monkeypatch
     stream._log_usb_evidence(
         "outage_observed",
         outage_id="outage-test",
-        read_spans=projection,
+        read_summary=projection,
     )
 
     records = _usb_evidence_records(messages, module)
@@ -704,7 +639,7 @@ def test_usb_flight_log_is_bounded_metadata_only(oglo_usb, tmp_path, monkeypatch
         assert redundant not in records[-1]
 
 
-def test_usb_read_history_keeps_only_real_errno(oglo_usb, tmp_path):
+def test_usb_read_summary_keeps_only_real_errno(oglo_usb, tmp_path):
     module, _holder = oglo_usb
     stream = module.OgloTactileStream(
         "tactile_left",
@@ -724,7 +659,6 @@ def test_usb_read_history_keeps_only_real_errno(oglo_usb, tmp_path):
         diagnostic="zero_byte_read",
     )
 
-    projection = stream._usb_read_history_projection()
-    assert projection[0]["errno"] == 5
-    assert "errno" not in projection[1]
-    assert all("exception_message" not in item for item in projection)
+    projection = stream._usb_read_summary(time.monotonic_ns())
+    assert projection["last_read_exception_errno"] == 5
+    assert "exception_message" not in projection

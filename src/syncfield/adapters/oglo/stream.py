@@ -22,7 +22,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import math
 import os
 import threading
 import time
@@ -114,22 +113,10 @@ _RECONNECT_ATTEMPT_DEADLINE_S = 1.6
 _RECONNECT_USB_RESET_AFTER_S = 3.0
 _USBDEVFS_RESET = (ord("U") << 8) | 20
 _USB_EVIDENCE_PREFIX = "OGLO_USB_EVIDENCE "
-_USB_INCIDENT_HISTORY_LIMIT = 16
 _USB_IDENT_COMMAND = b"GET IDENT\n"
 _USB_IDENT_PREFIX = b"#IDENT "
 _USB_IDENT_PROBE_TIMEOUT_S = 0.75
 _USB_IDENT_MAX_LINE_BYTES = 4096
-# The on-board ICM-42688P/TDK accelerometer is configured for +/-8 g in the
-# matching firmware. Keep a short, bounded host-side window so a complete MCU
-# power loss cannot erase the motion immediately preceding a USB outage. This
-# is correlation evidence, not a cause classifier: gravity contributes roughly
-# 1,000 mg and a cable tug, impact, or ordinary hand motion can look alike.
-_PRE_OUTAGE_IMU_WINDOW_NS = 5_000_000_000
-_PRE_OUTAGE_IMU_MAX_SAMPLES = 3_000
-_IMU_ACCEL_SCALE_MG_PER_LSB = 0.244
-_IMU_ACCEL_FULL_SCALE_G = 8
-
-
 @dataclass(frozen=True)
 class _UsbIdentityProbe:
     identity: dict[str, Any] | None
@@ -227,12 +214,6 @@ def _parse_usb_identity(raw: bytes) -> dict[str, Any]:
         "available" if identity["journal_ready"] else "invalid"
     )
     if identity["journal_ready"]:
-        journal_boot_id = required_string("journal_boot_id", max_chars=16)
-        if len(journal_boot_id) != 16 or any(
-            char not in "0123456789abcdef" for char in journal_boot_id
-        ):
-            raise OgloProtocolError("OGLO USB identity has invalid journal_boot_id")
-        identity["journal_boot_id"] = journal_boot_id
         identity["journal_boot_counter"] = required_int("journal_boot_counter")
     else:
         identity["journal_error"] = required_string("journal_error", max_chars=128)
@@ -468,24 +449,19 @@ class OgloTactileStream(StreamBase):
         self._substream_callbacks: list[Callable[[Any], None]] = []
         self._imu_recent_ns: deque[int] = deque(maxlen=120)
         self._mag_recent_ns: deque[int] = deque(maxlen=120)
-        self._pre_outage_accel: deque[tuple[int, int, bool]] = deque(
-            maxlen=_PRE_OUTAGE_IMU_MAX_SAMPLES
-        )
         self._imu_recent_lock = threading.Lock()
 
         # Drop detection across packets (seq_base continuity).
         self._next_expected_seq: dict[str, int] = {}
 
-        # Metadata-only flight recorder. It is emitted to the normal process
-        # log when an outage occurs; sensor and raw USB bytes never enter it.
-        self._usb_read_history: deque[tuple[int, int, str, int | None]] = deque(
-            maxlen=_USB_INCIDENT_HISTORY_LIMIT
-        )
+        # Metadata-only read summary. Repeated zero-byte reads are collapsed so
+        # a long silence cannot evict the last valid frame from the evidence.
+        self._last_valid_usb_frame_at_ns: int | None = None
+        self._last_nonzero_usb_read: tuple[int, int, str] | None = None
+        self._consecutive_zero_usb_reads = 0
+        self._last_usb_read_exception_errno: int | None = None
         self._usb_evidence_identity = _usb_physical_identity(self._serial_port)
-        # The ID is allocated with the identity baseline, before an outage
-        # exists. If the link later fails, every host action and the after probe
-        # reuse it. A successful after probe is also the next outage's baseline.
-        self._pending_outage_id: str | None = None
+        self._identity_baseline: _UsbIdentityProbe | None = None
 
     # ------------------------------------------------------------------
     # Stream SPI — 4-phase lifecycle
@@ -511,9 +487,8 @@ class OgloTactileStream(StreamBase):
         self._next_expected_seq = {}
         self._connect_error = None
         self._manifest = None
-        self._pending_outage_id = None
-        with self._imu_recent_lock:
-            self._pre_outage_accel.clear()
+        self._identity_baseline = None
+        self._reset_usb_read_diagnostics()
         self._ready_event.clear()
         self._stop_event.clear()
 
@@ -1063,14 +1038,6 @@ class OgloTactileStream(StreamBase):
             **probe.identity,
         )
 
-    def _start_identity_epoch(self, probe: _UsbIdentityProbe) -> None:
-        self._pending_outage_id = str(uuid4())
-        self._log_identity_probe(
-            phase="before",
-            outage_id=self._pending_outage_id,
-            probe=probe,
-        )
-
     def _record_usb_read(
         self,
         *,
@@ -1083,9 +1050,21 @@ class OgloTactileStream(StreamBase):
         if not isinstance(errno, int) or isinstance(errno, bool):
             errno = None
         duration_us = max(0, (time.monotonic_ns() - started_ns) // 1_000)
-        self._usb_read_history.append(
-            (duration_us, byte_count, diagnostic, errno)
-        )
+        if diagnostic == "valid_frame":
+            self._last_valid_usb_frame_at_ns = time.monotonic_ns()
+            self._last_usb_read_exception_errno = None
+        if diagnostic == "zero_byte_read":
+            self._consecutive_zero_usb_reads += 1
+        else:
+            self._consecutive_zero_usb_reads = 0
+        if byte_count > 0:
+            self._last_nonzero_usb_read = (
+                duration_us,
+                byte_count,
+                diagnostic,
+            )
+        if diagnostic == "read_exception" and errno is not None:
+            self._last_usb_read_exception_errno = errno
 
     @staticmethod
     def _classify_usb_read(
@@ -1102,66 +1081,33 @@ class OgloTactileStream(StreamBase):
             return "malformed_header_or_frame"
         return "unframed_traffic"
 
-    def _usb_read_history_projection(self) -> list[dict[str, Any]]:
-        projection: list[dict[str, Any]] = []
-        for duration_us, byte_count, classification, errno in self._usb_read_history:
-            item: dict[str, Any] = {
+    def _usb_read_summary(self, outage_at_ns: int) -> dict[str, Any]:
+        summary: dict[str, Any] = {
+            "consecutive_zero_reads": self._consecutive_zero_usb_reads,
+        }
+        if self._last_valid_usb_frame_at_ns is not None:
+            summary["last_valid_frame_age_ms"] = max(
+                0,
+                (outage_at_ns - self._last_valid_usb_frame_at_ns) // 1_000_000,
+            )
+        if self._last_nonzero_usb_read is not None:
+            duration_us, byte_count, classification = self._last_nonzero_usb_read
+            summary["last_nonzero_read"] = {
                 "duration_us": duration_us,
                 "byte_count": byte_count,
                 "classification": classification,
             }
-            if errno is not None:
-                item["errno"] = errno
-            projection.append(item)
-        return projection
+        if self._last_usb_read_exception_errno is not None:
+            summary["last_read_exception_errno"] = (
+                self._last_usb_read_exception_errno
+            )
+        return summary
 
-    def _take_pre_outage_imu_projection(self, outage_at_ns: int) -> dict[str, Any]:
-        """Drain and summarize recent acceleration without retaining samples.
-
-        The evidence stays metadata-only: only a count, peak magnitude, age,
-        and saturation bit are logged. Raw IMU samples remain in the normal
-        sensor artifact when recording is active.
-        """
-
-        cutoff_ns = outage_at_ns - _PRE_OUTAGE_IMU_WINDOW_NS
-        with self._imu_recent_lock:
-            recent = [
-                sample
-                for sample in self._pre_outage_accel
-                if sample[0] >= cutoff_ns
-            ]
-            self._pre_outage_accel.clear()
-
-        window_ms = _PRE_OUTAGE_IMU_WINDOW_NS // 1_000_000
-        if not recent:
-            return {
-                "status": "unavailable",
-                "window_ms": window_ms,
-                "reason": "no_recent_imu_sample",
-            }
-
-        peak_at_ns, peak_norm_sq, peak_saturated = max(
-            recent, key=lambda sample: sample[1]
-        )
-        latest_at_ns = recent[-1][0]
-        return {
-            "status": "observed",
-            "window_ms": window_ms,
-            "sample_count": len(recent),
-            "latest_sample_age_ms": max(
-                0, (outage_at_ns - latest_at_ns) // 1_000_000
-            ),
-            "peak_sample_age_ms": max(
-                0, (outage_at_ns - peak_at_ns) // 1_000_000
-            ),
-            "peak_resultant_mg": round(
-                math.sqrt(peak_norm_sq) * _IMU_ACCEL_SCALE_MG_PER_LSB
-            ),
-            "peak_axis_saturated": peak_saturated,
-            "accelerometer_full_scale_g": _IMU_ACCEL_FULL_SCALE_G,
-            "scale_mg_per_lsb": _IMU_ACCEL_SCALE_MG_PER_LSB,
-            "classification": "evidence_only_not_cause",
-        }
+    def _reset_usb_read_diagnostics(self) -> None:
+        self._last_valid_usb_frame_at_ns = None
+        self._last_nonzero_usb_read = None
+        self._consecutive_zero_usb_reads = 0
+        self._last_usb_read_exception_errno = None
 
     # ------------------------------------------------------------------
     # Payload decoding (unit-testable without asyncio / bleak)
@@ -1230,8 +1176,8 @@ class OgloTactileStream(StreamBase):
             time.sleep(0.2)
             manifest = self._read_usb_manifest(ser)
             self._apply_manifest(manifest)
-            self._start_identity_epoch(
-                self._read_usb_identity(ser, quiesce_stream=False)
+            self._identity_baseline = self._read_usb_identity(
+                ser, quiesce_stream=False
             )
             ser.reset_input_buffer()
             ser.write(STREAM_ON_COMMAND)
@@ -1261,22 +1207,21 @@ class OgloTactileStream(StreamBase):
             """
             nonlocal ser, buffer, last_packet_at
             outage_at_ns = time.monotonic_ns()
-            outage_id = self._pending_outage_id or str(uuid4())
-            if self._pending_outage_id is None:
-                self._pending_outage_id = outage_id
-                self._log_identity_probe(
-                    phase="before",
-                    outage_id=outage_id,
-                    probe=_UsbIdentityProbe(None, "baseline_unavailable"),
-                )
+            outage_id = str(uuid4())
+            self._log_identity_probe(
+                phase="before",
+                outage_id=outage_id,
+                probe=self._identity_baseline
+                or _UsbIdentityProbe(None, "baseline_unavailable"),
+            )
             self._log_usb_evidence(
                 "outage_observed",
                 level=logging.WARNING,
                 outage_id=outage_id,
                 reason=reason,
-                read_spans=self._usb_read_history_projection(),
-                pre_outage_imu=self._take_pre_outage_imu_projection(outage_at_ns),
+                read_summary=self._usb_read_summary(outage_at_ns),
             )
+            self._reset_usb_read_diagnostics()
             reconnected = self._usb_reconnect(
                 reason=reason,
                 outage_id=outage_id,
@@ -1630,10 +1575,7 @@ class OgloTactileStream(StreamBase):
                 reconnect_summary=reconnect_summary(),
                 **loss_fields,
             )
-            # The recovered board is now the authoritative baseline for the
-            # next incident, even when its identity probe failed. Preallocating
-            # the next ID lets that failure be explicit before any outage.
-            self._start_identity_epoch(adoption.identity_probe)
+            self._identity_baseline = adoption.identity_probe
             return ser, adoption.seed
         self._log_identity_probe(
             phase="after",
@@ -1641,7 +1583,6 @@ class OgloTactileStream(StreamBase):
             probe=last_identity_probe,
             connection_adopted=False,
         )
-        self._pending_outage_id = None
         self._log_usb_evidence(
             "recovery_result",
             level=logging.ERROR,
@@ -1755,12 +1696,8 @@ class OgloTactileStream(StreamBase):
         device_ns: int,
     ) -> None:
         """Fan a wrist-IMU sample out to the live handler + substream file."""
-        ax, ay, az = imu[:3]
-        accel_norm_sq = ax * ax + ay * ay + az * az
-        accel_saturated = any(abs(axis) >= 32_767 for axis in (ax, ay, az))
         with self._imu_recent_lock:
             self._imu_recent_ns.append(recv_ns)
-            self._pre_outage_accel.append((recv_ns, accel_norm_sq, accel_saturated))
         channels = {name: int(v) for name, v in zip(IMU_CHANNELS, imu)}
 
         with self._recording_lock:

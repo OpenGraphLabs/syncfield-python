@@ -12,6 +12,5 @@
   "wedge_last_stall_ms": 0,
   "wedge_guard": false,
   "journal_ready": true,
-  "journal_boot_counter": 7,
-  "journal_boot_id": "0123456789abcdef"
+  "journal_boot_counter": 7
 }
