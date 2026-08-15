@@ -1,5 +1,4 @@
 {
-  "ident_schema": 1,
   "mcu_boot_id": "00112233445566778899aabbccddeeff",
   "boot_count": 7,
   "reset_reason": "poweron",

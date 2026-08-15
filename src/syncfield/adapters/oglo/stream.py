@@ -114,8 +114,6 @@ _RECONNECT_ATTEMPT_DEADLINE_S = 1.6
 _RECONNECT_USB_RESET_AFTER_S = 3.0
 _USBDEVFS_RESET = (ord("U") << 8) | 20
 _USB_EVIDENCE_PREFIX = "OGLO_USB_EVIDENCE "
-_USB_EVIDENCE_SCHEMA_VERSION = "oglo.usb_evidence.v1"
-_USB_IDENT_SCHEMA_VERSION = 1
 _USB_INCIDENT_HISTORY_LIMIT = 16
 _USB_IDENT_COMMAND = b"GET IDENT\n"
 _USB_IDENT_PREFIX = b"#IDENT "
@@ -172,14 +170,6 @@ def _parse_usb_identity(raw: bytes) -> dict[str, Any]:
             raise OgloProtocolError(f"OGLO USB identity has invalid {field}")
         return value
 
-    ident_schema = decoded.get("ident_schema", 0)
-    if (
-        not isinstance(ident_schema, int)
-        or isinstance(ident_schema, bool)
-        or ident_schema not in (0, _USB_IDENT_SCHEMA_VERSION)
-    ):
-        raise OgloProtocolError("OGLO USB identity has unsupported ident_schema")
-
     mcu_boot_id = required_string("mcu_boot_id", max_chars=32)
     if len(mcu_boot_id) != 32 or any(
         char not in "0123456789abcdef" for char in mcu_boot_id
@@ -187,7 +177,6 @@ def _parse_usb_identity(raw: bytes) -> dict[str, Any]:
         raise OgloProtocolError("OGLO USB identity has invalid mcu_boot_id")
 
     identity: dict[str, Any] = {
-        "ident_schema": ident_schema,
         "mcu_boot_id": mcu_boot_id,
         "boot_count": required_int("boot_count"),
         "reset_reason": required_string("reset_reason", max_chars=64),
@@ -201,13 +190,19 @@ def _parse_usb_identity(raw: bytes) -> dict[str, Any]:
     }
 
     application_sha256 = decoded.get("application_sha256")
+    application_sha256_status = decoded.get("application_sha256_status")
+    if application_sha256_status is not None and application_sha256_status not in (
+        "available",
+        "unavailable",
+    ):
+        raise OgloProtocolError(
+            "OGLO USB identity has invalid application_sha256_status"
+        )
     if application_sha256 is None:
-        if ident_schema == _USB_IDENT_SCHEMA_VERSION:
-            status = required_string("application_sha256_status", max_chars=32)
-            if status != "unavailable":
-                raise OgloProtocolError(
-                    "OGLO USB identity has invalid application_sha256_status"
-                )
+        if application_sha256_status == "available":
+            raise OgloProtocolError(
+                "OGLO USB identity has invalid application_sha256_status"
+            )
         identity["application_sha256_status"] = "unavailable"
     else:
         if (
@@ -216,18 +211,14 @@ def _parse_usb_identity(raw: bytes) -> dict[str, Any]:
             or any(char not in "0123456789abcdef" for char in application_sha256)
         ):
             raise OgloProtocolError("OGLO USB identity has invalid application_sha256")
-        if ident_schema == _USB_IDENT_SCHEMA_VERSION:
-            status = required_string("application_sha256_status", max_chars=32)
-            if status != "available":
-                raise OgloProtocolError(
-                    "OGLO USB identity has invalid application_sha256_status"
-                )
+        if application_sha256_status == "unavailable":
+            raise OgloProtocolError(
+                "OGLO USB identity has invalid application_sha256_status"
+            )
         identity["application_sha256_status"] = "available"
         identity["application_sha256"] = application_sha256
 
     if "journal_ready" not in decoded:
-        if ident_schema == _USB_IDENT_SCHEMA_VERSION:
-            raise OgloProtocolError("OGLO USB identity has invalid journal_ready")
         identity["journal_status"] = "unavailable"
         return identity
 
@@ -987,7 +978,6 @@ class OgloTactileStream(StreamBase):
             if value is not None:
                 self._usb_evidence_identity[key] = value
         event: dict[str, Any] = {
-            "schema_version": _USB_EVIDENCE_SCHEMA_VERSION,
             "event_type": event_type,
             "source_monotonic_ns": time.monotonic_ns(),
             "source_realtime_ns": time.time_ns(),

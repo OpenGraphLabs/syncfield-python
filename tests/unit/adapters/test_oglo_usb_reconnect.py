@@ -49,7 +49,6 @@ def _identity(
     reset_reason="poweron",
 ):
     return {
-        "ident_schema": 1,
         "mcu_boot_id": mcu_boot_id,
         "boot_count": journal_boot_counter,
         "reset_reason": reset_reason,
@@ -475,7 +474,6 @@ def test_identity_parser_preserves_explicitly_unavailable_application_hash(oglo_
 def test_identity_parser_accepts_the_hand_flashed_0913_legacy_shape(oglo_usb):
     module, _holder = oglo_usb
     identity = _identity()
-    identity.pop("ident_schema")
     identity.pop("application_sha256_status")
     identity.pop("application_sha256")
     identity.pop("journal_ready")
@@ -485,20 +483,18 @@ def test_identity_parser_accepts_the_hand_flashed_0913_legacy_shape(oglo_usb):
 
     parsed = module.stream._parse_usb_identity(json.dumps(identity).encode())
 
-    assert parsed["ident_schema"] == 0
     assert parsed["application_sha256_status"] == "unavailable"
     assert parsed["journal_status"] == "unavailable"
 
 
-def test_identity_parser_matches_the_shared_v1_golden_vector(oglo_usb):
+def test_identity_parser_matches_the_shared_additive_metadata_vector(oglo_usb):
     module, _holder = oglo_usb
     fixture = (
-        Path(__file__).with_name("oglo") / "ident_contract_v1.json"
+        Path(__file__).with_name("oglo") / "ident_metadata.json"
     ).read_bytes()
 
     parsed = module.stream._parse_usb_identity(fixture)
 
-    assert parsed["ident_schema"] == 1
     assert parsed["mcu_boot_id"] == "00112233445566778899aabbccddeeff"
     assert parsed["application_sha256_status"] == "available"
     assert parsed["journal_status"] == "available"
@@ -692,7 +688,6 @@ def test_usb_flight_log_is_bounded_metadata_only(oglo_usb, tmp_path, monkeypatch
     records = _usb_evidence_records(messages, module)
     assert records[-1]["event_type"] == "outage_observed"
     assert records[-1]["outage_id"] == "outage-test"
-    assert records[-1]["schema_version"] == "oglo.usb_evidence.v1"
     assert records[-1]["source_monotonic_ns"] > 0
     assert records[-1]["source_realtime_ns"] > 0
     assert "usb_serial" in records[-1]
