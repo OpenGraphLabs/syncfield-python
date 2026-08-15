@@ -306,6 +306,6 @@ def test_adoption_requires_a_real_packet_not_just_bytes(oglo_usb, tmp_path, monk
     monkeypatch.setattr(module.stream, "_RECONNECT_ATTEMPT_DEADLINE_S", 0.3)
     monkeypatch.setattr(module.stream, "_RECONNECT_STREAM_ON_AFTER_S", 0.05)
 
-    assert stream._try_adopt_reconnected(chatter) is None, (
+    assert stream._try_adopt_reconnected(chatter).seed is None, (
         "a port that only chatters must never be adopted as a live stream"
     )

@@ -1,0 +1,16 @@
+{
+  "mcu_boot_id": "00112233445566778899aabbccddeeff",
+  "boot_count": 7,
+  "reset_reason": "poweron",
+  "fw_rev": "0.9.14",
+  "hw_rev": "RDR02_FLEX5_REV_D_TIA",
+  "serial": "OGLO-TEST-L",
+  "application_sha256_status": "available",
+  "application_sha256": "abababababababababababababababababababababababababababababababab",
+  "uptime_ms": 1234,
+  "wedge_recoveries": 0,
+  "wedge_last_stall_ms": 0,
+  "wedge_guard": false,
+  "journal_ready": true,
+  "journal_boot_counter": 7
+}
