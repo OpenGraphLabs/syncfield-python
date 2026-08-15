@@ -114,6 +114,8 @@ _RECONNECT_ATTEMPT_DEADLINE_S = 1.6
 _RECONNECT_USB_RESET_AFTER_S = 3.0
 _USBDEVFS_RESET = (ord("U") << 8) | 20
 _USB_EVIDENCE_PREFIX = "OGLO_USB_EVIDENCE "
+_USB_EVIDENCE_SCHEMA_VERSION = "oglo.usb_evidence.v1"
+_USB_IDENT_SCHEMA_VERSION = 1
 _USB_INCIDENT_HISTORY_LIMIT = 16
 _USB_IDENT_COMMAND = b"GET IDENT\n"
 _USB_IDENT_PREFIX = b"#IDENT "
@@ -170,26 +172,69 @@ def _parse_usb_identity(raw: bytes) -> dict[str, Any]:
             raise OgloProtocolError(f"OGLO USB identity has invalid {field}")
         return value
 
-    application_sha256 = required_string("application_sha256", max_chars=64)
-    if len(application_sha256) != 64 or any(
-        char not in "0123456789abcdef" for char in application_sha256
+    ident_schema = decoded.get("ident_schema", 0)
+    if (
+        not isinstance(ident_schema, int)
+        or isinstance(ident_schema, bool)
+        or ident_schema not in (0, _USB_IDENT_SCHEMA_VERSION)
     ):
-        raise OgloProtocolError("OGLO USB identity has invalid application_sha256")
+        raise OgloProtocolError("OGLO USB identity has unsupported ident_schema")
+
+    mcu_boot_id = required_string("mcu_boot_id", max_chars=32)
+    if len(mcu_boot_id) != 32 or any(
+        char not in "0123456789abcdef" for char in mcu_boot_id
+    ):
+        raise OgloProtocolError("OGLO USB identity has invalid mcu_boot_id")
 
     identity: dict[str, Any] = {
-        "mcu_boot_id": required_string("mcu_boot_id", max_chars=128),
+        "ident_schema": ident_schema,
+        "mcu_boot_id": mcu_boot_id,
         "boot_count": required_int("boot_count"),
         "reset_reason": required_string("reset_reason", max_chars=64),
         "fw_rev": required_string("fw_rev", max_chars=64),
         "hw_rev": required_string("hw_rev", max_chars=128),
         "serial": required_string("serial", max_chars=128),
-        "application_sha256": application_sha256,
         "uptime_ms": required_int("uptime_ms"),
         "wedge_recoveries": required_int("wedge_recoveries"),
         "wedge_last_stall_ms": required_int("wedge_last_stall_ms"),
         "wedge_guard": required_bool("wedge_guard"),
-        "journal_ready": required_bool("journal_ready"),
     }
+
+    application_sha256 = decoded.get("application_sha256")
+    if application_sha256 is None:
+        if ident_schema == _USB_IDENT_SCHEMA_VERSION:
+            status = required_string("application_sha256_status", max_chars=32)
+            if status != "unavailable":
+                raise OgloProtocolError(
+                    "OGLO USB identity has invalid application_sha256_status"
+                )
+        identity["application_sha256_status"] = "unavailable"
+    else:
+        if (
+            not isinstance(application_sha256, str)
+            or len(application_sha256) != 64
+            or any(char not in "0123456789abcdef" for char in application_sha256)
+        ):
+            raise OgloProtocolError("OGLO USB identity has invalid application_sha256")
+        if ident_schema == _USB_IDENT_SCHEMA_VERSION:
+            status = required_string("application_sha256_status", max_chars=32)
+            if status != "available":
+                raise OgloProtocolError(
+                    "OGLO USB identity has invalid application_sha256_status"
+                )
+        identity["application_sha256_status"] = "available"
+        identity["application_sha256"] = application_sha256
+
+    if "journal_ready" not in decoded:
+        if ident_schema == _USB_IDENT_SCHEMA_VERSION:
+            raise OgloProtocolError("OGLO USB identity has invalid journal_ready")
+        identity["journal_status"] = "unavailable"
+        return identity
+
+    identity["journal_ready"] = required_bool("journal_ready")
+    identity["journal_status"] = (
+        "available" if identity["journal_ready"] else "invalid"
+    )
     if identity["journal_ready"]:
         journal_boot_id = required_string("journal_boot_id", max_chars=16)
         if len(journal_boot_id) != 16 or any(
@@ -200,6 +245,40 @@ def _parse_usb_identity(raw: bytes) -> dict[str, Any]:
         identity["journal_boot_counter"] = required_int("journal_boot_counter")
     else:
         identity["journal_error"] = required_string("journal_error", max_chars=128)
+    return identity
+
+
+def _usb_physical_identity(serial_port: str) -> dict[str, str | None]:
+    """Best-effort stable USB identity for joining host and adapter evidence."""
+
+    identity: dict[str, str | None] = {
+        "usb_serial": None,
+        "usb_physical_path": None,
+        "usb_controller": None,
+    }
+    try:
+        tty_name = Path(os.path.realpath(serial_port)).name
+        resolved = Path(os.path.realpath(f"/sys/class/tty/{tty_name}/device"))
+        device_dir = next(
+            candidate
+            for candidate in (resolved, *resolved.parents)
+            if (candidate / "idVendor").is_file()
+            and (candidate / "idProduct").is_file()
+        )
+        identity["usb_physical_path"] = device_dir.name
+        serial_path = device_dir / "serial"
+        if serial_path.is_file():
+            identity["usb_serial"] = serial_path.read_text().strip() or None
+        for candidate in (device_dir, *device_dir.parents):
+            if candidate.name.startswith("xhci-hcd."):
+                identity["usb_controller"] = candidate.name
+                break
+            driver = candidate / "driver"
+            if driver.exists() and driver.resolve().name == "xhci_hcd":
+                identity["usb_controller"] = candidate.name
+                break
+    except (OSError, RuntimeError, StopIteration, UnicodeError):
+        pass
     return identity
 
 
@@ -411,6 +490,7 @@ class OgloTactileStream(StreamBase):
         self._usb_read_history: deque[tuple[int, int, str, int | None]] = deque(
             maxlen=_USB_INCIDENT_HISTORY_LIMIT
         )
+        self._usb_evidence_identity = _usb_physical_identity(self._serial_port)
         # The ID is allocated with the identity baseline, before an outage
         # exists. If the link later fails, every host action and the after probe
         # reuse it. A successful after probe is also the next outage's baseline.
@@ -902,10 +982,18 @@ class OgloTactileStream(StreamBase):
         **fields: Any,
     ) -> None:
         """Write one metadata-only JSON record to the existing process log."""
+        current_identity = _usb_physical_identity(self._serial_port)
+        for key, value in current_identity.items():
+            if value is not None:
+                self._usb_evidence_identity[key] = value
         event: dict[str, Any] = {
+            "schema_version": _USB_EVIDENCE_SCHEMA_VERSION,
             "event_type": event_type,
+            "source_monotonic_ns": time.monotonic_ns(),
+            "source_realtime_ns": time.time_ns(),
             "stream_id": self.id,
             "serial_port": self._serial_port,
+            **self._usb_evidence_identity,
             **fields,
         }
         try:

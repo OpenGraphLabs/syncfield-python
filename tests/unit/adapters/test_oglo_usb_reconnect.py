@@ -18,6 +18,7 @@ import struct
 import sys
 import threading
 import time
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -42,18 +43,20 @@ class _SerialError(Exception):
 
 def _identity(
     *,
-    mcu_boot_id="mcu-boot-1",
+    mcu_boot_id="00112233445566778899aabbccddeeff",
     journal_boot_id="0123456789abcdef",
     journal_boot_counter=7,
     reset_reason="poweron",
 ):
     return {
+        "ident_schema": 1,
         "mcu_boot_id": mcu_boot_id,
         "boot_count": journal_boot_counter,
         "reset_reason": reset_reason,
-        "fw_rev": "0.9.13",
+        "fw_rev": "0.9.14",
         "hw_rev": "RDR02_FLEX5_REV_D_TIA",
         "serial": "OGLO-TEST-L",
+        "application_sha256_status": "available",
         "application_sha256": "ab" * 32,
         "uptime_ms": 1234,
         "wedge_recoveries": 0,
@@ -341,7 +344,7 @@ def test_rebooted_glove_gets_a_stream_on_nudge(oglo_usb, tmp_path, monkeypatch):
         "p",
         stream_on_gated=True,
         identity=_identity(
-            mcu_boot_id="mcu-boot-2",
+            mcu_boot_id="ffeeddccbbaa99887766554433221100",
             journal_boot_id="fedcba9876543210",
             journal_boot_counter=8,
             reset_reason="software",
@@ -369,7 +372,7 @@ def test_rebooted_glove_gets_a_stream_on_nudge(oglo_usb, tmp_path, monkeypatch):
         if event["event_type"] == "identity_after"
         and event["outage_id"] == outage["outage_id"]
     )
-    assert after["mcu_boot_id"] == "mcu-boot-2"
+    assert after["mcu_boot_id"] == "ffeeddccbbaa99887766554433221100"
     assert after["journal_boot_id"] == "fedcba9876543210"
     assert after["journal_boot_counter"] == 8
     assert after["reset_reason"] == "software"
@@ -448,12 +451,70 @@ def test_reconnect_identity_failure_keeps_recovery_and_outage_join(
     stream.disconnect()
 
 
-def test_identity_parser_requires_signed_application_hash(oglo_usb):
+def test_identity_parser_rejects_a_hash_status_that_claims_missing_bytes(oglo_usb):
     module, _holder = oglo_usb
     identity = _identity()
     identity.pop("application_sha256")
 
     with pytest.raises(module.stream.OgloProtocolError, match="application_sha256"):
+        module.stream._parse_usb_identity(json.dumps(identity).encode())
+
+
+def test_identity_parser_preserves_explicitly_unavailable_application_hash(oglo_usb):
+    module, _holder = oglo_usb
+    identity = _identity()
+    identity.pop("application_sha256")
+    identity["application_sha256_status"] = "unavailable"
+
+    parsed = module.stream._parse_usb_identity(json.dumps(identity).encode())
+
+    assert parsed["application_sha256_status"] == "unavailable"
+    assert "application_sha256" not in parsed
+
+
+def test_identity_parser_accepts_the_hand_flashed_0913_legacy_shape(oglo_usb):
+    module, _holder = oglo_usb
+    identity = _identity()
+    identity.pop("ident_schema")
+    identity.pop("application_sha256_status")
+    identity.pop("application_sha256")
+    identity.pop("journal_ready")
+    identity.pop("journal_boot_counter")
+    identity.pop("journal_boot_id")
+    identity["fw_rev"] = "0.9.13"
+
+    parsed = module.stream._parse_usb_identity(json.dumps(identity).encode())
+
+    assert parsed["ident_schema"] == 0
+    assert parsed["application_sha256_status"] == "unavailable"
+    assert parsed["journal_status"] == "unavailable"
+
+
+def test_identity_parser_matches_the_shared_v1_golden_vector(oglo_usb):
+    module, _holder = oglo_usb
+    fixture = (
+        Path(__file__).with_name("oglo") / "ident_contract_v1.json"
+    ).read_bytes()
+
+    parsed = module.stream._parse_usb_identity(fixture)
+
+    assert parsed["ident_schema"] == 1
+    assert parsed["mcu_boot_id"] == "00112233445566778899aabbccddeeff"
+    assert parsed["application_sha256_status"] == "available"
+    assert parsed["journal_status"] == "available"
+
+
+@pytest.mark.parametrize(
+    "mcu_boot_id",
+    ("mcu-boot-1", "A" * 32, "a" * 31, "a" * 33),
+)
+def test_identity_parser_rejects_noncanonical_mcu_boot_id(
+    oglo_usb, mcu_boot_id
+):
+    module, _holder = oglo_usb
+    identity = _identity(mcu_boot_id=mcu_boot_id)
+
+    with pytest.raises(module.stream.OgloProtocolError, match="mcu_boot_id"):
         module.stream._parse_usb_identity(json.dumps(identity).encode())
 
 
@@ -631,15 +692,18 @@ def test_usb_flight_log_is_bounded_metadata_only(oglo_usb, tmp_path, monkeypatch
     records = _usb_evidence_records(messages, module)
     assert records[-1]["event_type"] == "outage_observed"
     assert records[-1]["outage_id"] == "outage-test"
+    assert records[-1]["schema_version"] == "oglo.usb_evidence.v1"
+    assert records[-1]["source_monotonic_ns"] > 0
+    assert records[-1]["source_realtime_ns"] > 0
+    assert "usb_serial" in records[-1]
+    assert "usb_physical_path" in records[-1]
+    assert "usb_controller" in records[-1]
     for redundant in (
         "event_id",
         "origin_seq",
-        "source_monotonic_ns",
-        "source_realtime_ns",
         "host_boot_id",
         "invocation_id",
         "parent_event_id",
-        "schema",
         "raw_payload",
     ):
         assert redundant not in records[-1]
