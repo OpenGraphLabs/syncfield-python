@@ -104,3 +104,61 @@ def test_defaults_when_fields_absent():
     assert m.sample_shape == (5, 4, 4)
     # Unknown side falls back to the right-hand canonical order.
     assert m.finger_labels[0] == "thumb"
+    assert m.tag_ver_max == 1
+    assert m.boot_id == ""
+    assert m.link_ping is False
+    assert m.supports_link_ping is False
+
+
+@pytest.mark.parametrize(
+    ("fw_rev", "capability", "expected"),
+    [
+        ("0.9.15", True, False),
+        ("0.9.16", False, False),
+        ("0.9.16", True, True),
+        ("0.9.17", True, True),
+        ("1.0.0", True, True),
+        ("0.9.16", "true", False),
+        ("0.9.16", 1, False),
+    ],
+)
+def test_link_ping_requires_exact_capability_and_minimum_firmware(
+    fw_rev, capability, expected
+):
+    manifest = OgloDeviceManifest.from_json(
+        _manifest(fw_rev=fw_rev, link_ping=capability)
+    )
+    assert manifest.link_ping is (capability is True)
+    assert manifest.supports_link_ping is expected
+
+
+def test_tag_v2_capability_and_boot_identity_are_transport_metadata():
+    boot_id = "0123456789abcdef0123456789abcdef"
+    m = OgloDeviceManifest.from_json(
+        _manifest(fw_rev="0.9.13", tag_ver_max=2, boot_id=boot_id)
+    )
+    assert m.schema_ver == 6
+    assert m.tag_ver_max == 2
+    assert m.boot_id == boot_id
+
+
+@pytest.mark.parametrize(
+    "tag_ver_max", [0, -1, 256, True, "2", "nope", 2.9, None]
+)
+def test_invalid_tag_version_capability_is_rejected(tag_ver_max):
+    with pytest.raises(OgloProtocolError, match="tag_ver_max"):
+        OgloDeviceManifest.from_json(_manifest(tag_ver_max=tag_ver_max))
+
+
+@pytest.mark.parametrize(
+    "boot_id",
+    ["short", "z" * 32, "00-11", True, -1, 1 << 128, 1.5, []],
+)
+def test_invalid_boot_identity_is_rejected(boot_id):
+    with pytest.raises(OgloProtocolError, match="boot_id"):
+        OgloDeviceManifest.from_json(_manifest(boot_id=boot_id))
+
+
+def test_integer_boot_identity_is_canonicalized_as_128_bit_hex():
+    manifest = OgloDeviceManifest.from_json(_manifest(boot_id=0xABCD))
+    assert manifest.boot_id == "0000000000000000000000000000abcd"

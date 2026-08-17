@@ -22,9 +22,11 @@ import asyncio
 import json
 import logging
 import os
+import re
 import threading
 import time
 from collections import deque
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -35,12 +37,15 @@ except ImportError as exc:  # pragma: no cover
     raise ImportError("OgloTactileStream requires the syncfield ble extra") from exc
 
 from syncfield.adapters.oglo.selection import GloveCandidate, select_glove
+from syncfield.adapters.oglo.clock_alignment import HostDeviceClockProjector
 from syncfield.adapters.oglo.manifest import OgloDeviceManifest, is_supported_firmware
 from syncfield.adapters.oglo.packet import OgloProtocolError, parse_v5
 from syncfield.adapters.oglo.usb_packet import (
     QUIET_COMMANDS,
-    STREAM_OFF_COMMAND,
-    STREAM_ON_COMMAND,
+    STREAM_V1_OFF_COMMAND,
+    STREAM_V1_ON_COMMAND,
+    STREAM_V2_OFF_COMMAND,
+    STREAM_V2_ON_COMMAND,
     TAG_TYPE_IMU,
     TAG_TYPE_MAG,
     TAG_TYPE_TACTILE,
@@ -112,6 +117,83 @@ _RECONNECT_ATTEMPT_DEADLINE_S = 1.6
 # healthy blip is never reset, while a wedge self-heals in ~4 s end-to-end.
 _RECONNECT_USB_RESET_AFTER_S = 3.0
 _USBDEVFS_RESET = (ord("U") << 8) | 20
+_TAG2_ACK_RE = re.compile(rb"#STREAM TAG2 on boot_id=([0-9a-f]{32})")
+_TAG2_ACK_TIMEOUT_S = 2.0
+_TAG2_ACK_MAX_BYTES = 512
+# Firmware 0.9.16 makes configured-stall self-recovery opt-in. A live host
+# refreshes that authorization without eliciting a reply, so the command is
+# safe alongside the binary device-to-host TAG stream. The interval remains
+# well inside the firmware's 8 s freshness window while adding negligible RX
+# traffic. Never send this command from version alone: an old/malformed CONFIG
+# must remain byte-for-byte compatible with pre-0.9.16 firmware.
+_LINK_PING_COMMAND = b"LINK PING\n"
+_LINK_PING_INTERVAL_S = 1.0
+_SERIAL_WRITE_TIMEOUT_S = 0.5
+_LINK_PING_JOIN_TIMEOUT_S = 2.0
+# ``capture_ns`` is projected from the glove clock using the least-delayed USB
+# batch observed on this connection.  The device-relative spacing is precise,
+# but one-way USB has no round-trip clock exchange that could prove a 0.5 ms
+# absolute host offset.  Report the 100 ms CDC read window conservatively rather
+# than advertising the old, false 500 us claim.
+_PROJECTED_TIMESTAMP_UNCERTAINTY_NS = 100_000_000
+
+
+def _safe_tag2_prelude_line(line: bytes) -> bool:
+    """Known asynchronous idle text that may win the loop race before ACK."""
+    if line == b"":
+        return True
+    return line.startswith(
+        (
+            b"#HB ",
+            b"DATA ",
+            b"#BLE connected",
+            b"#BLE disconnected",
+            b"#BLE command queue dropped=",
+            b"#I2C lines changed:",
+            b"#I2C recovered,",
+        )
+    ) and all(byte == 9 or 32 <= byte <= 126 for byte in line)
+
+
+class _DeviceClockReset(OgloProtocolError):
+    """The stream's device clock moved backward without a valid v1 wrap."""
+
+
+class _U32DeviceClock:
+    """Unwrap one modality's TAG v1 u32 clock and reject MCU resets.
+
+    Each modality has a monotonically increasing sequence, so unlike a shared
+    cross-modality unwrapper it never has to guess whether an older IMU packet
+    arrived after a newer tactile packet. A large backward transition is the
+    single valid u32 wrap; a small backward transition means the MCU rebooted
+    and the current recording no longer has one continuous device clock.
+    """
+
+    _MODULUS = 1 << 32
+    _HALF = 1 << 31
+
+    def __init__(self) -> None:
+        self._last_raw: int | None = None
+        self._last_unwrapped: int | None = None
+        self._epoch = 0
+
+    def unwrap(self, raw_us: int) -> int:
+        raw = int(raw_us) & 0xFFFFFFFF
+        if self._last_raw is None:
+            value = raw
+        elif raw < self._last_raw and self._last_raw - raw > self._HALF:
+            self._epoch += self._MODULUS
+            value = self._epoch + raw
+        else:
+            value = self._epoch + raw
+            if self._last_unwrapped is not None and value < self._last_unwrapped:
+                raise _DeviceClockReset(
+                    f"TAG v1 device clock moved backward from "
+                    f"{self._last_raw} to {raw} us without rollover"
+                )
+        self._last_raw = raw
+        self._last_unwrapped = value
+        return value
 
 
 def _usb_device_reset(serial_port: str, *, stream_id: str = "") -> bool:
@@ -157,31 +239,26 @@ _OGLO_SENSOR_WRITER_OPTIONS = {
 
 
 def _open_usb_cdc(serial_module: Any, port: str, *, timeout: float) -> Any:
-    """Open a native ESP32-S3 CDC port without pulsing its reset lines.
+    """Open native ESP32-S3 CDC with the transmit-enabling line asserted.
 
-    ``pyserial.Serial(port, ...)`` opens immediately with DTR/RTS asserted by
-    default.  On the XIAO ESP32-S3 those control-line transitions can reset or
-    re-enumerate the native USB device, leaving the just-opened file descriptor
-    attached to a stale CDC endpoint.  Configure the lines while the handle is
-    still closed, then open it once.  This is also the sequence used by OGLO's
-    production firmware tools.
+    TinyUSB gates device-to-host CDC writes on DTR.  Suppressing the control
+    line can appear to work only while an earlier opener's asserted state is
+    still latched; after a re-enumeration the glove accepts commands but can no
+    longer return CONFIG, ACKs, or TAG frames.  Configure the closed handle so
+    the first open asserts DTR, while RTS remains low.  Native USB has no UART
+    bridge auto-reset circuit, so this does not pulse the MCU reset sequence.
+    This is the same contract used by oglo-sdk's live-qualified USB opener.
     """
-    # ``dtr=False``/``rts=False`` still makes pyserial issue TIOCMBIC during
-    # open; ESP32-S3 native CDC returns EPROTO for that ioctl.  Temporarily
-    # mark both lines as flow-controlled so pyserial skips both modem-control
-    # ioctls, then disable RTS/CTS in termios before the first write.
-    ser = serial_module.Serial(
-        port=None,
-        baudrate=115200,
-        timeout=timeout,
-        dsrdtr=True,
-        rtscts=True,
-    )
-    ser.dtr = False
+    ser = serial_module.Serial()
+    ser.baudrate = 115200
+    ser.timeout = timeout
+    # Bound command-side writes so a disconnected CDC endpoint cannot strand
+    # the LINK PING worker (and therefore disconnect()) forever.
+    ser.write_timeout = _SERIAL_WRITE_TIMEOUT_S
+    ser.dtr = True
     ser.rts = False
     ser.port = port
     ser.open()
-    ser.rtscts = False
     return ser
 
 
@@ -278,6 +355,21 @@ class OgloTactileStream(StreamBase):
         self._serial: Any = None  # pyserial handle when on the USB transport
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
+        # LINK PING runs beside the reader, so every host-to-device byte must
+        # share one transaction lock. RLock is intentional: a future raw/OTA
+        # writer can hold _serial_write_transaction() across BEGIN + binary +
+        # END while reusing _write_serial() for individual chunks. There is no
+        # raw firmware-transfer API in this adapter today.
+        self._serial_write_lock = threading.RLock()
+        self._usb_connection_generation = 0
+        self._link_ping_generation: Optional[int] = None
+        self._link_ping_failed_generation: Optional[int] = None
+        self._link_ping_failure_reason: Optional[str] = None
+        self._link_ping_failure_event = threading.Event()
+        self._link_ping_thread: Optional[threading.Thread] = None
+        self._link_ping_stop_event = threading.Event()
+        self._link_ping_wake_event = threading.Event()
+        self._link_ping_lifecycle_lock = threading.Lock()
 
         # Set once the manifest is read + validated on the reader thread; unblocks
         # connect(). ``_connect_error`` carries any connect/validation failure
@@ -286,10 +378,25 @@ class OgloTactileStream(StreamBase):
         self._connect_error: Optional[BaseException] = None
         self._manifest: Optional[OgloDeviceManifest] = None
         self._channel_labels: tuple[str, ...] = ()
+        # The manifest negotiates exactly one USB TAG version per connection.
+        # Firmware <=0.9.12 omits tag_ver_max and remains on v1; 0.9.13+
+        # advertises v2 and sends a native u64 timestamp.
+        self._tag_version = 1
+        self._stream_on_command = STREAM_V1_ON_COMMAND
+        self._stream_off_command = STREAM_V1_OFF_COMMAND
+        self._stream_boot_id = ""
+        self._device_clocks: dict[str, _U32DeviceClock] = {}
+        self._last_v2_device_us: dict[str, int] = {}
+        self._host_device_clock = HostDeviceClockProjector()
 
         # Recording state — primary taxel stream.
         self._recording = False
         self._recording_lock = threading.RLock()
+        # A reader can die asynchronously after start_recording() returns.
+        # Preserve that terminal fact until finalization; a health event alone
+        # must never allow the episode manifest to claim "completed".
+        self._recording_fatal_error: Optional[str] = None
+        self._reader_terminal_error: Optional[str] = None
         self._frame_count = 0
         self._first_at: Optional[int] = None
         self._last_at: Optional[int] = None
@@ -331,13 +438,21 @@ class OgloTactileStream(StreamBase):
         if self._thread is not None and self._thread.is_alive():
             return
 
+        self._stop_link_ping_worker()
         self._recording = False
         self._frame_count = 0
         self._first_at = None
         self._last_at = None
         self._next_expected_seq = {}
         self._connect_error = None
+        self._recording_fatal_error = None
+        self._reader_terminal_error = None
         self._manifest = None
+        self._tag_version = 1
+        self._stream_on_command = STREAM_V1_ON_COMMAND
+        self._stream_off_command = STREAM_V1_OFF_COMMAND
+        self._stream_boot_id = ""
+        self._reset_device_clocks()
         self._ready_event.clear()
         self._stop_event.clear()
 
@@ -347,7 +462,7 @@ class OgloTactileStream(StreamBase):
         self._thread.start()
 
         if not self._ready_event.wait(timeout=self._connect_timeout):
-            self._stop_event.set()
+            self.disconnect()
             raise RuntimeError(
                 f"[{self.id}] OGLO connect timed out after {self._connect_timeout}s "
                 "(no config manifest read)"
@@ -383,6 +498,7 @@ class OgloTactileStream(StreamBase):
         # the first packet in the window becomes that baseline.
         with self._recording_lock:
             self._next_expected_seq = {}
+            self._recording_fatal_error = None
             self._begin_recording_window(session_clock)
             self._recording = True
 
@@ -416,17 +532,23 @@ class OgloTactileStream(StreamBase):
         """
         with self._recording_lock:
             self._recording = False
+            fatal_error = self._recording_fatal_error
+            if fatal_error is None:
+                fatal_error = self._reader_terminal_error
+            thread = self._thread
+            if fatal_error is None and (thread is None or not thread.is_alive()):
+                fatal_error = "OGLO USB TAG reader terminated during recording"
             self._close_imu_writer()
             self._close_mag_writer()
         return FinalizationReport(
             stream_id=self.id,
-            status="completed",
+            status="failed" if fatal_error is not None else "completed",
             frame_count=self._frame_count,
             file_path=None,
             first_sample_at_ns=self._first_at,
             last_sample_at_ns=self._last_at,
             health_events=list(self._collected_health),
-            error=None,
+            error=fatal_error,
             recording_anchor=self._recording_anchor(),
         )
 
@@ -489,6 +611,14 @@ class OgloTactileStream(StreamBase):
             old_count = self._frame_count
             old_first = self._first_at
             old_last = self._last_at
+            old_fatal_error = self._recording_fatal_error
+            if old_fatal_error is None:
+                old_fatal_error = self._reader_terminal_error
+            thread = self._thread
+            if old_fatal_error is None and (
+                thread is None or not thread.is_alive()
+            ):
+                old_fatal_error = "OGLO USB TAG reader terminated during recording"
             self._frame_count = 0
             self._first_at = None
             self._last_at = None
@@ -508,22 +638,41 @@ class OgloTactileStream(StreamBase):
         self._recorded_artifacts = tuple(artifacts)
         return FinalizationReport(
             stream_id=self.id,
-            status="completed" if old_count > 0 else "failed",
+            status="completed"
+            if old_count > 0 and old_fatal_error is None
+            else "failed",
             frame_count=old_count,
             file_path=None,
             first_sample_at_ns=old_first,
             last_sample_at_ns=old_last,
             health_events=list(self._collected_health),
-            error=None if old_count > 0 else "No tactile samples arrived during segment.",
+            error=(
+                old_fatal_error
+                if old_fatal_error is not None
+                else None
+                if old_count > 0
+                else "No tactile samples arrived during segment."
+            ),
             recording_anchor=old_anchor,
         )
 
     def disconnect(self) -> None:
         """Stop the TAG reader and release the serial port."""
         self._stop_event.set()
-        if self._thread is not None:
-            self._thread.join(timeout=3.0)
-            self._thread = None
+        self._stop_link_ping_worker()
+        thread = self._thread
+        if thread is not None:
+            thread.join(timeout=3.0)
+            if thread.is_alive():
+                # Keep the truthful reference: clearing it would let a later
+                # connect() open a second owner for the same CDC endpoint while
+                # this reader can still touch the first one. POSIX reads are
+                # configured with a 100 ms timeout, so reaching this branch is
+                # an abnormal lifecycle failure and must stay observable.
+                logger.error("[%s] OGLO USB reader did not stop in 3 seconds", self.id)
+                return
+            if self._thread is thread:
+                self._thread = None
 
     # ------------------------------------------------------------------
     # Legacy one-shot lifecycle
@@ -786,8 +935,118 @@ class OgloTactileStream(StreamBase):
         """
         self._manifest = manifest
         self._channel_labels = manifest.channel_labels()
+        self._set_tag_version(2 if manifest.tag_ver_max >= 2 else 1)
+        if manifest.boot_id:
+            self._stream_boot_id = manifest.boot_id
         if manifest.side in ("left", "right"):
             self._hand = manifest.side
+
+    def _set_tag_version(self, version: int) -> None:
+        if version == 2:
+            self._tag_version = 2
+            self._stream_on_command = STREAM_V2_ON_COMMAND
+            self._stream_off_command = STREAM_V2_OFF_COMMAND
+        else:
+            self._tag_version = 1
+            self._stream_on_command = STREAM_V1_ON_COMMAND
+            self._stream_off_command = STREAM_V1_OFF_COMMAND
+
+    def _reset_device_clocks(self) -> None:
+        self._device_clocks = {}
+        self._last_v2_device_us = {}
+        self._host_device_clock.reset()
+
+    def _accept_tag2_boot_id(
+        self, observed: str, *, allow_epoch_change: bool = False
+    ) -> None:
+        """Bind one exact TAG2 start acknowledgement to this connection."""
+        if self._stream_boot_id and observed != self._stream_boot_id:
+            with self._recording_lock:
+                recording = self._recording
+            if recording:
+                raise _DeviceClockReset(
+                    "OGLO rebooted during recording "
+                    f"(boot_id {self._stream_boot_id} -> {observed})"
+                )
+            if not allow_epoch_change:
+                raise OgloProtocolError(
+                    "TAG2 CONFIG/ACK boot_id mismatch "
+                    f"({self._stream_boot_id} != {observed})"
+                )
+            self._reset_device_clocks()
+            self._next_expected_seq = {}
+        self._stream_boot_id = observed
+
+    def _read_tag2_ack(
+        self,
+        ser: Any,
+        seed: bytes = b"",
+        *,
+        allow_epoch_change: bool = False,
+    ) -> bytes:
+        """Require the exact split-safe TAG2 ACK and return following bytes.
+
+        Binary frames may arrive in the same USB read as the acknowledgement;
+        those bytes are returned unchanged. Missing or malformed ACKs are a
+        protocol failure, never a silent downgrade to TAG v1.
+        """
+        pending = bytearray(seed)
+        consumed = 0
+        deadline = time.monotonic() + _TAG2_ACK_TIMEOUT_S
+        while time.monotonic() < deadline:
+            while (newline := pending.find(b"\n")) >= 0:
+                line = bytes(pending[:newline]).removesuffix(b"\r")
+                del pending[:newline + 1]
+                consumed += newline + 1
+                match = _TAG2_ACK_RE.fullmatch(line)
+                if match is None:
+                    if _safe_tag2_prelude_line(line):
+                        continue
+                    raise OgloProtocolError(
+                        f"malformed TAG2 start acknowledgement: {line[:96]!r}"
+                    )
+                observed = match.group(1).decode("ascii")
+                self._accept_tag2_boot_id(
+                    observed, allow_epoch_change=allow_epoch_change
+                )
+                return bytes(pending)
+            if consumed + len(pending) > _TAG2_ACK_MAX_BYTES:
+                raise OgloProtocolError(
+                    "TAG2 start acknowledgement prelude exceeded 512 bytes"
+                )
+            chunk = ser.read(4096)
+            if chunk:
+                pending += chunk
+            else:
+                self._stop_event.wait(0.005)
+        raise OgloProtocolError("no TAG2 start acknowledgement within 2 seconds")
+
+    def _device_time_us(self, packet: UsbTaggedPacket) -> int:
+        modality = packet.modality
+        if packet.tag_version == 1:
+            clock = self._device_clocks.setdefault(modality, _U32DeviceClock())
+            try:
+                return clock.unwrap(packet.device_us)
+            except _DeviceClockReset:
+                with self._recording_lock:
+                    recording = self._recording
+                if recording:
+                    raise
+                # A reconnect while only previewing may include an MCU reboot.
+                # No sellable capture spans the boundary, so begin a fresh
+                # device-clock epoch instead of killing preview forever.
+                self._reset_device_clocks()
+                clock = self._device_clocks.setdefault(modality, _U32DeviceClock())
+                return clock.unwrap(packet.device_us)
+
+        value = int(packet.device_us)
+        previous = self._last_v2_device_us.get(modality)
+        if previous is not None and value < previous:
+            raise _DeviceClockReset(
+                f"TAG v2 {modality} clock moved backward from {previous} to {value} us"
+            )
+        self._last_v2_device_us[modality] = value
+        return value
 
     # ------------------------------------------------------------------
     # Payload decoding (unit-testable without asyncio / bleak)
@@ -797,6 +1056,167 @@ class OgloTactileStream(StreamBase):
     # USB CDC transport (wired, preferred)
     # ------------------------------------------------------------------
 
+    @contextmanager
+    def _serial_write_transaction(self):
+        """Exclude LINK PING for an entire host-to-device transaction.
+
+        All current writes are one command and go through :meth:`_write_serial`.
+        If raw firmware transfer is ever added here, it must hold this context
+        across the complete BEGIN/body/END exchange, not once per chunk; that
+        invariant prevents a keepalive command from entering binary payload.
+        """
+        with self._serial_write_lock:
+            yield
+
+    def _write_serial(self, ser: Any, data: bytes, *, flush: bool = True) -> Any:
+        """Write one complete command while excluding the keepalive worker."""
+        with self._serial_write_transaction():
+            written = ser.write(data)
+            if flush:
+                ser.flush()
+            return written
+
+    def _close_serial(self, ser: Any) -> None:
+        """Close a handle only after any in-flight command has left the lock."""
+        with self._serial_write_transaction():
+            ser.close()
+
+    def _activate_usb_connection(self, ser: Any) -> int:
+        """Publish a proven handle as a fresh firmware USB generation."""
+        with self._serial_write_transaction():
+            self._serial = ser
+            self._usb_connection_generation += 1
+            generation = self._usb_connection_generation
+            self._link_ping_generation = None
+            self._link_ping_failed_generation = None
+            self._link_ping_failure_reason = None
+            self._link_ping_failure_event.clear()
+        # A worker waiting on the old/disconnected handle must immediately
+        # authorize this new generation rather than waiting a full interval.
+        self._link_ping_wake_event.set()
+        return generation
+
+    def _detach_usb_connection(self, expected: Any | None = None) -> Any | None:
+        """Make the active handle unreachable to LINK PING before closing it."""
+        with self._serial_write_transaction():
+            if expected is not None and self._serial is not expected:
+                return None
+            old = self._serial
+            self._serial = None
+            self._link_ping_generation = None
+            return old
+
+    def _send_link_ping(self) -> None:
+        """Refresh recovery authorization for exactly the active USB generation."""
+        with self._serial_write_transaction():
+            manifest = self._manifest
+            ser = self._serial
+            generation = self._usb_connection_generation
+            if (
+                manifest is None
+                or not manifest.supports_link_ping
+                or ser is None
+                or generation <= 0
+                or self._link_ping_failed_generation == generation
+            ):
+                return
+            try:
+                written = ser.write(_LINK_PING_COMMAND)
+            except Exception as exc:  # noqa: BLE001 - reader owns recovery
+                self._record_link_ping_failure(
+                    generation, f"LINK PING write failed: {exc}"
+                )
+                return
+            if written != len(_LINK_PING_COMMAND):
+                self._record_link_ping_failure(
+                    generation,
+                    "partial LINK PING write "
+                    f"({written!r}/{len(_LINK_PING_COMMAND)} bytes)",
+                )
+                return
+            self._link_ping_generation = generation
+
+    def _record_link_ping_failure(self, generation: int, reason: str) -> None:
+        """Poison one generation and wake the reader to reconnect it.
+
+        Retrying after a short write could append a second command to a
+        partial ``LINK PING`` and make old firmware emit text into the binary
+        stream. Once any ping write is uncertain, no more bytes are sent on
+        that handle; the reader replaces the USB generation instead.
+        """
+        self._link_ping_failed_generation = generation
+        self._link_ping_failure_reason = reason
+        self._link_ping_failure_event.set()
+        logger.warning("[%s] %s on USB generation %d", self.id, reason, generation)
+
+    def _take_link_ping_failure(self) -> str | None:
+        """Consume a failure only when it belongs to the active generation."""
+        if not self._link_ping_failure_event.is_set():
+            return None
+        with self._serial_write_transaction():
+            if self._link_ping_failed_generation != self._usb_connection_generation:
+                self._link_ping_failure_event.clear()
+                return None
+            reason = self._link_ping_failure_reason or "LINK PING failed"
+            self._link_ping_failure_event.clear()
+            return reason
+
+    def _active_usb_connection_is_poisoned(self) -> bool:
+        """Whether another command could concatenate with a partial ping."""
+        with self._serial_write_transaction():
+            return (
+                self._serial is not None
+                and self._link_ping_failed_generation
+                == self._usb_connection_generation
+            )
+
+    def _run_link_ping_worker(self) -> None:
+        """Periodically authorize only a manifest-gated, currently-open link."""
+        while not self._link_ping_stop_event.is_set():
+            self._link_ping_wake_event.wait(_LINK_PING_INTERVAL_S)
+            self._link_ping_wake_event.clear()
+            if self._link_ping_stop_event.is_set():
+                break
+            self._send_link_ping()
+
+    def _start_link_ping_worker(self) -> None:
+        manifest = self._manifest
+        if manifest is None or not manifest.supports_link_ping:
+            return
+        with self._link_ping_lifecycle_lock:
+            current = self._link_ping_thread
+            if current is not None and current.is_alive():
+                self._link_ping_wake_event.set()
+                return
+            self._link_ping_stop_event.clear()
+            self._link_ping_wake_event.clear()
+            worker = threading.Thread(
+                target=self._run_link_ping_worker,
+                name=f"oglo-link-ping-{self.id}",
+                daemon=True,
+            )
+            self._link_ping_thread = worker
+            worker.start()
+            # First authorization is immediate; subsequent refreshes use the
+            # one-second interval.
+            self._link_ping_wake_event.set()
+
+    def _stop_link_ping_worker(self) -> None:
+        """Request, join and retire the optional worker; safe when repeated."""
+        with self._link_ping_lifecycle_lock:
+            worker = self._link_ping_thread
+            if worker is None:
+                return
+            self._link_ping_stop_event.set()
+            self._link_ping_wake_event.set()
+            if worker is not threading.current_thread():
+                worker.join(timeout=_LINK_PING_JOIN_TIMEOUT_S)
+            if worker.is_alive():
+                logger.error("[%s] LINK PING worker did not stop in time", self.id)
+                return
+            if self._link_ping_thread is worker:
+                self._link_ping_thread = None
+
     def _synthesise_usb_manifest(self) -> OgloDeviceManifest:
         """Schema-6 geometry fallback used only for unit-level construction."""
         side = self._hand if self._hand in ("left", "right") else "unknown"
@@ -805,14 +1225,12 @@ class OgloTactileStream(StreamBase):
         )
 
     def _read_usb_manifest(self, ser: Any) -> OgloDeviceManifest:
-        ser.write(QUIET_COMMANDS)
-        ser.flush()
+        self._write_serial(ser, QUIET_COMMANDS)
         time.sleep(0.25)
         ser.reset_input_buffer()
         deadline = time.monotonic() + 6.0
         while time.monotonic() < deadline and not self._stop_event.is_set():
-            ser.write(b"GET CONFIG\n")
-            ser.flush()
+            self._write_serial(ser, b"GET CONFIG\n")
             attempt_end = min(deadline, time.monotonic() + 1.0)
             while time.monotonic() < attempt_end and not self._stop_event.is_set():
                 line = ser.readline()
@@ -852,28 +1270,46 @@ class OgloTactileStream(StreamBase):
             import serial  # lazy: only the wired path needs pyserial
 
             ser = _open_usb_cdc(serial, self._serial_port, timeout=0.1)
-            self._serial = ser
+            self._activate_usb_connection(ser)
             time.sleep(0.2)
             manifest = self._read_usb_manifest(ser)
             self._apply_manifest(manifest)
             ser.reset_input_buffer()
-            ser.write(STREAM_ON_COMMAND)
-            ser.flush()
+            self._write_serial(ser, self._stream_on_command)
+            seed = self._read_tag2_ack(ser) if self._tag_version == 2 else b""
+            self._start_link_ping_worker()
         except Exception as exc:  # noqa: BLE001 - report to connect() caller
             self._connect_error = exc
             self._ready_event.set()
             if ser is not None:
                 try:
-                    ser.close()
+                    self._write_serial(ser, self._stream_off_command)
                 except Exception:
                     pass
-            self._serial = None
+                try:
+                    active = self._detach_usb_connection(expected=ser)
+                    self._close_serial(active if active is not None else ser)
+                except Exception:
+                    pass
             return
 
-        buffer = b""
+        buffer = seed
         ready = False
         ready_deadline = time.monotonic() + 3.0
         last_packet_at = time.monotonic()
+
+        if buffer:
+            packet_iter, buffer = iter_usb_packets(buffer)
+            packets = tuple(
+                packet for packet in packet_iter
+                if packet.tag_version == self._tag_version
+            )
+            if packets:
+                ready = True
+                self._ready_event.set()
+                self._handle_usb_packets(packets, receive_ns=time.monotonic_ns())
+            if packets:
+                last_packet_at = time.monotonic()
 
         def recover_or_die(reason: str) -> None:
             """Re-establish the link, or raise so the thread exits.
@@ -893,16 +1329,28 @@ class OgloTactileStream(StreamBase):
             # them now; waiting for the next chunk would hold them hostage
             # on a quiet link.
             ser, buffer = reconnected
-            packets, buffer = iter_usb_packets(buffer)
-            for packet in packets:
-                self._handle_usb_packet(packet)
+            packet_iter, buffer = iter_usb_packets(buffer)
+            packets = tuple(
+                packet for packet in packet_iter
+                if packet.tag_version == self._tag_version
+            )
+            self._handle_usb_packets(packets, receive_ns=time.monotonic_ns())
             # Adoption already proved a real packet arrived on this handle.
             last_packet_at = time.monotonic()
 
         try:
             while not self._stop_event.is_set():
+                ping_failure = self._take_link_ping_failure()
+                if ping_failure is not None:
+                    if not ready:
+                        raise OgloProtocolError(
+                            f"{ping_failure} before the first TAG packet"
+                        )
+                    recover_or_die(ping_failure)
+                    continue
                 try:
                     chunk = ser.read(4096)
+                    receive_ns = time.monotonic_ns()
                 except Exception:
                     if not ready:
                         raise OgloProtocolError(
@@ -917,24 +1365,22 @@ class OgloTactileStream(StreamBase):
                     continue
                 if chunk:
                     buffer += chunk
-                    packets, buffer = iter_usb_packets(buffer)
-                    handled = 0
-                    for packet in packets:
-                        if not ready:
-                            ready = True
-                            self._ready_event.set()
-                        self._handle_usb_packet(packet)
-                        handled += 1
-                    if handled:
-                        # Only framed packets count as liveness, and the count
-                        # must come from the iteration: `iter_usb_packets`
-                        # returns an ITERATOR, and an empty iterator is still
-                        # truthy, so `if packets:` refreshed liveness on every
-                        # read. A stopped glove keeps emitting `#HB …`
-                        # heartbeat text forever, so that made the watchdog
-                        # permanently blind (ogpi-005 bench, 2026-08-12).
+                    packet_iter, buffer = iter_usb_packets(buffer)
+                    packets = tuple(
+                        packet for packet in packet_iter
+                        if packet.tag_version == self._tag_version
+                    )
+                    if packets and not ready:
+                        ready = True
+                        self._ready_event.set()
+                    self._handle_usb_packets(packets, receive_ns=receive_ns)
+                    if packets:
+                        # Only a decoded packet in the negotiated TAG version
+                        # counts as liveness. Materialising the iterator is
+                        # intentional: an empty iterator itself is truthy, and
+                        # heartbeat text must not keep a dead stream alive.
                         last_packet_at = time.monotonic()
-                elif not ready and time.monotonic() >= ready_deadline:
+                if not ready and time.monotonic() >= ready_deadline:
                     raise OgloProtocolError("OGLO TAG stream produced no valid packet")
                 silent_s = time.monotonic() - last_packet_at
                 if ready and silent_s > _STREAM_SILENCE_TIMEOUT_S:
@@ -951,22 +1397,35 @@ class OgloTactileStream(StreamBase):
                 self._connect_error = exc
                 self._ready_event.set()
             else:
+                detail = str(exc) or type(exc).__name__
+                terminal_error = f"USB TAG reader failed: {detail}"
+                # Publish the terminal state before taking the recording lock.
+                # stop_recording() may race this exception; it must see either
+                # this general reader error or the in-window fatal latch.
+                self._reader_terminal_error = terminal_error
+                with self._recording_lock:
+                    if self._recording and self._recording_fatal_error is None:
+                        self._recording_fatal_error = terminal_error
                 self._emit_health(HealthEvent(
                     stream_id=self.id,
                     kind=HealthEventKind.ERROR,
                     at_ns=time.monotonic_ns(),
-                    detail=f"USB TAG reader failed: {exc}",
+                    detail=terminal_error,
                 ))
         finally:
-            ser = self._serial
+            self._stop_link_ping_worker()
+            poisoned = self._active_usb_connection_is_poisoned()
+            ser = self._detach_usb_connection()
             if ser is not None:
+                if not poisoned:
+                    try:
+                        self._write_serial(ser, self._stream_off_command)
+                    except Exception:
+                        pass
                 try:
-                    ser.write(STREAM_OFF_COMMAND)
-                    ser.flush()
-                    ser.close()
+                    self._close_serial(ser)
                 except Exception:
                     pass
-            self._serial = None
 
     def _try_adopt_reconnected(self, ser: Any) -> bytes | None:
         """Prove a fresh handle carries a live TAG stream; return its bytes.
@@ -986,12 +1445,20 @@ class OgloTactileStream(StreamBase):
         # adoption still succeeded on whatever was already in flight. The
         # command is idempotent for a glove that is already streaming.
         try:
-            ser.write(STREAM_ON_COMMAND)
-            ser.flush()
+            self._write_serial(ser, self._stream_on_command)
         except Exception:
             return None
 
-        buffer = b""
+        try:
+            buffer = (
+                self._read_tag2_ack(ser, allow_epoch_change=True)
+                if self._tag_version == 2
+                else b""
+            )
+        except _DeviceClockReset:
+            raise
+        except Exception:
+            return None
         nudged = False
         started = time.monotonic()
         while not self._stop_event.is_set():
@@ -1001,8 +1468,7 @@ class OgloTactileStream(StreamBase):
             if not nudged and not buffer and elapsed >= _RECONNECT_STREAM_ON_AFTER_S:
                 nudged = True
                 try:
-                    ser.write(STREAM_ON_COMMAND)
-                    ser.flush()
+                    self._write_serial(ser, self._stream_on_command)
                 except Exception:
                     return None
             try:
@@ -1012,15 +1478,14 @@ class OgloTactileStream(StreamBase):
             if not chunk:
                 continue
             buffer += chunk
-            packets, _remainder = iter_usb_packets(buffer)
-            # `next(..., None)` — NOT `if packets:`. iter_usb_packets returns
-            # an ITERATOR, and an empty iterator is truthy, so the old check
-            # adopted any handle that produced a single byte. A stopped glove
-            # keeps emitting `#HB …` heartbeat text, so reconnect reported
-            # success on a link carrying no samples at all: that is how
-            # ogpi-007 logged "USB link reconnected after 8443 ms" and then
-            # recorded 36 minutes of nothing (2026-08-12).
-            if next(packets, None) is not None:
+            packet_iter, _remainder = iter_usb_packets(buffer)
+            packets = tuple(
+                packet for packet in packet_iter
+                if packet.tag_version == self._tag_version
+            )
+            # Bytes, heartbeat text, and packets from a stale stream version
+            # are not proof that the replacement link is delivering samples.
+            if packets:
                 return buffer
             if len(buffer) > 65_536:
                 return None  # a flood that never frames is not a TAG stream
@@ -1038,11 +1503,14 @@ class OgloTactileStream(StreamBase):
         every wedged glove on ogpi-005 where logical replugging did not.
         """
         outage_started = time.monotonic()
-        old = self._serial
-        self._serial = None
+        old = self._detach_usb_connection()
+        # A worker is scoped to one open handle. Stop it before closing that
+        # DTR epoch, then create a fresh worker only after a replacement handle
+        # has delivered a valid TAG packet and becomes the new generation.
+        self._stop_link_ping_worker()
         if old is not None:
             try:
-                old.close()
+                self._close_serial(old)
             except Exception:
                 pass
         self._emit_health(HealthEvent(
@@ -1069,19 +1537,29 @@ class OgloTactileStream(StreamBase):
             except Exception:
                 if ser is not None:
                     try:
-                        ser.close()
+                        self._close_serial(ser)
                     except Exception:
                         pass
                 self._stop_event.wait(_RECONNECT_RETRY_INTERVAL_S)
                 continue
-            seed = self._try_adopt_reconnected(ser)
+            try:
+                seed = self._try_adopt_reconnected(ser)
+            except BaseException:
+                # The candidate handle is not yet owned by self._serial. Every
+                # exceptional adoption path must close it before propagating.
+                try:
+                    self._close_serial(ser)
+                except Exception:
+                    pass
+                raise
             if seed is None:
                 try:
-                    ser.close()
+                    self._close_serial(ser)
                 except Exception:
                     pass
                 continue
-            self._serial = ser
+            self._activate_usb_connection(ser)
+            self._start_link_ping_worker()
             with self._recording_lock:
                 # A rebooted device restarts its counters near zero; a stale
                 # baseline would make the corrupt-frame guard discard every
@@ -1121,28 +1599,57 @@ class OgloTactileStream(StreamBase):
         return None
 
     def _handle_usb_packet(self, packet: UsbTaggedPacket) -> None:
-        """Route one independently timestamped schema-6 TAG packet."""
-        recv_ns = time.monotonic_ns()
-        if not self._detect_drop(packet.modality, packet.seq, 1, recv_ns):
+        """Unit-test hook for one TAG packet outside a tty read batch."""
+        self._handle_usb_packets((packet,), receive_ns=time.monotonic_ns())
+
+    def _handle_usb_packets(
+        self,
+        packets: tuple[UsbTaggedPacket, ...],
+        *,
+        receive_ns: int,
+    ) -> None:
+        """Route one tty read while preserving the glove's device spacing."""
+        accepted = tuple(
+            packet for packet in packets if packet.tag_version == self._tag_version
+        )
+        if not accepted:
+            return
+        prepared = tuple(
+            (packet, self._device_time_us(packet) * 1_000)
+            for packet in accepted
+        )
+        capture_times = self._host_device_clock.project_batch(
+            ((packet.modality, device_ns) for packet, device_ns in prepared),
+            receive_ns=receive_ns,
+        )
+        for (packet, device_ns), capture_ns in zip(prepared, capture_times):
+            self._handle_prepared_usb_packet(packet, capture_ns, device_ns)
+
+    def _handle_prepared_usb_packet(
+        self,
+        packet: UsbTaggedPacket,
+        capture_ns: int,
+        device_ns: int,
+    ) -> None:
+        if not self._detect_drop(packet.modality, packet.seq, 1, capture_ns):
             return
         if packet.stream_type == TAG_TYPE_IMU:
-            self._handle_imu(packet.values, recv_ns, packet.device_ns)
+            self._handle_imu(packet.values, capture_ns, device_ns)
             return
         if packet.stream_type == TAG_TYPE_MAG:
-            self._handle_mag(packet.values, recv_ns, packet.device_ns)
+            self._handle_mag(packet.values, capture_ns, device_ns)
             return
         if packet.stream_type != TAG_TYPE_TACTILE:
             return
         labels = self._channel_labels
-        device_ns = packet.device_ns
         channels = {labels[i]: int(v) for i, v in enumerate(packet.values)}
 
         with self._recording_lock:
             if self._recording:
-                self._observe_first_frame(recv_ns, device_ns)
+                self._observe_first_frame(capture_ns, device_ns)
                 if self._first_at is None:
-                    self._first_at = recv_ns
-                self._last_at = recv_ns
+                    self._first_at = capture_ns
+                self._last_at = capture_ns
                 self._frame_count += 1
                 frame_number = self._frame_count - 1
             else:
@@ -1152,9 +1659,9 @@ class OgloTactileStream(StreamBase):
                 SampleEvent(
                     stream_id=self.id,
                     frame_number=frame_number,
-                    capture_ns=recv_ns,
+                    capture_ns=capture_ns,
                     channels=channels,
-                    uncertainty_ns=500_000,
+                    uncertainty_ns=_PROJECTED_TIMESTAMP_UNCERTAINTY_NS,
                     device_ns=device_ns,
                 )
             )
@@ -1181,20 +1688,30 @@ class OgloTactileStream(StreamBase):
             )
             return
 
-        if not self._detect_drop("tactile", packet.seq_base, packet.count, recv_ns):
+        clock = self._device_clocks.setdefault("ble_tactile", _U32DeviceClock())
+        device_times = tuple(clock.unwrap(sample.device_us) * 1_000 for sample in packet.samples)
+        capture_times = self._host_device_clock.project_batch(
+            (("tactile", device_ns) for device_ns in device_times),
+            receive_ns=recv_ns,
+        )
+        first_capture_ns = capture_times[0] if capture_times else recv_ns
+        if not self._detect_drop(
+            "tactile", packet.seq_base, packet.count, first_capture_ns
+        ):
             return
 
         labels = self._channel_labels
-        for sample in packet.samples:
-            device_ns = sample.device_ns
+        for sample, device_ns, capture_ns in zip(
+            packet.samples, device_times, capture_times
+        ):
             channels = {labels[i]: int(v) for i, v in enumerate(sample.taxels)}
 
             with self._recording_lock:
                 if self._recording:
-                    self._observe_first_frame(recv_ns, device_ns)
+                    self._observe_first_frame(capture_ns, device_ns)
                     if self._first_at is None:
-                        self._first_at = recv_ns
-                    self._last_at = recv_ns
+                        self._first_at = capture_ns
+                    self._last_at = capture_ns
                     self._frame_count += 1
                     frame_number = self._frame_count - 1
                 else:
@@ -1204,24 +1721,24 @@ class OgloTactileStream(StreamBase):
                     SampleEvent(
                         stream_id=self.id,
                         frame_number=frame_number,
-                        capture_ns=recv_ns,
+                        capture_ns=capture_ns,
                         channels=channels,
-                        uncertainty_ns=500_000,  # ~0.5 ms device-clock precision
+                        uncertainty_ns=_PROJECTED_TIMESTAMP_UNCERTAINTY_NS,
                         device_ns=device_ns,
                     )
                 )
                 if sample.imu is not None:
-                    self._handle_imu(sample.imu, recv_ns, device_ns)
+                    self._handle_imu(sample.imu, capture_ns, device_ns)
 
     def _handle_imu(
         self,
         imu: tuple[int, int, int, int, int, int],
-        recv_ns: int,
+        capture_ns: int,
         device_ns: int,
     ) -> None:
         """Fan a wrist-IMU sample out to the live handler + substream file."""
         with self._imu_recent_lock:
-            self._imu_recent_ns.append(recv_ns)
+            self._imu_recent_ns.append(capture_ns)
         channels = {name: int(v) for name, v in zip(IMU_CHANNELS, imu)}
 
         with self._recording_lock:
@@ -1234,9 +1751,9 @@ class OgloTactileStream(StreamBase):
                         writer.write(
                             SensorSample(
                                 frame_number=frame_number,
-                                capture_ns=recv_ns,
+                                capture_ns=capture_ns,
                                 channels=channels,
-                                uncertainty_ns=500_000,
+                                uncertainty_ns=_PROJECTED_TIMESTAMP_UNCERTAINTY_NS,
                                 device_timestamp_ns=device_ns,
                             )
                         )
@@ -1247,9 +1764,9 @@ class OgloTactileStream(StreamBase):
             SampleEvent(
                 stream_id=f"{self.id}.imu",
                 frame_number=frame_number,
-                capture_ns=recv_ns,
+                capture_ns=capture_ns,
                 channels=channels,
-                uncertainty_ns=500_000,
+                uncertainty_ns=_PROJECTED_TIMESTAMP_UNCERTAINTY_NS,
                 device_ns=device_ns,
             )
         )
@@ -1257,12 +1774,12 @@ class OgloTactileStream(StreamBase):
     def _handle_mag(
         self,
         mag: tuple[int, ...],
-        recv_ns: int,
+        capture_ns: int,
         device_ns: int,
     ) -> None:
         """Persist one independently timestamped magnetometer sample."""
         with self._imu_recent_lock:
-            self._mag_recent_ns.append(recv_ns)
+            self._mag_recent_ns.append(capture_ns)
         channels = {name: int(v) for name, v in zip(MAG_CHANNELS, mag)}
         with self._recording_lock:
             if self._recording:
@@ -1273,9 +1790,9 @@ class OgloTactileStream(StreamBase):
                     if writer is not None:
                         writer.write(SensorSample(
                             frame_number=frame_number,
-                            capture_ns=recv_ns,
+                            capture_ns=capture_ns,
                             channels=channels,
-                            uncertainty_ns=500_000,
+                            uncertainty_ns=_PROJECTED_TIMESTAMP_UNCERTAINTY_NS,
                             device_timestamp_ns=device_ns,
                         ))
             else:
@@ -1283,9 +1800,9 @@ class OgloTactileStream(StreamBase):
         self._emit_substream_sample(SampleEvent(
             stream_id=f"{self.id}.mag",
             frame_number=frame_number,
-            capture_ns=recv_ns,
+            capture_ns=capture_ns,
             channels=channels,
-            uncertainty_ns=500_000,
+            uncertainty_ns=_PROJECTED_TIMESTAMP_UNCERTAINTY_NS,
             device_ns=device_ns,
         ))
 
@@ -1405,3 +1922,22 @@ class OgloTactileStream(StreamBase):
     def manifest(self) -> Optional[OgloDeviceManifest]:
         """The validated device manifest, or ``None`` before connect."""
         return self._manifest
+
+    def recording_metadata(self) -> dict[str, Any]:
+        """Device-clock provenance persisted in the episode manifest."""
+        manifest = self._manifest
+        if manifest is None:
+            return {"device": "oglo", "tag_version": self._tag_version}
+        metadata: dict[str, Any] = {
+            "device": manifest.device,
+            "serial": manifest.serial,
+            "side": manifest.side,
+            "firmware": manifest.fw_rev,
+            "schema_version": manifest.schema_ver,
+            "tag_version": self._tag_version,
+            "timestamp_alignment": "host_monotonic_min_delay_device_projection_v1",
+            "timestamp_uncertainty_ns": _PROJECTED_TIMESTAMP_UNCERTAINTY_NS,
+        }
+        if self._stream_boot_id:
+            metadata["boot_id"] = self._stream_boot_id
+        return metadata

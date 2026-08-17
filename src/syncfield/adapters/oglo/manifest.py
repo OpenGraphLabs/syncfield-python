@@ -12,7 +12,8 @@ Emitted keys (``FW_REV 0.9.3+``): ``device``, ``schema_ver``, ``serial``,
 ``side``, ``hw_rev``, ``fw_rev``, ``rate_hz``, ``samples_per_packet``,
 ``adc_bits``, ``stream_mode``, ``values_per_sample``, ``sample_order``,
 ``sample_shape``, ``channels`` (5 side-aware finger names), ``device_id``,
-``pair_id``, ``batch``, ``factory_passed``, ``cal_valid``, ``imu``.
+``pair_id``, ``batch``, ``factory_passed``, ``cal_valid``, ``imu`` and the
+optional firmware-0.9.16 ``link_ping`` capability.
 """
 
 from __future__ import annotations
@@ -28,9 +29,11 @@ from syncfield.adapters.oglo.packet import (
 )
 
 __all__ = [
+    "LINK_PING_MIN_FW_REV",
     "MIN_SUPPORTED_FW_REV",
     "OgloDeviceManifest",
     "SUPPORTED_SCHEMA_VER",
+    "firmware_revision_at_least",
     "is_supported_firmware",
 ]
 
@@ -40,7 +43,14 @@ SUPPORTED_SCHEMA_VER = 6
 # Tagged USB first shipped in 0.9.3. Later patch releases keep schema 6 and
 # the same wire contract; the current production golden is 0.9.8.
 MIN_SUPPORTED_FW_REV = (0, 9, 3)
+LINK_PING_MIN_FW_REV = (0, 9, 16)
 _FW_REV_PATTERN = re.compile(r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$")
+
+
+def firmware_revision_at_least(value: str, minimum: tuple[int, int, int]) -> bool:
+    """Compare a stable three-component firmware revision, failing closed."""
+    match = _FW_REV_PATTERN.fullmatch(value.strip())
+    return bool(match and tuple(int(part) for part in match.groups()) >= minimum)
 
 
 def is_supported_firmware(value: str) -> bool:
@@ -50,8 +60,7 @@ def is_supported_firmware(value: str) -> bool:
     by ``schema_ver == 6``; the minimum rejects pre-TAG Rev-D firmware while
     allowing validated patch releases such as the 0.9.8 golden image.
     """
-    match = _FW_REV_PATTERN.fullmatch(value.strip())
-    return bool(match and tuple(int(part) for part in match.groups()) >= MIN_SUPPORTED_FW_REV)
+    return firmware_revision_at_least(value, MIN_SUPPORTED_FW_REV)
 
 #: Firmware default matrix shape: 5 fingers x 4 rows x 4 cols.
 _DEFAULT_SAMPLE_SHAPE: Tuple[int, int, int] = (5, 4, 4)
@@ -89,6 +98,9 @@ class OgloDeviceManifest:
     finger_labels: Tuple[str, ...]
     serial: str
     fw_rev: str
+    tag_ver_max: int = 1
+    boot_id: str = ""
+    link_ping: bool = False
     raw: Dict[str, Any] = field(default_factory=dict, repr=False)
 
     @classmethod
@@ -122,6 +134,12 @@ class OgloDeviceManifest:
         values_per_sample = int(data.get("values_per_sample") or DEFAULT_VALUES_PER_SAMPLE)
         shape = _coerce_shape(data.get("sample_shape"))
         labels = _coerce_finger_labels(data.get("channels"), side, shape[0])
+        tag_ver_max = _coerce_tag_ver_max(data.get("tag_ver_max", 1))
+        boot_id = _coerce_boot_id(data.get("boot_id"))
+        # Capability negotiation is deliberately exact. In particular, the
+        # strings "true"/"1" and integer 1 must not opt an older or malformed
+        # manifest into a command it may parse as an error inside TAG output.
+        link_ping = data.get("link_ping") is True
 
         return cls(
             device=str(data.get("device") or "oglo"),
@@ -133,6 +151,9 @@ class OgloDeviceManifest:
             finger_labels=labels,
             serial=str(data.get("serial") or ""),
             fw_rev=str(data.get("fw_rev") or ""),
+            tag_ver_max=tag_ver_max,
+            boot_id=boot_id,
+            link_ping=link_ping,
             raw=data,
         )
 
@@ -140,6 +161,18 @@ class OgloDeviceManifest:
     def per_finger(self) -> int:
         """Taxels per finger (``rows * cols``)."""
         return self.sample_shape[1] * self.sample_shape[2]
+
+    @property
+    def supports_link_ping(self) -> bool:
+        """Whether this exact firmware/config pair authorizes ``LINK PING``.
+
+        Both conditions are load-bearing: capability-only gating would send a
+        new command to a mislabeled old image, while version-only gating would
+        send it to a 0.9.16 build that did not actually implement the command.
+        """
+        return self.link_ping and firmware_revision_at_least(
+            self.fw_rev, LINK_PING_MIN_FW_REV
+        )
 
     def channel_label(self, taxel_index: int) -> str:
         """Return the ``<finger>_<row>_<col>`` label for a taxel index.
@@ -171,6 +204,44 @@ def _coerce_shape(value: Any) -> Tuple[int, int, int]:
         except (TypeError, ValueError):
             pass
     return _DEFAULT_SAMPLE_SHAPE
+
+
+def _coerce_tag_ver_max(value: Any) -> int:
+    """Validate the transport capability without changing schema version.
+
+    Firmware before 0.9.13 omits the key and is therefore TAG v1. A future
+    firmware may advertise a higher maximum; this host will still negotiate
+    the highest version it understands.
+    """
+    # JSON booleans are integers in Python, and int("2") / int(2.9) would
+    # silently accept non-canonical manifests. Keep the wire contract exact:
+    # one JSON integer in the one-byte protocol-version range.
+    if type(value) is not int or not 1 <= value <= 0xFF:
+        raise OgloProtocolError(
+            "config tag_ver_max must be an integer between 1 and 255"
+        )
+    return value
+
+
+def _coerce_boot_id(value: Any) -> str:
+    """Return the optional per-boot identity advertised by TAG v2 firmware."""
+    if value is None or value == "":
+        return ""
+    if isinstance(value, bool):
+        raise OgloProtocolError("config boot_id must be 32 hexadecimal characters")
+    if isinstance(value, int):
+        if value < 0 or value >= (1 << 128):
+            raise OgloProtocolError(
+                "config boot_id must be 32 hexadecimal characters"
+            )
+        text = f"{value:032x}"
+    elif isinstance(value, str):
+        text = value.strip().lower()
+    else:
+        raise OgloProtocolError("config boot_id must be 32 hexadecimal characters")
+    if not re.fullmatch(r"[0-9a-f]{32}", text):
+        raise OgloProtocolError("config boot_id must be 32 hexadecimal characters")
+    return text
 
 
 def _coerce_finger_labels(value: Any, side: str, finger_count: int) -> Tuple[str, ...]:

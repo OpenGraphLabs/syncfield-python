@@ -15,6 +15,7 @@ it must either recover or kill the thread so the host can stop the recording.
 """
 
 import importlib
+import json
 import struct
 import sys
 import threading
@@ -26,6 +27,9 @@ import pytest
 
 from syncfield.adapters.oglo.usb_packet import TAG_MAGIC, TAG_TYPE_TACTILE
 from syncfield.clock import SessionClock
+from syncfield.orchestrator import SessionOrchestrator
+from syncfield.testing import FakeStream
+from syncfield.tone import SyncToneConfig
 from syncfield.types import HealthEventKind, SyncPoint
 
 
@@ -179,13 +183,68 @@ def test_unrecoverable_silence_kills_the_thread(oglo_usb, tmp_path, monkeypatch)
     stream.on_health(health.append)
     stream.connect()
     stream.start_recording(_clock())
+    first.feed(tag(1, 5_000))
+    _wait(lambda: stream._frame_count == 1)
 
     _wait(lambda: not stream._thread.is_alive())
 
     assert any(h.kind is HealthEventKind.ERROR for h in health), (
         "an unrecoverable silent link must fail loud"
     )
+    report = stream.stop_recording()
+    assert report.status == "failed"
+    assert report.frame_count == 1
+    assert report.first_sample_at_ns is not None
+    assert report.last_sample_at_ns is not None
+    assert report.error is not None
+    assert "reader failed" in report.error
+    assert any(h.kind is HealthEventKind.ERROR for h in report.health_events)
     stream.disconnect()
+
+
+def test_one_dead_glove_cannot_be_completed_in_episode_manifest(
+    oglo_usb, tmp_path, monkeypatch
+):
+    """A healthy peer must not hide one terminal OGLO reader failure."""
+    module, holder = oglo_usb
+    monkeypatch.setattr(module.stream, "_STREAM_SILENCE_TIMEOUT_S", 0.2)
+    monkeypatch.setattr(module.stream, "_RECONNECT_WINDOW_S", 0.3)
+    monkeypatch.setattr(module.stream, "_RECONNECT_RETRY_INTERVAL_S", 0.02)
+    monkeypatch.setattr(module.stream, "_RECONNECT_ATTEMPT_DEADLINE_S", 0.08)
+
+    first = _FakeSerial("p")
+    first.feed(tag(0, 1_000))
+    holder["queue"] = [first]
+    glove = module.OgloTactileStream(
+        "tactile_right",
+        serial_port="/dev/serial/by-id/oglo-right",
+        hand="right",
+        output_dir=tmp_path,
+    )
+    healthy = FakeStream("healthy_peer")
+    session = SessionOrchestrator(
+        host_id="pi5",
+        output_dir=tmp_path,
+        sync_tone=SyncToneConfig.silent(),
+    )
+    session.add(glove)
+    session.add(healthy)
+    session.start(countdown_s=0)
+    healthy.push_sample(0, time.monotonic_ns())
+
+    _wait(lambda: glove._thread is not None and not glove._thread.is_alive())
+    result = session.stop()
+    by_id = {report.stream_id: report for report in result.finalizations}
+    assert by_id["healthy_peer"].status == "completed"
+    assert by_id["tactile_right"].status == "failed"
+    assert by_id["tactile_right"].error is not None
+
+    manifest = json.loads(
+        (session.last_episode_dir / "manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["streams"]["healthy_peer"]["status"] == "completed"
+    assert manifest["streams"]["tactile_right"]["status"] == "failed"
+    assert "reader failed" in manifest["streams"]["tactile_right"]["error"]
 
 
 def test_reconnect_always_reasserts_stream_on(oglo_usb, tmp_path, monkeypatch):
@@ -253,7 +312,10 @@ class _ChatteringSerial(_FakeSerial):
     perpetually-truthy packet iterator, so it believed data was flowing.
     """
 
-    _HEARTBEAT = b"#HB t_us=26826757 f0=772 f1=603 f2=687 scan_us=2795 ble=0 imu_ok=1\r\n"
+    _HEARTBEAT = (
+        b"#HB t_us=26826757 f0=772 f1=603 f2=687 "
+        b"scan_us=2795 ble=0 imu_ok=1\r\n"
+    )
 
     def read(self, n):
         with self._lock:
@@ -288,16 +350,20 @@ def test_heartbeat_chatter_is_not_mistaken_for_data(oglo_usb, tmp_path, monkeypa
 
     _wait(lambda: not stream._thread.is_alive())
     assert any(h.kind is HealthEventKind.ERROR for h in health)
+    report = stream.stop_recording()
+    assert report.status == "failed"
+    assert report.error is not None
     stream.disconnect()
 
 
-def test_adoption_requires_a_real_packet_not_just_bytes(oglo_usb, tmp_path, monkeypatch):
+def test_adoption_requires_a_real_packet_not_just_bytes(
+    oglo_usb, tmp_path, monkeypatch
+):
     """The ogpi-007 root cause: `iter_usb_packets` returns an iterator, and an
     empty iterator is still truthy, so adoption "succeeded" on a link that had
     delivered nothing. Reconnect then reported success and the episode
     recorded one hand for 36 minutes."""
-    module, holder = oglo_usb
-
+    module, _holder = oglo_usb
     chatter = _ChatteringSerial("p")
     stream = module.OgloTactileStream(
         "tactile_right", serial_port="/dev/serial/by-id/oglo-right", hand="right",

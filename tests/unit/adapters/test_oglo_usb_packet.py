@@ -8,6 +8,8 @@ from syncfield.adapters.oglo.packet import OgloProtocolError
 from syncfield.adapters.oglo.usb_packet import (
     TAG_HEADER_LEN,
     TAG_MAGIC,
+    TAG_V2_HEADER_LEN,
+    TAG_V2_MAGIC,
     TAG_TYPE_IMU,
     TAG_TYPE_MAG,
     TAG_TYPE_TACTILE,
@@ -31,6 +33,14 @@ def packed_tactile_packet(values, seq: int = 7, t_us: int = 1234) -> bytes:
     return TAG_MAGIC + bytes([TAG_TYPE_TACTILE]) + struct.pack("<HII", len(payload), seq, t_us) + payload
 
 
+def packet_v2(kind: int, seq: int = 7, t_us: int = 1234, values=()) -> bytes:
+    formats = {TAG_TYPE_TACTILE: "<80H", TAG_TYPE_IMU: "<6h", TAG_TYPE_MAG: "<3h"}
+    if not values:
+        values = [0] * {TAG_TYPE_TACTILE: 80, TAG_TYPE_IMU: 6, TAG_TYPE_MAG: 3}[kind]
+    payload = struct.pack(formats[kind], *values)
+    return TAG_V2_MAGIC + bytes([kind]) + struct.pack("<HIQ", len(payload), seq, t_us) + payload
+
+
 @pytest.mark.parametrize("kind,count", [(1, 80), (2, 6), (3, 3)])
 def test_decodes_each_independent_modality(kind, count):
     p = parse_usb_packet(packet(kind, seq=42, t_us=2_000_000, values=range(count)))
@@ -45,6 +55,67 @@ def test_decodes_0_9_9_packed12_tactile():
     p = parse_usb_packet(packed_tactile_packet(values, seq=99))
     assert p.seq == 99
     assert p.values == values
+
+
+def test_decodes_tag_v2_native_u64_timestamp():
+    timestamp = (1 << 32) + 987_654
+    p = parse_usb_packet(packet_v2(TAG_TYPE_IMU, seq=42, t_us=timestamp, values=range(6)))
+    assert p.tag_version == 2
+    assert p.seq == 42
+    assert p.device_us == timestamp
+    assert p.device_ns == timestamp * 1_000
+    assert TAG_V2_HEADER_LEN == 17
+
+
+def test_tag_v2_rejects_the_legacy_wide_tactile_payload():
+    wide = packet_v2(TAG_TYPE_TACTILE)
+    with pytest.raises(OgloProtocolError, match="payload"):
+        parse_usb_packet(wide)
+
+    parsed, leftover = iter_usb_packets(
+        wide + packet_v2(TAG_TYPE_IMU, seq=9, t_us=(2 << 32) + 1)
+    )
+    packets = list(parsed)
+    assert [(p.tag_version, p.modality, p.seq) for p in packets] == [
+        (2, "imu", 9)
+    ]
+    assert leftover == b""
+
+
+def test_iterator_decodes_mixed_v1_v2_during_upgrade_resync():
+    parsed, leftover = iter_usb_packets(
+        b"ascii" + packet(TAG_TYPE_TACTILE, seq=1, t_us=0xFFFFFFF0)
+        + b"noise" + packet_v2(TAG_TYPE_IMU, seq=2, t_us=(1 << 32) + 10)
+    )
+    packets = list(parsed)
+    assert [(p.tag_version, p.modality, p.seq) for p in packets] == [
+        (1, "tactile", 1),
+        (2, "imu", 2),
+    ]
+    assert leftover == b""
+
+
+@pytest.mark.parametrize("partial", [b"\xA5", TAG_V2_MAGIC + b"\x02\x0c"])
+def test_iterator_preserves_partial_v2_header(partial):
+    parsed, leftover = iter_usb_packets(b"junk" + partial)
+    assert list(parsed) == []
+    assert leftover == partial
+
+
+@pytest.mark.parametrize("version", [1, 2])
+def test_every_partial_frame_prefix_is_buffered_and_never_decoded(version):
+    """Firmware fail-close may end a USB session at any byte of a frame."""
+    frame = (
+        packet(TAG_TYPE_IMU, seq=41, t_us=9000, values=range(6))
+        if version == 1
+        else packet_v2(
+            TAG_TYPE_IMU, seq=41, t_us=(2 << 32) + 9000, values=range(6)
+        )
+    )
+    for cut in range(1, len(frame)):
+        parsed, leftover = iter_usb_packets(frame[:cut])
+        assert list(parsed) == [], cut
+        assert leftover == frame[:cut], cut
 
 
 def test_rejects_unknown_type_and_wrong_length():
