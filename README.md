@@ -74,6 +74,9 @@ Each device is wrapped in a `Stream` adapter with a fixed SPI: `prepare → conn
 
 Shipped adapters: `UVCWebcamStream`, `BLEImuGenericStream`, `OakCameraStream`, `MetaQuestCameraStream`, `MetaQuestHandStream`, `Go3SStream` (Insta360), `OgloTactileStream`, `HostAudioStream`, `JSONLFileStream`, `PollingSensorStream`, `PushSensorStream`.
 
+OGLO users: see [firmware preparation and validation scope](docs/oglo-firmware.md).
+Updating this package does not automatically update glove firmware.
+
 ## Multi-host
 
 ```bash
